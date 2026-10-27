@@ -45,6 +45,8 @@ const HARNESSES = [
   "dock-harness.ts",
   "swipe-harness.ts",
   "touch-harness.ts",
+  // P1 数据安全（指纹 / 原子写 / 版本闸门 / 冲突 / 完整性）
+  "p1-harness.ts",
 ];
 
 const only = process.argv[2];

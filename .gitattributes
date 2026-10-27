@@ -1,0 +1,22 @@
+# 统一换行符：仓库里一律 LF
+#
+# 背景：Windows 上的编辑器（含某些 AI 工具）会把文件写成 CRLF，
+# 导致 git 把「只改了一行」显示成「整文件重写」，diff 完全没法看。
+# text=auto 让 git 在入库时自动规范成 LF，工作区保持原样也能正确比较。
+* text=auto eol=lf
+
+# 明确指定文本类型（避免被误判成二进制）
+*.ts   text eol=lf
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.css  text eol=lf
+*.html text eol=lf
+
+# 真正的二进制文件（不做换行转换，也不参与 diff）
+*.png  binary
+*.jpg  binary
+*.pdf  binary
+*.zip  binary
+*.ico  binary

@@ -67,6 +67,14 @@ http
     if (p === '/feel-harness.js') return send(res, path.join(root, 'test/feel-harness.js'));
     if (p === '/plugin.html') return send(res, path.join(root, 'test/plugin.html'));
     if (p === '/plugin-harness.js') return send(res, path.join(root, 'test/plugin-harness.js'));
+    // 兜底：test/ 下的静态文件（新增 harness 不必每加一个就改路由表）
+    if (/\.(html|js|mjs|css)$/.test(p)) {
+      const testRoot = path.join(root, 'test');
+      const cand = path.join(testRoot, p.replace(/^\/+/, ''));
+      if (cand.startsWith(testRoot + path.sep) || cand === testRoot) {
+        if (fs.existsSync(cand) && fs.statSync(cand).isFile()) return send(res, cand);
+      }
+    }
     res.writeHead(404).end('404');
   })
   .listen(Number(process.env.PORT) || 8901, '127.0.0.1', () => console.log('http://127.0.0.1:8901'));

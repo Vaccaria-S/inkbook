@@ -5,17 +5,26 @@ import fs from 'node:fs';
 const url = process.argv[2] || 'http://127.0.0.1:8901/test.html';
 const timeout = Number(process.argv[3] || 45000);
 const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
-const profile = path.resolve('.edge-run');
+/**
+ * 端口与 profile 目录可用环境变量覆盖。
+ *
+ * 必要性：上一次跑挂了但没退出的无头 Edge 会一直占着 9343，
+ * 新实例绑不上端口会被静默忽略，run.mjs 于是连到**旧实例**——
+ * 一旦旧实例上还挂着同名页面，就会读到上一次的旧输出，出现假绿。
+ * 换端口 + 换 profile 目录，各 harness 之间互不干扰。
+ */
+const CDP_PORT = Number(process.env.CDP_PORT || 9343);
+const profile = path.resolve(process.env.CDP_PROFILE || '.edge-run');
 fs.mkdirSync(profile, { recursive: true });
 const child = spawn(EDGE, [
   '--headless=new', '--disable-gpu', '--no-first-run', '--no-proxy-server',
-  '--remote-debugging-port=9343', `--user-data-dir=${profile}`, url,
+  `--remote-debugging-port=${CDP_PORT}`, `--user-data-dir=${profile}`, url,
 ], { stdio: 'ignore' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let page;
 for (let i = 0; i < 60; i++) {
   try {
-    const list = await (await fetch('http://127.0.0.1:9343/json/list')).json();
+    const list = await (await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`)).json();
     // 必须精确匹配目标 URL，否则会抓到上次会话遗留的标签页
     const want = new URL(url).pathname;
     page = list.find((t) => t.type === 'page' && t.url.includes('127.0.0.1') && t.url.includes(want));
