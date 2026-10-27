@@ -1,0 +1,1669 @@
+/* 墨本 Inkbook —— A4 手写笔记本 */
+
+/*
+ * 选择器带 .mb-root.view-content 双类，是为了压住宿主给
+ * .view-content 的样式（Obsidian 自带 .view-content { display: block }，
+ * 某些主题还会给它加别的规则）。
+ *
+ * 单靠 .mb-root（特异性 0,1,0）会被 .view-content（0,1,0）或
+ * #id 规则盖掉——一旦 display 被改回 block，
+ * 整条 flex 约束链就断了，滚动容器被内容撑开，
+ * 滚动条失效、缩放补偿失效。
+ * 双类（0,2,0）能稳稳压住同级规则。
+ */
+.mb-root.view-content,
+.mb-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 0 !important;
+  overflow: hidden;
+
+  /*
+   * 撑满父容器。
+   *
+   * Obsidian 里 .mb-root 就是 contentEl 本身（.view-content），
+   * 块级元素 width:auto 会自动填满——但只要宿主把它当成
+   * flex 子项（或者某些主题给它加了 display:flex），
+   * 宽度就会按内容收缩，页面被挤成一小条，滚动彻底失效。
+   *
+   * 显式写死 width/height 100% + min-width/height 0，
+   * 无论宿主怎么摆都能拿到完整空间。
+   */
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.mb-status {
+  min-width: 46px;
+  text-align: right;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  padding: 0 4px;
+  white-space: nowrap;
+}
+
+.mb-status.is-dirty {
+  color: var(--text-warning, #b07d1f);
+}
+
+.mb-del-sel {
+  color: var(--text-error);
+}
+
+.mb-colors {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  transition: opacity 0.15s;
+}
+
+.mb-colors.is-dim {
+  opacity: 0.25;
+}
+
+.mb-swatch {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  cursor: pointer;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  box-sizing: border-box;
+  flex: 0 0 auto;
+}
+
+.mb-swatch-hl {
+  border-radius: 4px;
+}
+
+.mb-swatch.is-active {
+  box-shadow: 0 0 0 2px var(--background-secondary), 0 0 0 3.5px var(--interactive-accent);
+}
+
+.mb-dyn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+}
+
+.mb-range {
+  width: 88px;
+  height: 16px;
+}
+
+.mb-size-lbl {
+  min-width: 24px;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+  text-align: center;
+}
+
+.mb-seg {
+  display: inline-flex;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.mb-seg-btn {
+  height: 22px;
+  padding: 0 7px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.mb-seg-btn.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.mb-mini-btn {
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.mb-hint {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+/* ============================== 工具长条 ==============================
+ *
+ * 右侧那一列常驻工具栏（钢笔 / 圆珠 / 荧光 / 橡皮 / 套索 / 形状 / 拖动），
+ * 加上侧栏开关和仅阅读开关。
+ *
+ * 为什么它是**一列**而不是浮在纸上的浮层：
+ *   浮层会压在滚动条上（用户反馈"边上的框会挡住滑动页面的那个条"），
+ *   而且跟着纸面走、位置会漂。一列占固定宽度，滚动条永远在它左边，
+ *   按钮位置也永远不动。
+ *
+ * 图标尺寸：
+ *   Obsidian 默认的 .svg-icon 是 16px，荧光笔、套索那种细线条造型
+ *   缩到那么小基本糊成一团。这里用自己的 .mb-ic 并写死尺寸，
+ *   主题也改不动（主题不认识这个 class）。
+ */
+
+.mb-rail {
+  flex: 0 0 auto;
+  width: 74px;
+  /*
+   * 宽度必须算进 padding 和边框。
+   *
+   * 默认的 content-box 会让 74px 变成 74 + padding*2 + border = 87px，
+   * 磁贴被挤到一边，长条比设计值宽一截。
+   */
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  padding: 8px 7px;
+  border-left: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+
+.mb-rail::-webkit-scrollbar {
+  width: 0;
+}
+
+.mb-rail-tools {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+/* 分隔线：把"选笔"和"开关"在视觉上分开 */
+.mb-rail-sep {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 1px;
+  margin: 4px 0 2px;
+  background: var(--background-modifier-border);
+}
+
+/*
+ * 工具磁贴：图标 + 文字竖着摞。
+ *
+ * 30px 的图标是 Obsidian 默认 16px 的近两倍。
+ */
+.mb-rail-tool {
+  width: 60px;
+  padding: 7px 2px 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  border: 1px solid transparent;
+  border-radius: 14px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  box-shadow: none;
+  transition:
+    background 0.16s ease,
+    color 0.16s ease,
+    transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+
+.mb-rail-tool:hover {
+  background: color-mix(in srgb, var(--background-modifier-hover) 90%, transparent);
+  color: var(--text-normal);
+}
+
+.mb-rail-tool:active {
+  transform: scale(0.93);
+}
+
+/*
+ * 图标尺寸写死在 .mb-ic 上。
+ *
+ * 不用 .svg-icon：那是 Obsidian 的公共类，主题可以给它写
+ * width/height/stroke-width 覆盖掉我们的规则——
+ * 用户反馈"电脑端每一个框里都看不到图标"，根因就在这。
+ * .mb-ic 是我们自己的类，主题不认识，也就不会打架。
+ */
+.mb-root .mb-ic {
+  display: block;
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  stroke-width: 1.8;
+}
+
+.mb-root .mb-rail-lbl {
+  font-size: 11.5px;
+  line-height: 1;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+/* 选中的工具：填主色，一眼看出当前用的哪支笔 */
+.mb-rail-tool.is-active {
+  background: var(--interactive-accent);
+  border-color: color-mix(in srgb, var(--interactive-accent) 70%, #000);
+  color: var(--text-on-accent);
+  box-shadow:
+    0 5px 14px -4px color-mix(in srgb, var(--interactive-accent) 60%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+
+.mb-rail-tool.is-active:hover {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+/* 「侧栏」开关：展开右侧工具栏 */
+.mb-rail-side,
+.mb-rail-read {
+  width: 60px;
+  height: 46px;
+  margin-top: 3px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--background-secondary) 70%, transparent);
+  color: var(--text-muted);
+  cursor: pointer;
+  box-shadow: none;
+  transition:
+    background 0.16s ease,
+    color 0.16s ease,
+    transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+
+.mb-rail-side:hover,
+.mb-rail-read:hover {
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
+}
+
+.mb-rail-side:active,
+.mb-rail-read:active {
+  transform: scale(0.93);
+}
+
+.mb-root .mb-rail-side .mb-ic {
+  width: 26px;
+  height: 26px;
+}
+
+.mb-root .mb-rail-read .mb-ic {
+  width: 26px;
+  height: 26px;
+}
+
+.mb-rail-side.is-active,
+.mb-rail-read.is-active {
+  background: var(--interactive-accent);
+  border-color: color-mix(in srgb, var(--interactive-accent) 70%, #000);
+  color: var(--text-on-accent);
+}
+
+/*
+ * 仅阅读模式：整条长条退到背景里。
+ *
+ * 只留一枚小圆钮（笔的图标），点它回到书写。
+ * 纸面干干净净，一个干扰都没有。
+ */
+.mb-root.is-reading .mb-rail {
+  width: 58px;
+  padding: 5px;
+  border-left: none;
+  background: transparent;
+}
+
+.mb-root.is-reading .mb-rail-tools,
+.mb-root.is-reading .mb-rail-side {
+  display: none;
+}
+
+.mb-root.is-reading .mb-rail-read {
+  width: 46px;
+  height: 46px;
+  margin-top: 0;
+  border-radius: 50%;
+  background: var(--interactive-accent);
+  border-color: color-mix(in srgb, var(--interactive-accent) 70%, #000);
+  color: var(--text-on-accent);
+  box-shadow:
+    0 6px 18px -4px rgba(0, 0, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22);
+}
+
+.mb-root.is-reading .mb-rail-read .mb-ic {
+  width: 24px;
+  height: 24px;
+}
+
+/* ------------------------------ 右下角浮标 ------------------------------ */
+
+/*
+ * 翻页 + 缩放，浮在纸的右下角。
+ *
+ * 为什么放外面（不在侧栏里）：
+ *   翻页和缩放是**看**笔记时最常用的两个动作，
+ *   却要展开侧栏才能够到。浮在外面随时可点。
+ *
+ * 缩放那组平时**不显示**，只在真的缩放了才浮现：
+ *   · 不操作时右下角干干净净，不干扰写字
+ *   · 一缩放就报出确切倍数（150% / 80%），不用猜
+ *   · 停止操作 2.6 秒后自动淡出，鼠标悬停时保持可见
+ */
+.mb-float {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  z-index: 6;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--background-primary) 88%, transparent);
+  backdrop-filter: blur(16px) saturate(1.4);
+  -webkit-backdrop-filter: blur(16px) saturate(1.4);
+  box-shadow: 0 8px 22px -10px rgba(0, 0, 0, 0.5);
+  pointer-events: auto;
+  opacity: 0.55;
+  transition: opacity 0.2s ease;
+}
+
+.mb-float:hover {
+  opacity: 1;
+}
+
+.mb-float-nav {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+}
+
+.mb-float-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  box-shadow: none;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.mb-float-btn:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.mb-root .mb-float-btn .mb-ic {
+  width: 16px;
+  height: 16px;
+}
+
+.mb-float-num {
+  min-width: 46px;
+  height: 26px;
+  padding: 0 6px;
+  border: none;
+  border-radius: 13px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  box-shadow: none;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.mb-float-num:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+/*
+ * 缩放组：默认宽度 0、看不见，缩放时才展开。
+ *
+ * 用 max-width + opacity 过渡，是"展开"而不是"突然冒出来"。
+ */
+.mb-float-zoom {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  max-width: 0;
+  overflow: hidden;
+  opacity: 0;
+  transition:
+    max-width 0.24s cubic-bezier(0.2, 0.9, 0.3, 1),
+    opacity 0.18s ease;
+}
+
+.mb-float-zoom.is-show {
+  max-width: 160px;
+  opacity: 1;
+}
+
+.mb-float-zoom .mb-float-num {
+  color: var(--text-normal);
+  font-weight: 600;
+}
+
+/* ---------------------------- 仅阅读提示 ---------------------------- */
+
+.mb-read-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 26px;
+  transform: translate(-50%, 8px);
+  z-index: 6;
+  max-width: 280px;
+  padding: 8px 13px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  background: var(--background-primary);
+  background: color-mix(in srgb, var(--background-primary) 92%, transparent);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  box-shadow: 0 10px 28px -10px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+  opacity: 0;
+  transition:
+    opacity 0.3s ease,
+    transform 0.3s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+
+.mb-read-hint.is-show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+/* 尊重系统的「减少动态效果」设置 */
+@media (prefers-reduced-motion: reduce) {
+  .mb-rail,
+  .mb-rail-tool,
+  .mb-rail-side,
+  .mb-rail-read,
+  .mb-float,
+  .mb-float-zoom,
+  .mb-read-hint,
+  .mb-ib {
+    transition-duration: 0.01ms !important;
+  }
+  .mb-rail-tool:active,
+  .mb-rail-side:active,
+  .mb-rail-read:active {
+    transform: none;
+  }
+}
+
+/* -------------------------------- 主体 -------------------------------- */
+
+.mb-body {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/*
+ * 编辑区 = 纸面列 + 右侧工具长条列，**并排的两列**。
+ *
+ * 之前长条是绝对定位浮在纸上的（position:absolute），
+ * 结果它压在滚动条上——想拖滚动条得先把长条挪开，
+ * 鼠标根本够不着。用户反馈"边上的框会挡住滑动页面的那个条"。
+ *
+ * 改成 flex 并排之后：
+ *   · 滚动条在纸面列自己的右缘，永远露在外面
+ *   · 长条不覆盖纸面，纸的可用宽度不缩水
+ *   · 长条常驻，点击目标稳定，不会随滚动跑位
+ */
+.mb-editor {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  position: relative;
+}
+
+/* 纸面列：装滚动容器和右下角浮标 */
+.mb-paper {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+.mb-host {
+  /*
+   * 必须是 flex 子项且允许收缩，否则内部滚动容器会被内容撑开——
+   * 几百页时滚动条直接失效，整篇文档变成一张超长页面。
+   */
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  /* 圆钮和面板以编辑区为基准定位 */
+  position: relative;
+}
+
+.mb-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  background: var(--background-secondary);
+  padding: 22px 0 90px;
+  overscroll-behavior: contain;
+  /*
+   * 关掉浏览器自带的滚动锚定。
+   *
+   * 缩放时页面高度会变，Chrome 会自作主张地调整 scrollTop
+   * 来"保持视觉锚点"——但它锚的是自己的选择，不是用户的鼠标位置。
+   * 这两套逻辑互相打架，表现为"滚一下就跳到别的页"。
+   *
+   * 我们自己算得很准（锚点在光标下的那个内容点），
+   * 所以让浏览器别插手。
+   */
+  overflow-anchor: none;
+}
+
+.mb-doc {
+  display: flex;
+  flex-direction: column;
+  align-items: safe center;
+  gap: 24px;
+  min-width: 100%;
+  padding-bottom: 10px;
+  /*
+   * 页面尺寸用 CSS 变量下发，所有页继承。
+   * 逐页写 style 会让几百页的文档在每次缩放时卡住 1 秒以上。
+   */
+  --mb-page-w: 635px;
+  --mb-page-h: 899px;
+}
+
+.mb-page-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  scroll-margin-top: 18px;
+}
+
+.mb-page {
+  position: relative;
+  width: var(--mb-page-w);
+  height: var(--mb-page-h);
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.16), 0 8px 24px rgba(0, 0, 0, 0.07);
+  overflow: hidden;
+  touch-action: none;
+}
+
+.mb-doc[data-tool="pen"] .mb-page,
+.mb-doc[data-tool="ballpoint"] .mb-page,
+.mb-doc[data-tool="highlighter"] .mb-page,
+.mb-doc[data-tool="shape"] .mb-page,
+.mb-doc[data-tool="lasso"] .mb-page {
+  cursor: crosshair;
+}
+
+.mb-doc[data-tool="eraser"] .mb-page {
+  cursor: none;
+}
+
+.mb-doc[data-tool="hand"] .mb-page {
+  cursor: grab;
+}
+
+.mb-doc[data-tool="hand"] .mb-page:active {
+  cursor: grabbing;
+}
+
+.mb-canvas,
+.mb-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: none;
+}
+
+.mb-page-num {
+  position: absolute;
+  right: 7px;
+  top: 5px;
+  font-size: 10px;
+  color: #9a9a9a;
+  pointer-events: none;
+  z-index: 3;
+  font-variant-numeric: tabular-nums;
+}
+
+.mb-add-page {
+  flex: 0 0 auto;
+  margin: 2px 0 26px;
+  padding: 9px 22px;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.mb-add-page:hover {
+  color: var(--text-normal);
+  border-color: var(--interactive-accent);
+}
+
+/* -------------------------------- 侧栏 -------------------------------- */
+
+.mb-side {
+  width: 258px;
+  flex: 0 0 258px;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  min-height: 0;
+}
+
+.mb-side.is-hidden {
+  display: none;
+}
+
+.mb-side-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 10px 8px 12px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+/* 标题区：名字和副标题占满剩余宽度 */
+.mb-side-headtext {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/*
+ * 侧栏关闭按钮。
+ *
+ * 窄屏（平板）上侧栏是盖在纸上的，必须有一个明确的关闭入口，
+ * 否则只能靠长条上的开关去关，两处都要记。
+ */
+.mb-side-close {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  box-shadow: none;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.mb-side-close:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.mb-root .mb-side-close .mb-ic {
+  width: 15px;
+  height: 15px;
+}
+
+/* 保存状态：贴在侧栏最底部 */
+.mb-side-status {
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  border-top: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+}
+
+/* 常用动作区：撤销 / 重做 / 删除 / 导入 / 导出 */
+.mb-sec-act {
+  padding-bottom: 2px;
+}
+
+.mb-ib-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+/*
+ * 侧栏里的图标按钮。
+ *
+ * 34px 见方是"鼠标点得准"和"不占地方"之间的平衡点；
+ * 平板端在下面单独放大到 46px。
+ */
+.mb-ib {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--background-modifier-hover) 60%, transparent);
+  color: var(--text-muted);
+  cursor: pointer;
+  box-shadow: none;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    transform 0.12s ease;
+}
+
+.mb-ib:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.mb-ib:active {
+  transform: scale(0.94);
+}
+
+.mb-ib.is-active {
+  background: var(--interactive-accent);
+  border-color: color-mix(in srgb, var(--interactive-accent) 70%, #000);
+  color: var(--text-on-accent);
+}
+
+.mb-ib.is-disabled {
+  opacity: 0.32;
+  pointer-events: none;
+}
+
+.mb-ib.is-hidden {
+  display: none;
+}
+
+.mb-root .mb-ib .mb-ic {
+  width: 17px;
+  height: 17px;
+}
+
+.mb-side-title {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mb-side-sub {
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.mb-side-body {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 10px 12px 18px;
+  min-width: 0;
+}
+
+.mb-sec {
+  margin-bottom: 14px;
+}
+
+.mb-sec-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mb-sec-title {
+  margin-bottom: 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.mb-sec-head .mb-sec-title {
+  margin-bottom: 0;
+}
+
+.mb-link {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 10px;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.mb-link:hover {
+  color: var(--interactive-accent);
+}
+
+.mb-pen-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin: 7px 0 5px;
+}
+
+.mb-size-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.mb-row-label {
+  width: 30px;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.mb-size-btn {
+  height: 21px;
+  padding: 0 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 10px;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.mb-size-btn:hover {
+  border-color: var(--interactive-accent);
+  color: var(--text-normal);
+}
+
+.mb-templates {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px;
+  margin: 8px 0 10px;
+}
+
+.mb-tpl {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 5px;
+  overflow: hidden;
+  cursor: pointer;
+  background: var(--background-primary);
+}
+
+.mb-tpl:hover {
+  border-color: var(--interactive-accent);
+}
+
+.mb-tpl.is-active {
+  border-color: var(--interactive-accent);
+  box-shadow: 0 0 0 2px var(--interactive-accent);
+}
+
+.mb-tpl-art {
+  aspect-ratio: 794 / 1123;
+  background: #fff;
+}
+
+.mb-tpl-art canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.mb-tpl-name {
+  padding: 3px 0 4px;
+  border-top: 1px solid var(--background-modifier-border);
+  text-align: center;
+  font-size: 9.5px;
+  color: var(--text-muted);
+}
+
+.mb-papers {
+  display: flex;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.mb-paper-chip {
+  position: relative;
+  width: 54px;
+  height: 32px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.mb-paper-chip.is-active {
+  box-shadow: 0 0 0 2px var(--interactive-accent);
+}
+
+.mb-paper-name {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 1px;
+  text-align: center;
+  font-size: 9px;
+  line-height: 1.2;
+  color: #666;
+  pointer-events: none;
+}
+
+.mb-layers {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.mb-layer {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 5px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.mb-layer:hover {
+  background: var(--background-modifier-hover);
+}
+
+.mb-layer.is-active {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.mb-layer-eye,
+.mb-layer-del {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  min-width: 18px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.mb-layer-eye .mb-ic,
+.mb-layer-del .mb-ic {
+  width: 13px;
+  height: 13px;
+}
+
+.mb-layer-del {
+  opacity: 0;
+}
+
+.mb-layer:hover .mb-layer-del {
+  opacity: 1;
+}
+
+.mb-layer-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mb-layer-count {
+  min-width: 18px;
+  text-align: right;
+  font-size: 9px;
+  color: var(--text-faint);
+}
+
+.mb-pages {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 7px;
+  margin-top: 8px;
+}
+
+.mb-thumb {
+  position: relative;
+  aspect-ratio: 794 / 1123;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 3px;
+  overflow: hidden;
+  background: #fff;
+  cursor: pointer;
+}
+
+.mb-thumb.is-active {
+  border-color: var(--interactive-accent);
+  box-shadow: 0 0 0 2px var(--interactive-accent);
+}
+
+.mb-thumb-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.mb-thumb-num {
+  position: absolute;
+  right: 3px;
+  bottom: 1px;
+  padding: 0 3px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.82);
+  color: #555;
+  font-size: 8.5px;
+  line-height: 1.5;
+  pointer-events: none;
+}
+
+.mb-thumb-act {
+  position: absolute;
+  top: 2px;
+  display: none;
+  width: 17px;
+  height: 17px;
+  min-width: 17px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  cursor: pointer;
+}
+
+.mb-thumb-act .mb-ic {
+  width: 11px;
+  height: 11px;
+}
+
+.mb-thumb-dup {
+  right: 21px;
+}
+
+.mb-thumb-del {
+  right: 2px;
+}
+
+.mb-thumb:hover .mb-thumb-act {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mb-thumb-add {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  border-style: dashed;
+  background: transparent;
+  color: var(--text-faint);
+}
+
+.mb-thumb-plus {
+  font-size: 19px;
+  line-height: 1;
+}
+
+.mb-thumb-add-label {
+  font-size: 8.5px;
+}
+
+.mb-stats {
+  margin-top: 4px;
+  font-size: 9.5px;
+  color: var(--text-faint);
+}
+
+.mb-side-foot {
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--background-modifier-border);
+  flex: 0 0 auto;
+}
+
+.mb-foot-btn {
+  flex: 1 1 0;
+  height: 26px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.mb-foot-btn:hover {
+  border-color: var(--interactive-accent);
+  color: var(--text-normal);
+}
+
+/* -------------------------------- 空状态 -------------------------------- */
+
+.mb-empty {
+  margin: auto;
+  max-width: 420px;
+  padding: 24px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.mb-empty-mark {
+  width: 54px;
+  height: 54px;
+  margin: 0 auto 12px;
+  border-radius: 14px;
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+  font-size: 24px;
+  line-height: 54px;
+  font-family: var(--font-serif, Georgia, serif);
+}
+
+.mb-empty h3 {
+  margin: 0 0 6px;
+}
+
+.mb-empty p {
+  margin: 0 0 16px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.mb-error {
+  margin: auto;
+  max-width: 420px;
+  padding: 24px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+/* -------------------------------- 弹窗 -------------------------------- */
+
+.mb-new-modal {
+  min-width: 420px;
+}
+
+.mb-new-label {
+  margin: 14px 0 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.mb-new-templates {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.mb-new-tpl {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 5px;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.mb-new-tpl.is-active {
+  border-color: var(--interactive-accent);
+  box-shadow: 0 0 0 2px var(--interactive-accent);
+}
+
+.mb-new-tpl-art {
+  aspect-ratio: 794 / 1123;
+  background: #fff;
+}
+
+.mb-new-tpl-art canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.mb-new-tpl-name {
+  padding: 4px 0;
+  border-top: 1px solid var(--background-modifier-border);
+  text-align: center;
+  font-size: 9.5px;
+  color: var(--text-muted);
+}
+
+.mb-new-papers {
+  display: flex;
+  gap: 10px;
+}
+
+.mb-new-paper {
+  width: 64px;
+  height: 34px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.mb-new-paper.is-active {
+  box-shadow: 0 0 0 2px var(--interactive-accent);
+}
+
+.mb-new-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.mb-jump-input,
+.mb-prompt-input {
+  width: 100%;
+  margin: 8px 0;
+  padding: 8px 10px;
+  font-size: 16px;
+}
+
+.mb-jump-hint {
+  margin-bottom: 10px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* -------------------------------- 移动端 -------------------------------- */
+
+@media (max-width: 820px) {
+  .mb-side {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 20;
+    width: min(280px, 78vw);
+    flex-basis: min(280px, 78vw);
+    box-shadow: -6px 0 24px rgba(0, 0, 0, 0.18);
+  }
+  .mb-body {
+    position: relative;
+  }
+  .mb-new-modal {
+    min-width: 0;
+  }
+  .mb-new-templates {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+/* ============================ 平板模式 ============================ */
+
+/*
+ * 平板上最重要的三件事：
+ *   1. 工具条放底部——拇指够得到，单手能操作
+ *   2. 按钮要够大——手指比鼠标粗，28px 的目标点不准
+ *   3. 侧栏变抽屉——不遮挡正文
+ */
+
+/*
+ * 平板形态：
+ *   · 长条贴右缘，图标更大、触摸目标更大（手指比鼠标粗）
+ *   · 面板仍从右侧滑出，**绝不占屏幕下方**
+ *   · 底部整条留白归纸——写到最后一页的末行时不会被压住
+ */
+
+/*
+ * 平板上长条更大：
+ *   · 磁贴 68px 宽（电脑 60px）
+ *   · 图标 32px（电脑 30px，Obsidian 默认只有 16px）
+ *   · 触摸目标远超 44px 的下限
+ */
+.mb-root.is-tablet .mb-rail {
+  width: 86px;
+  padding: 9px 7px;
+}
+
+.mb-root.is-tablet .mb-rail-tools {
+  gap: 5px;
+}
+
+.mb-root.is-tablet .mb-rail-tool {
+  width: 68px;
+  padding: 8px 2px 7px;
+  border-radius: 15px;
+  gap: 4px;
+}
+
+.mb-root.is-tablet .mb-rail-tool .mb-ic {
+  width: 32px;
+  height: 32px;
+}
+
+.mb-root.is-tablet .mb-rail-lbl {
+  font-size: 12px;
+}
+
+.mb-root.is-tablet .mb-rail-side,
+.mb-root.is-tablet .mb-rail-read {
+  width: 68px;
+  height: 52px;
+  border-radius: 15px;
+}
+
+.mb-root.is-tablet .mb-rail-side .mb-ic,
+.mb-root.is-tablet .mb-rail-read .mb-ic {
+  width: 28px;
+  height: 28px;
+}
+
+.mb-root.is-tablet.is-reading .mb-rail {
+  width: 66px;
+}
+
+.mb-root.is-tablet.is-reading .mb-rail-read {
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+}
+
+.mb-root.is-tablet.is-reading .mb-rail-read .mb-ic {
+  width: 27px;
+  height: 27px;
+}
+
+/* 触摸设备没有 hover，激活态要更明显 */
+@media (hover: none) {
+  .mb-root .mb-rail-tool.is-active {
+    background: var(--interactive-accent);
+    color: var(--text-on-accent);
+  }
+  .mb-root .mb-swatch.is-active {
+    box-shadow: 0 0 0 3px var(--interactive-accent);
+  }
+}
+
+/* 颜色点放大 */
+.mb-root.is-tablet .mb-swatch {
+  width: 28px;
+  height: 28px;
+}
+
+.mb-root.is-tablet .mb-pen-row {
+  gap: 9px;
+}
+
+/* 滑块加高，方便拖 */
+.mb-root.is-tablet .mb-range {
+  height: 30px;
+  width: 130px;
+}
+
+.mb-root.is-tablet .mb-size-lbl {
+  font-size: 13px;
+}
+
+.mb-root.is-tablet .mb-hint {
+  font-size: 12px;
+}
+
+/* 尺寸档按钮加大 */
+.mb-root.is-tablet .mb-size-btn {
+  min-width: 42px;
+  height: 38px;
+  font-size: 13px;
+}
+
+/* 侧栏里的图标按钮：触摸目标放大 */
+.mb-root.is-tablet .mb-ib {
+  width: 46px;
+  height: 46px;
+  border-radius: 13px;
+}
+
+.mb-root.is-tablet .mb-ib .mb-ic {
+  width: 22px;
+  height: 22px;
+}
+
+/*
+ * 平板上的侧栏：从右缘盖过来。
+ *
+ * 现在长条是编辑区里的**一列**（不再浮在纸上），
+ * 侧栏盖过来时要让开它，否则长条上的按钮点不到。
+ *
+ * 让开的宽度 = 长条宽（86px）+ 8px 间隙。
+ */
+.mb-root.is-tablet .mb-side {
+  position: absolute;
+  right: 94px;
+  top: 0;
+  bottom: 0;
+  z-index: 35;
+  width: min(320px, calc(100vw - 102px));
+  flex-basis: min(320px, calc(100vw - 102px));
+  border-right: 1px solid var(--background-modifier-border);
+  border-left: 1px solid var(--background-modifier-border);
+  border-radius: 16px 0 0 16px;
+  box-shadow: -8px 0 30px rgba(0, 0, 0, 0.22);
+  padding-top: env(safe-area-inset-top);
+}
+
+/*
+ * 侧栏盖过来时，长条退到它后面，不跟它抢。
+ *
+ * .mb-side 的 z-index(35) 高于纸面列，长条在纸面列里，
+ * 所以侧栏展开时自然压住长条——不需要额外的选择器。
+ */
+
+.mb-root.is-tablet .mb-body {
+  position: relative;
+}
+
+/* 底部留出空间，别挡住最后一页 */
+.mb-root.is-tablet .mb-scroll {
+  padding-bottom: 110px;
+}
+
+/* 浮标在平板上也大一点，手指点得准 */
+.mb-root.is-tablet .mb-float-btn {
+  width: 34px;
+  height: 34px;
+}
+
+.mb-root.is-tablet .mb-float-btn .mb-ic {
+  width: 19px;
+  height: 19px;
+}
+
+.mb-root.is-tablet .mb-float-num {
+  min-width: 58px;
+  height: 34px;
+  font-size: 13px;
+}
+
+/* 缩略图更大，好点 */
+.mb-root.is-tablet .mb-thumb-act {
+  width: 30px;
+  height: 30px;
+  min-width: 30px;
+}
+
+.mb-root.is-tablet .mb-thumb-act .mb-ic {
+  width: 16px;
+  height: 16px;
+}
+
+/* 纸张模板预览也放大 */
+.mb-root.is-tablet .mb-templates {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+/* 侧栏底部按钮加大 */
+.mb-root.is-tablet .mb-foot-btn {
+  height: 42px;
+  font-size: 14px;
+}
+
+/* 笔盒行间距 */
+.mb-root.is-tablet .mb-pen-row {
+  gap: 9px;
+}
+
+.mb-root.is-tablet .mb-size-row {
+  gap: 7px;
+}
+
+/* 提示条（工具栏里的文字提示）在平板上小一点 */
+.mb-root.is-tablet .mb-hint {
+  font-size: 11px;
+  max-width: 130px;
+}
+
+/* 仅阅读：工具面板收起，只留右侧长条 */
+/*
+ * 仅阅读模式：面板收起，屏幕尽量全给纸。
+ *
+ * 之前底部要留 90px 给浮在右下角的圆钮，
+ * 现在圆钮变成了右缘的长条，横向不再被占，
+ * 底部整条都能写字。
+ */
+.mb-root.is-reading .mb-scroll {
+  padding-top: 10px;
+  padding-bottom: 22px;
+}
+
+/* 电脑上阅读时页边距更宽，好读 */
+.mb-root.is-reading .mb-doc {
+  gap: 28px;
+}
+
+/* ============================ 导入 ============================ */
+
+.mb-import-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 46vh;
+  overflow-y: auto;
+  margin-top: 8px;
+}
+
+.mb-import-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s, 4px);
+  cursor: pointer;
+}
+
+.mb-import-item:hover {
+  background: var(--background-modifier-hover);
+  border-color: var(--interactive-accent);
+}
+
+.mb-import-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.mb-import-meta {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.mb-import-all {
+  width: 100%;
+  margin-top: 10px;
+  padding: 8px;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: var(--radius-s, 4px);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.mb-import-all:hover {
+  color: var(--text-normal);
+  border-color: var(--interactive-accent);
+}
+
+/* 平板上导入列表项更大 */
+.mb-root.is-tablet .mb-import-item {
+  padding: 14px 12px;
+}
+
+.mb-root.is-tablet .mb-import-name {
+  font-size: 15px;
+}
+
+/* 有底图的页面：页码标记说明来源 */
+.mb-page-wrap.has-bg .mb-page-num::after {
+  content: " · 批注";
+  font-size: 8px;
+  color: var(--text-faint);
+}

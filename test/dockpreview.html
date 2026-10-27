@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <title>inkbook 控制坞预览</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <style>
+      :root {
+        --background-primary: #fff;
+        --background-secondary: #f4f4f5;
+        --background-primary-alt: #fafafa;
+        --text-normal: #222;
+        --text-muted: #666;
+        --text-faint: #999;
+        --text-error: #d64545;
+        --text-warning: #b07d1f;
+        --text-on-accent: #fff;
+        --background-modifier-border: #e3e3e6;
+        --background-modifier-hover: rgba(0, 0, 0, 0.06);
+        --interactive-accent: #6c5ce7;
+        --radius-s: 4px;
+      }
+      body {
+        margin: 0;
+        font-family: system-ui, sans-serif;
+        background: var(--background-secondary);
+      }
+      #view-host {
+        width: 1280px;
+        height: 860px;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      #view-host > .view-content {
+        flex: 1 1 auto;
+        min-height: 0;
+        display: flex;
+      }
+      body.tablet #view-host {
+        width: 900px;
+        height: 700px;
+      }
+      body.tablet {
+        background: #e9e9ec;
+      }
+      /* 深色主题：Obsidian 用户常用暗色，面板要在暗色下也好看 */
+      body.dark {
+        --background-primary: #1e1e21;
+        --background-secondary: #161618;
+        --background-primary-alt: #26262b;
+        --text-normal: #dcddde;
+        --text-muted: #9a9b9e;
+        --text-faint: #6b6c6f;
+        --text-error: #e06c75;
+        --text-on-accent: #fff;
+        --background-modifier-border: #33333a;
+        --background-modifier-hover: rgba(255, 255, 255, 0.075);
+        --interactive-accent: #7c6cf0;
+      }
+      body.dark {
+        background: #101012;
+      }
+      body.tablet #view-host > .view-content {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="view-host"></div>
+    <script type="module" src="/dockpreview.js"></script>
+  </body>
+</html>

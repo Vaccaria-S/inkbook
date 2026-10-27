@@ -1,0 +1,8 @@
+node_modules/
+dist/
+tmp/
+.edge-*/
+*.log
+.DS_Store
+
+test/*.js

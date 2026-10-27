@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <title>inkbook view harness</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <style>
+      :root {
+        --background-primary: #fff; --background-secondary: #f4f4f5; --background-primary-alt: #fafafa;
+        --text-normal: #222; --text-muted: #666; --text-faint: #999; --text-error: #d64545;
+        --text-warning: #b07d1f; --text-on-accent: #fff; --background-modifier-border: #e3e3e6;
+        --background-modifier-hover: rgba(0,0,0,.06); --interactive-accent: #6c5ce7; --radius-s: 4px;
+      }
+      body { margin: 0; font-family: system-ui, sans-serif; }
+      #view-host > .view-content { flex: 1 1 auto; min-height: 0; display: flex; }
+      #view-host { width: 1180px; height: 820px; display: flex; flex-direction: column; }
+      #out { position: fixed; right: 0; bottom: 0; width: 42vw; max-height: 50vh; overflow: auto; z-index: 9999;
+        background: #111; color: #0f0; font-size: 11px; padding: 8px; margin: 0; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <div id="view-host"></div>
+    <pre id="out">running…</pre>
+    <script type="module" src="/view-harness.js"></script>
+  </body>
+</html>

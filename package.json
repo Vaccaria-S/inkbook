@@ -1,0 +1,24 @@
+{
+  "name": "inkbook",
+  "version": "0.1.0",
+  "description": "墨本 Inkbook —— Obsidian 里的 A4 手写笔记本",
+  "main": "main.js",
+  "scripts": {
+    "build": "tsc --noEmit && node esbuild.config.mjs",
+    "dev": "node esbuild.config.mjs --watch",
+    "demo": "node esbuild.config.mjs --demo",
+    "typecheck": "tsc --noEmit"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^4.10.38",
+    "perfect-freehand": "^1.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "esbuild": "^0.24.2",
+    "obsidian": "^1.7.2",
+    "typescript": "^5.7.2"
+  }
+}

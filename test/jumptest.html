@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>缩放跳页复现</title>
+<link rel="stylesheet" href="/styles.css">
+<style>
+  html, body { margin: 0; font-family: system-ui; background: #202020; }
+  #host { position: absolute; left: 0; top: 0; width: 900px; height: 700px; overflow: hidden; display: flex; flex-direction: column; }
+  #out { position: fixed; right: 0; top: 0; width: 460px; height: 100vh; overflow: auto; z-index: 9999; background: #111; color: #0f0; font-size: 12px; padding: 10px; margin: 0; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="host"></div>
+<pre id="out">running…</pre>
+<script type="module" src="/jumptest.js"></script>
+</body>
+</html>
