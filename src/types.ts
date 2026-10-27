@@ -79,11 +79,22 @@ export interface Page {
 }
 
 export interface InkBook {
-  version: 1;
+  /** 文件格式版本。当前支持 1，见 storage.ts 的 CURRENT_VERSION */
+  version: number;
   kind: "inkbook";
   title: string;
   width: number;
   height: number;
+  /**
+   * 落盘时的自检记录：页数 + 笔迹数。
+   *
+   * 读回来对不上就说明文件不完整（写一半被打断、同步冲突、磁盘满…），
+   * 这时宁可提示用户去翻备份，也不要静默按读到的残缺内容打开。
+   */
+  integrity?: {
+    pageCount: number;
+    strokeCount: number;
+  };
   /** 关联的源文档（导入 PDF / Word 时记录） */
   source?: {
     name: string;

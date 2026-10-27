@@ -2,7 +2,15 @@ import { FileView, Menu, Notice, type TFile } from "obsidian";
 import { setIcon } from "./icons";
 import { BookEditor } from "./editor";
 import { BookStore } from "./store";
-import { readBook, writeBook } from "./storage";
+import {
+  bookStats,
+  fingerprint,
+  readBook,
+  recoverFromBackup,
+  TooNewError,
+  writeBook,
+  type FileFingerprint,
+} from "./storage";
 import {
   A4_HEIGHT,
   A4_WIDTH,
@@ -11,6 +19,7 @@ import {
   PEN_COLORS,
   PEN_SIZES,
   TEMPLATES,
+  type InkBook,
   type InkbookSettings,
   type PaperId,
   type ShapeKind,
@@ -59,6 +68,14 @@ function debounce<T extends (...args: any[]) => void>(fn: T, wait: number): T & 
     t = null;
   };
   return wrapped;
+}
+
+/** 冲突副本的时间戳：yyyyMMdd-HHmm */
+function conflictStamp(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(
+    d.getMinutes()
+  )}`;
 }
 
 export interface InkbookPluginLike {
@@ -138,6 +155,20 @@ export class InkbookView extends FileView {
   private lastZoom = -1;
   private touchBtn!: HTMLButtonElement;
   private dirty = false;
+  /** 只有翻页/切页这类「没动笔迹的改动」变脏，单独一个标记，避免整本写盘 */
+  private metaDirty = false;
+  /** 上次成功写盘时文件在磁盘上的指纹；null = 拿不到指纹，不做冲突检测 */
+  private fp: FileFingerprint | null = null;
+  /** 上次成功写盘时的 activePage，用来看"翻页后到底要不要写一次" */
+  private savedActivePage = -1;
+  /** 检测到外部改动后置真：此后不再写主文件，等用户自己处理两份副本 */
+  private conflict = false;
+  /** 只读态的"改动不会保存"提示是否已经弹过（每本书一次，别刷屏） */
+  private readOnlyNoticeShown = false;
+  /** 是否正在装配视图（装配期的 setReading / markDirty 不算用户操作） */
+  private assembling = false;
+  /** 只读恢复时另存出来的副本**文件名**；有它才能告诉用户"改用那份" */
+  private recoveredCopyName: string | null = null;
   private saving = false;
   private saveAgain = false;
   private readOnly = false;
@@ -174,12 +205,105 @@ export class InkbookView extends FileView {
   }
 
   async onClose(): Promise<void> {
-    if (this.store && this.editor) this.store.data.activePage = this.editor.getState().pageIndex;
+    this.syncActivePage();
     await this.flushSave();
+    // 冲突还没解决就关窗：内存里的内容必须落到磁盘上，不能静默丢
+    await this.preserveConflictCopy();
     this.destroyEditor();
   }
 
   /* ------------------------------- 文件 ------------------------------- */
+
+  /**
+   * 把编辑器当前的页码同步回内存里的书，并判断这次翻页是否需要写盘。
+   *
+   * 只在页码**与上次写盘时不同**才置 metaDirty —— 打开看一眼、
+   * 一页没翻就关掉，不该产生任何写盘。
+   */
+  private syncActivePage(): void {
+    if (!this.store || !this.editor) return;
+    this.store.data.activePage = this.editor.getState().pageIndex;
+    if (this.savedActivePage !== this.store.data.activePage) this.metaDirty = true;
+  }
+
+  /** 装载一本书（首次读成功、以及从备份恢复时共用） */
+  private openBook(book: InkBook, readOnly: boolean): void {
+    this.store = new BookStore(book);
+    this.store.onChange = () => this.markDirty();
+    this.readOnly = readOnly;
+    this.conflict = false;
+    this.metaDirty = false;
+    // dirty 必须一起复位：上一本书留下的"未保存"标记会跟着新文件走，
+    // 导致打开另一本书什么都不做就白写一次整本
+    this.dirty = false;
+    this.saveAgain = false;
+    this.recoveredCopyName = null;
+    this.savedActivePage = book.activePage || 0;
+    this.destroyEditor();
+    /*
+     * 装配期（buildUI → buildRail → setReading）会顺手动到 setReading /
+     * markDirty，那不是用户操作。用 assembling 挡住它，否则"每本一次"的
+     * 只读提示会在打开的一瞬间就被消耗掉，用户真正改内容时反而一声不响。
+     */
+    this.assembling = true;
+    try {
+      this.buildUI();
+      this.mountEditor(book.activePage || 0);
+      this.applyEditorReadOnly();
+    } finally {
+      this.assembling = false;
+    }
+    this.saveState = "saved";
+    this.updateStatus();
+    /*
+     * 只读提示的复位必须放在装配**之后**：buildUI → buildRail → setReading
+     * 会在装配期就调一次 warning，若在这里之前复位，那一次就把"每本一次"
+     * 的额度用光了，等用户真正动手改内容时反而一声不响。
+     */
+    this.readOnlyNoticeShown = false;
+    // 装配过程中编辑器会先报一次第 0 页再滚到 activePage，
+    // 那不是用户翻页，不能因此记一笔"待落盘"
+    this.metaDirty = false;
+  }
+
+  /** 丢掉当前书的全部内存状态（读失败时用，避免旧 store 绑到新文件路径上） */
+  private dropBook(): void {
+    this.destroyEditor();
+    this.store = null;
+    this.fp = null;
+    this.recoveredCopyName = null;
+    this.dirty = false;
+    this.metaDirty = false;
+    this.conflict = false;
+  }
+
+  /**
+   * 只读恢复之后，把恢复出来的内容落成一份**能用的新文件**。
+   *
+   * 只读页面只能让用户看清"丢了什么"，真正能接着写的是这份副本——
+   * 之前提示写"请先另存为新文件"，可插件根本没有"另存为 .inkbook"
+   * 这个功能，等于把人领到一扇不存在的门前。
+   *
+   * 文件名必须**绝不重名**：提示里让用户"改用这个副本"，用户就会在那上面
+   * 接着写；同一分钟内再恢复一次如果覆盖同名文件，等于把用户刚写的字抹掉。
+   */
+  private async saveRecoveredCopy(book: InkBook): Promise<{ path: string | null; error: string }> {
+    if (!this.file) return { path: null, error: "没有文件路径" };
+    const adapter = this.app.vault.adapter;
+    const base = this.file.path.replace(/\.inkbook$/i, "");
+    const stamp = conflictStamp(new Date());
+    try {
+      // 撞名时由 uniqueCopyPath 加 -2/-3…，绝不覆盖用户已经在用的副本
+      const target = await this.uniqueCopyPath(adapter, `${base}.recovered-${stamp}.inkbook`);
+      // 走 writeBook：同样是 tmp+rename 原子写，integrity 由它自己记
+      await writeBook(adapter, target, book);
+      this.recoveredCopyName = target.split("/").pop() || target;
+      return { path: target, error: "" };
+    } catch (e: any) {
+      console.error("[inkbook] 另存恢复副本失败", e);
+      return { path: null, error: e && e.message ? e.message : String(e) };
+    }
+  }
 
   async onLoadFile(file: TFile): Promise<void> {
     const token = ++this._loadToken;
@@ -191,29 +315,70 @@ export class InkbookView extends FileView {
       this.showError(`墨本只处理 .inkbook 文件，${file.name} 打不开。`);
       return;
     }
+    const adapter = this.app.vault.adapter;
     try {
-      const book = await readBook(this.app.vault.adapter, file.path, file.basename);
+      const book = await readBook(adapter, file.path, file.basename);
       if (token !== this._loadToken) return;
-      this.store = new BookStore(book);
-      this.store.onChange = () => this.markDirty();
-      this.readOnly = false;
-      this.destroyEditor();
-      this.buildUI();
-      this.mountEditor(book.activePage || 0);
+      this.openBook(book, false);
+      this.fp = await fingerprint(adapter, file.path);
     } catch (e: any) {
       console.error("[inkbook] 读取失败", e);
-      this.showError("打不开：" + (e && e.message ? e.message : e));
+      if (token !== this._loadToken) return;
+      /*
+       * 版本过新：备份必然也是旧一代的文件，救不回新格式。
+       * 拿旧备份糊上去不但救不了，还会把"请升级墨本"这唯一正确的
+       * 提示盖成"最近一分钟可能没保存"，用户就真以为只是同步丢了一点。
+       * 所以这种情况**不走备份**，直接如实报错。
+       */
+      if (e instanceof TooNewError) {
+        this.dropBook();
+        this.readOnly = true;
+        this.showError(e.message);
+        return;
+      }
+      // 正文读不出来（残缺/截断）→ 先试备份。备份能读出来就只读打开，
+      // 绝不拿残缺内容去覆盖原文件。
+      const backup = await recoverFromBackup(adapter, file.path, file.basename);
+      if (token !== this._loadToken) return;
+      if (backup) {
+        this.openBook(backup, true);
+        this.fp = await fingerprint(adapter, file.path);
+        // 只读页面只是让用户看清丢了什么；真正能接着写的是落出来的副本
+        const copy = await this.saveRecoveredCopy(backup);
+        if (copy.path) {
+          const name = copy.path.split("/").pop() || copy.path;
+          new Notice(
+            `已从备份恢复，并另存为 「${name}」：这是上一次成功保存时的内容，` +
+              `之后的笔迹可能没有保存。当前页面只读，可直接改用这个副本。`,
+            15000
+          );
+        } else {
+          new Notice(
+            `已从备份恢复，但另存副本失败（${copy.error}）。` +
+              `请手动把同目录的 .bak 复制一份并改名成 .inkbook。`,
+            10000
+          );
+        }
+        return;
+      }
+      this.dropBook();
       this.readOnly = true;
+      // showError 的标题已经是「打不开」，这里只放原因，别再叠一层"打不开："
+      this.showError(e && e.message ? e.message : String(e));
     }
   }
 
   async onUnloadFile(): Promise<void> {
-    if (this.store && this.editor) this.store.data.activePage = this.editor.getState().pageIndex;
-    if (this.store && this.editor) this.dirty = true;
+    // 翻页只算「元数据脏」，不置 dirty —— 否则看一眼就整本写一次盘
+    this.syncActivePage();
     await this.flushSave();
+    // 冲突还没解决就切文件：内存里的内容必须落到磁盘上，不能静默丢
+    await this.preserveConflictCopy();
     this.destroyEditor();
     this.store = null;
     this.file = null;
+    this.fp = null;
+    this.conflict = false;
     this.renderEmpty();
   }
 
@@ -580,9 +745,16 @@ export class InkbookView extends FileView {
    * 但翻页、缩放、滚动照常——「看」笔记不该被「写」的能力打扰。
    */
   private setReading(on: boolean): void {
+    /*
+     * 只读恢复态（readOnly）是"不能保存"的硬约束。
+     *
+     * 在这里直接放开编辑器 = 让用户写字、却永远存不下去：saveNow 会因
+     * readOnly 早退，状态栏停在"未保存"，切走就全丢。
+     * 所以编辑器是否可写由 reading || readOnly 共同决定。
+     */
     this.reading = on;
     this.contentEl.toggleClass("is-reading", on);
-    this.editor?.setReadOnly(on);
+    this.applyEditorReadOnly();
     this.applySideVisibility();
 
     if (this.railReadBtn) {
@@ -595,6 +767,32 @@ export class InkbookView extends FileView {
       this.railReadBtn.title = on ? "退出仅阅读模式 · 开始书写" : "仅阅读模式";
     }
     this.showReadHint(on);
+    // 想退出仅阅读却被 readOnly 卡住时说清原因，否则像是"按钮坏了"
+    if (!on && this.readOnly) this.warnReadOnly();
+  }
+
+  /**
+   * 编辑器是否可写：仅阅读 或 只读恢复态，任一成立就不能落笔。
+   */
+  private applyEditorReadOnly(): void {
+    this.editor?.setReadOnly(this.reading || this.readOnly);
+  }
+
+  /** 提醒"这份笔记现在存不下去"。同一份笔记只提醒一次。 */
+  private warnReadOnly(): void {
+    if (this.assembling) return;
+    if (this.readOnlyNoticeShown) return;
+    this.readOnlyNoticeShown = true;
+    /*
+     * 措辞必须和事实一致：
+     *   · 有 recovered 副本 → 让用户改用那份（这才是能继续写的文件）
+     *   · 其它只读路径（原文件打不开）→ 别许诺"另存为"，
+     *     插件没有这个功能，只能让用户自己复制 .bak
+     */
+    const msg = this.recoveredCopyName
+      ? "这是只读状态（从备份恢复或原文件不可写），改动不会保存。已另存为 recovered 副本，请改用那份。"
+      : "这是只读状态（从备份恢复或原文件不可写），改动不会保存。要接着写，请把同目录的 .bak 复制一份并改名。";
+    new Notice(msg, 8000);
   }
 
 
@@ -1326,8 +1524,20 @@ export class InkbookView extends FileView {
   }
 
   private onPageChanged(): void {
-    this.dirty = true;
-    if (this.plugin.settings.autosave) this.saveDebounce();
+    /*
+     * 只是翻了一页：笔迹一条没变，变的是 activePage。
+     *
+     * 以前这里直接 dirty = true + 防抖保存 —— 翻 60 页就是 60 次整本覆盖写，
+     * 每次几十 MB 的序列化。现在只记「元数据脏」，真正的写在
+     * 关文件 / 切文件时由 flushSave 落一次。
+     */
+    const page = this.editor
+      ? this.editor.getState().pageIndex
+      : this.store
+      ? this.store.data.activePage
+      : -1;
+    // 页码和上次写盘时一样 → 这次翻页没产生任何需要落盘的改动
+    if (page !== this.savedActivePage) this.metaDirty = true;
     this.updateUI();
     this.thumbDebounce();
   }
@@ -1336,6 +1546,9 @@ export class InkbookView extends FileView {
     this.dirty = true;
     this.saveState = "dirty";
     this.updateStatus();
+    // 只读态（备份恢复 / 打不开）下的改动一律不会落盘，必须当场说清楚，
+    // 否则用户会以为写着写着就存上了
+    if (this.readOnly) this.warnReadOnly();
     if (this.plugin.settings.autosave) this.saveDebounce();
     this.thumbDebounce();
   }
@@ -1351,7 +1564,14 @@ export class InkbookView extends FileView {
   /* ------------------------------- 保存 ------------------------------- */
 
   async saveNow(): Promise<void> {
-    if (!this.store || !this.file || this.readOnly) return;
+    if (!this.store || !this.file || this.readOnly || this.conflict) {
+      /*
+       * 兜底：只读态下有改动却走到这里（万一以后又冒出别的只读路径），
+       * 至少要让用户知道"这些字存不下去"，而不是安静地丢掉。
+       */
+      if (this.readOnly && (this.dirty || this.metaDirty)) this.warnReadOnly();
+      return;
+    }
     if (this.saving) {
       this.saveAgain = true;
       return;
@@ -1360,11 +1580,30 @@ export class InkbookView extends FileView {
     this.saveAgain = false;
     this.saveState = "saving";
     this.updateStatus();
+    const adapter = this.app.vault.adapter;
+    const path = this.file.path;
     try {
       if (this.editor) this.store.data.activePage = this.editor.getState().pageIndex;
-      await writeBook(this.app.vault.adapter, this.file.path, this.store.data);
+
+      // 写之前先看磁盘上的文件有没有被别处改过（同步、别的窗口、外部编辑器）
+      const now = await fingerprint(adapter, path);
+      if (this.fp && now && (now.mtime !== this.fp.mtime || now.size !== this.fp.size)) {
+        await this.saveConflictCopies(adapter, path);
+        this.conflict = true;
+        this.saveState = "dirty";
+        new Notice(
+          "检测到文件已被外部修改，已另存为两份副本，本次未覆盖原文件。请手动检查后选择保留哪一份。",
+          15000
+        );
+        return;
+      }
+
+      await writeBook(adapter, path, this.store.data);
       this.dirty = false;
+      this.metaDirty = false;
       this.saveState = "saved";
+      this.savedActivePage = this.store.data.activePage;
+      this.fp = await fingerprint(adapter, path);
     } catch (e: any) {
       console.error("[inkbook] 保存失败", e);
       this.saveState = "dirty";
@@ -1379,9 +1618,128 @@ export class InkbookView extends FileView {
     }
   }
 
+  /**
+   * 给「副本」类文件取一个不会撞名的路径：**只增不改**。
+   *
+   * 副本名里的时间戳只精确到分钟，同一分钟内发生第二次就会覆盖
+   * 用户已经拿去用的那一份（恢复副本踩过这个坑，冲突副本同理）。
+   * 撞名时依次试 -2、-3…；拿不到 exists 能力就按「不存在」处理 ——
+   * 宁可多产出一份，也不能因为探不了名就不生成副本。
+   */
+  private async uniqueCopyPath(
+    adapter: { exists?: (path: string) => Promise<boolean> },
+    wanted: string
+  ): Promise<string> {
+    const exists = adapter?.exists;
+    if (typeof exists !== "function") return wanted;
+    const suffix = ".inkbook";
+    const hasExt = wanted.toLowerCase().endsWith(suffix);
+    const stem = hasExt ? wanted.slice(0, -suffix.length) : wanted;
+    const ext = hasExt ? wanted.slice(-suffix.length) : "";
+    const taken = async (p: string): Promise<boolean> => {
+      try {
+        return await exists.call(adapter, p);
+      } catch (_) {
+        return false;
+      }
+    };
+    if (!(await taken(wanted))) return wanted;
+    for (let n = 2; n < 100; n += 1) {
+      const cand = `${stem}-${n}${ext}`;
+      if (!(await taken(cand))) return cand;
+    }
+    return `${stem}-${Date.now().toString(36)}${ext}`;
+  }
+
+  /**
+   * 冲突时把两份内容都另存出来，**主文件一个字节都不写**。
+   *
+   * 这里不能猜哪一份是用户想要的：磁盘上那份可能是同步下来的新版本，
+   * 内存里那份可能是刚写了半小时的笔记。所以两份都给，让用户自己挑。
+   *
+   * 两份副本各自探名（`-disk-` 与 `-mine-` 不共用编号），同分钟再冲突
+   * 只会多出新副本，不会覆盖用户已经拿去用的那份。
+   */
+  private async saveConflictCopies(
+    adapter: {
+      read: (p: string) => Promise<string>;
+      write: (p: string, d: string) => Promise<void>;
+      exists?: (p: string) => Promise<boolean>;
+    },
+    path: string
+  ): Promise<void> {
+    const base = path.replace(/\.inkbook$/i, "");
+    const stamp = conflictStamp(new Date());
+
+    // 磁盘上的版本：原样抄一份，不经过任何解析，保证一字不差
+    let diskText = "";
+    let diskPages = 0;
+    try {
+      diskText = await adapter.read(path);
+      const raw = JSON.parse(diskText);
+      diskPages = Array.isArray(raw?.pages) ? raw.pages.length : 0;
+    } catch (e) {
+      console.warn("[inkbook] 读取磁盘版本用于另存失败", e);
+      diskText = "";
+    }
+    if (diskText) {
+      try {
+        const target = await this.uniqueCopyPath(
+          adapter,
+          `${base}.conflict-${stamp}-disk-p${diskPages}.inkbook`
+        );
+        await adapter.write(target, diskText);
+      } catch (e) {
+        console.error("[inkbook] 另存磁盘版本失败", e);
+      }
+    }
+
+    // 内存里的版本
+    const mine = this.store ? this.store.data : null;
+    if (mine) {
+      try {
+        mine.integrity = bookStats(mine);
+        const target = await this.uniqueCopyPath(
+          adapter,
+          `${base}.conflict-${stamp}-mine-p${mine.pages.length}.inkbook`
+        );
+        await adapter.write(target, JSON.stringify(mine));
+      } catch (e) {
+        console.error("[inkbook] 另存内存版本失败", e);
+      }
+    }
+  }
+
+  /**
+   * 冲突未解决就关文件 / 切文件时的兜底：把内存里的内容再抄一份。
+   *
+   * `conflict` 为真时 saveNow 整个跳过（不能写主文件），但用户可能
+   * 在冲突之后又写了半小时——那些笔迹只在内存里。关掉视图就等于丢掉。
+   * 所以关文件前无条件另存一份 `-mine-` 副本，主文件依然一个字节不动。
+   */
+  private async preserveConflictCopy(): Promise<void> {
+    if (!this.conflict || !this.store || !this.file) return;
+    if (!this.dirty && !this.metaDirty) return;
+    const base = this.file.path.replace(/\.inkbook$/i, "");
+    const mine = this.store.data;
+    mine.integrity = bookStats(mine);
+    try {
+      const adapter = this.app.vault.adapter;
+      const target = await this.uniqueCopyPath(
+        adapter,
+        `${base}.conflict-${conflictStamp(new Date())}-mine-p${mine.pages.length}.inkbook`
+      );
+      await adapter.write(target, JSON.stringify(mine));
+      new Notice("冲突未解决：当前内容已另存为副本，原文件未被改动。", 10000);
+    } catch (e) {
+      console.error("[inkbook] 冲突兜底另存失败", e);
+      new Notice("冲突未解决，且另存副本失败：请先别关闭这个标签页。", 0);
+    }
+  }
+
   async flushSave(): Promise<void> {
     this.saveDebounce.cancel();
-    if (this.dirty) await this.saveNow();
+    if (this.dirty || this.metaDirty) await this.saveNow();
   }
 
   /* ------------------------------- 快捷键 ------------------------------- */
