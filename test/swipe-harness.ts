@@ -181,6 +181,25 @@ declare global {
   await sleep(120);
   pass(hostGot > 0, "左缘轻触（位移小）放行（宿主收到 " + hostGot + " 次）");
 
+  /* ---- 场景 6：左缘起手要让「派发层」知道 ----
+   * 真机上宿主的滑动监听比插件注册得早，DOM 层拦不住它，
+   * 唯一有效的是等它派发 swipe 时再吞。派发层看不到坐标，
+   * 只能靠 editor.edgeSwipeRecent() 这个时间戳判断，这条断言锁住它。
+   */
+  await touch("touchStart", left + 4, midY);
+  await touch("touchMove", left + 60, midY + 2);
+  await touch("touchEnd", left + 60, midY + 2);
+  await sleep(120);
+  pass(
+    (view as any).editor?.edgeSwipeRecent?.() === true,
+    "左缘起手后 edgeSwipeRecent 为真（派发层据此拦截）"
+  );
+  await sleep(950);
+  pass(
+    (view as any).editor?.edgeSwipeRecent?.() === false,
+    "900ms 后自动失效，不会永久占着拦截"
+  );
+
   document.removeEventListener("touchmove", onHost, true);
 
   log("");
