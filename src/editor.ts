@@ -78,6 +78,15 @@ interface PageRec {
   ctx: CanvasRenderingContext2D | null;
   octx: CanvasRenderingContext2D | null;
   mounted: boolean;
+  /**
+   * IO 最近一次回调的 isIntersecting：
+   * true = 在预挂范围内（含视口外的 600px 边距）。
+   *
+   * 这个字段只由 IO 回调写，mount()/unmount() 都不许碰它——
+   * 它记的是「IO 怎么判的」，不是「现在挂没挂」。
+   * enforceMountLimit() 靠它一票否决：范围内的页绝不卸。
+   */
+  ioVisible: boolean;
 }
 
 type Gesture = "none" | "draw" | "shape" | "erase" | "lasso" | "move" | "pan";
@@ -92,11 +101,47 @@ type Gesture = "none" | "draw" | "shape" | "erase" | "lasso" | "move" | "pan";
  *
  * 所以要给 dpr 封顶：像素预算不够时自动降采样，
  * 保证「总内存」而不是「缩放倍数」优先。
+ *
+ * ⚠️ 单块上限保持不变：降到 8M 会让 2.8 倍下 dpr 从 1.51 掉到 1.07
+ * （2 倍屏上等于 1.87 倍拉伸），中文小字会糊成一片——这是被产品明确
+ * 否决过的方案。内存的乘数是「同时挂几页」，不是单块上限。
+ * 真正的解是 P3 的 tile 渲染（只画视口内那几块瓦片，分辨率与缩放解耦），
+ * 届时才动这里。
  */
 const MAX_CANVAS_PIXELS = 16_000_000;
 
 /** 导出的底图位图宽度上限（设备像素） */
 const MAX_EXPORT_PX = 4096;
+
+/**
+ * 同时挂载的所有画布总字节预算（不含 PDF 位图缓存）。
+ *
+ * 这是**软目标**，不是硬上界：实际挂载量会被 MIN_MOUNTED 抬到 2 页
+ * （2.8 倍时 2×122 = 244MB）。预算真正的作用是削掉低倍率下的多余挂载
+ * ——0.8 倍时一页才 17MB，不按字节算的话光看页数会挂满 12 页。
+ *
+ * 为什么不用它压死高倍率：高倍率下真正致命的不是内存超一点，
+ * 而是「当前页没有画布」——那是一片永久空白（见 MIN_MOUNTED）。
+ */
+const MOUNT_BUDGET_BYTES = 160 * 1024 * 1024;
+
+/**
+ * 页数硬上限：低倍率下页很小，光看字节会挂太多页——
+ * 几十个 canvas 元素本身就够拖慢合成，跟每块多小无关。
+ */
+const MAX_MOUNTED = 8;
+
+/**
+ * 页数下限 2：当前页 + 一页预挂。
+ *
+ * 2.8 倍时预算只够 1 页，但绝不能把邻页卸掉——卸了滚过去就是整页空白：
+ * IntersectionObserver 只在**跨越交叉阈值**时回调，邻页是「已进视口、
+ * 又在本回调里被卸掉」，状态没变化，IO 不会再触发第二次；
+ * 而 updateCurrentFromScroll() 只改 current 不挂画布。
+ * 结果就是滚到那页时 current 变了、画布却没有，一直白到你滚出去再滚回来。
+ * 所以宁可超预算，也不留这个空洞。
+ */
+const MIN_MOUNTED = 2;
 
 export interface EditorOptions {
   app?: unknown;
@@ -210,8 +255,14 @@ export class BookEditor {
   /**
    * PDF 页位图缓存：按字节预算淘汰，内存有上限。
    * 翻几百页也不会把显存撑爆。
+   *
+   * 160MB：128MB 实测只够 14 张位图（30 页 PDF 翻一遍占满 121.9/128MB），
+   * 往回翻必然重渲、页面白闪一下。回到 160MB 换回 2 页余量，
+   * 代价是纯手写本的画布预算（52–168MB）加上它最坏 328MB——
+   * 但两者的峰值极少同时出现（手写本用不到 PDF 缓存）。
+   * 真正该降的时候再降：P3 的 tile 落地后画布会大幅缩小，届时可把这里调回 192MB。
    */
-  private bgBitmaps = new BitmapCache({ budget: 192 * 1024 * 1024 });
+  private bgBitmaps = new BitmapCache({ budget: 160 * 1024 * 1024 });
   /** 已打开的 PDF 文档（按路径缓存），避免每页都重新解析 */
   private pdfDocs = new Map<string, Promise<PdfDoc>>();
   /** 每页 PDF 期望的位图宽度（设备像素）——用户放大时随之提高 */
@@ -302,13 +353,6 @@ export class BookEditor {
   private eraseBefore: HistoryEntry | null = null;
   /** 擦除手势的当前层状态 */
   private eraseAfter: HistoryEntry | null = null;
-  /**
-   * 同时挂载（分配 canvas）的页数上限。
-   *
-   * 每页两块 canvas，A4@dpr2 约 14MB 一块。挂太多页会吃光显存——
-   * 平板上尤其危险。正常情况只有 2-4 页在视口里。
-   */
-  private readonly maxMounted = 12;
 
   constructor(host: HTMLElement, store: BookStore, opts: EditorOptions = {}) {
     this.host = host;
@@ -572,6 +616,7 @@ export class BookEditor {
       ctx: null,
       octx: null,
       mounted: false,
+      ioVisible: false,
     };
     return rec;
   }
@@ -641,6 +686,7 @@ export class BookEditor {
       this.observer.disconnect();
       this.observer = null;
     }
+    // 页对象重建了，旧的 ioVisible 状态随 rec 一起作废
     this.recs = [];
     this.docEl.innerHTML = "";
     this.store.data.pages.forEach((page, i) => {
@@ -1152,12 +1198,14 @@ export class BookEditor {
         for (const entry of entries) {
           const rec = this.recs[Number((entry.target as HTMLElement).dataset.page)];
           if (!rec) continue;
+          // 先记 IO 的判定，再决定挂/卸——enforceMountLimit() 要读它
+          rec.ioVisible = entry.isIntersecting;
           if (entry.isIntersecting) this.mount(rec);
           else this.unmount(rec);
         }
-        // 兜底：挂载数必须有上限。
-        // 极端情况下（布局塌陷、rootMargin 过大）IO 可能把几百页都判为可见，
-        // 每页两块 canvas 会瞬间吃掉几百 MB 显存——平板上直接闪退。
+        // 兜底：挂载数要压回预算内。
+        // enforceMountLimit() 只削「已经滚出预挂范围」的页，
+        // 绝不碰 ioVisible 的那些（见 PageRec.ioVisible）。
         this.enforceMountLimit();
       },
       { root: this.scrollEl, rootMargin: "600px 0px" }
@@ -1168,24 +1216,98 @@ export class BookEditor {
   }
 
   /**
-   * 保证同时挂载的页数不超过上限。
+   * 当前缩放 / 像素比下的挂载预算，折算成页数。
    *
-   * 超过时优先卸载离当前页最远的——保留当前页和它附近的。
+   * 按字节预算（160MB）反算，再夹在 [MIN_MOUNTED, MAX_MOUNTED] 之间。
+   *
+   * ⚠️ 这是**软目标**，不是实际上限：
+   * 实际挂载数 = max(limit, IO 预挂范围内的页数)。
+   * 范围内的页一票不卸（卸了就是永久空白，见 PageRec.ioVisible），
+   * 所以 1.4 倍时范围内 3 页会比 limit=2 多挂一页——这是有意的。
+   *
+   * 2 倍屏参考值（dpr 被单块上限夹住后）：
+   *   - 2.8 倍：一页 122MB → limit 2（预算只够 1，被下限抬起）
+   *   - 2.0 倍：一页 109MB → limit 2（同上）
+   *   - 1.5 倍：一页 61MB → limit 2
+   *   - 1.0 倍：一页 27MB → limit 5
+   *   - 0.8 倍及以下：一页 ≤18MB → 撞页数硬上限 8
+   *
+   * 只在 IntersectionObserver 回调里调，不在滚动帧里——算一次很便宜，
+   * 没必要加缓存，加了反而要和 zoom / dpr 的变化手动同步。
+   */
+  private mountLimit(): number {
+    const dpr = this.renderDpr();
+    const w = this.store.data.width * this.zoom * dpr;
+    const h = this.store.data.height * this.zoom * dpr;
+    const perPage = w * h * 4 * 2; // 两块画布，4 字节/像素
+    if (!(perPage > 0)) return MIN_MOUNTED;
+    const byBytes = Math.floor(MOUNT_BUDGET_BYTES / perPage);
+    return clamp(byBytes, MIN_MOUNTED, MAX_MOUNTED);
+  }
+
+  /**
+   * 保证同时挂载的页数尽量不超预算。
+   *
+   * 削减顺序按**离视口矩形的像素距离**排，远的先卸。
+   * 索引距离不够用：回滚时 current 两侧的页索引差会打平，
+   * 稳定排序正好把「下一屏就要看的那页」牺牲掉。
    */
   private enforceMountLimit(): void {
-    if (this.recs.length <= this.maxMounted) return;
+    const limit = this.mountLimit();
+    if (this.recs.length <= limit) return;
     const mounted = this.recs.filter((r) => r.mounted);
-    if (mounted.length <= this.maxMounted) return;
+    if (mounted.length <= limit) return;
 
-    // 按离当前页的距离排序，远的先卸载
-    mounted.sort(
-      (a, b) => Math.abs(b.index - this.current) - Math.abs(a.index - this.current)
-    );
-    const excess = mounted.length - this.maxMounted;
-    for (let i = 0; i < excess; i++) {
-      const rec = mounted[i];
-      if (rec.index === this.current) continue;
-      this.unmount(rec, true);
+    const sr = this.scrollEl.getBoundingClientRect();
+    /*
+     * 先把每页到视口的像素距离量一次存表，再排序。
+     * 不要在 sort 的比较函数里调 getBoundingClientRect：比较函数会被调用
+     * O(n log n) 次，每次都强制同步布局——这正是本文件里反复强调
+     * 「不要遍历 getBoundingClientRect」的原因。
+     */
+    const dist = new Map<PageRec, number>();
+    for (const rec of mounted) {
+      const b = rec.wrap.getBoundingClientRect();
+      dist.set(rec, b.bottom < sr.top ? sr.top - b.bottom : b.top > sr.bottom ? b.top - sr.bottom : 0);
+    }
+    const farthestFirst = (a: PageRec, b: PageRec): number =>
+      (dist.get(b) ?? 0) - (dist.get(a) ?? 0);
+
+    /*
+     * 只卸「IO 判定不在预挂范围内」的页。
+     *
+     * 为什么绝不能卸范围内的页：IO 只在跨越交叉阈值时回调。把范围内的页
+     * 卸掉之后，它再进入视口时状态没变化，IO 不会二次触发，也没有别的地方
+     * 补挂 → 用户会停在一直空白的页上
+     * （实测 1.4/1.5 倍回滚必现：可见页 overlap 179px 却 mounted=false，
+     * 静置 1.5s 不自愈）。
+     * 所以 limit 在这儿是**软目标**：范围内本身就超过 limit 时，宁可爱超。
+     */
+    const cand = mounted
+      .filter((r) => !r.ioVisible && r.index !== this.current)
+      .sort(farthestFirst);
+
+    let excess = mounted.length - limit;
+    for (const rec of cand) {
+      if (excess <= 0) break;
+      this.unmount(rec);
+      excess--;
+    }
+
+    /*
+     * 极端兜底：布局塌陷时 IO 可能把几百页全判为可见，
+     * 上面那条规则一页都卸不掉，会瞬间吃掉几百 MB 显存——平板上直接闪退。
+     * 这种情况下按页数硬上限强卸最远的（范围几何正常时不会走到这里：
+     * 同时最多 2-3 页在范围内）。
+     */
+    if (this.recs.filter((r) => r.mounted).length > MAX_MOUNTED) {
+      const rest = this.recs
+        .filter((r) => r.mounted && r.index !== this.current)
+        .sort(farthestFirst);
+      for (const rec of rest) {
+        if (this.recs.filter((r) => r.mounted).length <= MAX_MOUNTED) break;
+        this.unmount(rec);
+      }
     }
   }
 
@@ -2400,6 +2522,16 @@ export class BookEditor {
       this.current = best;
       this.store.setPage(best);
       this.clearSelection();
+      /*
+       * 兜底挂载：翻页时保证当前页一定有画布。
+       *
+       * 挂载上限是按字节预算算的，高倍率下被下限抬到只有 2 格；
+       * IO 回调里「挂上第 3 页 → 同一轮回调被 enforceMountLimit 卸掉」之后，
+       * IO 已经记过 isIntersecting，**不会再触发第二次**。
+       * 没有这一行，翻过去的页面就是一片空白，直到滚出预挂范围再滚回来。
+       * mount() 幂等，已挂载时是空操作。
+       */
+      this.mount(this.recs[best]);
       this.emitState();
       if (this.opts.onPageChange) this.opts.onPageChange(best);
     }
