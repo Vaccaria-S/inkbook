@@ -22,6 +22,7 @@ import {
   polygonBounds,
   selectionBounds,
   splitStrokeByEraser,
+  straightenPoints,
   strokeBounds,
   strokeHit,
   strokeInPolygon,
@@ -157,6 +158,12 @@ export interface EditorOptions {
    * 默认 true；关掉后左缘右滑交还给宿主（用于打开文件列表）。
    */
   edgeSwipeBlock?: boolean;
+  /**
+   * 画完自动把「看起来是直线」的笔迹拉直。
+   *
+   * 只对自由笔迹生效（荧光笔、圆珠笔、钢笔），不碰形状工具。
+   */
+  straighten?: boolean;
   onState?: () => void;
   onChange?: () => void;
   onPageChange?: (index: number) => void;
@@ -174,6 +181,8 @@ export class BookEditor {
   highlighterColor = "#F2C84B";
   highlighterSize = 24;
   shapeKind: ShapeKind = "rect";
+  /** 自动把直线画直的开关（由设置同步进来） */
+  private straighten = false;
   eraserMode: "whole" | "part" = "part";
   eraserSize = 26;
   zoom = 0.8;
@@ -402,6 +411,13 @@ export class BookEditor {
         if (this.scrollRaf) return;
         this.scrollRaf = requestAnimationFrame(() => {
           this.scrollRaf = 0;
+          /*
+           * 捏合缩放期间不判定当前页。
+           *
+           * 缩放补偿本身会改 scrollTop，每帧都重算会让页码在相邻页之间乱跳
+           * （用户看到的就是「捏合时跳到别的页」）。手势结束后统一算一次。
+           */
+          if (this.pinchActive) return;
           this.updateCurrentFromScroll();
         });
       },
@@ -439,6 +455,7 @@ export class BookEditor {
     );
 
     if (this.opts.edgeSwipeBlock !== false) this.installEdgeSwipeGuard();
+    this.straighten = this.opts.straighten === true;
 
     if (typeof ResizeObserver !== "undefined") {
       this.resizeObserver = new ResizeObserver(() => {
@@ -976,6 +993,10 @@ export class BookEditor {
   private endPinch(): void {
     this.pinch = null;
     this.pinchActive = false;
+    // 手势期间冻结了当前页判定，这里补算一次（页码/缩略图/状态栏都靠它）
+    this.measurePageMetrics();
+    this.updateCurrentFromScroll();
+    this.emitState();
   }
 
   /**
@@ -1855,6 +1876,11 @@ export class BookEditor {
     else this.uninstallEdgeSwipeGuard();
   }
 
+  /** 设置里切换「自动把直线画直」时调用 */
+  setStraighten(on: boolean): void {
+    this.straighten = on;
+  }
+
   private applyTouchAction(): void {
     // 手指始终允许滚动/缩放（双指手势由仲裁器接管），
     // 笔的书写不受 touch-action 影响，所以两种输入可以共存。
@@ -2289,8 +2315,13 @@ export class BookEditor {
       this.store.addStroke(stroke, rec.index);
     } else {
       if (!draft.points.length) return;
+      let stroke: Stroke = { ...draft, id: uid("stroke") };
+      if (this.straighten) {
+        const straight = straightenPoints(stroke.points);
+        if (straight) stroke = { ...stroke, points: straight };
+      }
       // addStroke 自己记增量撤销
-      this.store.addStroke({ ...draft, id: uid("stroke") }, rec.index);
+      this.store.addStroke(stroke, rec.index);
     }
     this.renderRec(rec);
     this.renderOverlay(rec);

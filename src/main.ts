@@ -97,8 +97,31 @@ export default class InkbookPlugin extends Plugin {
     const ws = (this.app as any)?.workspace;
     if (!ws) return;
 
+    /*
+     * 判据：当前文件是 .inkbook 就整条吃掉横向滑动。
+     *
+     * 一开始想用「这次滑动是不是从容器左缘起手」做精判，真机证明不可靠：
+     * 缩小（纸张小于视口）时手/笔落点经常落在纸张外的空白区，
+     * 坐标判据抓不到；而放大时又因为别的原因根本不触发。
+     * 用户要的语义其实更简单——**在墨本里就别让这个手势工作**。
+     *
+     * 代价：在墨本里用这个手势打开文件列表会失效（左侧栏按钮 / 命令面板仍可用），
+     * 关掉设置里的开关即可恢复。
+     */
+    const isInkbookActive = (): boolean => {
+      const file = this.app.workspace.getActiveFile?.();
+      if (file && (file.extension || "").toLowerCase() === "inkbook") return true;
+      const active: any = (this.app.workspace as any).activeLeaf?.view;
+      if (active && typeof active.getViewType === "function" && active.getViewType() === VIEW_TYPE) {
+        return true;
+      }
+      return false;
+    };
+
     const shouldBlock = (): boolean => {
       if (!this.settings.blockEdgeSwipe) return false;
+      if (isInkbookActive()) return true;
+      // 兜底：活动文件拿不到时，看有没有墨本编辑器刚记录过左缘起手
       for (const leaf of this.app.workspace.getLeavesOfType?.(VIEW_TYPE) || []) {
         const ed = (leaf.view as any)?.editor;
         if (ed && typeof ed.edgeSwipeRecent === "function" && ed.edgeSwipeRecent()) return true;

@@ -183,3 +183,51 @@ export function splitStrokeByEraser(
   if (cur.length >= 2) out.push(cur);
   return out;
 }
+
+/**
+ * 把「看起来是直线」的笔迹拉直。
+ *
+ * 判定：首尾连线长度 ≥ minLength，且所有点到这条连线的最大垂距
+ * ≤ max(minTol, 长度 × ratio)。手写直线通常有 1–3% 的抖动，
+ * ratio 取 0.022（约 1.3°）刚好能容下手抖，又不会把弧线误判成直线。
+ *
+ * 通过判定则把每个点**投影**到首尾连线上：点数与压感全部保留，
+ * 笔锋的粗细变化不会丢，只是几何上变成严格共线。
+ *
+ * @returns 拉直后的新数组；不像直线时返回 null（调用方保持原样）
+ */
+export function straightenPoints(
+  points: Pt[],
+  opts: { minLength?: number; ratio?: number; minTol?: number } = {}
+): Pt[] | null {
+  const minLength = opts.minLength ?? 20;
+  const ratio = opts.ratio ?? 0.022;
+  const minTol = opts.minTol ?? 2.5;
+
+  if (points.length < 3) return null;
+
+  const a = points[0];
+  const b = points[points.length - 1];
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const len = Math.hypot(dx, dy);
+  // 太短或首尾几乎重合（画了个圈/钩）都不算直线
+  if (len < minLength) return null;
+
+  const tol = Math.max(minTol, len * ratio);
+  const ux = dx / len;
+  const uy = dy / len;
+
+  let maxDev = 0;
+  for (const p of points) {
+    const t = (p[0] - a[0]) * ux + (p[1] - a[1]) * uy;
+    const dev = Math.hypot(p[0] - (a[0] + ux * t), p[1] - (a[1] + uy * t));
+    if (dev > maxDev) maxDev = dev;
+  }
+  if (maxDev > tol) return null;
+
+  return points.map((p) => {
+    const t = (p[0] - a[0]) * ux + (p[1] - a[1]) * uy;
+    return [a[0] + ux * t, a[1] + uy * t, p[2]] as Pt;
+  });
+}

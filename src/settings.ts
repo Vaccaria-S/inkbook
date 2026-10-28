@@ -120,13 +120,26 @@ export class InkbookSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("写字时屏蔽右滑弹出文件列表")
+      .setName("在墨本里屏蔽「左缘右滑弹文件列表」")
       .setDesc(
-        "开启后，用笔从纸张最左缘往右划不会弹出文件列表（代价：想用这个手势打开文件列表时会失效，改用左侧边栏按钮或命令面板；关掉开关即可恢复）。"
+        "开启后，在墨本笔记里从最左缘往右划不会弹出文件列表（手指、笔都算）。代价：在墨本里这个手势会失效，改用左侧栏按钮或命令面板；关掉开关即可恢复。"
       )
       .addToggle((t) =>
         t.setValue(this.plugin.settings.blockEdgeSwipe).onChange(async (v) => {
           this.plugin.settings.blockEdgeSwipe = v;
+          await this.plugin.saveSettings();
+          this.plugin.refreshViews();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("自动把直线画直")
+      .setDesc(
+        "开启后，用钢笔、圆珠笔或荧光笔画出的近似直线，抬手时会自动拉直（保留原来的粗细与压感）。只识别直线，圆圈、曲线、字迹不受影响。"
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.straightLine === true).onChange(async (v) => {
+          this.plugin.settings.straightLine = v;
           await this.plugin.saveSettings();
           this.plugin.refreshViews();
         })

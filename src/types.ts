@@ -130,6 +130,8 @@ export interface InkbookSettings {
    * 用触控笔从左往右写字会被误判成右滑。
    */
   blockEdgeSwipe: boolean;
+  /** 画完自动把笔直的笔迹拉直（只认直线） */
+  straightLine: boolean;
 }
 
 export const A4_WIDTH = 794;
@@ -148,6 +150,7 @@ export const DEFAULT_SETTINGS: InkbookSettings = {
   lastPenColor: "#1A1A1A",
   lastHighlighterColor: "#F6E05E",
   blockEdgeSwipe: true,
+  straightLine: false,
 };
 
 export const PEN_COLORS = [
