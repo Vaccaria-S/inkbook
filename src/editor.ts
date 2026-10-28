@@ -287,6 +287,13 @@ export class BookEditor {
    * 也就不会弹列表。
    */
   private edgeGuard = { x0: 0, y0: 0, active: false, armed: false };
+  /**
+   * 最近一次「贴着容器左缘起手」的时间戳。
+   *
+   * 派发层（main.ts 的 swipe 拦截）只能看到 direction，看不到坐标，
+   * 由这里把坐标判定结果带过去——只有从最左缘起手的滑动才可能是写字误触。
+   */
+  private edgeSwipeAt = 0;
   /** 手势拦截器的反注册函数 */
   private guardTeardown: (() => void) | null = null;
   /** 页面之间的间距（px），从 CSS 读一次，用于算术定位 */
@@ -1782,23 +1789,58 @@ export class BookEditor {
     };
 
     /*
+     * 记录「从左缘起手」的时刻，供派发层判断这次滑动是不是写字误触。
+     *
+     * 用 pointerdown 而不是 touchstart：触控笔在部分安卓机上只派发 pointer 系列，
+     * 只监听 touch 会漏掉笔（这正是上一版在真机上失效的原因之一）。
+     * 左缘区间给到 48px：宿主的滑动识别区贴着屏幕左边，笔尖落点常有几像素误差。
+     */
+    const onPointerDown = (e: PointerEvent) => {
+      if (!inEditor(e)) return;
+      const left = this.scrollEl.getBoundingClientRect().left;
+      /*
+       * 两个条件满足其一就算「贴着左缘起手」：
+       * - 距容器左边 0~48px：纸张贴着屏幕左边时的正常情况；
+       * - 屏幕坐标 <= 48px：容器本身有内缩（页面居中、侧栏留白）时，
+       *   宿主的滑动识别区仍然贴屏幕边，只按容器坐标算会漏掉。
+       */
+      const nearContainer = e.clientX - left >= -4 && e.clientX - left <= 48;
+      const nearScreen = e.clientX <= 48;
+      if (nearContainer || nearScreen) this.edgeSwipeAt = Date.now();
+    };
+
+    /*
      * 挂在 window 的**捕获阶段**——整条事件路径上第一个执行。
      *
-     * 挂在滚动容器上是不够的：宿主的监听器在 document 捕获阶段，
-     * 比容器上的监听器**先**执行，等到容器再拦已经晚了。
+     * 挂在这一层只能挡住「比我们晚注册」的监听器。宿主的滑动监听在插件加载前
+     * 就挂好了，所以真实环境里这条链挡不住它——真正的拦截在 main.ts 的派发层。
+     * 这里保留，是为了让能挡的那部分（原生滚动、其他插件）少走一遍。
      */
     const opts = { capture: true, passive: false } as const;
+    window.addEventListener("pointerdown", onPointerDown, opts);
     window.addEventListener("touchstart", onTouchStart, opts);
     window.addEventListener("touchmove", onTouchMove, opts);
     window.addEventListener("touchend", onTouchEnd, opts);
     window.addEventListener("touchcancel", onTouchEnd, opts);
 
     this.guardTeardown = () => {
+      window.removeEventListener("pointerdown", onPointerDown, opts);
       window.removeEventListener("touchstart", onTouchStart, opts);
       window.removeEventListener("touchmove", onTouchMove, opts);
       window.removeEventListener("touchend", onTouchEnd, opts);
       window.removeEventListener("touchcancel", onTouchEnd, opts);
     };
+  }
+
+  /**
+   * 最近是否发生过「贴着容器左缘起手」的指针动作。
+   *
+   * 给 main.ts 的派发层用：宿主的滑动识别发生在它自己的监听器里，我们拦不住
+   * （它的监听器比插件注册得早），只能等它派发 swipe 事件时再吞。900ms 足够覆盖
+   * 一次滑动手势从起手到识别的全过程。
+   */
+  edgeSwipeRecent(ms = 900): boolean {
+    return this.edgeSwipeAt > 0 && Date.now() - this.edgeSwipeAt <= ms;
   }
 
   private uninstallEdgeSwipeGuard(): void {
