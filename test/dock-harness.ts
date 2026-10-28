@@ -1,12 +1,13 @@
 /**
  * 工具长条 + 右下角浮标 + 侧栏 回归测试。
  *
- * 覆盖五条主线：
- *   1. 竖长条结构：常驻右缘、7 个工具 + 侧栏开关 + 阅读开关
+ * 覆盖六条主线：
+ *   1. 竖长条结构：常驻右缘、7 个工具 + 立即保存 + 侧栏开关 + 阅读开关
  *   2. 长条**不遮挡滚动条**（用户反馈"边上的框会挡住滑动页面的那个条"）
  *   3. 右下角浮标：翻页常驻、缩放**只在缩放时**浮现并显示确切倍数
  *   4. 侧栏收纳全部工具：导出 / 导入 / 撤销 / 输入方式都在里面
  *   5. 图标**真的看得见**（用户反馈"每一个框里面都看不到图标"）
+ *   6. 立即保存：点一下就落盘，干净时不重复写，存不下去时必须说清楚
  */
 import { InkbookView } from "../src/view";
 import { createBook, createPage, DEFAULT_SETTINGS, type Pt } from "../src/types";
@@ -23,6 +24,19 @@ function pass(ok: boolean, msg: string) {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 window.addEventListener("error", (e) => log("ERROR " + e.message + " @ " + e.filename + ":" + e.lineno));
 window.addEventListener("unhandledrejection", (e) => log("REJECT " + (e.reason?.stack || e.reason)));
+
+/**
+ * Notice 在 obsidian-stub 里只打一行 console.log，页面上看不见。
+ * 截下来当"提示真的弹了"的可观测信号——否则只能断言"没写盘"，
+ * 分不清是给了提示还是静默什么都没做。
+ */
+const noticeTexts: string[] = [];
+const rawConsoleLog = console.log.bind(console);
+console.log = (...args: unknown[]) => {
+  const s = args.map((a) => String(a)).join(" ");
+  if (s.startsWith("[Notice]")) noticeTexts.push(s);
+  rawConsoleLog(...args);
+};
 
 /* --------------------------------------------------------------- 脚手架 */
 
@@ -49,10 +63,21 @@ function makeBook(pages = 3) {
   return book;
 }
 
+/**
+ * 正文写盘次数（不含 .bak 备份）。
+ *
+ * 「立即保存」的代价必须能量出来：点一次 = 写一次磁盘，
+ * 干净状态下点一次 = 一次都不能多写。
+ */
+let bodyWrites = 0;
+
 const adapter = {
   exists: async (p: string) => files.has(p),
   read: async (p: string) => files.get(p),
-  write: async (p: string, d: string) => void files.set(p, d),
+  write: async (p: string, d: string) => {
+    if (!p.endsWith(".bak")) bodyWrites += 1;
+    files.set(p, d);
+  },
   writeBinary: async (p: string, d: any) => void files.set(p, d),
   mkdir: async () => {},
 };
@@ -462,6 +487,117 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   );
 
   root.classList.remove("is-tablet");
+  await sleep(200);
+
+  /* ============ 10. 长条「立即保存」 ============ */
+  /*
+   * 用户场景（平板）：落几笔 → 点一下 → 立刻落盘。
+   * 自动保存有 850ms 防抖，等不了那一下。
+   */
+  const saveBtn = root.querySelector(".mb-rail-save") as HTMLButtonElement | null;
+  pass(
+    !!saveBtn && !!saveBtn.querySelector("svg.mb-ic path"),
+    "长条上有「立即保存」按钮，且图标真的画出来了（不是空框）"
+  );
+
+  /*
+   * 关掉自动保存：这样"有没有写盘"完全由这次点击决定，
+   * 不会被 850ms 防抖在断言之前偷偷存掉（那会让第 3、4 条全部失真）。
+   */
+  plugin.settings.autosave = false;
+  await view.flushSave();
+  await sleep(150);
+
+  const statusEl = root.querySelector(".mb-side-status") as HTMLElement;
+
+  drawAt(240, 320);
+  await sleep(200);
+  pass(
+    statusEl.textContent!.includes("未保存") && saveBtn!.classList.contains("is-dirty"),
+    "落一笔后状态是「" +
+      statusEl.textContent +
+      "」且按钮亮起未保存点（is-dirty=" +
+      saveBtn!.classList.contains("is-dirty") +
+      "）"
+  );
+
+  // 点一下 → 必须真的落盘，且只写一次正文
+  const beforeClick = bodyWrites;
+  saveBtn!.click();
+  await sleep(400);
+  pass(
+    bodyWrites === beforeClick + 1 &&
+      statusEl.textContent!.includes("已保存") &&
+      !saveBtn!.classList.contains("is-dirty"),
+    "点「立即保存」→ 写盘 " +
+      beforeClick +
+      " → " +
+      bodyWrites +
+      "（+" +
+      (bodyWrites - beforeClick) +
+      " 次），状态变「" +
+      statusEl.textContent +
+      "」，未保存点消失"
+  );
+
+  // 干净状态下再点一次 → 一次都不能多写
+  const beforeIdle = bodyWrites;
+  saveBtn!.click();
+  await sleep(400);
+  pass(
+    bodyWrites === beforeIdle,
+    "干净状态下再点一次不重复写盘（写盘次数停在 " + bodyWrites + "）"
+  );
+
+  /*
+   * 仅阅读模式下点：没有新内容可存 → 不写盘，但要明确告知，
+   * 不能"点了没反应"。
+   */
+  (readBtn as HTMLElement).click();
+  await sleep(200);
+  const beforeReading = bodyWrites;
+  const noticesBeforeReading = noticeTexts.length;
+  saveBtn!.click();
+  await sleep(300);
+  const readingNotice = noticeTexts.slice(noticesBeforeReading).join(" | ");
+  pass(
+    bodyWrites === beforeReading && readingNotice.includes("无需保存"),
+    "仅阅读模式下点「立即保存」不写盘（" +
+      beforeReading +
+      " → " +
+      bodyWrites +
+      "），提示：" +
+      (readingNotice || "（没有提示！）")
+  );
+
+  /*
+   * 只读态（从备份恢复 / 原文件打不开）：这份笔记**存不下去**。
+   * 点按钮必须说清楚，不能静默返回——否则用户会以为写进去了。
+   */
+  view.readOnly = true;
+  view.dirty = true;
+  view.saveState = "dirty";
+  view.updateStatus();
+  const beforeReadOnly = bodyWrites;
+  const noticesBeforeReadOnly = noticeTexts.length;
+  saveBtn!.click();
+  await sleep(300);
+  const roNotice = noticeTexts.slice(noticesBeforeReadOnly).join(" | ");
+  pass(
+    bodyWrites === beforeReadOnly && roNotice.includes("只读"),
+    "只读态下点「立即保存」不写盘（" +
+      beforeReadOnly +
+      " → " +
+      bodyWrites +
+      "），提示：" +
+      (roNotice || "（没有提示！）")
+  );
+
+  view.readOnly = false;
+  view.dirty = false;
+  view.saveState = "saved";
+  view.updateStatus();
+  (readBtn as HTMLElement).click(); // 退出仅阅读
   await sleep(200);
 
   log("");
