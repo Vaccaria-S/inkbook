@@ -13,6 +13,8 @@ window.addEventListener("unhandledrejection", (e) => log("UNHANDLED: " + (e.reas
 const swipeCalls: any[] = [];
 /** getLeavesOfType 的返回值，测试里按需改 */
 let inkbookLeaves: any[] = [];
+/** getActiveFile 的返回值 */
+let activeFile: any = null;
 
 /** 原型上带 trigger：插件只该改这个原型，不该落到 Object.prototype */
 const wsProto: any = {
@@ -25,7 +27,7 @@ Object.assign(workspace, {
   on: () => ({}),
   onLayoutReady: (cb: () => void) => setTimeout(cb, 0),
   getLeaf: () => ({ openFile: async () => {}, setViewState: async () => {} }),
-  getActiveFile: () => null,
+  getActiveFile: () => activeFile,
   getActiveViewOfType: () => null,
   getLeavesOfType: () => inkbookLeaves,
 });
@@ -83,6 +85,18 @@ async function main() {
       (Object.prototype.hasOwnProperty.call(Object.prototype, "trigger") ? "FAIL" : "PASS") +
         " 未污染 Object.prototype"
     );
+
+    /* 活动文件是 .inkbook 时，不看坐标也不看时间，一律拦 */
+    plugin.settings.blockEdgeSwipe = true;
+    inkbookLeaves = [];
+    activeFile = { extension: "inkbook" };
+    log((fire() === 0 ? "PASS" : "FAIL") + " 活动文件是 .inkbook 时直接拦（宿主收到 0 次）");
+    activeFile = { extension: "md" };
+    log((fire() === 1 ? "PASS" : "FAIL") + " 活动文件是 md 时放行（1 次）");
+    activeFile = { extension: "inkbook" };
+    plugin.settings.blockEdgeSwipe = false;
+    log((fire() === 1 ? "PASS" : "FAIL") + " 开关关掉后即使活动文件是 .inkbook 也放行（1 次）");
+    plugin.settings.blockEdgeSwipe = true;
 
     plugin.onunload();
     log(

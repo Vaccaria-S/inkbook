@@ -2,6 +2,7 @@ import { BookEditor } from "../src/editor";
 import { BookStore } from "../src/store";
 import { createBook, createPage, type Pt, type Stroke } from "../src/types";
 import { readBook, writeBook } from "../src/storage";
+import { straightenPoints } from "../src/geometry";
 
 const lines: string[] = [];
 const out = document.getElementById("out")!;
@@ -205,6 +206,61 @@ async function main() {
   const back = await readBook(adapter, "a.inkbook", "a");
   pass(back.pages.length === store.data.pages.length, "存储读出页数一致");
   pass(back.kind === "inkbook", "kind = inkbook");
+
+  /* ---- 直线识别（纯函数） ---- */
+  {
+    // 手抖的横线：首尾 (100,100)→(400,110)，中间上下抖 1.5px
+    const jitter: Pt[] = [];
+    for (let i = 0; i <= 20; i++) {
+      const t = i / 20;
+      jitter.push([100 + 300 * t, 100 + 10 * t + (i % 2 ? 1.5 : -1.5), 0.5 + 0.02 * i]);
+    }
+    const flat = straightenPoints(jitter);
+    pass(!!flat, "近直线被识别（抖动 ±1.5px）");
+    if (flat) {
+      // 所有点到首尾连线的垂距应接近 0
+      const a = flat[0];
+      const b = flat[flat.length - 1];
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      let maxDev = 0;
+      for (const p of flat) {
+        const t = ((p[0] - a[0]) * (b[0] - a[0]) + (p[1] - a[1]) * (b[1] - a[1])) / (len * len);
+        const px = a[0] + (b[0] - a[0]) * t;
+        const py = a[1] + (b[1] - a[1]) * t;
+        maxDev = Math.max(maxDev, Math.hypot(p[0] - px, p[1] - py));
+      }
+      pass(maxDev < 0.01, "拉直后严格共线（最大垂距 " + maxDev.toFixed(4) + "px）");
+      pass(flat.length === jitter.length, "点数保留：" + flat.length + " / " + jitter.length);
+      pass(
+        Math.abs(flat[7][2] - jitter[7][2]) < 1e-9,
+        "压感保留（第 7 点 " + jitter[7][2].toFixed(3) + "）"
+      );
+    }
+    // 明显弧线：中点偏离 40px
+    const arc: Pt[] = [];
+    for (let i = 0; i <= 20; i++) {
+      const t = i / 20;
+      arc.push([100 + 300 * t, 100 + 400 * Math.sin(Math.PI * t), 0.5]);
+    }
+    pass(straightenPoints(arc) === null, "弧线不被误判为直线");
+    // 太短
+    pass(
+      straightenPoints([
+        [0, 0, 0.5],
+        [5, 0, 0.5],
+        [10, 1, 0.5],
+      ]) === null,
+      "过短的笔画不处理（长度 10px）"
+    );
+    // 圆圈（首尾重合）
+    const loop: Pt[] = [];
+    for (let i = 0; i < 24; i++) {
+      const a = (i / 24) * Math.PI * 2;
+      loop.push([200 + 60 * Math.cos(a), 200 + 60 * Math.sin(a), 0.5]);
+    }
+    loop.push([...loop[0]] as Pt);
+    pass(straightenPoints(loop) === null, "圆圈不被误判为直线");
+  }
 
   log("DONE");
   document.title = "DONE";
