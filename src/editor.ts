@@ -151,6 +151,12 @@ export interface EditorOptions {
   smoothing?: number;
   /** 笔画预测：墨迹跑在笔尖前面 */
   prediction?: boolean;
+  /**
+   * 是否屏蔽「从纸张左缘右滑」这个宿主手势。
+   *
+   * 默认 true；关掉后左缘右滑交还给宿主（用于打开文件列表）。
+   */
+  edgeSwipeBlock?: boolean;
   onState?: () => void;
   onChange?: () => void;
   onPageChange?: (index: number) => void;
@@ -283,14 +289,6 @@ export class BookEditor {
   private edgeGuard = { x0: 0, y0: 0, active: false, armed: false };
   /** 手势拦截器的反注册函数 */
   private guardTeardown: (() => void) | null = null;
-  /**
-   * 最近一次落笔的时间戳（performance.now）。
-   *
-   * 宿主派发 swipe 事件时用它判断：
-   * 「刚才正在写字 → 这是误触，拦掉」
-   * 「没在写字 → 用户真要滑出文件列表，放行」
-   */
-  private lastInkTime = -1e9;
   /** 页面之间的间距（px），从 CSS 读一次，用于算术定位 */
   private pageGap = 24;
   /** 首页顶部在滚动内容里的位置（算术定位的基准） */
@@ -433,7 +431,7 @@ export class BookEditor {
       { passive: false }
     );
 
-    this.installEdgeSwipeGuard();
+    if (this.opts.edgeSwipeBlock !== false) this.installEdgeSwipeGuard();
 
     if (typeof ResizeObserver !== "undefined") {
       this.resizeObserver = new ResizeObserver(() => {
@@ -1803,21 +1801,16 @@ export class BookEditor {
     };
   }
 
-  /**
-   * 刚刚（900ms 内）有没有在写字？
-   *
-   * 900ms 是权衡出来的：
-   *   · 太短（比如 200ms）—— 用户写完一笔停一下再滑，还是会被拦
-   *   · 太长（比如 5s）—— 用户写完字想去翻文件列表，会被误拦
-   * 900ms 刚好覆盖「写完一笔顺势想滑」这个动作，同时不误伤后续操作。
-   */
-  recentlyInked(): boolean {
-    return performance.now() - this.lastInkTime < 900;
-  }
-
   private uninstallEdgeSwipeGuard(): void {
     this.guardTeardown?.();
     this.guardTeardown = null;
+  }
+
+  /** 设置里切换「写字时屏蔽右滑」时调用；重复调用必须安全（内部会先卸再装）。 */
+  setEdgeSwipeBlock(on: boolean): void {
+    this.opts.edgeSwipeBlock = on;
+    if (on) this.installEdgeSwipeGuard();
+    else this.uninstallEdgeSwipeGuard();
   }
 
   private applyTouchAction(): void {
@@ -1965,8 +1958,6 @@ export class BookEditor {
 
     e.preventDefault();
     this.pointerId = e.pointerId;
-    // 记下「刚刚在写字」——宿主派发 swipe 时据此判断是不是误触
-    this.lastInkTime = performance.now();
     try {
       rec.pageEl.setPointerCapture(e.pointerId);
     } catch (_) {}

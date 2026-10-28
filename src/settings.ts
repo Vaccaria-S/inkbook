@@ -122,12 +122,13 @@ export class InkbookSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("写字时屏蔽右滑弹出文件列表")
       .setDesc(
-        "安卓 / iPad 版 Obsidian 从屏幕左缘右滑会弹出文件列表；用触控笔从左往右写字时会被误判。打开后只在写字的瞬间屏蔽，平时滑动不受影响"
+        "开启后，用笔从纸张最左缘往右划不会弹出文件列表（代价：想用这个手势打开文件列表时会失效，改用左侧边栏按钮或命令面板；关掉开关即可恢复）。"
       )
       .addToggle((t) =>
         t.setValue(this.plugin.settings.blockEdgeSwipe).onChange(async (v) => {
           this.plugin.settings.blockEdgeSwipe = v;
           await this.plugin.saveSettings();
+          this.plugin.refreshViews();
         })
       );
 

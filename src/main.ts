@@ -72,72 +72,13 @@ export default class InkbookPlugin extends Plugin {
 
     this.addSettingTab(new InkbookSettingTab(this.app, this));
 
-    this.installSwipeGuard();
-  }
-
-  /**
-   * 拦截宿主的横向滑动事件派发。
-   *
-   * 安卓/iPad Obsidian 从左缘右滑会弹出文件列表（左边框）。
-   * 用触控笔从左往右写字时，那一笔会被误判成右滑。
-   *
-   * Obsidian 识别出滑动手势后，通过 `workspace.trigger('swipe', …)`
-   * 派发事件。这里把这个通道掐掉——
-   * 但**只在刚写过字的一小段时间内**掐，
-   * 用户真想去翻文件列表时（没在写字）不受影响。
-   *
-   * DOM 层（捕获阶段 stopPropagation）已经挡了一路，
-   * 这一层是兜底：万一宿主在捕获阶段就读了事件，DOM 层会漏。
-   */
-  private installSwipeGuard(): void {
-    const app = this.app as any;
-    const ws = app?.workspace;
-    if (!ws) return;
-
-    // 已经被别的插件（或本次热重载）装过就别重复装
-    if ((ws as any).__inkbookSwipeGuard) return;
-
-    const isBlocked = () => {
-      if (!this.settings.blockEdgeSwipe) return false;
-      // 没有任何视图在写字 → 放行
-      let inked = false;
-      for (const leaf of app.workspace.getLeavesOfType?.(VIEW_TYPE) || []) {
-        const v = leaf.view as any;
-        if (v?.editor?.recentlyInked?.()) {
-          inked = true;
-          break;
-        }
-      }
-      return inked;
-    };
-
-    const targets = [ws, ws.rootSplit, ws.activeLeaf].filter(Boolean);
-    for (const t of targets) {
-      const proto = Object.getPrototypeOf(t);
-      if (!proto || typeof proto.trigger !== "function") continue;
-      if ((proto.trigger as any).__inkbookPatched) continue;
-      const orig = proto.trigger;
-      const patched = function (this: unknown, event: string, data: any) {
-        try {
-          if (
-            event === "swipe" &&
-            data &&
-            data.direction === "x" &&
-            data.points === 1 &&
-            isBlocked()
-          ) {
-            // 误触：吞掉，不派发
-            return;
-          }
-        } catch (_) {
-          // 判定出错时宁可放行，不能把用户的正常操作也堵死
-        }
-        return orig.call(this, event, data);
-      };
-      (patched as any).__inkbookPatched = true;
-      proto.trigger = patched;
-    }
-    (ws as any).__inkbookSwipeGuard = true;
+    /*
+     * 这里曾经安装过「吞掉 workspace.trigger('swipe')」的补丁。
+     * 2026-10-28 删除：它替换的是宿主原型方法，会波及其他插件的滑动，
+     * 禁用插件后还会残留到重启；而且真机验证过——真正挡住误触的是
+     * editor.ts 的 window 捕获层（installEdgeSwipeGuard），这层补丁从未生效。
+     * 不要加回来。
+     */
   }
 
   private openNewBook(): void {

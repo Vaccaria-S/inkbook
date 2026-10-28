@@ -401,6 +401,7 @@ export class InkbookView extends FileView {
       pressure: this.plugin.settings.pressure,
       smoothing: this.plugin.settings.smoothing,
       prediction: this.plugin.settings.prediction,
+      edgeSwipeBlock: this.plugin.settings.blockEdgeSwipe !== false,
       onState: () => this.updateUI(),
       onChange: () => this.markDirty(),
       onPageChange: () => this.onPageChanged(),
@@ -1882,6 +1883,7 @@ export class InkbookView extends FileView {
     this.editor.setPressure(this.plugin.settings.pressure);
     this.editor.setSmoothing(this.plugin.settings.smoothing ?? 0.55);
     this.editor.setPrediction(this.plugin.settings.prediction !== false);
+    this.editor.setEdgeSwipeBlock(this.plugin.settings.blockEdgeSwipe !== false);
     this.editor.penSize = this.plugin.settings.defaultPenSize;
     this.updateUI();
   }
