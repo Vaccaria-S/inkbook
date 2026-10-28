@@ -93,6 +93,13 @@ export class InkbookView extends FileView {
   private railEl!: HTMLElement;
   private railReadBtn!: HTMLButtonElement;
   private railSideBtn!: HTMLButtonElement;
+  /**
+   * 长条上的「立即保存」按钮。
+   *
+   * 自动保存有 850ms 防抖：写完最后一笔想马上确认"已经存住了"时没有入口。
+   * 按钮常驻在长条上，不用先展开侧栏。
+   */
+  private railSaveBtn!: HTMLButtonElement;
   private readHintEl!: HTMLElement;
   private floatEl!: HTMLElement;
   private floatZoomEl!: HTMLElement;
@@ -540,8 +547,9 @@ export class InkbookView extends FileView {
    * 之前浮层压在滚动条上，想拖滚动条得先把工具挪开，
    * 用户反馈"边上的那个框会挡住滑动页面的那个条"。
    *
-   * 长条上只留三样东西：
+   * 长条上只留四样东西：
    *   · 7 个笔工具（大图标 + 文字标签）
+   *   · 立即保存（点一下马上落盘，不等 850ms 防抖）
    *   · 侧栏开关（展开/收起右侧栏）
    *   · 仅阅读开关
    *
@@ -569,6 +577,21 @@ export class InkbookView extends FileView {
 
     /* 分隔线：把"选笔"和"开关"在视觉上分开 */
     rail.createDiv("mb-rail-sep");
+
+    /*
+     * 立即保存。
+     *
+     * 自动保存有 850ms 防抖，用户落完笔想马上确认"已经存住了"时没有入口。
+     * 放在长条上（常驻可见），不用先展开侧栏。
+     */
+    const railSave = rail.createEl("button", {
+      cls: "mb-rail-save",
+      attr: { "aria-label": "立即保存", "aria-live": "polite" },
+    });
+    setIcon(railSave, "save");
+    railSave.title = "保存（立即写入磁盘）";
+    railSave.onclick = () => void this.requestSave();
+    this.railSaveBtn = railSave;
 
     /*
      * 侧栏开关。
@@ -1559,9 +1582,55 @@ export class InkbookView extends FileView {
       this.saveState === "saving" ? "保存中…" : this.saveState === "dirty" ? "未保存" : "已保存";
     this.statusEl.setText(text);
     this.statusEl.toggleClass("is-dirty", this.saveState !== "saved");
+
+    /*
+     * 长条上的「立即保存」跟着保存状态走：
+     *   · 有未保存改动 → 右上角一个点（不改变按钮尺寸/位置）
+     *   · 保存中 → 禁用。否则点下去只会进 saveNow 的 saveAgain 分支，
+     *     按钮看起来"没反应"，用户会以为没点上。
+     */
+    if (this.railSaveBtn) {
+      this.railSaveBtn.toggleClass("is-dirty", this.saveState === "dirty");
+      this.railSaveBtn.toggleClass("is-saving", this.saveState === "saving");
+      this.railSaveBtn.disabled = this.saveState === "saving";
+      this.railSaveBtn.title =
+        this.saveState === "saving"
+          ? "正在保存…"
+          : this.saveState === "dirty"
+            ? "有未保存的改动，点击立即保存"
+            : "保存（立即写入磁盘）";
+    }
   }
 
   /* ------------------------------- 保存 ------------------------------- */
+
+  /**
+   * 长条「立即保存」按钮的入口。
+   *
+   * 三种"没写盘"的情况都要给明确反馈，不能静默返回——
+   * 用户点了一下按钮什么都没发生，会以为存上了。
+   */
+  private async requestSave(): Promise<void> {
+    if (!this.store || !this.file) {
+      new Notice("这份笔记还没加载完成，暂时无法保存。", 4000);
+      return;
+    }
+    if (this.readOnly) {
+      this.warnReadOnly();
+      return;
+    }
+    if (this.conflict) {
+      new Notice("当前处于冲突状态，未写入原文件。请先处理冲突副本。", 8000);
+      return;
+    }
+    if (!this.dirty && !this.metaDirty) {
+      new Notice("已是最新，无需保存。", 1500);
+      return;
+    }
+    await this.saveNow();
+    // saveNow 里冲突/失败都会把状态退回 dirty 并自己弹提示，这里只在真存成时道喜
+    if (this.saveState === "saved") new Notice("已保存。", 1500);
+  }
 
   async saveNow(): Promise<void> {
     if (!this.store || !this.file || this.readOnly || this.conflict) {

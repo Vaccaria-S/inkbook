@@ -273,7 +273,13 @@
   color: var(--text-on-accent);
 }
 
-/* 「侧栏」开关：展开右侧工具栏 */
+/*
+ * 长条上的三个"方按钮"：立即保存 / 侧栏开关 / 仅阅读。
+ *
+ * 三者必须同族——同样的宽高、圆角、底色、按压手感。
+ * 只给其中一两个写样式会让长条看起来像拼起来的。
+ */
+.mb-rail-save,
 .mb-rail-side,
 .mb-rail-read {
   width: 60px;
@@ -295,15 +301,22 @@
     transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1);
 }
 
+.mb-rail-save:hover,
 .mb-rail-side:hover,
 .mb-rail-read:hover {
   color: var(--text-normal);
   background: var(--background-modifier-hover);
 }
 
+.mb-rail-save:active,
 .mb-rail-side:active,
 .mb-rail-read:active {
   transform: scale(0.93);
+}
+
+.mb-root .mb-rail-save .mb-ic {
+  width: 26px;
+  height: 26px;
 }
 
 .mb-root .mb-rail-side .mb-ic {
@@ -314,6 +327,34 @@
 .mb-root .mb-rail-read .mb-ic {
   width: 26px;
   height: 26px;
+}
+
+/*
+ * 有未保存改动：右上角一个小点。
+ *
+ * 用 ::after 叠一个点，**不改按钮尺寸也不改位置**——
+ * 长条宽度是踩过坑的（74px 必须含 padding），
+ * 让按钮为了加个点而变宽会把磁贴挤歪。
+ */
+.mb-rail-save.is-dirty {
+  position: relative;
+}
+
+.mb-rail-save.is-dirty::after {
+  content: "";
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-warning, #d97706);
+}
+
+/* 保存中：变淡且不可点（点下去只会排进 saveAgain，看着像没反应） */
+.mb-rail-save.is-saving {
+  opacity: 0.55;
+  cursor: default;
 }
 
 .mb-rail-side.is-active,
@@ -355,6 +396,23 @@
 }
 
 .mb-root.is-reading .mb-rail-read .mb-ic {
+  width: 24px;
+  height: 24px;
+}
+
+/*
+ * 仅阅读时长条只有 58px 宽（内宽 48px），60px 的方按钮会溢出被裁。
+ * 所以保存按钮跟着缩成 46px 的圆钮，**留在长条上而不是隐藏**：
+ * 切到阅读模式时可能还有没落盘的笔迹，那个"未保存"的点必须看得见、点得到。
+ */
+.mb-root.is-reading .mb-rail-save {
+  width: 46px;
+  height: 46px;
+  margin-top: 8px;
+  border-radius: 50%;
+}
+
+.mb-root.is-reading .mb-rail-save .mb-ic {
   width: 24px;
   height: 24px;
 }
@@ -518,6 +576,7 @@
 @media (prefers-reduced-motion: reduce) {
   .mb-rail,
   .mb-rail-tool,
+  .mb-rail-save,
   .mb-rail-side,
   .mb-rail-read,
   .mb-float,
@@ -527,6 +586,7 @@
     transition-duration: 0.01ms !important;
   }
   .mb-rail-tool:active,
+  .mb-rail-save:active,
   .mb-rail-side:active,
   .mb-rail-read:active {
     transform: none;
@@ -1401,6 +1461,7 @@
   font-size: 12px;
 }
 
+.mb-root.is-tablet .mb-rail-save,
 .mb-root.is-tablet .mb-rail-side,
 .mb-root.is-tablet .mb-rail-read {
   width: 68px;
@@ -1408,6 +1469,7 @@
   border-radius: 15px;
 }
 
+.mb-root.is-tablet .mb-rail-save .mb-ic,
 .mb-root.is-tablet .mb-rail-side .mb-ic,
 .mb-root.is-tablet .mb-rail-read .mb-ic {
   width: 28px;
@@ -1427,6 +1489,12 @@
 .mb-root.is-tablet.is-reading .mb-rail-read .mb-ic {
   width: 27px;
   height: 27px;
+}
+
+/* 平板上仅阅读的长条是 66px（内宽 56px）：保存钮跟「眼」一样缩到 54px */
+.mb-root.is-tablet.is-reading .mb-rail-save {
+  width: 54px;
+  height: 54px;
 }
 
 /* 触摸设备没有 hover，激活态要更明显 */

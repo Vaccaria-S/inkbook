@@ -46,6 +46,12 @@ const ICONS: Record<string, string> = {
   copy: "M8 8h12v12H8z M4 16V4h12",
   import: "M12 3v12 M7 10l5 5 5-5 M4 21h16",
   download: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4 M7 10l5 5 5-5 M12 15V3",
+  /*
+   * 软盘 = "保存"，一眼就懂。
+   * 外框 + 抽屉 + 上方滑块三段画在**同一条** d 里（用空格分隔），
+   * 因为 iconSvg 只生成一个 <path>；拆成多个 path 得改图标系统。
+   */
+  save: "M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z M17 21v-8H7v8 M7 3v5h8",
   image: "M3 3h18v18H3z M3 16l5-5 4 4 3-3 6 6",
   "file-text": "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z M14 2v6h6 M8 13h8 M8 17h8",
   "layout-template": "M3 3h18v18H3z M3 9h18 M9 21V9",
