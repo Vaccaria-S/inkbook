@@ -91,15 +91,17 @@ export class InkbookView extends FileView {
   editor: BookEditor | null = null;
 
   private railEl!: HTMLElement;
-  private railReadBtn!: HTMLButtonElement;
-  private railSideBtn!: HTMLButtonElement;
+  private railReadBtn!: HTMLElement;
+  private railSideBtn!: HTMLElement;
+  /** 浮层工具盘的拖动手柄 */
+  private railHandleBtn!: HTMLElement;
   /**
    * 长条上的「立即保存」按钮。
    *
    * 自动保存有 850ms 防抖：写完最后一笔想马上确认"已经存住了"时没有入口。
    * 按钮常驻在长条上，不用先展开侧栏。
    */
-  private railSaveBtn!: HTMLButtonElement;
+  private railSaveBtn!: HTMLElement;
   private readHintEl!: HTMLElement;
   private floatEl!: HTMLElement;
   private floatZoomEl!: HTMLElement;
@@ -116,7 +118,7 @@ export class InkbookView extends FileView {
   private delSelBtn!: HTMLButtonElement;
   private stylusBtn!: HTMLButtonElement;
   private toolButtons = new Map<ToolId, HTMLButtonElement>();
-  private sideBtn!: HTMLButtonElement;
+  private sideBtn!: HTMLElement;
   private layerListEl: HTMLElement | null = null;
   private pageListEl: HTMLElement | null = null;
   private templateGrid: HTMLElement | null = null;
@@ -410,6 +412,7 @@ export class InkbookView extends FileView {
     this.editor.penColor = this.plugin.settings.lastPenColor || "#1A1A1A";
     this.editor.penSize = this.plugin.settings.defaultPenSize || 2.8;
     this.editor.highlighterColor = this.plugin.settings.lastHighlighterColor || "#F6E05E";
+    this.buildHeaderActions();
     this.buildRail();
     this.buildFloat();
     this.buildSide();
@@ -564,6 +567,20 @@ export class InkbookView extends FileView {
     this.railEl = rail;
     this.toolButtons.clear();
 
+    /*
+     * 手柄：拖动移动，单击切换横竖。
+     *
+     * 长条从"占一列的固定栏"改成浮层——把宽度还给纸张。
+     * 只让手柄可抓：拖着笔写字时不该把整个工具盘带跑。
+     */
+    const handle = rail.createEl("button", {
+      cls: "mb-rail-handle",
+      attr: { "aria-label": "拖动移动，单击切换横竖" },
+    });
+    setIcon(handle, "drag");
+    handle.title = "拖动移动 · 单击切换横竖";
+    this.railHandleBtn = handle;
+
     const toolCol = rail.createDiv("mb-rail-tools");
     for (const t of TOOLS) {
       const b = toolCol.createEl("button", {
@@ -577,83 +594,193 @@ export class InkbookView extends FileView {
       this.toolButtons.set(t.id, b);
     }
 
-    /* 分隔线：把"选笔"和"开关"在视觉上分开 */
-    rail.createDiv("mb-rail-sep");
-
-    /*
-     * 立即保存。
-     *
-     * 自动保存有 850ms 防抖，用户落完笔想马上确认"已经存住了"时没有入口。
-     * 放在长条上（常驻可见），不用先展开侧栏。
-     */
-    const railSave = rail.createEl("button", {
-      cls: "mb-rail-save",
-      attr: { "aria-label": "立即保存", "aria-live": "polite" },
-    });
-    setIcon(railSave, "save");
-    railSave.title = "保存（立即写入磁盘）";
-    railSave.onclick = () => void this.requestSave();
-    this.railSaveBtn = railSave;
-
-    /*
-     * 侧栏开关。
-     *
-     * 之前这个按钮藏在控制坞的"更多"页里，用户反馈
-     * "不用再叠放到其他图标里面了"——所以直接放到长条上，
-     * 一眼就能看见、一按就能展开侧栏。
-     */
-    const railSide = rail.createEl("button", {
-      cls: "mb-rail-side",
-      attr: {
-        "aria-label": "显示 / 隐藏侧栏",
-        "aria-expanded": "false",
-        "aria-controls": "mb-side",
-      },
-    });
-    setIcon(railSide, "panel-right");
-    railSide.title = "显示 / 隐藏侧栏";
-    railSide.onclick = () => this.toggleSide();
-    this.railSideBtn = railSide;
-    this.sideBtn = railSide;
-
-    /* 「仅阅读」开关：进去就只剩纸，长条淡出 */
-    const railRead = rail.createEl("button", {
-      cls: "mb-rail-read",
-      attr: {
-        "aria-label": "进入仅阅读模式",
-        "aria-pressed": "false",
-      },
-    });
-    setIcon(railRead, "eye");
-    railRead.title = "仅阅读模式";
-    railRead.onclick = () => this.setReading(!this.reading);
-    this.railReadBtn = railRead;
+    rail.dataset.orient = this.plugin.settings.toolPanel?.vertical === false ? "h" : "v";
+    this.bindRailHandle(rail, handle);
+    this.applyRailPosition(rail);
 
     /* ---------------------------- 仅阅读提示 ---------------------------- */
     const hint = this.editorHost.createDiv({
       cls: "mb-read-hint",
-      text: "仅阅读模式 · 点右侧长条开始书写",
+      text: "仅阅读模式 · 点顶栏的眼睛图标开始书写",
     });
     this.readHintEl = hint;
 
     this.setReading(this.reading);
   }
 
-  /* ------------------------------ 右下角浮标 ------------------------------ */
+  /* ------------------------- 浮层工具盘的位置与方向 ------------------------- */
+
+  /** 默认停在左侧中部（右侧留给滚动条，之前浮层压住滚动条被用户提过） */
+  private applyRailPosition(rail: HTMLElement): void {
+    const p = this.plugin.settings.toolPanel;
+    if (p && Number.isFinite(p.left) && Number.isFinite(p.top)) {
+      rail.addClass("is-placed");
+      rail.style.left = p.left + "px";
+      rail.style.top = p.top + "px";
+    } else {
+      rail.removeClass("is-placed");
+      rail.style.left = "";
+      rail.style.top = "";
+    }
+    this.clampRail(rail);
+  }
+
+  private clampRail(rail: HTMLElement): void {
+    if (!rail.classList.contains("is-placed")) return;
+    const host = this.editorHost.getBoundingClientRect();
+    if (!host.width || !host.height) return;
+    const maxLeft = Math.max(0, host.width - rail.offsetWidth);
+    const maxTop = Math.max(0, host.height - rail.offsetHeight);
+    const left = Math.min(Math.max(0, parseFloat(rail.style.left || "0")), maxLeft);
+    const top = Math.min(Math.max(0, parseFloat(rail.style.top || "0")), maxTop);
+    rail.style.left = left + "px";
+    rail.style.top = top + "px";
+  }
+
+  private saveRailPosition(rail: HTMLElement): void {
+    let left = parseFloat(rail.style.left);
+    let top = parseFloat(rail.style.top);
+    // 还没定位过（比如一上来就点了手柄切换方向）：把当前位置固化成像素
+    if (!Number.isFinite(left) || !Number.isFinite(top)) {
+      const r = rail.getBoundingClientRect();
+      const host = this.editorHost.getBoundingClientRect();
+      left = r.left - host.left;
+      top = r.top - host.top;
+      rail.addClass("is-placed");
+      rail.style.left = Math.round(left) + "px";
+      rail.style.top = Math.round(top) + "px";
+    }
+    this.plugin.settings.toolPanel = {
+      left: Math.round(left),
+      top: Math.round(top),
+      vertical: rail.dataset.orient !== "h",
+    };
+    void this.plugin.saveSettings();
+  }
 
   /**
-   * 右下角浮标：翻页 + 缩放。
+   * 手柄交互：按住拖动 = 移动；单击 = 横竖切换。
    *
-   * 为什么放到外边（而不是侧栏里）：
-   *   翻页和缩放是**看**笔记时最常用的两个动作，
-   *   却藏在侧栏深处，每次都要展开侧栏才能够到。
-   *   浮在纸的右下角，随时可点。
-   *
-   * 缩放那一组**平时不显示**，只在真的缩放了才浮现：
-   *   · 不操作的时候右下角干干净净，不干扰写字
-   *   · 一缩放就报出确切数值（150% / 80%），不用猜
-   *   · 停止操作几秒后自动淡出，鼠标悬停时保持可见
+   * 用位移 > 6px 判定「拖动」，否则一次轻微抖动会被当成拖动，
+   * 用户想切换方向反而切不动。
    */
+  private bindRailHandle(rail: HTMLElement, handle: HTMLElement): void {
+    let pid = -1;
+    let sx = 0;
+    let sy = 0;
+    let baseL = 0;
+    let baseT = 0;
+    let moved = false;
+    let active = false;
+
+    handle.addEventListener("pointerdown", (e) => {
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+      active = true;
+      moved = false;
+      pid = e.pointerId;
+      sx = e.clientX;
+      sy = e.clientY;
+      const r = rail.getBoundingClientRect();
+      const host = this.editorHost.getBoundingClientRect();
+      baseL = r.left - host.left;
+      baseT = r.top - host.top;
+      try {
+        handle.setPointerCapture(e.pointerId);
+      } catch (_) {}
+      e.preventDefault();
+      e.stopPropagation();
+    });
+
+    handle.addEventListener("pointermove", (e) => {
+      if (!active || e.pointerId !== pid) return;
+      const dx = e.clientX - sx;
+      const dy = e.clientY - sy;
+      if (!moved && Math.hypot(dx, dy) < 6) return;
+      moved = true;
+      const host = this.editorHost.getBoundingClientRect();
+      const maxLeft = Math.max(0, host.width - rail.offsetWidth);
+      const maxTop = Math.max(0, host.height - rail.offsetHeight);
+      const l = Math.min(Math.max(0, baseL + dx), maxLeft);
+      const t = Math.min(Math.max(0, baseT + dy), maxTop);
+      rail.addClass("is-placed");
+      rail.style.left = l + "px";
+      rail.style.top = t + "px";
+      e.preventDefault();
+    });
+
+    const finish = (e: PointerEvent) => {
+      if (!active || e.pointerId !== pid) return;
+      active = false;
+      pid = -1;
+      try {
+        handle.releasePointerCapture(e.pointerId);
+      } catch (_) {}
+      if (!moved) {
+        rail.dataset.orient = rail.dataset.orient === "h" ? "v" : "h";
+        this.clampRail(rail);
+        this.saveRailPosition(rail);
+        return;
+      }
+      this.saveRailPosition(rail);
+    };
+    handle.addEventListener("pointerup", finish);
+    handle.addEventListener("pointercancel", finish);
+  }
+
+  /* --------------------------- 顶栏上的三个按钮 --------------------------- */
+
+  /**
+   * 保存 / 侧栏 / 仅阅读挂到视图标题栏（就是显示「墨本试用」那条）。
+   *
+   * 用宿主的 addAction 拿到原生位置与点击区域，再把图标换成自绘的：
+   * 宿主图标集里查不到的 name 会画成空框，这个坑踩过。
+   */
+  private buildHeaderActions(): void {
+    const mk = (icon: string, title: string, cls: string): HTMLElement => {
+      let el: HTMLElement | null = null;
+      const make = (this as unknown as {
+        addAction?: (i: string, t: string, cb: () => void) => HTMLElement | undefined;
+      }).addAction;
+      if (typeof make === "function") {
+        const made = make.call(this, icon, title, () => {});
+        // 测试桩的 addAction 是空实现（返回 undefined），必须判一下
+        if (made && typeof (made as HTMLElement).addClass === "function") el = made;
+      }
+      if (!el) {
+        /*
+         * 宿主没有 addAction（测试桩 / 极老版本）：退到容器里自己建一个。
+         * 位置不完美，但点击行为与真实环境一致，
+         * 「点一下写不写盘」这类断言就不用依赖宿主实现。
+         */
+        el = document.createElement("div");
+        const host = this.containerEl as unknown as { appendChild?: (n: Node) => void } | undefined;
+        if (host && typeof host.appendChild === "function") host.appendChild(el);
+      }
+      el.addClass(cls);
+      el.empty();
+      setIcon(el, icon);
+      el.setAttr("aria-label", title);
+      el.title = title;
+      return el;
+    };
+
+    const save = mk("save", "保存（立即写入磁盘）", "mb-rail-save");
+    save.onclick = () => void this.requestSave();
+    this.railSaveBtn = save;
+
+    const side = mk("panel-right", "显示 / 隐藏侧栏", "mb-rail-side");
+    side.setAttr("aria-expanded", "false");
+    side.setAttr("aria-controls", "mb-side");
+    side.onclick = () => this.toggleSide();
+    this.railSideBtn = side;
+    this.sideBtn = side;
+
+    const read = mk("eye", "仅阅读模式", "mb-rail-read");
+    read.setAttr("aria-pressed", "false");
+    read.onclick = () => this.setReading(!this.reading);
+    this.railReadBtn = read;
+  }
+
   private buildFloat(): void {
     this.floatEl?.remove();
     const float = this.paperHost.createDiv("mb-float");
@@ -1594,7 +1721,8 @@ export class InkbookView extends FileView {
     if (this.railSaveBtn) {
       this.railSaveBtn.toggleClass("is-dirty", this.saveState === "dirty");
       this.railSaveBtn.toggleClass("is-saving", this.saveState === "saving");
-      this.railSaveBtn.disabled = this.saveState === "saving";
+      // 顶栏按钮是 div（addAction 给的壳），没有 disabled，用 aria + 类名表达
+      this.railSaveBtn.setAttr("aria-disabled", this.saveState === "saving" ? "true" : "false");
       this.railSaveBtn.title =
         this.saveState === "saving"
           ? "正在保存…"
@@ -1613,6 +1741,7 @@ export class InkbookView extends FileView {
    * 用户点了一下按钮什么都没发生，会以为存上了。
    */
   private async requestSave(): Promise<void> {
+    if (this.saveState === "saving") return; // 正在写，别再排队
     if (!this.store || !this.file) {
       new Notice("这份笔记还没加载完成，暂时无法保存。", 4000);
       return;

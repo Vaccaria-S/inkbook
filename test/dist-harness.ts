@@ -336,8 +336,8 @@ async function main() {
    * 墨具坞的圆钮、标签页、工具按钮都在。
    */
   pass(!!host.querySelector(".mb-rail"), "工具长条已渲染");
-  pass(!!host.querySelector(".mb-rail-side"), "长条上的侧栏开关已渲染");
-  pass(!!host.querySelector(".mb-rail-read"), "长条上的仅阅读按钮已渲染");
+  pass(!!view.containerEl.querySelector(".mb-rail-side"), "顶栏侧栏开关已渲染");
+  pass(!!view.containerEl.querySelector(".mb-rail-read"), "顶栏仅阅读按钮已渲染");
   pass(!!host.querySelector(".mb-float"), "右下角浮标已渲染");
   pass(
     host.querySelectorAll(".mb-rail-tool").length === 7,

@@ -147,10 +147,9 @@
  * 右侧那一列常驻工具栏（钢笔 / 圆珠 / 荧光 / 橡皮 / 套索 / 形状 / 拖动），
  * 加上侧栏开关和仅阅读开关。
  *
- * 为什么它是**一列**而不是浮在纸上的浮层：
- *   浮层会压在滚动条上（用户反馈"边上的框会挡住滑动页面的那个条"），
- *   而且跟着纸面走、位置会漂。一列占固定宽度，滚动条永远在它左边，
- *   按钮位置也永远不动。
+ * 现在是**浮层**：默认停左侧中部，右侧留给滚动条。
+ *   （早前浮层压住过滚动条，所以默认位置刻意避开右边；
+ *     用户拖动后的位置会记在 settings.toolPanel 里。）
  *
  * 图标尺寸：
  *   Obsidian 默认的 .svg-icon 是 16px，荧光笔、套索那种细线条造型
@@ -158,27 +157,76 @@
  *   主题也改不动（主题不认识这个 class）。
  */
 
+/* 浮层工具盘（可拖动 / 可横竖切换）
+ *
+ * 以前它是右侧固定一列，占掉 74–86px 的纸张宽度。
+ * 现在浮在纸面上：宽度全还给纸张，位置和方向由用户自己定。
+ * 默认停左侧中部——右侧要让给滚动条（浮层压住滚动条被用户提过一次）。
+ */
 .mb-rail {
-  flex: 0 0 auto;
-  width: 74px;
-  /*
-   * 宽度必须算进 padding 和边框。
-   *
-   * 默认的 content-box 会让 74px 变成 74 + padding*2 + border = 87px，
-   * 磁贴被挤到一边，长条比设计值宽一截。
-   */
+  position: absolute;
+  z-index: 30;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 5px;
-  padding: 8px 7px;
-  border-left: 1px solid var(--background-modifier-border);
-  background: var(--background-primary);
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--background-primary) 88%, transparent);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 8px 22px -12px rgba(0, 0, 0, 0.55);
+  max-height: calc(100% - 16px);
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-width: none;
 }
+
+/* 用户拖动过：位置来自保存的像素值，不再垂直居中 */
+.mb-rail.is-placed {
+  transform: none;
+}
+
+/* 横放：手柄在最左，工具排成一行 */
+.mb-rail[data-orient="h"] {
+  flex-direction: row;
+  align-items: center;
+}
+
+/* 手柄：拖动移动，单击切换横竖 */
+.mb-rail-handle {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 20px;
+  margin: 0 0 2px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: grab;
+  touch-action: none;
+}
+
+.mb-rail[data-orient="h"] .mb-rail-handle {
+  margin: 0 2px 0 0;
+}
+
+.mb-rail-handle:active {
+  cursor: grabbing;
+}
+
+.mb-root .mb-rail-handle .mb-ic {
+  width: 18px;
+  height: 18px;
+}
+
 
 .mb-rail::-webkit-scrollbar {
   width: 0;
@@ -191,14 +239,10 @@
   gap: 4px;
 }
 
-/* 分隔线：把"选笔"和"开关"在视觉上分开 */
-.mb-rail-sep {
-  flex: 0 0 auto;
-  width: 34px;
-  height: 1px;
-  margin: 4px 0 2px;
-  background: var(--background-modifier-border);
+.mb-rail[data-orient="h"] .mb-rail-tools {
+  flex-direction: row;
 }
+
 
 /*
  * 工具磁贴：图标 + 文字竖着摞。
@@ -279,19 +323,25 @@
  * 三者必须同族——同样的宽高、圆角、底色、按压手感。
  * 只给其中一两个写样式会让长条看起来像拼起来的。
  */
+/* 顶栏上的三个按钮（保存 / 侧栏 / 仅阅读）
+ *
+ * 由 addAction 提供位置和点击区，图标换成自绘的 .mb-ic。
+ * 尺寸按视图头的图标钮来（30×30），和宿主其他 action 视觉一致。
+ */
 .mb-rail-save,
 .mb-rail-side,
 .mb-rail-read {
-  width: 60px;
-  height: 46px;
-  margin-top: 3px;
+  position: relative;
+  width: 30px;
+  height: 30px;
+  margin: 0 1px;
   padding: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 14px;
-  background: color-mix(in srgb, var(--background-secondary) 70%, transparent);
+  border: none;
+  border-radius: 8px;
+  background: transparent;
   color: var(--text-muted);
   cursor: pointer;
   box-shadow: none;
@@ -314,19 +364,19 @@
   transform: scale(0.93);
 }
 
-.mb-root .mb-rail-save .mb-ic {
-  width: 26px;
-  height: 26px;
+.mb-rail-save .mb-ic {
+  width: 20px;
+  height: 20px;
 }
 
-.mb-root .mb-rail-side .mb-ic {
-  width: 26px;
-  height: 26px;
+.mb-rail-side .mb-ic {
+  width: 20px;
+  height: 20px;
 }
 
-.mb-root .mb-rail-read .mb-ic {
-  width: 26px;
-  height: 26px;
+.mb-rail-read .mb-ic {
+  width: 20px;
+  height: 20px;
 }
 
 /*
@@ -343,8 +393,8 @@
 .mb-rail-save.is-dirty::after {
   content: "";
   position: absolute;
-  top: 6px;
-  right: 6px;
+  top: 3px;
+  right: 3px;
   width: 7px;
   height: 7px;
   border-radius: 50%;
@@ -371,51 +421,12 @@
  * 纸面干干净净，一个干扰都没有。
  */
 .mb-root.is-reading .mb-rail {
-  width: 58px;
-  padding: 5px;
-  border-left: none;
-  background: transparent;
-}
-
-.mb-root.is-reading .mb-rail-tools,
-.mb-root.is-reading .mb-rail-side {
   display: none;
 }
 
-.mb-root.is-reading .mb-rail-read {
-  width: 46px;
-  height: 46px;
-  margin-top: 0;
-  border-radius: 50%;
-  background: var(--interactive-accent);
-  border-color: color-mix(in srgb, var(--interactive-accent) 70%, #000);
-  color: var(--text-on-accent);
-  box-shadow:
-    0 6px 18px -4px rgba(0, 0, 0, 0.45),
-    inset 0 1px 0 rgba(255, 255, 255, 0.22);
-}
 
-.mb-root.is-reading .mb-rail-read .mb-ic {
-  width: 24px;
-  height: 24px;
-}
 
-/*
- * 仅阅读时长条只有 58px 宽（内宽 48px），60px 的方按钮会溢出被裁。
- * 所以保存按钮跟着缩成 46px 的圆钮，**留在长条上而不是隐藏**：
- * 切到阅读模式时可能还有没落盘的笔迹，那个"未保存"的点必须看得见、点得到。
- */
-.mb-root.is-reading .mb-rail-save {
-  width: 46px;
-  height: 46px;
-  margin-top: 8px;
-  border-radius: 50%;
-}
 
-.mb-root.is-reading .mb-rail-save .mb-ic {
-  width: 24px;
-  height: 24px;
-}
 
 /* ------------------------------ 右下角浮标 ------------------------------ */
 
@@ -1461,40 +1472,20 @@
   font-size: 12px;
 }
 
+/* 平板上顶栏图标稍大一档，手指更好点 */
 .mb-root.is-tablet .mb-rail-save,
 .mb-root.is-tablet .mb-rail-side,
 .mb-root.is-tablet .mb-rail-read {
-  width: 68px;
-  height: 52px;
-  border-radius: 15px;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
 }
 
 .mb-root.is-tablet .mb-rail-save .mb-ic,
 .mb-root.is-tablet .mb-rail-side .mb-ic,
 .mb-root.is-tablet .mb-rail-read .mb-ic {
-  width: 28px;
-  height: 28px;
-}
-
-.mb-root.is-tablet.is-reading .mb-rail {
-  width: 66px;
-}
-
-.mb-root.is-tablet.is-reading .mb-rail-read {
-  width: 54px;
-  height: 54px;
-  border-radius: 50%;
-}
-
-.mb-root.is-tablet.is-reading .mb-rail-read .mb-ic {
-  width: 27px;
-  height: 27px;
-}
-
-/* 平板上仅阅读的长条是 66px（内宽 56px）：保存钮跟「眼」一样缩到 54px */
-.mb-root.is-tablet.is-reading .mb-rail-save {
-  width: 54px;
-  height: 54px;
+  width: 22px;
+  height: 22px;
 }
 
 /* 触摸设备没有 hover，激活态要更明显 */

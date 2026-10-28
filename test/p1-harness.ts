@@ -458,7 +458,7 @@ async function C9b() {
   pass(nb.length > 0, "C9b① 恢复提示=" + JSON.stringify(nb));
 
   // 真实用户路径：点长条「仅阅读」按钮两次（进→出），再真的落笔
-  const btn = v.contentEl.querySelector(".mb-rail-read") as HTMLElement;
+  const btn = v.containerEl.querySelector(".mb-rail-read") as HTMLElement;
   const before = v.store.strokeCount;
   btn?.click();
   await sleep(150);

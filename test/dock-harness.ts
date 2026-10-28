@@ -167,18 +167,95 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   const paper = root.querySelector(".mb-paper") as HTMLElement;
   const scroll = root.querySelector(".mb-scroll") as HTMLElement;
   const sideEl = root.querySelector(".mb-side") as HTMLElement;
-  const sideBtn = root.querySelector(".mb-rail-side") as HTMLElement;
-  const readBtn = root.querySelector(".mb-rail-read") as HTMLElement;
+  const headerEl = view.containerEl as HTMLElement;
+  const sideBtn = headerEl.querySelector(".mb-rail-side") as HTMLElement;
+  const readBtn = headerEl.querySelector(".mb-rail-read") as HTMLElement;
 
   pass(!!rail, "存在工具长条 .mb-rail");
   pass(!!paper, "存在纸面列 .mb-paper");
-  pass(!!sideBtn, "长条上有「侧栏」开关");
-  pass(!!readBtn, "长条上有「仅阅读」按钮");
+  pass(!!sideBtn, "顶栏上有「侧栏」开关");
+  pass(!!readBtn, "顶栏上有「仅阅读」按钮");
 
   // 旧的抽屉结构必须已经消失
   pass(!root.querySelector(".mb-dock-panel"), "旧抽屉面板已移除");
   pass(!root.querySelector(".mb-dock-tab"), "旧标签页已移除");
   pass(!root.querySelector(".mb-rail-more"), "旧「更多」按钮已移除");
+
+  /*
+   * 手柄：单击切换横竖，按住拖动改位置并记住。
+   * 这是这次「长条变浮层」的核心交互，必须锁住。
+   */
+  const handle = rail.querySelector(".mb-rail-handle") as HTMLElement;
+  pass(!!handle, "浮层上有拖动手柄");
+  {
+    // 默认位置要在拖动之前测：下面的拖拽会把它挪走
+    const gap = Math.abs(
+      rail.getBoundingClientRect().left - scroll.getBoundingClientRect().left
+    );
+    pass(gap <= 24, "浮层默认停在左侧（左沿距滚动区 " + gap.toFixed(0) + "px ≤ 24）");
+  }
+  pass(
+    rail.dataset.orient === "v",
+    "默认竖排（data-orient=" + rail.dataset.orient + "）"
+  );
+
+  const pe = (type: string, x: number, y: number) =>
+    new PointerEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      pointerId: 1,
+      pointerType: "touch",
+      clientX: x,
+      clientY: y,
+    });
+  const hr = handle.getBoundingClientRect();
+
+  // 单击（不移动）→ 切横排
+  handle.dispatchEvent(pe("pointerdown", hr.left + 10, hr.top + 10));
+  handle.dispatchEvent(pe("pointerup", hr.left + 10, hr.top + 10));
+  await sleep(60);
+  pass(
+    rail.dataset.orient === "h",
+    "单击手柄切到横排（data-orient=" + rail.dataset.orient + "）"
+  );
+  pass(
+    plugin.settings.toolPanel?.vertical === false,
+    "方向已记进设置（vertical=" + plugin.settings.toolPanel?.vertical + "）"
+  );
+
+  // 再点一次 → 回到竖排
+  const hr2 = handle.getBoundingClientRect();
+  handle.dispatchEvent(pe("pointerdown", hr2.left + 10, hr2.top + 10));
+  handle.dispatchEvent(pe("pointerup", hr2.left + 10, hr2.top + 10));
+  await sleep(60);
+  pass(rail.dataset.orient === "v", "再单击一次回到竖排");
+
+  // 按住拖动 → 位置变化并落进设置
+  const railBoxBefore = rail.getBoundingClientRect();
+  const hr3 = handle.getBoundingClientRect();
+  handle.dispatchEvent(pe("pointerdown", hr3.left + 10, hr3.top + 10));
+  handle.dispatchEvent(pe("pointermove", hr3.left + 130, hr3.top + 90));
+  handle.dispatchEvent(pe("pointerup", hr3.left + 130, hr3.top + 90));
+  await sleep(80);
+  const railBoxAfter = rail.getBoundingClientRect();
+  pass(
+    Math.abs(railBoxAfter.left - railBoxBefore.left) > 40 ||
+      Math.abs(railBoxAfter.top - railBoxBefore.top) > 40,
+    "按住手柄拖动会移动浮层（Δx=" +
+      (railBoxAfter.left - railBoxBefore.left).toFixed(0) +
+      " Δy=" +
+      (railBoxAfter.top - railBoxBefore.top).toFixed(0) +
+      "）"
+  );
+  pass(
+    Number.isFinite(plugin.settings.toolPanel?.left) &&
+      plugin.settings.toolPanel!.left ===
+        Math.round(
+          railBoxAfter.left -
+            (root.querySelector(".mb-editor") as HTMLElement).getBoundingClientRect().left
+        ),
+    "拖动后的位置写进设置（left=" + plugin.settings.toolPanel?.left + "）"
+  );
 
   // 7 个工具
   const tools = root.querySelectorAll(".mb-rail-tool");
@@ -210,31 +287,44 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
    */
   const scrollRect = scroll.getBoundingClientRect();
   const railRect = rail.getBoundingClientRect();
+
+  /*
+   * 浮层不许压住滚动条。
+   *
+   * 早期版本浮在纸上、压在滚动条上，用户反馈"边上的框会挡住滑动页面的那个条"。
+   * 现在浮层默认停左侧中部，右沿离滚动区右沿必须留出滚动条的宽度。
+   */
   pass(
-    railRect.left >= scrollRect.right - 1,
-    "长条在滚动区右侧，不压滚动条（长条左沿 " +
-      railRect.left.toFixed(0) +
-      " ≥ 滚动区右沿 " +
+    scrollRect.right - railRect.right >= 12,
+    "浮层右沿离开滚动条（滚动区右沿 " +
       scrollRect.right.toFixed(0) +
-      "）"
+      " − 浮层右沿 " +
+      railRect.right.toFixed(0) +
+      " = " +
+      (scrollRect.right - railRect.right).toFixed(0) +
+      "px ≥ 12）"
   );
 
-  // 长条和纸面列是并排的两列
-  const paperRect = paper.getBoundingClientRect();
+  // 现在它确实是浮层：叠在滚动区上方，而不是占一列
   pass(
-    Math.abs(railRect.left - paperRect.right) < 2,
-    "长条紧贴纸面列右缘（是并排的两列，不是浮层）"
+    railRect.right > scrollRect.left,
+    "浮层叠在纸面上（不再占用固定的一列宽度）"
+  );
+  pass(
+    railRect.left >= scrollRect.left - 1 && railRect.right <= scrollRect.right + 1,
+    "拖动后浮层仍在编辑区内（不越界）"
+  );
+  pass(
+    getComputedStyle(rail).position === "absolute",
+    "浮层是 absolute 定位（实测 " + getComputedStyle(rail).position + "）"
   );
 
   /*
-   * 长条宽度要真的等于设计值。
-   *
-   * content-box 下 74px 会变成 74 + padding*2 + border = 87px，
-   * 磁贴被挤到一边，长条比设计值宽一截——这里守住。
+   * 浮层宽度要收得住：它压在纸上，太宽会挡住正文。
    */
   pass(
     railRect.width <= 78,
-    "长条宽度符合设计值（实测 " + railRect.width.toFixed(0) + "px ≤ 78px）"
+    "浮层宽度符合设计值（实测 " + railRect.width.toFixed(0) + "px ≤ 78px）"
   );
 
   /* ============ 3. 图标真的看得见 ============ */
@@ -482,8 +572,10 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
     root.querySelector(".mb-rail") as HTMLElement
   ).getBoundingClientRect();
   pass(
-    tRailRect.left >= tScrollRect.right - 1,
-    "平板端长条也不挡滚动条"
+    tScrollRect.right - tRailRect.right >= 12,
+    "平板端浮层也不挡滚动条（留出 " +
+      (tScrollRect.right - tRailRect.right).toFixed(0) +
+      "px）"
   );
 
   root.classList.remove("is-tablet");
@@ -494,7 +586,7 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
    * 用户场景（平板）：落几笔 → 点一下 → 立刻落盘。
    * 自动保存有 850ms 防抖，等不了那一下。
    */
-  const saveBtn = root.querySelector(".mb-rail-save") as HTMLButtonElement | null;
+  const saveBtn = headerEl.querySelector(".mb-rail-save") as HTMLButtonElement | null;
   pass(
     !!saveBtn && !!saveBtn.querySelector("svg.mb-ic path"),
     "长条上有「立即保存」按钮，且图标真的画出来了（不是空框）"

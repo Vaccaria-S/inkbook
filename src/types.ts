@@ -132,6 +132,8 @@ export interface InkbookSettings {
   blockEdgeSwipe: boolean;
   /** 画完自动把笔直的笔迹拉直（只认直线） */
   straightLine: boolean;
+  /** 浮层工具盘的位置与方向（缺省 = 左侧居中竖排） */
+  toolPanel?: { left: number; top: number; vertical: boolean };
 }
 
 export const A4_WIDTH = 794;
