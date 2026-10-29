@@ -1,5 +1,6 @@
 import {
   activeLayer,
+  PEN_COLORS,
   type Page,
   type PageBackground,
   type PageText,
@@ -36,6 +37,18 @@ export interface EditorState {
   highlighterColor: string;
   highlighterSize: number;
   shapeKind: ShapeKind;
+  /** 新建文字用的字号 / 字体 / 颜色 */
+  textSize: number;
+  textFont: string;
+  textColor: string;
+  /** 当前选中的文字对象；null = 没选中 */
+  textSelected: {
+    id: string;
+    text: string;
+    size: number;
+    font: string;
+    color: string;
+  } | null;
   canUndo: boolean;
   canRedo: boolean;
   penOnly: boolean;
@@ -90,14 +103,46 @@ interface PageRec {
 type Gesture = "none" | "draw" | "shape" | "erase" | "pan";
 
 /**
- * 文字对象的字体栈。
+ * 文字可用字体。
  *
- * 屏幕渲染、编辑框、导出画布三处必须用同一个字符串，
- * 否则"编辑时是这个宽度、保存后变另一个宽度"。
- * 中文优先落到系统自带的黑体，不额外打包字体（导出矢量文字时才需要嵌，见三期）。
+ * 只用系统自带字体，不打包（打包中文字体动辄几 MB，自用不值）。
+ * 屏幕渲染、编辑框、导出画布三处都走 `textFontStack()`，
+ * 否则「编辑时是这个宽度、存下来变另一个宽度」。
+ *
+ * id 会写进文件，所以别随便改名；新增可以，老 id 要留着。
  */
-const TEXT_FONT =
-  '-apple-system, BlinkMacSystemFont, "Noto Sans SC", "Microsoft YaHei", "PingFang SC", sans-serif';
+export const TEXT_FONTS: Array<{ id: string; label: string; stack: string }> = [
+  {
+    id: "sans",
+    label: "黑体",
+    stack:
+      '-apple-system, BlinkMacSystemFont, "Noto Sans SC", "Microsoft YaHei", "PingFang SC", sans-serif',
+  },
+  {
+    id: "serif",
+    label: "宋体",
+    stack: '"Songti SC", "Noto Serif SC", "Source Han Serif SC", "SimSun", serif',
+  },
+  {
+    id: "kai",
+    label: "楷体",
+    stack: '"Kaiti SC", "STKaiti", "KaiTi", "Noto Serif SC", serif',
+  },
+  {
+    id: "mono",
+    label: "等宽",
+    stack: 'ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, "Courier New", monospace',
+  },
+];
+
+/** 字体 id → CSS font-family；未知 id 落回黑体 */
+export function textFontStack(id?: string): string {
+  const hit = TEXT_FONTS.find((f) => f.id === id);
+  return (hit || TEXT_FONTS[0]).stack;
+}
+
+/** 兼容旧代码里的单字体引用（PDF 原文也用黑体） */
+const TEXT_FONT = TEXT_FONTS[0].stack;
 
 /**
  * 单张画布允许的最大像素数。
@@ -209,11 +254,19 @@ export class BookEditor {
     y: number;
     size: number;
     color: string;
+    font: string;
   } | null = null;
   /** 正在补抽文字的页（防止重复触发） */
   private textExtracting = new Set<number>();
   /** 新建文字用的字号（页面坐标）；已有文字编辑时保持它自己的字号 */
   private textSizeValue = 18;
+  /** 新建文字用的字体 id 与颜色 */
+  private textFontValue = "sans";
+  private textColorValue = "#1A1A1A";
+  /** 当前选中的文字对象 id（只在文字工具下有意义） */
+  private selectedTextId: string | null = null;
+  /** 选中文字后浮在纸上方的属性条 */
+  private textBarEl: HTMLElement | null = null;
   private pointerId: number | null = null;
   private draft: Stroke | null = null;
   private draftRec: PageRec | null = null;
@@ -545,6 +598,21 @@ export class BookEditor {
       highlighterColor: this.highlighterColor,
       highlighterSize: this.highlighterSize,
       shapeKind: this.shapeKind,
+      textSize: this.textSizeValue,
+      textFont: this.textFontValue,
+      textColor: this.textColorValue,
+      textSelected: (() => {
+        const t = this.selectedText;
+        return t
+          ? {
+              id: t.id,
+              text: t.text,
+              size: t.size,
+              font: t.font || "sans",
+              color: t.color || "#1A1A1A",
+            }
+          : null;
+      })(),
       canUndo: this.store.canUndo(),
       canRedo: this.store.canRedo(),
       penOnly: !!this.opts.penOnly,
@@ -559,6 +627,17 @@ export class BookEditor {
   }
 
   private emitState(): void {
+    /*
+     * 选中对象失效就丢掉：
+     *   · 换了页（selectedText 只在当前页找）
+     *   · 撤销 / 删除把那一段去掉了
+     * 不在这里清的话，属性条会挂在已经不存在（或不在当前页）的文字上。
+     */
+    if (this.selectedTextId && !this.selectedText) {
+      this.selectedTextId = null;
+      this.textBarEl?.remove();
+      this.textBarEl = null;
+    }
     if (this.opts.onState) this.opts.onState();
   }
 
@@ -588,6 +667,8 @@ export class BookEditor {
     if (this.tool === tool) return;
     this.tool = tool;
     this.eraserPos = null;
+    // 离开文字工具就没有"选中文字"这回事了，属性条一并收掉
+    if (tool !== "text") this.selectText(null);
     this.applyTouchAction();
     this.emitState();
   }
@@ -600,7 +681,240 @@ export class BookEditor {
     const v = clamp(Math.round(size), 8, 96);
     if (v === this.textSizeValue) return;
     this.textSizeValue = v;
+    /* 选中的那段文字跟着改——"选中它再改字号"是最自然的手势 */
+    const sel = this.selectedText;
+    if (sel) this.updateSelectedText({ size: v });
+    else this.emitState();
+  }
+
+  get textFont(): string {
+    return this.textFontValue;
+  }
+
+  setTextFont(id: string): void {
+    if (!TEXT_FONTS.some((f) => f.id === id)) return;
+    this.textFontValue = id;
+    const sel = this.selectedText;
+    if (sel) this.updateSelectedText({ font: id });
+    else this.emitState();
+  }
+
+  get textColor(): string {
+    return this.textColorValue;
+  }
+
+  setTextColor(color: string): void {
+    if (!color) return;
+    this.textColorValue = color;
+    const sel = this.selectedText;
+    if (sel) this.updateSelectedText({ color });
+    else this.emitState();
+  }
+
+  /* --------------------------- 选中文字对象 --------------------------- */
+
+  /** 当前页选中的那段文字；页面里找不到就是 null */
+  get selectedText(): PageText | null {
+    if (!this.selectedTextId) return null;
+    const page = this.store.data.pages[this.current];
+    return page?.texts?.find((t) => t.id === this.selectedTextId) ?? null;
+  }
+
+  /**
+   * 选中 / 取消选中一段文字。
+   *
+   * 为什么要"先选中、再编辑"：直接点一下就弹输入框的话，
+   * 想改字号颜色根本没有落脚点，手指也没法在纸上精确点两次。
+   * 选中后浮一条属性条，字号 / 字体 / 颜色 / 编辑 / 删除都在上面。
+   */
+  selectText(id: string | null): void {
+    if (this.selectedTextId === id) return;
+    this.selectedTextId = id;
+    const rec = this.recs[this.current];
+    if (rec) this.renderOverlay(rec);
+    this.syncTextBar();
     this.emitState();
+  }
+
+  /** 改选中文字的属性（字号 / 字体 / 颜色 / 加粗），一次改动一条历史 */
+  updateSelectedText(patch: Partial<Pick<PageText, "size" | "font" | "color" | "bold">>): void {
+    if (this.readOnly) return;
+    const sel = this.selectedText;
+    const rec = this.recs[this.current];
+    if (!sel || !rec) return;
+    const page = this.store.data.pages[rec.index];
+    const target = page?.texts?.find((t) => t.id === sel.id);
+    if (!target) return;
+
+    let dirty = false;
+    if (typeof patch.size === "number") {
+      const v = clamp(Math.round(patch.size), 8, 96);
+      if (v !== target.size) {
+        target.size = v;
+        dirty = true;
+      }
+    }
+    if (typeof patch.font === "string" && TEXT_FONTS.some((f) => f.id === patch.font)) {
+      if (patch.font !== target.font) {
+        target.font = patch.font;
+        dirty = true;
+      }
+    }
+    if (typeof patch.color === "string" && patch.color !== target.color) {
+      target.color = patch.color;
+      dirty = true;
+    }
+    if (typeof patch.bold === "boolean" && patch.bold !== !!target.bold) {
+      target.bold = patch.bold;
+      dirty = true;
+    }
+    if (!dirty) return;
+
+    this.store.snapshotPage(rec.index);
+    this.store.touch();
+    this.changed();
+    this.renderTextLayer(rec);
+    this.renderOverlay(rec);
+    this.syncTextBar();
+    this.emitState();
+  }
+
+  /** 删除选中文字（Delete / 属性条上的「删除」） */
+  deleteSelectedText(): void {
+    if (this.readOnly) return;
+    const sel = this.selectedText;
+    const rec = this.recs[this.current];
+    if (!sel || !rec) return;
+    const page = this.store.data.pages[rec.index];
+    if (!page?.texts?.length) return;
+    this.store.snapshotPage(rec.index);
+    page.texts = page.texts.filter((t) => t.id !== sel.id);
+    this.store.touch();
+    this.changed();
+    this.selectedTextId = null;
+    this.renderTextLayer(rec);
+    this.renderOverlay(rec);
+    this.syncTextBar();
+    this.emitState();
+  }
+
+  /**
+   * 选中文字上方那一条属性工具。
+   *
+   * 落在页面上（而不是侧栏）是因为：选中文字时视线在纸上，
+   * 侧栏可能是收起的，跑过去点一下再回来太远。
+   * 每次改动都重建——它是十几个节点的小东西，重建比手动同步状态省心。
+   */
+  private syncTextBar(): void {
+    this.textBarEl?.remove();
+    this.textBarEl = null;
+    const sel = this.selectedText;
+    const rec = this.recs[this.current];
+    if (!sel || !rec || !rec.mounted || this.readOnly) return;
+
+    const bar = document.createElement("div");
+    bar.className = "mb-textbar";
+    // 属性条上的手势一律不许传到画布，否则点一下字号会顺手画一笔
+    const eat = (e: Event) => e.stopPropagation();
+    for (const evName of ["pointerdown", "mousedown", "touchstart"]) {
+      bar.addEventListener(evName, eat, { passive: true });
+    }
+
+    const mkBtn = (label: string, title: string, cb: () => void): HTMLButtonElement => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "mb-tb-btn";
+      b.textContent = label;
+      b.title = title;
+      b.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        cb();
+      });
+      return b;
+    };
+
+    // 字号：− 当前 +
+    const minSize = Math.max(8, sel.size - 2);
+    const plusSize = Math.min(96, sel.size + 2);
+    const dec = mkBtn("−", "缩小字号", () => this.updateSelectedText({ size: minSize }));
+    const sizeLbl = document.createElement("span");
+    sizeLbl.className = "mb-tb-size";
+    sizeLbl.textContent = String(Math.round(sel.size));
+    const inc = mkBtn("+", "放大字号", () => this.updateSelectedText({ size: plusSize }));
+    bar.append(dec, sizeLbl, inc);
+    bar.appendChild(this.textBarSep());
+
+    // 字体
+    const fontSel = document.createElement("select");
+    fontSel.className = "mb-tb-font";
+    fontSel.title = "字体";
+    for (const f of TEXT_FONTS) {
+      const opt = document.createElement("option");
+      opt.value = f.id;
+      opt.textContent = f.label;
+      if ((sel.font || "sans") === f.id) opt.selected = true;
+      fontSel.appendChild(opt);
+    }
+    fontSel.addEventListener("change", () => this.updateSelectedText({ font: fontSel.value }));
+    fontSel.addEventListener("pointerdown", eat);
+    bar.appendChild(fontSel);
+    bar.appendChild(this.textBarSep());
+
+    // 颜色
+    for (const c of PEN_COLORS.slice(0, 6)) {
+      const dot = document.createElement("button");
+      dot.type = "button";
+      dot.className = "mb-tb-dot" + ((sel.color || "").toLowerCase() === c.toLowerCase() ? " is-active" : "");
+      dot.style.background = c;
+      dot.title = "改成这个颜色";
+      dot.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.updateSelectedText({ color: c });
+      });
+      bar.appendChild(dot);
+    }
+    bar.appendChild(this.textBarSep());
+
+    // 编辑 / 删除
+    bar.appendChild(
+      mkBtn("编辑", "修改文字内容", () => {
+        const t = this.selectedText;
+        const live = this.recs[this.current];
+        if (!t || !live) return;
+        this.beginTextEdit(live, t.x + 4, t.y - t.size * 0.4);
+      })
+    );
+    const del = mkBtn("删除", "删掉这段文字（可撤销）", () => this.deleteSelectedText());
+    del.classList.add("is-danger");
+    bar.appendChild(del);
+
+    rec.pageEl.appendChild(bar);
+    this.textBarEl = bar;
+    this.positionTextBar();
+  }
+
+  private textBarSep(): HTMLElement {
+    const sep = document.createElement("span");
+    sep.className = "mb-tb-sep";
+    return sep;
+  }
+
+  /** 属性条跟着文字走：优先放在文字上方，顶到页眉就翻到下方 */
+  private positionTextBar(): void {
+    const bar = this.textBarEl;
+    const sel = this.selectedText;
+    if (!bar || !sel) return;
+    const z = this.zoom;
+    const pageW = this.store.data.width * z;
+    const w = bar.offsetWidth || 320;
+    const h = bar.offsetHeight || 32;
+    const left = Math.max(4, Math.min(sel.x * z, pageW - w - 4));
+    const above = (sel.y - sel.size * 1.18) * z - h - 8;
+    const top = above >= 4 ? above : (sel.y + sel.size * 0.5) * z + 8;
+    bar.style.left = `${left}px`;
+    bar.style.top = `${top}px`;
   }
 
   setPenColor(color: string): void {
@@ -755,6 +1069,7 @@ export class BookEditor {
     this.applyLayout();
     this.applyTouchAction();
     this.observePages();
+    this.syncTextBar();
     requestAnimationFrame(() => this.goToPage(this.current, false));
   }
 
@@ -786,6 +1101,8 @@ export class BookEditor {
     this.docEl.style.setProperty("--mb-page-h", `${h}px`);
     // 文字层按页面坐标写死尺寸，整体用这个变量缩放
     this.docEl.style.setProperty("--mb-zoom", String(this.zoom));
+    // 属性条是按像素定位的，缩放后得重算一次
+    this.positionTextBar();
     // 只重建已挂载页的 canvas（数量很少，通常 1-3 个）
     for (const rec of this.recs) {
       if (rec.mounted) this.resizeRec(rec);
@@ -1263,6 +1580,8 @@ export class BookEditor {
     this.renderTextLayer(rec);
     this.ensurePageTexts(rec);
     this.resizeRec(rec);
+    // 页面重新挂载（卸载过又滚回来）时，选中还在就把属性条挂回去
+    if (rec.index === this.current) this.syncTextBar();
   }
 
   private unmount(rec: PageRec, force = false): void {
@@ -1270,6 +1589,11 @@ export class BookEditor {
     // 正在这一页写字时不卸载（会打断笔画）
     if (!force && rec.index === this.current && this.gesture !== "none") return;
     this.commitTextEdit();
+    // 属性条挂在这一页的 DOM 上，随页面一起收掉；引用要清，否则会指向死节点
+    if (rec.index === this.current) {
+      this.textBarEl?.remove();
+      this.textBarEl = null;
+    }
     rec.canvas?.remove();
     rec.textLayer?.remove();
     rec.overlay?.remove();
@@ -1708,6 +2032,26 @@ export class BookEditor {
       ctx.stroke();
       ctx.restore();
     }
+
+    /*
+     * 选中文字的虚线框。
+     *
+     * 画在 overlay 而不是用 DOM：overlay 本来就按页面坐标缩放好了，
+     * 缩放、滚动都不用管；而且它压在文字层之上，框不会被字盖住。
+     */
+    const sel = this.tool === "text" ? this.selectedText : null;
+    if (sel) {
+      const bw = Math.max(24, this.measureTextWidth(sel));
+      const lines = Math.max(1, sel.text.split("\n").length);
+      const top = sel.y - sel.size * 1.18;
+      const bh = sel.size * 1.32 * lines + sel.size * 0.24;
+      ctx.save();
+      ctx.strokeStyle = "#6C5CE7";
+      ctx.lineWidth = 1.4 / this.zoom;
+      ctx.setLineDash([5 / this.zoom, 4 / this.zoom]);
+      ctx.strokeRect(sel.x - 3, top, bw + 8, bh);
+      ctx.restore();
+    }
   }
 
   /* ------------------------------- 文字层 ------------------------------- */
@@ -1743,7 +2087,7 @@ export class BookEditor {
       el.style.left = `${t.x}px`;
       el.style.top = `${t.y}px`;
       el.style.fontSize = `${t.size}px`;
-      el.style.fontFamily = TEXT_FONT;
+      el.style.fontFamily = textFontStack(t.font);
       // 数据里 y 是基线，span 的定位点是顶边，往上挪约 0.82 个字高
       el.style.transform = "translateY(-0.82em)";
       if (t.source === "user") {
@@ -1831,6 +2175,33 @@ export class BookEditor {
    * 编辑框是页面里的一个 textarea，位置按当前缩放换算——
    * 所见即所得，提交后交给文字层渲染。
    */
+  /**
+   * 文字工具下点了一下页面。
+   *
+   * 三种情况，按"最不容易误操作"排序：
+   *   · 点在空白处 → 取消选中，直接开一个新输入框（这是最常见的动作）
+   *   · 点在没选中的文字上 → **只选中**，浮出属性条（改字号/字体/颜色/删除）
+   *   · 点在已选中的文字上 → 进入编辑（第二下才是改内容，避免一点就弹框）
+   */
+  private handleTextPointer(rec: PageRec, px: number, py: number): void {
+    if (this.readOnly) return;
+    const page = this.store.data.pages[rec.index];
+    if (!page) return;
+    const hit = this.hitText(page.texts ?? [], px, py);
+
+    if (!hit) {
+      this.selectText(null);
+      this.beginTextEdit(rec, px, py);
+      return;
+    }
+    if (this.selectedTextId === hit.id) {
+      // 用文字内部坐标，保证 beginTextEdit 里的命中判定还能选中它
+      this.beginTextEdit(rec, hit.x + 4, hit.y - hit.size * 0.4);
+      return;
+    }
+    this.selectText(hit.id);
+  }
+
   private beginTextEdit(rec: PageRec, px: number, py: number): void {
     if (this.readOnly) return;
     this.commitTextEdit();
@@ -1839,7 +2210,8 @@ export class BookEditor {
 
     const hit = this.hitText(page.texts ?? [], px, py);
     const size = hit?.size ?? this.textSizeValue;
-    const color = hit?.color ?? this.penColor;
+    const color = hit?.color ?? this.textColorValue;
+    const font = hit?.font ?? this.textFontValue;
     const x = hit ? hit.x : px;
     // 新建时让点击点落在文字中部（基线在下方约 0.82 字高）
     const y = hit ? hit.y : py + size * 0.82;
@@ -1848,7 +2220,7 @@ export class BookEditor {
     ta.className = "mb-text-edit";
     ta.spellcheck = false;
     ta.value = hit?.text ?? "";
-    ta.style.fontFamily = TEXT_FONT;
+    ta.style.fontFamily = textFontStack(font);
     ta.style.fontSize = `${size * this.zoom}px`;
     ta.style.lineHeight = "1.32";
     ta.style.color = color;
@@ -1857,7 +2229,7 @@ export class BookEditor {
     ta.style.minWidth = `${Math.max(96, (hit ? this.measureTextWidth(hit) : 140) * this.zoom)}px`;
     rec.pageEl.appendChild(ta);
 
-    this.textEdit = { rec, el: ta, id: hit?.id ?? null, x, y, size, color };
+    this.textEdit = { rec, el: ta, id: hit?.id ?? null, x, y, size, color, font };
 
     let done = false;
     const finish = (save: boolean) => {
@@ -1926,6 +2298,7 @@ export class BookEditor {
         y: ed.y,
         size: ed.size,
         color: ed.color,
+        font: ed.font,
         text: value,
       };
       page.texts = arr.concat(item);
@@ -1951,7 +2324,7 @@ export class BookEditor {
     for (const t of texts) {
       ctx.save();
       ctx.fillStyle = t.color || "#1A1A1A";
-      ctx.font = `${t.bold ? "600 " : ""}${t.size}px ${TEXT_FONT}`;
+      ctx.font = `${t.bold ? "600 " : ""}${t.size}px ${textFontStack(t.font)}`;
       ctx.textBaseline = "alphabetic";
       const lines = t.text.split("\n");
       for (let i = 0; i < lines.length; i++) {
@@ -2237,7 +2610,7 @@ export class BookEditor {
         const p = this.pointFromEvent(e, rec);
         this.current = rec.index;
         this.store.setPage(rec.index);
-        this.beginTextEdit(rec, p[0], p[1]);
+        this.handleTextPointer(rec, p[0], p[1]);
         e.preventDefault();
         return;
       }
@@ -2294,7 +2667,7 @@ export class BookEditor {
 
     if (this.tool === "text") {
       const tp = this.pointFromEvent(e, rec);
-      this.beginTextEdit(rec, tp[0], tp[1]);
+      this.handleTextPointer(rec, tp[0], tp[1]);
       return;
     }
 
@@ -2975,6 +3348,8 @@ export class BookEditor {
       void p.then((doc) => doc?.destroy?.()).catch(() => {});
     }
     this.pdfDocs.clear();
+    this.textBarEl = null;
+    this.selectedTextId = null;
     this.host.innerHTML = "";
   }
 }

@@ -707,6 +707,68 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
     );
   }
 
+  /* ============ 12. 文字：选中 / 属性条 / 键盘删除 ============ */
+  {
+    const pg = view.store!.data.pages[0];
+    pg.texts = [
+      {
+        id: "t_dock",
+        source: "user",
+        x: 120,
+        y: 240,
+        size: 20,
+        color: "#1A1A1A",
+        font: "sans",
+        text: "可编辑文字",
+      },
+    ];
+    view.editor!.renderPages();
+    await sleep(200);
+    view.editor!.setTool("text");
+    view.editor!.selectText("t_dock");
+    await sleep(80);
+
+    const tbar = root.querySelector(".mb-textbar") as HTMLElement;
+    pass(!!tbar, "选中文字后纸上浮出属性条 .mb-textbar");
+    pass(
+      (tbar?.querySelectorAll(".mb-tb-btn").length ?? 0) >= 4,
+      "属性条按钮齐全（字号−/＋、编辑、删除）：" + (tbar?.querySelectorAll(".mb-tb-btn").length ?? 0)
+    );
+
+    // 侧栏里文字工具应该有字体下拉与色点
+    const fontSel = root.querySelector(".mb-font-sel") as HTMLSelectElement;
+    pass(!!fontSel && fontSel.options.length >= 4, "侧栏文字面板有字体下拉（4 种）");
+    pass(
+      (root.querySelectorAll(".mb-tcolor").length ?? 0) >= 6,
+      "侧栏文字面板有颜色点（" + root.querySelectorAll(".mb-tcolor").length + " 个）"
+    );
+
+    // Esc：先取消选中，不该顺手切到仅阅读
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await sleep(80);
+    pass(view.editor!.selectedText === null, "Esc 取消选中");
+    pass(!root.classList.contains("is-reading"), "Esc 取消选中时不会误切仅阅读");
+
+    // Delete：删掉选中文字，可撤销
+    view.editor!.selectText("t_dock");
+    await sleep(60);
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Delete", bubbles: true }));
+    await sleep(100);
+    pass((view.store!.data.pages[0].texts || []).length === 0, "Delete 删掉选中的文字");
+    view.editor!.undo();
+    await sleep(100);
+    pass((view.store!.data.pages[0].texts || []).length === 1, "Delete 删除可撤销");
+
+    // 形状面板：颜色点（粗细滑杆本来就有）
+    view.editor!.setTool("shape");
+    await sleep(80);
+    pass(
+      (root.querySelectorAll(".mb-tcolor").length ?? 0) >= 6,
+      "形状面板也有颜色点（" + root.querySelectorAll(".mb-tcolor").length + " 个）"
+    );
+    pass(!!root.querySelector(".mb-range"), "形状面板仍有粗细滑杆");
+  }
+
   log("");
   const fails = lines.filter((l) => l.startsWith("FAIL")).length;
   log(fails === 0 ? "ALL PASS" : fails + " FAILED");

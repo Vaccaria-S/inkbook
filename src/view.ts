@@ -1,6 +1,7 @@
 import { FileView, Menu, Notice, type TFile } from "obsidian";
 import { setIcon } from "./icons";
-import { BookEditor } from "./editor";
+import { BookEditor, TEXT_FONTS } from "./editor";
+import { writeTextIndex } from "./indexer";
 import { BookStore } from "./store";
 import {
   bookStats,
@@ -116,6 +117,13 @@ export class InkbookView extends FileView {
   private actionsHostEl: HTMLElement | null = null;
   /** 放不下时，整行搬进视图自己画的这条顶栏条 */
   private topBarEl: HTMLElement | null = null;
+  /**
+   * 从 `obsidian://inkbook?page=N` 跳进来时，编辑器还没建好就先记下来，
+   * mountEditor 之后再滚过去。
+   */
+  private pendingPage: number | null = null;
+  /** 文字索引的去抖定时器（保存后 1s 写一次，避免连续保存反复重写） */
+  private indexTimer = 0;
   /** 侧边可拖动滑条（替代系统滚动条，手指也抓得住） */
   private sbEl: HTMLElement | null = null;
   private sbTrack: HTMLElement | null = null;
@@ -436,6 +444,13 @@ export class InkbookView extends FileView {
     this.updateUI();
     this.saveState = "saved";
     this.updateStatus();
+
+    // 从索引链接跳进来：布局完成后再滚，否则拿到的页偏移是 0
+    if (this.pendingPage != null) {
+      const p = this.pendingPage;
+      this.pendingPage = null;
+      requestAnimationFrame(() => this.editor?.goToPage(p, false));
+    }
   }
 
   private destroyEditor(): void {
@@ -448,6 +463,8 @@ export class InkbookView extends FileView {
     this.topBarEl = null;
     window.clearTimeout(this.hintTimer);
     window.clearTimeout(this.zoomHintTimer);
+    window.clearTimeout(this.indexTimer);
+    this.indexTimer = 0;
     this.floatEl?.remove();
     // 滑条挂在 paperHost 上，跟着编辑器一起拆；监听器走 AbortController 一并断掉
     this.sbAbort?.abort();
@@ -1238,20 +1255,53 @@ export class InkbookView extends FileView {
     if (s.tool === "text") {
       this.dynEl.createSpan({
         cls: "mb-hint",
-        text: "点页面输入文字；点已有文字可编辑，清空即删除",
+        text: "点页面输入；点已有文字选中，再点一次编辑",
       });
+
       /*
-       * 字号：只作用于**新建**的文字。编辑已有文字时保留它自己的字号，
-       * 不然点开一段旧字再点一下别的字号，会把已排好的版弄乱。
-       * 颜色跟随当前笔色（侧栏的调色板）。
+       * 这三组控制「新建文字」的默认样式；
+       * 如果此刻已选中某段文字，改这里会直接改那段（editor 的 setter 会转发）。
        */
+
+      // 字号
       const seg = this.dynEl.createDiv("mb-seg");
       for (const n of [14, 18, 24, 32]) {
         const b = seg.createEl("button", {
-          cls: "mb-seg-btn" + (this.editor.textSize === n ? " is-active" : ""),
+          cls: "mb-seg-btn" + (s.textSize === n ? " is-active" : ""),
           text: String(n),
         });
-        b.onclick = () => this.editor?.setTextSize(n);
+        b.onclick = () => {
+          this.editor?.setTextSize(n);
+          this.renderDynamicTools();
+        };
+      }
+
+      // 字体
+      const fontSel = this.dynEl.createEl("select", { cls: "mb-font-sel" });
+      fontSel.title = "字体";
+      for (const f of TEXT_FONTS) {
+        const opt = fontSel.createEl("option", { text: f.label, value: f.id });
+        if (s.textFont === f.id) opt.selected = true;
+      }
+      fontSel.onchange = () => {
+        this.editor?.setTextFont(fontSel.value);
+        this.renderDynamicTools();
+      };
+
+      // 颜色
+      const crow = this.dynEl.createDiv("mb-tcolor-row");
+      for (const c of PEN_COLORS) {
+        const dot = crow.createEl("button", {
+          cls:
+            "mb-tcolor" +
+            (s.textColor.toLowerCase() === c.toLowerCase() ? " is-active" : ""),
+        });
+        dot.style.background = c;
+        dot.title = c;
+        dot.onclick = () => {
+          this.editor?.setTextColor(c);
+          this.renderDynamicTools();
+        };
       }
       return;
     }
@@ -1268,6 +1318,25 @@ export class InkbookView extends FileView {
       };
       paint();
       btn.onclick = (e) => this.showShapeMenu(e);
+
+      /*
+       * 形状用的是笔的颜色（创建时取 penColor），所以这里放的是笔色色板。
+       * 之前只有下面的粗细滑杆，颜色得跑去侧栏最上面找，藏得太深。
+       */
+      const crow = this.dynEl.createDiv("mb-tcolor-row");
+      for (const c of PEN_COLORS) {
+        const dot = crow.createEl("button", {
+          cls:
+            "mb-tcolor" +
+            (s.penColor.toLowerCase() === c.toLowerCase() ? " is-active" : ""),
+        });
+        dot.style.background = c;
+        dot.title = c;
+        dot.onclick = () => {
+          this.editor?.setPenColor(c);
+          this.renderDynamicTools();
+        };
+      }
     }
 
     const hl = s.tool === "highlighter";
@@ -1991,6 +2060,42 @@ export class InkbookView extends FileView {
     if (this.saveState === "saved") new Notice("已保存。", 1500);
   }
 
+  /**
+   * 保存后延迟写文字索引。
+   *
+   * 去抖 1 秒：写字时每 0.85 秒就会保存一次，逐次重写索引会让
+   * 同步盘和 Obsidian 的搜索索引一直忙。只在停笔一阵后写一次。
+   *
+   * 调度时就把 file / book 捕获下来：切文件以后旧定时器回调
+   * 也不会把新本子的内容写进旧索引。
+   */
+  private scheduleTextIndex(): void {
+    if (!this.file || !this.store) return;
+    if (this.plugin.settings.searchIndex === false) return;
+    const file = this.file;
+    const book = this.store.data;
+    window.clearTimeout(this.indexTimer);
+    this.indexTimer = window.setTimeout(() => {
+      this.indexTimer = 0;
+      void writeTextIndex(this.app, file, book);
+    }, 1000);
+  }
+
+  /**
+   * 从索引里的链接跳进来：打开到指定页（1 起）。
+   *
+   * 编辑器可能还没建好（文件刚打开），那时先记下，mountEditor 后消费。
+   */
+  gotoPageFromLink(page1: number): void {
+    const idx = Math.max(0, Math.round(Number(page1) || 1) - 1);
+    if (this.editor) {
+      this.editor.goToPage(idx, false);
+      this.pendingPage = null;
+    } else {
+      this.pendingPage = idx;
+    }
+  }
+
   async saveNow(): Promise<void> {
     if (!this.store || !this.file || this.readOnly || this.conflict) {
       /*
@@ -2032,6 +2137,11 @@ export class InkbookView extends FileView {
       this.saveState = "saved";
       this.savedActivePage = this.store.data.activePage;
       this.fp = await fingerprint(adapter, path);
+      /*
+       * 本子落盘之后再更新文字索引：索引是派生物，
+       * 万一它写失败，不能反过来把「本子已保存」报成失败。
+       */
+      this.scheduleTextIndex();
     } catch (e: any) {
       console.error("[inkbook] 保存失败", e);
       this.saveState = "dirty";
@@ -2199,7 +2309,17 @@ export class InkbookView extends FileView {
     if (mod || e.altKey) return;
 
     const k = e.key.toLowerCase();
+    if ((e.key === "Delete" || e.key === "Backspace") && this.editor.selectedText) {
+      e.preventDefault();
+      this.editor.deleteSelectedText();
+      return;
+    }
     if (e.key === "Escape") {
+      // 有选中的文字：先取消选中，别一下子跳到"切换仅阅读"
+      if (this.editor.selectedText) {
+        this.editor.selectText(null);
+        return;
+      }
       // 逐级退出：收起侧栏 → 最后切仅阅读
       if (this.sideShown) {
         this.toggleSide();

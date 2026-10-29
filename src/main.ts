@@ -1,4 +1,4 @@
-import { FuzzySuggestModal, Plugin, type App, type TFile } from "obsidian";
+import { FuzzySuggestModal, Notice, Plugin, TFile, type App } from "obsidian";
 import { InkbookView, VIEW_TYPE } from "./view";
 import { InkbookSettingTab, DEFAULT_SETTINGS } from "./settings";
 import { NewBookModal } from "./modals";
@@ -74,6 +74,40 @@ export default class InkbookPlugin extends Plugin {
 
     this.installSwipeGuard();
     this.installPaletteGuard();
+
+    /*
+     * 文字索引里的跳页链接：`obsidian://inkbook?file=<本子路径>&page=N`
+     *
+     * 全局搜索命中索引 md 后，点这条链接就回到本子的第 N 页。
+     * 用协议而不是内部链接，是因为内部链接只能打开文件、定位不到页。
+     */
+    this.registerObsidianProtocolHandler("inkbook", (params) => {
+      void this.openFromLink(params);
+    });
+  }
+
+  /** 处理 obsidian://inkbook?file=…&page=N */
+  private async openFromLink(params: Record<string, string>): Promise<void> {
+    let path = params.file || "";
+    if (!path) return;
+    // 协议参数一般已经解码过；没解开的再试一次（路径里带空格/中文时常见）
+    if (!this.app.vault.getAbstractFileByPath(path)) {
+      try {
+        path = decodeURIComponent(path);
+      } catch (_) {
+        /* 解不开就用原值 */
+      }
+    }
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) {
+      new Notice("墨本：找不到这本手写本 —— " + path);
+      return;
+    }
+    const page = Number(params.page || "1") || 1;
+    const leaf = this.app.workspace.getLeaf(false);
+    await leaf.openFile(file);
+    const view = leaf.view;
+    if (view instanceof InkbookView) view.gotoPageFromLink(page);
   }
 
   /** 被替换掉的原型方法，卸载时原样放回 */

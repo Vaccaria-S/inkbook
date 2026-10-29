@@ -79,12 +79,13 @@ async function main() {
       addButton(cb){ const c = { buttonEl: document.createElement('button'), setButtonText(){return c;}, setIcon(){return c;}, onClick(){return c;}, setTooltip(){return c;} }; if(cb) cb(c); return this; }
     }
     export class Plugin {
-      constructor(app, manifest){ this.app = app; this.manifest = manifest; this.__views = {}; this.__cmds = []; this.__ribbons = []; this.__settingsTab = null; this.__data = {}; }
+      constructor(app, manifest){ this.app = app; this.manifest = manifest; this.__views = {}; this.__cmds = []; this.__ribbons = []; this.__settingsTab = null; this.__data = {}; this.__protocols = {}; }
       registerView(type, cb){ this.__views[type] = cb; }
       registerExtensions(){ }
       addRibbonIcon(icon, title, cb){ this.__ribbons.push({icon,title}); }
       addCommand(c){ this.__cmds.push(c); }
       addSettingTab(t){ this.__settingsTab = t; }
+      registerObsidianProtocolHandler(action, handler){ this.__protocols[action] = handler; }
       async loadData(){
         // 没有 data.json 时给一份默认设置，和真实插件一致
         if (!this.__data || !Object.keys(this.__data).length) {
@@ -92,7 +93,9 @@ async function main() {
             defaultTemplate: "grid", defaultPaper: "white", penOnly: false,
             pressure: 1, smoothing: 0.55, prediction: true, autosave: true,
             sidebarOpen: true, defaultPenSize: 2.8,
-            lastPenColor: "#1A1A1A", lastHighlighterColor: "#F6E05E"
+            lastPenColor: "#1A1A1A", lastHighlighterColor: "#F6E05E",
+            blockEdgeSwipe: true, blockCommandPalette: true, straightLine: false,
+            searchIndex: true
           };
         }
         return this.__data;
@@ -290,6 +293,7 @@ async function main() {
   pass(plugin.__cmds.length === 3, "注册了 3 条命令：" + plugin.__cmds.map((c: any) => c.id).join(","));
   pass(plugin.__ribbons.length === 2, "注册了 2 个侧栏图标");
   pass(!!plugin.__settingsTab, "注册了设置面板");
+  pass(!!plugin.__protocols.inkbook, "注册了 obsidian://inkbook 跳页协议");
 
   // 打开一个真实的 .inkbook
   const sample = JSON.stringify({

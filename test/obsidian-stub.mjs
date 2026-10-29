@@ -300,6 +300,13 @@ export class Plugin {
   }
   registerEvent() {}
   registerDomEvent() {}
+  /**
+   * 协议处理器：Obsidian 的 `obsidian://inkbook?file=…&page=N` 走这里。
+   * 桩里只记下来，测试可以手动触发（window.__protocolHandlers）。
+   */
+  registerObsidianProtocolHandler(action, handler) {
+    (window.__protocolHandlers = window.__protocolHandlers || {})[action] = handler;
+  }
   async loadData() {
     return {};
   }

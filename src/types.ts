@@ -45,6 +45,8 @@ export interface PageText {
   size: number;
   /** 颜色，仅 user 用 */
   color?: string;
+  /** 字体 id（见 editor.ts 的 TEXT_FONTS），仅 user 用；缺省 = 黑体 */
+  font?: string;
   /** 字重，仅 user 用 */
   bold?: boolean;
   /** 原文在 PDF 里的宽度（页面坐标），仅 pdf 用，用于选中高亮对齐 */
@@ -173,6 +175,14 @@ export interface InkbookSettings {
   blockCommandPalette: boolean;
   /** 画完自动把笔直的笔迹拉直（只认直线） */
   straightLine: boolean;
+  /**
+   * 生成「文字索引」md，让 Obsidian 全局搜索能搜到本子里的文字。
+   *
+   * 索引文件与本子同目录、同名前缀（`数学.墨本文字.md`），
+   * 里面每页一节 + 一个 `obsidian://inkbook?page=N` 跳页链接。
+   * 属于派生数据：删掉不影响本子，下次保存会重建。
+   */
+  searchIndex: boolean;
   /** 浮层工具盘的位置与方向（缺省 = 左侧居中竖排） */
   toolPanel?: { left: number; top: number; vertical: boolean };
 }
@@ -195,6 +205,7 @@ export const DEFAULT_SETTINGS: InkbookSettings = {
   blockEdgeSwipe: true,
   blockCommandPalette: true,
   straightLine: false,
+  searchIndex: true,
 };
 
 export const PEN_COLORS = [

@@ -811,6 +811,153 @@
   white-space: pre;
 }
 
+/* -------------------- 选中文字的属性条 --------------------
+ *
+ * 选中一段文字后浮在它上方：字号 −/＋、字体、颜色、编辑、删除。
+ * 放在纸上而不是侧栏，是因为选中时视线在纸上，侧栏常常是收起的。
+ *
+ * 层级要比文字层和编辑框高，但低于浮标（缩放提示）。
+ */
+.mb-textbar {
+  position: absolute;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  /* 页面缩得很小时换行，绝不横向溢出纸面 */
+  flex-wrap: wrap;
+  max-width: calc(100% - 8px);
+  gap: 5px;
+  padding: 4px 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 9px;
+  background: var(--background-primary);
+  box-shadow: 0 6px 20px -8px rgba(0, 0, 0, 0.55);
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-normal);
+}
+
+.mb-tb-btn {
+  min-width: 24px;
+  height: 24px;
+  padding: 0 6px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-normal, #1a1a1a);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.mb-tb-btn:hover {
+  background: var(--background-modifier-hover);
+}
+
+.mb-tb-btn.is-danger {
+  color: var(--text-error, #d64545);
+}
+
+.mb-tb-size {
+  min-width: 22px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+.mb-tb-font {
+  height: 24px;
+  max-width: 76px;
+  padding: 0 4px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 12px;
+}
+
+.mb-tb-dot {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  box-shadow: none;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.mb-tb-dot.is-active {
+  outline: 2px solid var(--interactive-accent, #6c5ce7);
+  outline-offset: 1px;
+}
+
+.mb-tb-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--background-modifier-border);
+  flex: 0 0 auto;
+}
+
+/* 侧栏里：文字字体下拉 + 文字/形状共用的小色点行 */
+.mb-font-sel {
+  width: 100%;
+  margin: 4px 0;
+  height: 26px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 12px;
+}
+
+.mb-tcolor-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 2px;
+}
+
+.mb-tcolor {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  box-shadow: none;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.mb-tcolor.is-active {
+  outline: 2px solid var(--interactive-accent, #6c5ce7);
+  outline-offset: 1px;
+}
+
+/* 平板：属性条得用手指点得准，按钮放大到 30px */
+.mb-tablet .mb-textbar {
+  gap: 7px;
+  padding: 6px 8px;
+}
+
+.mb-tablet .mb-tb-btn {
+  min-width: 30px;
+  height: 30px;
+  font-size: 13px;
+}
+
+.mb-tablet .mb-tb-font {
+  height: 30px;
+  max-width: 88px;
+  font-size: 13px;
+}
+
+.mb-tablet .mb-tb-dot {
+  width: 22px;
+  height: 22px;
+}
+
 .mb-canvas,
 .mb-overlay {
   position: absolute;

@@ -559,7 +559,16 @@ async function D12() {
   };
   b.pages[0].texts = [
     { id: "t1", source: "pdf", x: 100, y: 200, size: 12, text: "原文一行", width: 80 },
-    { id: "t2", source: "user", x: 150, y: 260, size: 20, color: "#D64545", text: "我加的字" },
+    {
+      id: "t2",
+      source: "user",
+      x: 150,
+      y: 260,
+      size: 20,
+      color: "#D64545",
+      font: "kai",
+      text: "我加的字",
+    },
   ];
   // 空数组表示"抽过但没文字"（扫描版），必须原样保留，否则每次挂载都重抽
   b.pages[1].texts = [];
@@ -595,6 +604,10 @@ async function D12() {
       saved?.pages?.[0]?.texts?.[0]?.text === "原文一行" &&
       saved?.pages?.[0]?.texts?.[1]?.color === "#D64545",
     "D12 文字内容/来源/颜色都保住了"
+  );
+  pass(
+    saved?.pages?.[0]?.texts?.[1]?.font === "kai",
+    "D12 文字字体也保住了（" + JSON.stringify(saved?.pages?.[0]?.texts?.[1]?.font) + "）"
   );
   pass(
     Array.isArray(saved?.pages?.[1]?.texts) && saved.pages[1].texts.length === 0,

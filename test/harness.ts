@@ -3,6 +3,7 @@ import { BookStore } from "../src/store";
 import { createBook, createPage, type Pt, type Stroke } from "../src/types";
 import { readBook, writeBook } from "../src/storage";
 import { straightenPoints } from "../src/geometry";
+import { buildIndexMarkdown, indexPathFor, writeTextIndex } from "../src/indexer";
 
 const lines: string[] = [];
 const out = document.getElementById("out")!;
@@ -177,19 +178,84 @@ async function main() {
     const spans = pageEl().querySelectorAll(".mb-text.is-user");
     pass(spans.length === 1 && spans[0].textContent === "第一行文字", "文字层渲染出可见文字");
 
-    // 点同一处：应该进入编辑，而不是叠一条新的
+    /*
+     * 点同一处：第一下只选中，浮出属性条。
+     * 用户原话是「没法选中这段文字进行编辑和删除」——选中态就是为这个加的。
+     */
     pageEl().dispatchEvent(ev("pointerdown", 206, 300, 1, 22));
     pageEl().dispatchEvent(ev("pointerup", 206, 300, 0, 22));
     await sleep(60);
-    const ta2 = pageEl().querySelector(".mb-text-edit") as HTMLTextAreaElement;
-    pass(!!ta2 && ta2.value === "第一行文字", "点已有文字进入编辑（预填原文）");
+    const bar = pageEl().querySelector(".mb-textbar") as HTMLElement;
+    pass(!!bar, "点已有文字先选中，纸上浮出属性条");
+    pass(!!editor.selectedText, "editor 记住了选中的那段文字");
+    pass(!pageEl().querySelector(".mb-text-edit"), "第一下选中，不会直接弹输入框");
+    pass(
+      (bar?.querySelectorAll(".mb-tb-dot").length ?? 0) >= 4,
+      "属性条上有颜色点（" + (bar?.querySelectorAll(".mb-tb-dot").length ?? 0) + " 个）"
+    );
+    pass(!!bar?.querySelector(".mb-tb-font"), "属性条上有字体下拉");
 
-    if (ta2) {
-      ta2.value = "";
-      ta2.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    }
+    // 再点一次才进编辑
+    pageEl().dispatchEvent(ev("pointerdown", 206, 300, 1, 24));
+    pageEl().dispatchEvent(ev("pointerup", 206, 300, 0, 24));
     await sleep(60);
-    pass((store.data.pages[0].texts || []).length === 0, "清空内容后删除该文字");
+    const ta2 = pageEl().querySelector(".mb-text-edit") as HTMLTextAreaElement;
+    pass(!!ta2 && ta2.value === "第一行文字", "再点一次进入编辑（预填原文）");
+
+    // Esc 只取消编辑，不删原文
+    ta2?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await sleep(60);
+    pass((store.data.pages[0].texts || []).length === 1, "Esc 只取消编辑，原文还在");
+
+    /* ---------------- 选中后改字号 / 字体 / 颜色 ---------------- */
+    editor.selectText((store.data.pages[0].texts || [])[0].id);
+    await sleep(30);
+
+    editor.updateSelectedText({ size: 28 });
+    await sleep(30);
+    pass(
+      store.data.pages[0].texts?.[0]?.size === 28,
+      "选中后改字号生效（" + (store.data.pages[0].texts?.[0]?.size ?? "-") + "）"
+    );
+
+    editor.updateSelectedText({ font: "serif" });
+    await sleep(30);
+    pass(
+      store.data.pages[0].texts?.[0]?.font === "serif",
+      "选中后改字体生效（" + (store.data.pages[0].texts?.[0]?.font ?? "-") + "）"
+    );
+
+    editor.updateSelectedText({ color: "#D64545" });
+    await sleep(30);
+    pass(
+      store.data.pages[0].texts?.[0]?.color === "#D64545",
+      "选中后改颜色生效（" + (store.data.pages[0].texts?.[0]?.color ?? "-") + "）"
+    );
+
+    const userSpan = pageEl().querySelector(".mb-text.is-user") as HTMLElement;
+    pass(userSpan?.style.fontSize === "28px", "文字层字号跟着变（" + userSpan?.style.fontSize + "）");
+    pass(
+      (userSpan?.style.fontFamily || "").indexOf("Songti") >= 0 ||
+        (userSpan?.style.fontFamily || "").indexOf("serif") >= 0,
+      "文字层字体跟着变（" + (userSpan?.style.fontFamily || "").slice(0, 24) + "）"
+    );
+    pass(
+      (userSpan?.style.color || "").replace(/\s/g, "") !== "" &&
+        userSpan.style.color !== "rgb(26, 26, 26)",
+      "文字层颜色跟着变（" + userSpan?.style.color + "）"
+    );
+
+    /* ---------------- 属性条上的删除按钮 ---------------- */
+    const barNow = pageEl().querySelector(".mb-textbar") as HTMLElement;
+    const delBtn = Array.from(barNow?.querySelectorAll(".mb-tb-btn") ?? []).find(
+      (b) => (b.textContent || "").trim() === "删除"
+    ) as HTMLElement | undefined;
+    pass(!!delBtn, "属性条上有「删除」按钮");
+    delBtn?.click();
+    await sleep(60);
+    pass((store.data.pages[0].texts || []).length === 0, "属性条删除按钮能删掉这段文字");
+    pass(!pageEl().querySelector(".mb-textbar"), "删除后属性条自动消失");
+    pass(editor.selectedText === null, "删除后选中态清空");
 
     editor.undo();
     await sleep(60);
@@ -199,15 +265,21 @@ async function main() {
       "撤销后文字层同步刷新（不是只在数据里）"
     );
 
+    /*
+     * 键盘删除（Delete / Esc）在 view 里做，这里没有 view 实例，
+     * 挪到 dock-harness 去测。
+     */
+
     // 导出画布必须画出用户文字，否则导出件"少一行字"
     const c = editor.exportPageCanvas(0, 1);
     const ctx = c.getContext("2d")!;
-    const px = ctx.getImageData(196, 286, 100, 24).data;
-    let dark = 0;
+    const px = ctx.getImageData(190, 250, 240, 80).data;
+    let ink = 0;
     for (let i = 0; i < px.length; i += 4) {
-      if (px[i] < 120 && px[i + 1] < 120 && px[i + 2] < 120 && px[i + 3] > 0) dark++;
+      const [r, g, b, a] = [px[i], px[i + 1], px[i + 2], px[i + 3]];
+      if (a > 0 && (r < 240 || g < 240 || b < 240)) ink++;
     }
-    pass(dark > 5, "导出画布里画出了文字（暗像素 " + dark + "）");
+    pass(ink > 5, "导出画布里画出了文字（非白像素 " + ink + "）");
   }
 
   /* 文本层：PDF 原文透明、书写时穿透、仅阅读可选 */
@@ -383,6 +455,87 @@ async function main() {
     }
     loop.push([...loop[0]] as Pt);
     pass(straightenPoints(loop) === null, "圆圈不被误判为直线");
+  }
+
+  /* 全局搜索索引（纯函数，不碰磁盘） */
+  {
+    const mockFile = {
+      path: "笔记/数学.inkbook",
+      basename: "数学",
+      parent: { path: "笔记" },
+    } as any;
+    const bk = createBook("数学", "grid", "white");
+    bk.pages[0].texts = [
+      { id: "p1", source: "pdf", x: 90, y: 400, size: 12, text: "下半页的原文" },
+      { id: "p2", source: "pdf", x: 90, y: 120, size: 12, text: "傅里叶变换的定义" },
+      { id: "u1", source: "user", x: 120, y: 260, size: 20, color: "#D64545", text: "我的批注" },
+    ];
+    bk.pages.push(createPage("lined", "cream"));
+    bk.pages[1].texts = [
+      { id: "p3", source: "pdf", x: 90, y: 100, size: 12, text: "第二页正文" },
+    ];
+
+    const md = buildIndexMarkdown(mockFile, bk);
+    pass(md.includes("傅里叶变换的定义"), "索引 md 含 PDF 原文");
+    pass(md.includes("我的批注"), "索引 md 含手动添加的文字");
+    pass(md.includes("## 第 1 页") && md.includes("## 第 2 页"), "索引 md 按页分节");
+    pass(
+      md.includes("obsidian://inkbook?file=") && md.includes("page=2"),
+      "索引 md 带跳页链接（含第 2 页）"
+    );
+    pass(
+      md.indexOf("傅里叶变换的定义") < md.indexOf("我的批注") &&
+        md.indexOf("我的批注") < md.indexOf("下半页的原文"),
+      "同一页内按 y 从上到下排列"
+    );
+    pass(!md.includes("undefined") && !md.includes("null"), "索引 md 没有 undefined/null");
+    pass(
+      indexPathFor(mockFile) === "笔记/数学.墨本文字.md",
+      "索引文件与本子同目录、同名前缀：" + indexPathFor(mockFile)
+    );
+    // 没有文字的书也不能崩
+    const empty = buildIndexMarkdown(mockFile, createBook("空", "grid", "white"));
+    pass(empty.includes("还没有可搜索的文字"), "没有文字的本子给出说明而不是空文件");
+
+    /* 真的写一遍：用内存 adapter 替身，验"内容没变就不重写" */
+    const fsMap = new Map<string, string>();
+    let writes = 0;
+    const mockApp = {
+      vault: {
+        adapter: {
+          exists: async (p: string) => fsMap.has(p),
+          read: async (p: string) => fsMap.get(p) || "",
+          write: async (p: string, d: string) => {
+            writes += 1;
+            fsMap.set(p, d);
+          },
+          remove: async (p: string) => {
+            fsMap.delete(p);
+          },
+        },
+      },
+    } as any;
+
+    await writeTextIndex(mockApp, mockFile, bk);
+    const written = fsMap.get("笔记/数学.墨本文字.md") || "";
+    pass(written.includes("傅里叶变换的定义"), "writeTextIndex 真的写出了索引文件");
+    const w1 = writes;
+    await writeTextIndex(mockApp, mockFile, bk);
+    pass(writes === w1, "内容没变化时不重复写（省同步与重解析）");
+
+    bk.pages[0].texts!.push({
+      id: "u2",
+      source: "user",
+      x: 100,
+      y: 500,
+      size: 18,
+      text: "新加的一句",
+    });
+    await writeTextIndex(mockApp, mockFile, bk);
+    pass(
+      writes === w1 + 1 && (fsMap.get("笔记/数学.墨本文字.md") || "").includes("新加的一句"),
+      "文字变了会更新索引"
+    );
   }
 
   log("DONE");
