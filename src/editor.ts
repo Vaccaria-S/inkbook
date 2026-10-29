@@ -219,6 +219,13 @@ export interface EditorOptions {
   onState?: () => void;
   onChange?: () => void;
   onPageChange?: (index: number) => void;
+  /**
+   * 某页的底图（PDF / 图片）渲染好了，通知侧栏重画那一页的缩略图。
+   *
+   * 缩略图是懒渲染的：进视口时先画一张（那时 PDF 位图多半还没有），
+   * 位图渲染完必须补一次，否则侧栏会一直停在灰底占位上。
+   */
+  onThumbNeedsRedraw?: (index: number) => void;
 }
 
 export class BookEditor {
@@ -360,6 +367,28 @@ export class BookEditor {
    * 真正该降的时候再降：P3 的 tile 落地后画布会大幅缩小，届时可把这里调回 192MB。
    */
   private bgBitmaps = new BitmapCache({ budget: 160 * 1024 * 1024 });
+  /**
+   * 侧栏缩略图专用的 PDF 位图缓存。
+   *
+   * 为什么不跟主视图共用一份：
+   *   主视图要的是"当前缩放下的清晰度"（放大到 2.8 倍时一张 2000px 宽、约 10MB），
+   *   缩略图只要 160px 宽、约 150KB。共用同一个 LRU 的话，用户在侧栏
+   *   翻上几十页就会把高清位图全挤出去，回到主视图又得重新光栅化、白闪一片。
+   *   分开之后：缩略图浏览再狠也只吃自己那 32MB。
+   */
+  private thumbBitmaps = new BitmapCache({ budget: 32 * 1024 * 1024 });
+  /**
+   * 缩略图渲染队列。
+   *
+   * 侧栏一滚，IntersectionObserver 会一次叫醒七八张缩略图；不排队的话
+   * 就是七八个 pdf.js 渲染任务同时压上来（每张还要 getPage + 建 canvas）。
+   * 一次只跑两张：视觉上还是"一下子都出来了"，但主线程不会被咬住。
+   */
+  private thumbQueue: { pdfPath: string; pageNo: number; key: string; want: number }[] = [];
+  private thumbQueued = new Set<string>();
+  private thumbActive = 0;
+  /** 正在渲染的缩略图底图（同一页不重复光栅化） */
+  private thumbRendering = new Set<string>();
   /** 已打开的 PDF 文档（按路径缓存），避免每页都重新解析 */
   private pdfDocs = new Map<string, Promise<PdfDoc>>();
   /** 每页 PDF 期望的位图宽度（设备像素）——用户放大时随之提高 */
@@ -2056,6 +2085,13 @@ export class BookEditor {
           this.renderOverlay(rec);
         }
       }
+      // 侧栏缩略图也要补一次：它第一次画的时候图片还没加载完
+      const thumbCb = this.opts.onThumbNeedsRedraw;
+      if (thumbCb) {
+        for (let i = 0; i < this.store.data.pages.length; i += 1) {
+          if (this.store.data.pages[i].background?.src === src) thumbCb(i);
+        }
+      }
     };
     img.onerror = () => {
       this.bgLoading.delete(src);
@@ -3445,9 +3481,16 @@ export class BookEditor {
   /**
    * 渲染侧栏缩略图。
    *
-   * 注意：这里**不画 PDF 底图**。
-   * 侧栏可能有几百页，每页都触发一次 PDF 光栅化会瞬间打满 CPU。
-   * 缩略图只需要看到笔迹，底图交给主视图按需渲染。
+   * 底图（PDF / 图片）以前是**故意跳过**的：侧栏几百页，每页都触发一次
+   * PDF 光栅化会瞬间打满 CPU。但代价是导入的 PDF 页在侧栏里全是一片空白，
+   * 用户分不出哪页是哪页（真机反馈：「导入 PDF 的那几页只能显示是空白的」）。
+   *
+   * 现在改成**可控地画**：
+   *   · 缩略图本身是懒渲染的（view 里的 IntersectionObserver 只管视口内那几张），
+   *     一屏最多 5–8 张，不会一次点爆；
+   *   · PDF 位图走独立的小缓存 `thumbBitmaps`（32MB），只要 160px 宽；
+   *   · 主视图已经渲染过同一页就借它的位图，省一次光栅化；
+   *   · 位图没就绪先画一层浅灰占位，渲染完由 onThumbNeedsRedraw 补画。
    */
   renderThumbnail(canvas: HTMLCanvasElement, index: number): void {
     const page = this.store.data.pages[index];
@@ -3471,11 +3514,127 @@ export class BookEditor {
       this.store.data.height,
       (0.85 * dpr) / kx
     );
-    // PDF 底图跳过（见上方注释）；Word 静态底图可以画
-    if (page.background?.src) this.drawBackground(ctx, page);
+    /*
+     * 底图：PDF 走缩略图专用的小尺寸渲染；图片（Word 导入）照旧。
+     * 这里**不能**调 drawBackground —— 它对 PDF 会按主视图缩放去请求
+     * 2000px 级别的高清位图，侧栏滚一遍等于把整个 PDF 重新光栅化一遍。
+     */
+    const bg = page.background;
+    if (bg?.pdf) this.drawPdfThumb(ctx, bg, cssW);
+    else if (bg?.src) this.drawBackground(ctx, page);
     for (const layer of page.layers) {
       if (!layer.visible) continue;
       for (const s of layer.strokes) drawStroke(ctx, s, layer.opacity);
+    }
+  }
+
+  /**
+   * 在缩略图里画 PDF 底图（小尺寸）。
+   *
+   * ctx 已经按「页面坐标 → 缩略图设备像素」缩放过，所以 bg.x/y/width/height
+   * 可以直接用，和主视图是同一套坐标。
+   */
+  private drawPdfThumb(
+    ctx: CanvasRenderingContext2D,
+    bg: PageBackground,
+    cssW: number
+  ): void {
+    const pdf = bg.pdf;
+    if (!pdf) return;
+    const key = `${pdf.path}#${pdf.page}`;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    // 1.4 倍余量：缩略图在 hover / 窄侧栏里会有几像素的尺寸浮动
+    const want = clamp(Math.round(cssW * dpr * 1.4), 96, 384);
+
+    // 先看缩略图自己的缓存，再借主视图的（主视图那份通常更清晰）
+    const bmp = this.thumbBitmaps.get(key) ?? this.bgBitmaps.get(key);
+    if (bmp) {
+      ctx.save();
+      ctx.drawImage(bmp, bg.x, bg.y, bg.width, bg.height);
+      ctx.restore();
+      return;
+    }
+
+    /*
+     * 位图还没好：画一层浅灰。
+     *
+     * 用 #F0EDE8 而不是纸白，是为了和"空白的纸"区分开——
+     * 一眼能看出这页有底图，只是还在渲染。
+     */
+    ctx.save();
+    ctx.fillStyle = "#F0EDE8";
+    ctx.fillRect(bg.x, bg.y, bg.width, bg.height);
+    ctx.restore();
+
+    this.requestPdfThumb(pdf.path, pdf.page, key, want);
+  }
+
+  /**
+   * 请求渲染一张缩略图尺寸的 PDF 位图。
+   *
+   * 同一页只跑一个：侧栏快速滚动时 renderThumbnail 会被连续调用，
+   * 靠 thumbQueued / thumbRendering 去重，否则同一页能排出十几次光栅化。
+   */
+  private requestPdfThumb(
+    pdfPath: string,
+    pageNo: number,
+    key: string,
+    want: number
+  ): void {
+    const have = this.thumbBitmaps.getEntry(key)?.width ?? 0;
+    // 已经够清晰（或主视图缓存里有更大的）就不重复渲染
+    if (have >= want * 0.8) return;
+    if (this.bgBitmaps.getEntry(key)) return;
+    if (this.thumbRendering.has(key) || this.thumbQueued.has(key)) return;
+    /*
+     * 队列封顶 20 条：侧栏快速滚动时，用户早就滑过去的那些页还会往队列里排。
+     * 丢最旧的（FIFO）——它最可能是已经滚出视野的，用户根本不会回头看。
+     */
+    if (this.thumbQueue.length >= 20) {
+      const dropped = this.thumbQueue.shift();
+      if (dropped) this.thumbQueued.delete(dropped.key);
+    }
+    this.thumbQueued.add(key);
+    this.thumbQueue.push({ pdfPath, pageNo, key, want });
+    this.pumpThumbQueue();
+  }
+
+  /** 最多两张同时渲染，其余排队 */
+  private pumpThumbQueue(): void {
+    while (this.thumbActive < 2 && this.thumbQueue.length) {
+      const job = this.thumbQueue.shift();
+      if (!job) break;
+      this.thumbQueued.delete(job.key);
+      this.thumbActive += 1;
+      this.thumbRendering.add(job.key);
+      void (async () => {
+        try {
+          const doc = await this.openPdfDoc(job.pdfPath);
+          const nowHave = this.thumbBitmaps.getEntry(job.key)?.width ?? 0;
+          if (nowHave >= job.want * 0.8 || this.bgBitmaps.getEntry(job.key)) return;
+          const rendered = await renderPdfPage(doc, job.pageNo, job.want);
+          this.thumbBitmaps.set(job.key, rendered.bitmap, rendered.bitmap.width);
+          this.notifyThumb(job.pdfPath, job.pageNo);
+        } catch (e) {
+          console.warn("[inkbook] 缩略图 PDF 底图渲染失败", e);
+        } finally {
+          this.thumbRendering.delete(job.key);
+          this.thumbActive -= 1;
+          this.pumpThumbQueue();
+        }
+      })();
+    }
+  }
+
+  /** 通知侧栏：这一页的底图好了，重画缩略图 */
+  private notifyThumb(pdfPath: string, pageNo: number): void {
+    if (!this.opts.onThumbNeedsRedraw) return;
+    const pages = this.store.data.pages;
+    for (let i = 0; i < pages.length; i += 1) {
+      const bg = pages[i].background;
+      if (bg?.pdf && bg.pdf.path === pdfPath && bg.pdf.page === pageNo) {
+        this.opts.onThumbNeedsRedraw(i);
+      }
     }
   }
 
@@ -3567,6 +3726,10 @@ export class BookEditor {
     if (this.wheelRaf) cancelAnimationFrame(this.wheelRaf);
     // 释放位图显存和 PDF 文档句柄
     this.bgBitmaps.clear();
+    this.thumbBitmaps.clear();
+    this.thumbRendering.clear();
+    this.thumbQueue.length = 0;
+    this.thumbQueued.clear();
     this.bgImages.clear();
     for (const p of this.pdfDocs.values()) {
       void p.then((doc) => doc?.destroy?.()).catch(() => {});

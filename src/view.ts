@@ -428,10 +428,21 @@ export class InkbookView extends FileView {
       smoothing: this.plugin.settings.smoothing,
       prediction: this.plugin.settings.prediction,
       edgeSwipeBlock: this.plugin.settings.blockEdgeSwipe !== false,
-        straighten: this.plugin.settings.straightLine === true,
+      straighten: this.plugin.settings.straightLine === true,
       onState: () => this.updateUI(),
       onChange: () => this.markDirty(),
       onPageChange: () => this.onPageChanged(),
+      /*
+       * 底图（PDF 页 / 图片）渲染好了 → 补画那一页的缩略图。
+       *
+       * 缩略图是"进视口就画一次"，那时候 PDF 位图基本还没光栅化完，
+       * 所以第一遍只能画灰底。没有这个回调，侧栏会一直停在灰底上，
+       * 用户以为那页是空的。
+       */
+      onThumbNeedsRedraw: (i: number) => {
+        const cv = this.thumbCanvases[i];
+        if (cv && cv.isConnected) this.editor?.renderThumbnail(cv, i);
+      },
     });
     this.editor.penColor = this.plugin.settings.lastPenColor || "#1A1A1A";
     this.editor.penSize = this.plugin.settings.defaultPenSize || 2.8;

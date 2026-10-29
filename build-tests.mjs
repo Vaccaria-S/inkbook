@@ -46,6 +46,8 @@ const HARNESSES = [
   "dock-harness.ts",
   "swipe-harness.ts",
   "touch-harness.ts",
+  // 侧栏缩略图的 PDF 底图（单独一个页面，不跟 perf 的失败状态混在一起）
+  "thumb-harness.ts",
   // P1 数据安全（指纹 / 原子写 / 版本闸门 / 冲突 / 完整性）
   "p1-harness.ts",
 ];

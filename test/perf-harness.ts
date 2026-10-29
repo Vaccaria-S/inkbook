@@ -262,7 +262,7 @@ async function main() {
     cv.remove();
   }
 
-  /* -------------------- PDF 底图不会在缩略图里触发渲染 -------------------- */
+  /* -------------------- 缩略图只走小尺寸，不抢主视图的高清位图 -------------------- */
   {
     const book = makeBook(3);
     const store = new BookStore(book);
@@ -270,7 +270,12 @@ async function main() {
     const editor = new BookEditor(host, store, { smoothing: 0.5 });
     await sleep(200);
 
-    // 缩略图渲染不应该发起 PDF 页渲染请求
+    // 缩略图**可以**请求 PDF 渲染（用户要求导入的 PDF 页在侧栏不能是空白），
+    // 但它必须走 thumbQueue 的低分辨率路径，绝不能去抬 bgTarget——
+    // 那是主视图按当前缩放要的清晰度，被缩略图一搅和就得重复光栅化。
+    //
+    // 「缩略图真的画出了 PDF 底图」由独立的 thumb.html 验证：
+    // 那个页面干净，不像这里前面几十个测试会对着不存在的 PDF 反复失败。
     //
     // 注意字段名：底图请求表在渐进式高清那轮重构里
     // 从 bgPending（Set）改成了 bgTarget（Map<key, 目标像素宽>）。
@@ -283,7 +288,7 @@ async function main() {
     const after = (editor as any).bgTarget.size;
     pass(
       before === after,
-      "缩略图渲染不触发 PDF 光栅化（避免几百页时打满 CPU）"
+      "缩略图不请求主视图尺寸的 PDF 位图（bgTarget 不变，只走 thumbQueue）"
     );
 
     editor.destroy();
