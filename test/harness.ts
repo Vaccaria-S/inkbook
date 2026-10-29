@@ -563,6 +563,106 @@ async function main() {
     bk.pages[1].texts = [];
     await writeTextIndex(mockApp, mockFile, bk);
     pass(!fsMap.has("笔记/数学.墨本索引/第 2 页.md"), "某页文字清空后删掉对应索引页");
+
+    /*
+     * 文件表路径：有 vault 一等 API 时必须走 create / modify。
+     *
+     * 真机故障复现：索引 md 明明写在磁盘上，Obsidian 的全局搜索却一个字
+     * 都搜不到——因为它压根不在 vault 的文件表里。
+     * 只有 vault.create / vault.modify 会登记；adapter.write 是裸写。
+     */
+    {
+      const disk = new Map<string, string>();
+      const folders = new Set<string>();
+      const registry = new Map<string, { path: string }>();
+      const calls: string[] = [];
+
+      const a2 = {
+        exists: async (p: string) => disk.has(p) || folders.has(p),
+        read: async (p: string) => disk.get(p) || "",
+        write: async (p: string, d: string) => {
+          calls.push("adapter.write");
+          disk.set(p, d);
+        },
+        remove: async (p: string) => {
+          calls.push("adapter.remove");
+          disk.delete(p);
+          registry.delete(p);
+        },
+        mkdir: async (p: string) => {
+          folders.add(p);
+        },
+        list: async (p: string) => ({
+          files: [...disk.keys()].filter((k) => k.startsWith(p + "/")),
+          folders: [],
+        }),
+      };
+      const vault = {
+        adapter: a2,
+        getAbstractFileByPath: (p: string) => registry.get(p) ?? null,
+        createFolder: async (p: string) => {
+          calls.push("createFolder");
+          if (folders.has(p)) throw new Error("Folder already exists.");
+          folders.add(p);
+          registry.set(p, { path: p });
+        },
+        create: async (p: string, d: string) => {
+          calls.push("create");
+          if (registry.has(p)) throw new Error("File already exists.");
+          const parent = p.split("/").slice(0, -1).join("/");
+          // 模拟 Obsidian：父目录不在文件表里就建不了文件
+          if (parent && !registry.has(parent)) throw new Error("Parent folder does not exist.");
+          disk.set(p, d);
+          registry.set(p, { path: p });
+        },
+        modify: async (f: { path: string }, d: string) => {
+          calls.push("modify");
+          disk.set(f.path, d);
+        },
+      };
+      const vApp = { vault } as any;
+
+      const bk2 = createBook("数学", "grid", "white");
+      bk2.pages[0].texts = [
+        { id: "v1", source: "pdf", x: 90, y: 100, size: 12, text: "要能被搜到的原文" },
+      ];
+      await writeTextIndex(vApp, mockFile, bk2);
+
+      pass(calls.includes("createFolder"), "✓ 索引目录走 vault.createFolder（Obsidian 才认得这个目录）");
+      pass(
+        calls.includes("create") && !calls.includes("adapter.write"),
+        "✓ 索引页走 vault.create，不是裸写 adapter（否则文件表里没有、全局搜索搜不到）"
+      );
+      pass(
+        registry.has("笔记/数学.墨本索引") && registry.has("笔记/数学.墨本索引/第 1 页.md"),
+        "✓ 目录与索引页都进了 vault 文件表"
+      );
+
+      calls.length = 0;
+      bk2.pages[0].texts![0].text = "改过的原文";
+      await writeTextIndex(vApp, mockFile, bk2);
+      pass(
+        calls.includes("modify") && !calls.includes("adapter.write"),
+        "✓ 内容变化走 vault.modify（检索能立刻看到新文字）"
+      );
+
+      /*
+       * 旧版遗留：文件在磁盘上、文件表里没有。
+       * create 会因"已存在"失败 —— 必须先删再建，否则这个文件永远进不了检索。
+       */
+      calls.length = 0;
+      const ghost = "笔记/数学.墨本索引/第 2 页.md";
+      disk.set(ghost, "旧内容");
+      bk2.pages.push(createPage("lined", "white"));
+      bk2.pages[1].texts = [
+        { id: "v2", source: "user", x: 10, y: 10, size: 14, text: "第二页新文字" },
+      ];
+      await writeTextIndex(vApp, mockFile, bk2);
+      pass(
+        registry.has(ghost) && disk.get(ghost)?.includes("第二页新文字"),
+        "✓ 磁盘上已有但未登记的索引页会被重建成登记态（旧版遗留能救回来）"
+      );
+    }
   }
 
   log("DONE");

@@ -129,6 +129,28 @@ declare global {
   }
   const touch = window.__cdpTouch;
 
+  /**
+   * 直接派发 PointerEvent。
+   *
+   * 脚本造不出多指 TouchEvent，但 PointerEvent 是可以手造的——
+   * editor 的整个手势层都建在 pointer 事件上，用它就能精确复现
+   * 「先抬第二根手指」这种 CDP 触摸桥做不出来的顺序。
+   */
+  function ptrTo(el: HTMLElement, type: string, id: number, x: number, y: number) {
+    el.dispatchEvent(
+      new PointerEvent(type, {
+        pointerId: id,
+        pointerType: "touch",
+        isPrimary: id === 11 || id === 21,
+        clientX: x,
+        clientY: y,
+        bubbles: true,
+        cancelable: true,
+        pressure: 1,
+      })
+    );
+  }
+
   const sr = scroll.getBoundingClientRect();
   const cx = sr.left + sr.width / 2;
   const cy = sr.top + sr.height / 2;
@@ -307,6 +329,139 @@ declare global {
     }
 
     pass(pageAfter === pageBefore, "捏合不跳页（" + pageBefore + " → " + pageAfter + "）");
+  }
+
+  /* ============ 场景 4：先抬一根手指，余指不能把页面拽走 ============ */
+  /*
+   * 真机最坏顺序：两根手指捏合，**先抬起第二根**。
+   *
+   * 这时 onUp 会因为 pointerId 是第一根而早退，gesture 仍停在 "pan"；
+   * 剩下那根手指一动就走 `scrollTop = pan.top - dy`，
+   * 而 pan.top 是捏合前的滚动位置——页面瞬间跳回去几千像素。
+   * 用户报的「捏合放大缩小，页面会跳」就是这一下。
+   */
+  {
+    scroll.scrollTop = 8000;
+    await sleep(300);
+    const topBefore = scroll.scrollTop;
+    const pageBefore = ed.current;
+    const zoomBefore = ed.getState().zoom;
+
+    const pageEl = ed.recs[ed.current].pageEl as HTMLElement;
+    const px = cx;
+    const py = cy;
+    const ptr = (type: string, id: number, x: number, y: number) =>
+      ptrTo(pageEl, type, id, x, y);
+
+    ptr("pointerdown", 11, px - 60, py);
+    await sleep(30);
+    ptr("pointerdown", 12, px + 60, py);
+    await sleep(30);
+
+    for (let i = 1; i <= 8; i++) {
+      const g = 60 + i * 15;
+      ptr("pointermove", 11, px - g, py);
+      ptr("pointermove", 12, px + g, py);
+      await sleep(25);
+    }
+    await sleep(80);
+    const zoomMid = ed.getState().zoom;
+
+    // 先抬第二根
+    ptr("pointerup", 12, px + 180, py);
+    await sleep(40);
+    const topAfterUp = scroll.scrollTop;
+
+    // 余指大幅移动——旧实现会在这里把 scrollTop 设回 pan.top
+    for (let i = 1; i <= 6; i++) {
+      ptr("pointermove", 11, px - 180, py - i * 40);
+      await sleep(30);
+    }
+    const topAfterMove = scroll.scrollTop;
+
+    ptr("pointerup", 11, px - 180, py - 240);
+    await sleep(350);
+
+    pass(
+      zoomMid > zoomBefore,
+      "余指场景：捏合照样生效（" + zoomBefore.toFixed(2) + " → " + zoomMid.toFixed(2) + "）"
+    );
+    pass(
+      Math.abs(topAfterMove - topAfterUp) < 2,
+      "先抬第二根后，余指移动不滚页面（" +
+        topAfterUp.toFixed(0) +
+        " → " +
+        topAfterMove.toFixed(0) +
+        "，起始 " +
+        topBefore.toFixed(0) +
+        "）"
+    );
+    pass(ed.current === pageBefore, "余指移动不跳页（" + pageBefore + " → " + ed.current + "）");
+  }
+
+  /* ======== 场景 5：两指中心落在纸外（页缝 / 首尾之外）也不能跳 ======== */
+  /*
+   * 缩小之后纸张之间是背景，双指中心常常正好落在两页之间的缝里。
+   * 旧实现把锚点的 fy 夹到 [0,1]，等于把「缝里那个点」谎报成「纸边缘」，
+   * 缩放后拼命把纸边缘往手指上拽 —— 整页平移一大段，就是"捏合会跳"。
+   */
+  {
+    ed.setZoom(0.45);
+    await sleep(320);
+
+    const rec = ed.recs[ed.current];
+    const srNow = scroll.getBoundingClientRect();
+    const pageTopInScroll =
+      rec.pageEl.getBoundingClientRect().top - srNow.top + scroll.scrollTop;
+    // 页上方留出 150px 空白，好让"纸外"的点落在视口里
+    scroll.scrollTop = Math.max(0, pageTopInScroll - 150);
+    await sleep(250);
+
+    const r0 = rec.pageEl.getBoundingClientRect();
+    const bx = r0.left + r0.width / 2;
+    const by = r0.top - 12; // 正上方那一页与本页之间 24px 缝的正中
+
+    const a0 = ed.pickAnchor(bx, by);
+    pass(
+      !!a0 && (a0.fy > 1.001 || a0.fy < -0.001),
+      "页缝里的锚点保留外推值，不再被夹到 [0,1]（fy=" +
+        (a0 ? a0.fy.toFixed(3) : "null") +
+        "）"
+    );
+
+    if (a0) {
+      const recA = ed.recs[a0.index];
+      const ra = recA.pageEl.getBoundingClientRect();
+      const ax0 = ra.left + a0.fx * ra.width;
+      const ay0 = ra.top + a0.fy * ra.height;
+      const z0 = ed.getState().zoom;
+
+      ptrTo(rec.pageEl as HTMLElement, "pointerdown", 21, bx - 50, by);
+      await sleep(30);
+      ptrTo(rec.pageEl as HTMLElement, "pointerdown", 22, bx + 50, by);
+      await sleep(30);
+      for (let i = 1; i <= 8; i++) {
+        const g = 50 + i * 8;
+        ptrTo(rec.pageEl as HTMLElement, "pointermove", 21, bx - g, by);
+        ptrTo(rec.pageEl as HTMLElement, "pointermove", 22, bx + g, by);
+        await sleep(25);
+      }
+      await sleep(80);
+      const z1 = ed.getState().zoom;
+
+      const ra2 = recA.pageEl.getBoundingClientRect();
+      const ax1 = ra2.left + a0.fx * ra2.width;
+      const ay1 = ra2.top + a0.fy * ra2.height;
+      const drift = Math.hypot(ax1 - ax0, ay1 - ay0);
+
+      ptrTo(rec.pageEl as HTMLElement, "pointerup", 22, bx + 114, by);
+      await sleep(40);
+      ptrTo(rec.pageEl as HTMLElement, "pointerup", 21, bx - 114, by);
+      await sleep(200);
+
+      pass(z1 > z0, "纸外捏合确实放大了（" + z0.toFixed(2) + " → " + z1.toFixed(2) + "）");
+      pass(drift < 3, "纸外锚点不漂移（漂移 " + drift.toFixed(2) + "px）");
+    }
   }
 
   log("");

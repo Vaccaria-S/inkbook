@@ -64,7 +64,12 @@ async function main() {
     log((map.inkbook === "inkbook-view" ? "PASS" : "FAIL") + " inkbook 扩展名 = " + map.inkbook);
     log((app.__views && app.__views["inkbook-view"] ? "PASS" : "FAIL") + " 视图已注册");
     const cmds = (window as any).__commands || [];
-    log((cmds.length === 3 ? "PASS" : "FAIL") + " 命令 3 条：" + cmds.map((c: any) => c.id).join(","));
+    const hasRebuild = cmds.some((c: any) => c.id === "inkbook-rebuild-index");
+    log(
+      (cmds.length === 4 && hasRebuild ? "PASS" : "FAIL") +
+        " 命令 4 条（含重建索引）：" +
+        cmds.map((c: any) => c.id).join(",")
+    );
     log((window as any).__settingTab ? "PASS 设置面板已注册" : "FAIL 设置面板缺失");
     const v = app.__views["inkbook-view"]({ app });
     log((v && v.getViewType() === "inkbook-view" ? "PASS" : "FAIL") + " 视图工厂可创建");

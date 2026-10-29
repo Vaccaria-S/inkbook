@@ -1217,6 +1217,23 @@ export class BookEditor {
    * 所以同一个相对位置在缩放前后指向的是同一个内容——
    * 这就是锚点能锁住的关键。
    */
+  /**
+   * 某个屏幕纵坐标落在第几页（纯算术，不碰 DOM）。
+   *
+   * 和 updateCurrentFromScroll 用同一套模型，但可以问任意一点——
+   * 捏合开始时要问的是「**视口中心**现在是第几页」，
+   * 而 this.current 是上一次 scroll 事件算出来的，可能已经滞后一页。
+   * 锁页锁错了，手势结束后页码就会跳。
+   */
+  private pageIndexAt(clientY: number): number {
+    if (!this.recs.length) return 0;
+    const sr = this.scrollEl.getBoundingClientRect();
+    const stride = this.store.data.height * this.zoom + this.pageGap;
+    if (stride <= 0) return 0;
+    const rel = clientY - sr.top + this.scrollEl.scrollTop - this.pageOrigin;
+    return clamp(Math.floor(rel / stride), 0, this.recs.length - 1);
+  }
+
   private pickAnchor(clientX: number, clientY: number): ZoomAnchor | null {
     // 光标可能在某一页上，也可能在页与页之间的缝隙里。
     // 逐页测 getBoundingClientRect 会触发强制重排，页数多时很慢，
@@ -1236,8 +1253,20 @@ export class BookEditor {
      * 三个候选全都不满足 → 返回 null → 这次缩放完全没有补偿，
      * 整篇文档直接跳一个页高。
      *
-     * 现在改成：取**离光标最近**的候选页，并把页内比例夹到 [0,1]。
-     * 锚在页边缘也比不锚好——至少内容不会整体位移。
+     * 2026-10-29 真机（平板捏合）再修正一次：
+     *
+     * **不能把 fy / fx 夹到 [0,1]**。两指中心经常落在纸外——缩小看整页时，
+     * 页面上下都是大片背景，双指自然落在空白处。夹到 [0,1] 等于把
+     * 「纸外 200px 的那个点」谎报成「纸边缘」，缩放后 restoreAnchor 拼命
+     * 把纸边缘对到手指上，整页猛地平移一段 —— 用户看到的就是「捏合时页面跳」。
+     *
+     * 现在 fy / fx 保持原值，可以做负值 / 大于 1 的外推：
+     * restoreAnchor 里是 `r.top + fy * r.height`，外推在数学上完全成立，
+     * 纸外的那个点能被精确对回手指。
+     *
+     * 选页的判据也顺势改了：取「页中心离光标最近」的候选页。
+     * 因为不夹之后 fy 自带正确性——就算选到隔壁页，fy 会变成 1.3 / -0.3
+     * 之类的值，算出来的内容点还是同一个位置。
      */
     let best: ZoomAnchor | null = null;
     let bestDist = Infinity;
@@ -1246,19 +1275,13 @@ export class BookEditor {
       if (!rec) continue;
       const r = rec.pageEl.getBoundingClientRect();
       if (!r.height || !r.width) continue;
-      const rawFy = (clientY - r.top) / r.height;
-      const fy = clamp(rawFy, 0, 1);
-      // 光标到页面范围的距离（像素）
-      const dist = Math.abs(rawFy - fy) * r.height;
-      if (dist < bestDist - 0.01) {
+      const fy = (clientY - r.top) / r.height;
+      const fx = (clientX - r.left) / r.width;
+      const dist = Math.abs(fy - 0.5);
+      if (dist < bestDist - 1e-6) {
         bestDist = dist;
-        best = {
-          index: rec.index,
-          fx: clamp((clientX - r.left) / r.width, 0, 1),
-          fy,
-        };
+        best = { index: rec.index, fx, fy };
       }
-      if (dist === 0) break; // 精确命中某页，无需再找
     }
     return best;
   }
@@ -1328,6 +1351,24 @@ export class BookEditor {
     this.cancelStroke();
 
     /*
+     * 把单指滚动那个"半残状态"清干净。
+     *
+     * 双指手势的第一根手指落下时，onDown 走的是 role === "pan" 分支：
+     * 于是 gesture="pan"、pointerId=第一根手指、pan={按下时的 scrollTop}。
+     * 第二根手指落下才切进手势——但上面这三个值**没人清**。
+     *
+     * 平时看不出来（手势期间所有移动都被 role="gesture" 挡在前面）。
+     * 真正出事的是**手势结束的那一刻**：如果先抬起的是第二根手指，
+     * onUp 会因 pointerId 不匹配而早退，gesture 仍然停在 "pan"；
+     * 剩下那根手指一动，就走进 `scrollTop = this.pan.top - dy` ——
+     * 而 pan.top 是**捏合开始前**的滚动位置，缩放补偿早把 scrollTop 改了几千像素。
+     * 页面于是瞬间跳回去，正是用户报的「捏合放大缩小，页面会跳」。
+     */
+    this.gesture = "none";
+    this.pointerId = null;
+    this.pan = null;
+
+    /*
      * 锚点取两指中心正下方的内容点。
      *
      * 用「中心下方」而不是「第一根手指下方」：
@@ -1348,7 +1389,17 @@ export class BookEditor {
      * 如果不屏蔽，锚点会在第一次缩放后就被判为失效，
      * 下一帧重新 pickAnchor → 锚点漂移 → 跳页。
      */
-    this.pinchStartPage = this.current;
+    /*
+     * 锁「捏合开始时用户眼睛在哪一页」，而不是 this.current。
+     *
+     * this.current 由 scroll 事件算，最后一次事件的时机与手势开始之间
+     * 可能差着一次滚动；直接拿它当锁页目标，手势一结束就会把页码
+     * 拽回上一页——又一个"捏合完页面跳了"的来源。
+     * 这里按视口中心重新算一次，当下看到的是哪页就锁哪页。
+     */
+    this.pinchStartPage = this.pageIndexAt(
+      this.scrollEl.getBoundingClientRect().top + this.scrollEl.clientHeight * 0.42
+    );
     window.clearTimeout(this.pinchReleaseTimer);
     this.pinchReleaseTimer = 0;
     this.pinchActive = true;
@@ -1373,13 +1424,29 @@ export class BookEditor {
     }
     this.emitState();
 
+    // 手势结束了，滚轮用的锚点锁没有意义了，留着会在下一次滚动时判成"用户没动"
+    this.lockedAnchor = null;
+
     /*
      * 补偿引起的 scroll 事件还会再跑几帧。若这里立刻把 pinchActive 放开，
      * 那些 scroll 会走 updateCurrentFromScroll，前面锁的页白锁了。
-     * 冻结 240ms，等滚动彻底停下来。
+     *
+     * 而且**手指可能还没抬完**：一根指尖抬起就算手势结束，另一根可能
+     * 还按在纸上继续滑。只要还有手指在屏上就一直冻结，全部抬起后再等
+     * 240ms 让 clamp 引起的滚动走完（上限约 5 秒，防止某次 up 丢失后
+     * 页码永久冻住）。
      */
+    this.freezeAfterPinch(0);
+  }
+
+  /** 捏合结束后的页码冻结期（见 endPinch） */
+  private freezeAfterPinch(retries: number): void {
     window.clearTimeout(this.pinchReleaseTimer);
     this.pinchReleaseTimer = window.setTimeout(() => {
+      if (this.arbiter.touchCountNow > 0 && retries < 20) {
+        this.freezeAfterPinch(retries + 1);
+        return;
+      }
       this.pinchReleaseTimer = 0;
       this.pinchActive = false;
     }, 240);
@@ -2614,21 +2681,26 @@ export class BookEditor {
   }
 
   private applyTouchAction(): void {
-    // 手指始终允许滚动/缩放（双指手势由仲裁器接管），
-    // 笔的书写不受 touch-action 影响，所以两种输入可以共存。
-    //
-    // 用 docEl 上的 data 属性统一控制，CSS 里靠继承生效——
+    // 用 docEl 上的 data 属性统一控制工具态，CSS 里靠继承生效——
     // 逐页写的话几百页时每次切换工具都要几百次样式写入。
     this.docEl.dataset.tool = this.tool;
     /*
-     * 不再放 `pinch-zoom`：那会让安卓 WebView 自己再缩放一层视觉视口，
-     * 与我们的 pinch 补偿叠加——用户看到的就是「捏合时跳到别的页」。
-     * 缩放完全由 BookEditor 的 pointer 手势接管。
+     * 写入模式：**touch-action: none**。
      *
-     * 选择工具下关掉滚动：拖动文字的手指移动如果同时滚页面，
-     * 文字会跟着页面跑，怎么都拖不准。双指捏合/平移仍由 pointer 处理。
+     * 以前是 `pan-x pan-y`，本意是"手指始终允许滚动"。但那会让浏览器
+     * 也参与滚动：单指拖动时我们的 pan 在改 scrollTop、浏览器原生滚动
+     * 同时也在跑，两边叠加；双指捏合时浏览器还会自己平移一把，和我们的
+     * 锚点补偿抢同一块画布——真机上的「捏合时页面跳」有一半是它干的。
+     * 更糟的是原生滚动一启动，浏览器就发 pointercancel 把手势抢走，
+     * 我们这边的 pan / pinch 直接断在半路。
+     *
+     * 滚动本来就是我们自己实现的（BookEditor.pan，1:1 跟手 + 自算惯性），
+     * 禁掉原生滚动不会丢能力，反而让手势只有一个主人。
+     *
+     * 阅读模式例外：文字层要能拖选、要能长按选词，那些是浏览器原生能力，
+     * 必须放开；此时滚动也交给浏览器（handlePointer 里不再接管触摸）。
      */
-    this.docEl.style.touchAction = this.tool === "select" ? "none" : "pan-x pan-y";
+    this.docEl.style.touchAction = this.readOnly ? "auto" : "none";
   }
 
   /**
@@ -2644,6 +2716,8 @@ export class BookEditor {
       this.cancelStroke();
       this.commitTextEdit();
     }
+    // 阅读模式要放开原生手势（选字），退出时要收回——touch-action 跟着变
+    this.applyTouchAction();
     this.emitState();
   }
 
@@ -2721,18 +2795,21 @@ export class BookEditor {
     if (this.gesture !== "none") return;
 
     /*
-     * 仅阅读模式：指针只用来滚动页面，不落笔。
+     * 仅阅读模式：不落笔。
      *
      * 放这里（在角色仲裁之后、画笔逻辑之前）是关键：
-     *   · 单指仍然走 role === "pan" 分支 → 手指照常翻页
      *   · 笔（role === "draw"）在这里被拦下 → 不会画出笔迹
-     *   · 鼠标左键同理
+     *   · 触摸交给浏览器原生滚动 / 选字（这时 touch-action 是 auto）
+     *
+     * 2026-10-29：触摸不再由这里接管。
+     * 阅读模式下 touch-action 必须放开才能拖选文字，而一旦放开，
+     * 浏览器就会自己滚动——我们再 set 一次 scrollTop 就是双倍速，
+     * 手指一动页面飞出去两倍距离。让浏览器独占这条路更稳。
+     * 鼠标不在 touch-action 的管辖内（不会"自动滚动"），所以照旧接管。
      */
     if (this.readOnly) {
-      if ((e.target as HTMLElement)?.closest?.(".mb-textlayer")) {
-        // 文字层要能拖选：不捕获指针、不 preventDefault，让浏览器自己处理
-        return;
-      }
+      if (e.pointerType !== "mouse") return;
+      if ((e.target as HTMLElement)?.closest?.(".mb-textlayer")) return;
       this.gesture = "pan";
       this.pointerId = e.pointerId;
       this.pan = {

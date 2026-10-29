@@ -12,6 +12,8 @@ export interface InkbookPluginLike {
   settings: InkbookSettings;
   saveSettings(): Promise<void>;
   refreshViews(): void;
+  /** 重建全库文字索引（main.ts 实现；测试桩可以不提供） */
+  rebuildTextIndex?: () => Promise<{ books: number; pages: number; failed: number }>;
 }
 
 export class InkbookSettingTab extends PluginSettingTab {
@@ -163,17 +165,49 @@ export class InkbookSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("生成文字索引（全局搜索能搜到手写本里的字）")
       .setDesc(
-        "开启后，保存时会在本子同目录写一份「本子名.墨本文字.md」，把每页的文字（PDF 原文 + 手动添加的）按页铺开。Obsidian 全局搜索命中它就能找到第几页，点里面的链接直接跳回那一页。索引是派生文件，删掉不影响本子。"
+        "开启后，每次保存会在本子同目录的「本子名.墨本索引/」里，为**有文字的页**各写一个「第 N 页.md」（文字来自 PDF 原文与手动添加的文字，手写笔迹不在其中）。Obsidian 全局搜索命中它就能定位到第几页，点开直接跳回那一页。索引是派生文件，删掉不影响本子，下次保存会重建。"
       )
       .addToggle((t) =>
         t.setValue(this.plugin.settings.searchIndex !== false).onChange(async (v) => {
           this.plugin.settings.searchIndex = v;
           await this.plugin.saveSettings();
           // 关掉后只是不再更新索引；已经生成的那份会停在最后一次保存的内容，
-          // 不需要它时直接删掉那个 md 即可（删了不影响本子）
+          // 不需要它时直接删掉那个目录即可（删了不影响本子）
           this.plugin.refreshViews();
         })
       );
+
+    /*
+     * 手动补建按钮。
+     *
+     * 为什么设置页也要放一颗（命令面板里已经有了）：
+     * 墨本默认屏蔽命令面板——用户在墨本里按 Ctrl+P 打不开，
+     * 想补建索引就必须先切到别的笔记，太绕。
+     */
+    new Setting(containerEl)
+      .setName("重建文字索引")
+      .setDesc(
+        "把库里每一本手写本重新写一遍索引。以前生成过索引、但全局搜索搜不到时点这里——旧版是绕过 Obsidian 的文件表直接落盘的，可能一直没被检索收录。"
+      )
+      .addButton((b) => {
+        b.setButtonText("立即重建").onClick(async () => {
+          if (!this.plugin.rebuildTextIndex) {
+            b.setButtonText("当前版本不支持");
+            return;
+          }
+          b.setButtonText("重建中…");
+          b.setDisabled(true);
+          try {
+            const r = await this.plugin.rebuildTextIndex();
+            b.setButtonText(r.pages > 0 ? `完成 · ${r.pages} 页` : "完成 · 无文字");
+          } catch (_) {
+            b.setButtonText("失败，看控制台");
+          } finally {
+            b.setDisabled(false);
+            window.setTimeout(() => b.setButtonText("立即重建"), 4000);
+          }
+        });
+      });
 
     new Setting(containerEl)
       .setName("自动保存")

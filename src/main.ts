@@ -3,7 +3,8 @@ import { InkbookView, VIEW_TYPE } from "./view";
 import { InkbookSettingTab, DEFAULT_SETTINGS } from "./settings";
 import { NewBookModal } from "./modals";
 import type { InkbookSettings } from "./types";
-import { parseIndexPath } from "./indexer";
+import { parseIndexPath, writeTextIndex } from "./indexer";
+import { readBook } from "./storage";
 
 class BookPickerModal extends FuzzySuggestModal<TFile> {
   private choose: (file: TFile) => void;
@@ -73,6 +74,22 @@ export default class InkbookPlugin extends Plugin {
 
     this.addSettingTab(new InkbookSettingTab(this.app, this));
 
+    /*
+     * 补建历史索引。
+     *
+     * 旧版用 adapter.write 直接落盘，Obsidian 的文件表可能压根没收录那些
+     * 索引 md（真机上表现为「文件在磁盘上、全局搜索却一个字都搜不到」）。
+     * 这条命令把库里每一本都重新走一遍 vault.create/modify，
+     * 让它们真正进到检索里。
+     *
+     * 注意：墨本里默认屏蔽了命令面板，所以在设置页也放了一颗同样的按钮。
+     */
+    this.addCommand({
+      id: "inkbook-rebuild-index",
+      name: "重建文字索引（让全局搜索能搜到所有手写本）",
+      callback: () => void this.rebuildTextIndex(),
+    });
+
     this.installSwipeGuard();
     this.installPaletteGuard();
 
@@ -104,6 +121,44 @@ export default class InkbookPlugin extends Plugin {
         }, 60);
       })
     );
+  }
+
+  /**
+   * 把库里所有手写本的文字索引重建一遍。
+   *
+   * 用途有二：
+   *   1. 旧版索引用 adapter 裸写，Obsidian 的文件表可能没收录 —— 重建一次就进检索了
+   *   2. 用户关掉过「生成文字索引」，后来想补回来
+   *
+   * 逐本读、逐本写：一本坏掉不影响其余，最后报个总数。
+   */
+  async rebuildTextIndex(): Promise<{ books: number; pages: number; failed: number }> {
+    const files = this.app.vault
+      .getFiles()
+      .filter((f) => (f.extension || "").toLowerCase() === "inkbook");
+    let books = 0;
+    let pages = 0;
+    let failed = 0;
+    for (const f of files) {
+      try {
+        const book = await readBook(this.app.vault.adapter, f.path, f.basename);
+        await writeTextIndex(this.app, f, book);
+        books += 1;
+        pages += book.pages.filter((p) => (p.texts ?? []).some((t) => (t.text || "").trim()))
+          .length;
+      } catch (e) {
+        failed += 1;
+        console.warn("[inkbook] 重建索引时读不出这一本，已跳过：" + f.path, e);
+      }
+    }
+    const msg =
+      files.length === 0
+        ? "墨本：库里还没有 .inkbook 手写本。"
+        : `墨本：${books} 本 / ${pages} 页有文字，已重建索引` +
+          (failed ? `（${failed} 本读取失败，已跳过）` : "") +
+          "。全局搜索现在能搜到这些页，点结果直接落在纸上。";
+    new Notice(msg, 10000);
+    return { books, pages, failed };
   }
 
   /** 处理 obsidian://inkbook?file=…&page=N */

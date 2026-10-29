@@ -291,7 +291,11 @@ async function main() {
   await plugin.onload();
   pass(true, "onload 完成");
   pass(Object.keys(plugin.__views).length === 1, "注册了视图：" + Object.keys(plugin.__views).join(","));
-  pass(plugin.__cmds.length === 3, "注册了 3 条命令：" + plugin.__cmds.map((c: any) => c.id).join(","));
+  pass(
+    plugin.__cmds.length === 4 &&
+      plugin.__cmds.some((c: any) => c.id === "inkbook-rebuild-index"),
+    "注册了 4 条命令（含重建索引）：" + plugin.__cmds.map((c: any) => c.id).join(",")
+  );
   pass(plugin.__ribbons.length === 2, "注册了 2 个侧栏图标");
   pass(!!plugin.__settingsTab, "注册了设置面板");
   pass(!!plugin.__protocols.inkbook, "注册了 obsidian://inkbook 跳页协议");

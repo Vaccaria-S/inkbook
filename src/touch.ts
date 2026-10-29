@@ -74,6 +74,19 @@ export class TouchArbiter {
   private penActive = false;
   private touchCount = 0;
   private gesturing = false;
+  /**
+   * 双指手势结束后的「余指禁行」。
+   *
+   * 真机现象：捏合放大缩小，松手时两根手指几乎不可能同时离开屏幕——
+   * 第一根抬起就结束手势，第二根还按在纸上。那一瞬间它从「手势的一根手指」
+   * 变成「一根普通手指」，会被判成 pan，页面立刻跟着它跑；
+   * 抬手时再补一下惯性。用户看到的就是「捏合完页面自己跳走了」。
+   *
+   * 所以：手势一结束就把标记立起来，剩下的手指在**全部抬起之前**
+   * 一律不产生任何动作（既不滚动也不落笔）。只有新的双指组合
+   * 才允许重新开始手势。
+   */
+  private holdAfterGesture = false;
   private cb: GestureCallbacks;
 
   constructor(cb: GestureCallbacks = {}) {
@@ -136,8 +149,19 @@ export class TouchArbiter {
       ).length;
       this.touchCount = liveTouches;
       if (this.touchCount >= 2) {
+        // 又凑齐两根：上一个手势的余指禁行立刻作废，开始新手势
+        this.holdAfterGesture = false;
         this.beginGesture();
         const role: TouchRole = "gesture";
+        this.cb.onRoleChange?.(role, e);
+        return role;
+      }
+      /*
+       * 上一个双指手势还有手指没抬完：这一根是"余指"，什么都不做。
+       * 不能判成 pan —— 那会让页面跟着它跑（见 holdAfterGesture 注释）。
+       */
+      if (this.holdAfterGesture) {
+        const role: TouchRole = "ignore";
         this.cb.onRoleChange?.(role, e);
         return role;
       }
@@ -177,7 +201,13 @@ export class TouchArbiter {
         this.cb.onRoleChange?.("gesture", e);
         return "gesture";
       }
+      // 手势已结束但还有手指没抬：这根手指的移动一律不算数
+      if (this.holdAfterGesture) {
+        this.cb.onRoleChange?.("ignore", e);
+        return "ignore";
+      }
       if (this.touchCount >= 2) {
+        this.holdAfterGesture = false;
         this.beginGesture();
         this.cb.onRoleChange?.("gesture", e);
         return "gesture";
@@ -215,6 +245,12 @@ export class TouchArbiter {
         this.cb.onRoleChange?.("ignore", e);
         return "ignore";
       }
+      // 所有手指都抬完了，余指禁行解除
+      if (this.touchCount === 0) this.holdAfterGesture = false;
+      if (this.holdAfterGesture) {
+        this.cb.onRoleChange?.("ignore", e);
+        return "ignore";
+      }
       this.cb.onRoleChange?.("pan", e);
       return "pan";
     }
@@ -238,6 +274,8 @@ export class TouchArbiter {
   private endGesture(): void {
     if (!this.gesturing) return;
     this.gesturing = false;
+    // 还有手指按在屏上 → 它们从这一刻起是"余指"，不许产生滚动
+    this.holdAfterGesture = this.touchCount > 0;
     this.cb.onGestureEnd?.();
   }
 
@@ -275,6 +313,7 @@ export class TouchArbiter {
     this.penActive = false;
     this.touchCount = 0;
     this.gesturing = false;
+    this.holdAfterGesture = false;
   }
 }
 

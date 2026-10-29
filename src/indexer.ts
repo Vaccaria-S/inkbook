@@ -119,19 +119,141 @@ interface AdapterLike {
 }
 
 /**
+ * vault 的一等文件 API（只需要这几个）。
+ *
+ * 为什么不能用 adapter 写索引：**见 writeIndexFile 的注释**。
+ * 这里只声明用到的部分，测试桩补几个函数就能跑。
+ */
+interface VaultLike {
+  getAbstractFileByPath: (path: string) => unknown;
+  createFolder?: (path: string) => Promise<unknown>;
+  create?: (path: string, data: string) => Promise<unknown>;
+  modify?: (file: unknown, data: string) => Promise<void>;
+  adapter: AdapterLike;
+}
+
+/**
+ * 这个 vault 是否具备完整的文件表 API。
+ *
+ * 测试桩里 `app.vault` 往往只有一个 adapter（跑单元测试用不着文件表），
+ * 那种情况下退回 adapter 直写，行为与旧版一致，不会把测试炸掉。
+ */
+function hasFileTable(vault: VaultLike | undefined): vault is VaultLike {
+  return !!vault && typeof vault.getAbstractFileByPath === "function";
+}
+
+/**
+ * 确保索引目录存在。
+ *
+ * 优先 `vault.createFolder`：它会把文件夹登记进 Obsidian 的文件表。
+ * 直接用 `adapter.mkdir` 建出来的目录，在 Obsidian 眼里可能"不存在"，
+ * 里面的文件也就跟着进不了全局搜索。
+ */
+async function ensureDir(vault: VaultLike, adapter: AdapterLike, dir: string): Promise<void> {
+  if (hasFileTable(vault) && vault.getAbstractFileByPath(dir)) return;
+  if (hasFileTable(vault) && typeof vault.createFolder === "function") {
+    try {
+      await vault.createFolder(dir);
+      if (vault.getAbstractFileByPath(dir)) return;
+    } catch (_) {
+      // 磁盘上已经有了（旧版用 adapter.mkdir 建的）→ createFolder 抛"已存在"。
+      // 这时候 Obsidian 只是没登记它，落盘照旧能写，这里不当作失败。
+    }
+  }
+  if (typeof adapter.mkdir === "function" && !(await adapter.exists(dir))) {
+    try {
+      await adapter.mkdir(dir);
+    } catch (_) {
+      /* 并发建目录时可能撞上，忽略 */
+    }
+  }
+}
+
+/**
+ * 写一个索引页。
+ *
+ * ### 为什么必须走 vault.create / vault.modify
+ *
+ * Obsidian 的全局搜索查的是它自己的文件表（`vault.getFiles()` 那张），
+ * 而这张表**只由 vault 的增删改流程维护**；`adapter.write` 是绕过文件表的裸写。
+ * 在 Windows 上批量新建目录时，外部变更监听很容易把整批 create 事件漏掉——
+ * 文件明明躺在磁盘上，Obsidian 却从来没听说过它，于是：
+ *
+ *   · 文件浏览器里看不到（或者要重启才出现）
+ *   · 全局搜索一个字都搜不到
+ *
+ * 这正是真机上「索引文件生成了、但全局检索还是搜不到手写本」的原因。
+ * 走 vault.create 之后，文件在写入的同时就被登记进文件表并进入检索。
+ *
+ * 内容没变就不写：省同步流量，也避免每次保存都让 Obsidian 重新解析一遍。
+ */
+async function writeIndexFile(
+  vault: VaultLike,
+  adapter: AdapterLike,
+  path: string,
+  content: string
+): Promise<void> {
+  // 没有文件表（测试桩 / 极老版本）：只能裸写，行为和旧版一致
+  if (!hasFileTable(vault)) {
+    if (await adapter.exists(path)) {
+      const old = await adapter.read(path);
+      if (old === content) return;
+    }
+    await adapter.write(path, content);
+    return;
+  }
+
+  const existing = vault.getAbstractFileByPath(path);
+  if (existing) {
+    let old = "";
+    try {
+      old = await adapter.read(path);
+    } catch (_) {
+      /* 读不出来就当作需要重写 */
+    }
+    if (old === content) return;
+    if (typeof vault.modify === "function") {
+      await vault.modify(existing, content);
+      return;
+    }
+    await adapter.write(path, content);
+    return;
+  }
+
+  if (typeof vault.create === "function") {
+    try {
+      await vault.create(path, content);
+      return;
+    } catch (_) {
+      /*
+       * 磁盘上已经有这个文件、但 Obsidian 没登记（旧版 adapter.write 的遗留）。
+       * create 会因为"文件已存在"失败——先删掉再建，才能把它收进文件表。
+       */
+      try {
+        if (typeof adapter.remove === "function" && (await adapter.exists(path))) {
+          await adapter.remove(path);
+          await vault.create(path, content);
+          return;
+        }
+      } catch (_) {
+        /* 落到下面的兜底 */
+      }
+    }
+  }
+  await adapter.write(path, content);
+}
+
+/**
  * 写索引：有文字的页各写一个文件，清掉多余的旧页与旧版单文件。
  *
- * 内容没变就不写（省同步与重解析）。失败只记日志——
- * 索引是附属品，不能因为它坏了就把「保存成功」报成失败。
+ * 失败只记日志——索引是附属品，不能因为它坏了就把「保存成功」报成失败。
  */
 export async function writeTextIndex(app: App, file: TFile, book: InkBook): Promise<void> {
   const dir = indexDirFor(file);
-  const adapter = app.vault.adapter as unknown as AdapterLike;
+  const vault = app.vault as unknown as VaultLike;
+  const adapter = (vault.adapter || (app.vault.adapter as unknown as AdapterLike));
   try {
-    if (!(await adapter.exists(dir))) {
-      if (typeof adapter.mkdir !== "function") return;
-      await adapter.mkdir(dir);
-    }
+    await ensureDir(vault, adapter, dir);
 
     const wanted = new Set<string>();
     for (let i = 0; i < book.pages.length; i += 1) {
@@ -142,11 +264,7 @@ export async function writeTextIndex(app: App, file: TFile, book: InkBook): Prom
       const hasText = (book.pages[i]?.texts ?? []).some((t) => (t.text || "").trim());
       if (!hasText) continue;
       wanted.add(path);
-      if (await adapter.exists(path)) {
-        const old = await adapter.read(path);
-        if (old === content) continue;
-      }
-      await adapter.write(path, content);
+      await writeIndexFile(vault, adapter, path, content);
     }
 
     // 页数变少 / 某页文字被清空：删掉对应的索引页
