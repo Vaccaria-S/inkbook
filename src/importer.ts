@@ -19,11 +19,12 @@ import {
   A4_HEIGHT,
   A4_WIDTH,
   createPage,
+  uid,
   type InkBook,
   type Page,
   type PageBackground,
 } from "./types";
-import { fitBackground, openPdf, pdfPageSize } from "./pdf";
+import { extractPdfText, fitBackground, openPdf, pdfPageSize } from "./pdf";
 import { parseDocxParagraphs, readZipText, renderDocxToPages } from "./word";
 
 export type ImportKind = "pdf" | "word";
@@ -104,7 +105,9 @@ export async function importPdf(
   file: TFile,
   bookPath: string,
   pageLimit = 0,
-  onProgress?: (done: number, total: number) => void
+  onProgress?: (done: number, total: number) => void,
+  /** 是否抽取文字层（默认抽；扫描版没有文字层，抽出来是空） */
+  extract = true
 ): Promise<ImportResult> {
   // 打开 PDF 只为拿页数和页面尺寸——这一步很快，
   // 因为 pdf.js 只读目录结构，不光栅化内容。
@@ -129,6 +132,35 @@ export async function importPdf(
       kind: "pdf",
     };
     page.background = bg;
+
+    /*
+     * 文字层（v2）：把这一页的原文抽出来存进本子。
+     *
+     * 为什么不"用的时候再抽"：原文抽出来之后，即使 PDF 被移动、
+     * 删除，或换设备打开，文字仍然可选、可搜、可导出。
+     * 抽不到（扫描版 PDF）就跳过，页面照常显示底图。
+     */
+    if (extract) {
+      try {
+        const lines = await extractPdfText(doc, i);
+        if (lines.length) {
+          const sx = size.width > 0 ? fit.width / size.width : 1;
+          const sy = size.height > 0 ? fit.height / size.height : 1;
+          page.texts = lines.map((t) => ({
+            id: uid("text"),
+            source: "pdf" as const,
+            x: fit.x + t.x * sx,
+            y: fit.y + t.y * sy,
+            size: Math.max(1, t.size * sy),
+            text: t.text,
+            width: Math.max(0, t.width * sx),
+          }));
+        }
+      } catch (_) {
+        // 单页抽取失败不影响导入：底图照旧，只是这页文字不可选
+      }
+    }
+
     pages.push(page);
     onProgress?.(i, limit);
   }

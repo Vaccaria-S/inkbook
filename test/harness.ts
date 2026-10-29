@@ -131,6 +131,124 @@ async function main() {
   editor.undo();
   pass(store.strokeCount === 2, "局部擦可撤销");
 
+  /* 文字：添加、编辑、删除、撤销、导出 */
+  {
+    editor.setTool("text");
+    pageEl().dispatchEvent(ev("pointerdown", 200, 300, 1, 21));
+    pageEl().dispatchEvent(ev("pointerup", 200, 300, 0, 21));
+    await sleep(60);
+    const ta = pageEl().querySelector(".mb-text-edit") as HTMLTextAreaElement;
+    pass(!!ta, "文字工具点页面后出现输入框");
+    pass(!!ta && document.activeElement === ta, "输入框自动获得焦点");
+
+    if (ta) {
+      ta.value = "第一行文字";
+      ta.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    }
+    await sleep(60);
+
+    const texts = store.data.pages[0].texts || [];
+    pass(texts.length === 1, "文字已写入页面数据（" + texts.length + " 条）");
+    pass(texts[0]?.source === "user", "来源标记为 user");
+    pass(texts[0]?.text === "第一行文字", "内容正确：" + JSON.stringify(texts[0]?.text || ""));
+    pass(Math.abs((texts[0]?.x ?? 0) - 200) < 2, "横向位置落在点击处（" + (texts[0]?.x ?? 0).toFixed(0) + "）");
+    pass(!pageEl().querySelector(".mb-text-edit"), "提交后输入框已移除");
+
+    const spans = pageEl().querySelectorAll(".mb-text.is-user");
+    pass(spans.length === 1 && spans[0].textContent === "第一行文字", "文字层渲染出可见文字");
+
+    // 点同一处：应该进入编辑，而不是叠一条新的
+    pageEl().dispatchEvent(ev("pointerdown", 206, 300, 1, 22));
+    pageEl().dispatchEvent(ev("pointerup", 206, 300, 0, 22));
+    await sleep(60);
+    const ta2 = pageEl().querySelector(".mb-text-edit") as HTMLTextAreaElement;
+    pass(!!ta2 && ta2.value === "第一行文字", "点已有文字进入编辑（预填原文）");
+
+    if (ta2) {
+      ta2.value = "";
+      ta2.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    }
+    await sleep(60);
+    pass((store.data.pages[0].texts || []).length === 0, "清空内容后删除该文字");
+
+    editor.undo();
+    await sleep(60);
+    pass((store.data.pages[0].texts || []).length === 1, "撤销后文字回来");
+    pass(
+      pageEl().querySelectorAll(".mb-text.is-user").length === 1,
+      "撤销后文字层同步刷新（不是只在数据里）"
+    );
+
+    // 导出画布必须画出用户文字，否则导出件"少一行字"
+    const c = editor.exportPageCanvas(0, 1);
+    const ctx = c.getContext("2d")!;
+    const px = ctx.getImageData(196, 286, 100, 24).data;
+    let dark = 0;
+    for (let i = 0; i < px.length; i += 4) {
+      if (px[i] < 120 && px[i + 1] < 120 && px[i + 2] < 120 && px[i + 3] > 0) dark++;
+    }
+    pass(dark > 5, "导出画布里画出了文字（暗像素 " + dark + "）");
+  }
+
+  /* 文本层：PDF 原文透明、书写时穿透、仅阅读可选 */
+  {
+    const page = store.data.pages[0];
+    page.texts = [
+      { id: "t_pdf1", source: "pdf", x: 120, y: 200, size: 12, text: "PDF 原文一行" },
+      { id: "t_pdf2", source: "pdf", x: 120, y: 230, size: 12, text: "Second line" },
+    ];
+    editor.renderPages();
+    await sleep(80);
+
+    const layer = pageEl().querySelector(".mb-textlayer") as HTMLElement;
+    pass(!!layer, "页面里有文字层 .mb-textlayer");
+    const pdfSpans = pageEl().querySelectorAll(".mb-text.is-pdf");
+    pass(pdfSpans.length === 2, "PDF 原文进了文字层（" + pdfSpans.length + " 行）");
+
+    const cs = getComputedStyle(pdfSpans[0] as HTMLElement);
+    const transparent =
+      cs.color === "rgba(0, 0, 0, 0)" ||
+      (cs as any).webkitTextFillColor === "rgba(0, 0, 0, 0)";
+    pass(transparent, "原文画成透明文字（视觉交给底图，避免重影）");
+
+    pass(
+      getComputedStyle(layer).pointerEvents === "none",
+      "书写时文字层穿透（不抢触摸）"
+    );
+
+    // 仅阅读：文字层接管指针，才能拖选复制
+    host.classList.add("mb-root", "is-reading");
+    await sleep(30);
+    pass(
+      getComputedStyle(layer).pointerEvents === "auto",
+      "仅阅读时文字层可选中（pointer-events:auto）"
+    );
+    pass(
+      getComputedStyle(layer).userSelect === "text",
+      "仅阅读时允许选择文字"
+    );
+
+    // 跨行选中要能复制成两行（否则粘出来是 "A行B行" 一长串）
+    const rg = document.createRange();
+    rg.setStart(pdfSpans[0], 0);
+    const lastNode = pdfSpans[1].firstChild;
+    if (lastNode) rg.setEnd(lastNode, (lastNode.textContent || "").length);
+    else rg.setEndAfter(pdfSpans[1]);
+    const sel = window.getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(rg);
+    const picked = sel?.toString() || "";
+    pass(picked.includes("\n"), "拖选两行，复制内容带换行：" + JSON.stringify(picked));
+    sel?.removeAllRanges();
+    host.classList.remove("is-reading");
+    host.classList.remove("mb-root");
+
+    // 收尾：别让这批文字影响后面的形状测试
+    page.texts = [];
+    editor.renderPages();
+    await sleep(80);
+  }
+
   /* 形状 */
   editor.setTool("shape");
   editor.setShapeKind("arrow");

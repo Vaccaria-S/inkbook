@@ -42,6 +42,7 @@ const HARNESSES = [
   "plugin-harness.ts",
   "jumptest.ts",
   "dockpreview.ts",
+  "textpreview.ts",
   "dock-harness.ts",
   "swipe-harness.ts",
   "touch-harness.ts",

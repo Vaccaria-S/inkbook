@@ -358,11 +358,11 @@ async function B() {
   v.containerEl.remove();
 }
 
-/** C8：version 2 拒开，且不写盘 */
+/** C8：version 3（未来版本）拒开，且不写盘 */
 async function C8() {
   const p = "C8.inkbook";
   const b: any = mkBook("C8本", 3, 2);
-  b.version = 2;
+  b.version = 3;
   const text = JSON.stringify(b);
   seed(p, text);
   const v = await openView();
@@ -405,11 +405,11 @@ function drawOnPage(v: any, pageIdx = 0): boolean {
   return true;
 }
 
-/** C9：version 2 + 合法 .bak → 不许被备份接住，必须如实报「请升级」 */
+/** C9：version 3 + 合法 .bak → 不许被备份接住，必须如实报「请升级」 */
 async function C9() {
   const p = "C9.inkbook";
   const b2: any = mkBook("C9本", 2, 1);
-  b2.version = 2;
+  b2.version = 3;
   const text = JSON.stringify(b2);
   seed(p, text);
   seed(p + ".bak", JSON.stringify(mkBook("C9本-旧备份", 4, 2))); // version 1 的合法备份
@@ -557,6 +557,12 @@ async function D12() {
     height: 900,
     kind: "pdf",
   };
+  b.pages[0].texts = [
+    { id: "t1", source: "pdf", x: 100, y: 200, size: 12, text: "原文一行", width: 80 },
+    { id: "t2", source: "user", x: 150, y: 260, size: 20, color: "#D64545", text: "我加的字" },
+  ];
+  // 空数组表示"抽过但没文字"（扫描版），必须原样保留，否则每次挂载都重抽
+  b.pages[1].texts = [];
   b.futureField = 1;
   b.pages[0].futurePageField = "x";
   seed(p, JSON.stringify(b));
@@ -579,7 +585,21 @@ async function D12() {
     !!saved?.pages?.[0]?.background && saved.pages[0].background.src === "附件/底图.png",
     "D12① background 仍在=" + JSON.stringify(saved?.pages?.[0]?.background?.src)
   );
-  pass(typeof saved?.version === "number" && saved.version === 1, "D12 version 是 number 且=1：" + JSON.stringify(saved?.version));
+  pass(typeof saved?.version === "number" && saved.version === 2, "D12 version 是 number 且=2（v2 起有 texts）：" + JSON.stringify(saved?.version));
+  pass(
+    saved?.pages?.[0]?.texts?.length === 2,
+    "D12 文字层往返：2 条（" + JSON.stringify(saved?.pages?.[0]?.texts?.length) + "）"
+  );
+  pass(
+    saved?.pages?.[0]?.texts?.[0]?.source === "pdf" &&
+      saved?.pages?.[0]?.texts?.[0]?.text === "原文一行" &&
+      saved?.pages?.[0]?.texts?.[1]?.color === "#D64545",
+    "D12 文字内容/来源/颜色都保住了"
+  );
+  pass(
+    Array.isArray(saved?.pages?.[1]?.texts) && saved.pages[1].texts.length === 0,
+    "D12 空文字数组被保留（代表已抽过，不用重抽）"
+  );
   known(
     "D12②[P1 不做，留 P2 透传 __unknown] 未知书籍字段 futureField 保留=" +
       JSON.stringify(saved?.futureField) + "（现状：被 normalizeBook 白名单丢弃，已知问题）"

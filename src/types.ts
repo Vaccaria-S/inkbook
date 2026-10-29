@@ -3,7 +3,7 @@ export type ToolId =
   | "ballpoint"
   | "highlighter"
   | "eraser"
-  
+  | "text"
   | "shape"
   | "hand";
 
@@ -22,6 +22,33 @@ export interface Stroke {
   opacity: number;
   points: Pt[];
   shape?: ShapeKind;
+}
+
+/**
+ * 页面上的一段文字。
+ *
+ * 两种来源合在一个数组里，渲染、选中、搜索、导出都走同一条链路：
+ *   · `pdf`  —— 导入 PDF 时抽取的原文，只读，画成透明文字（视觉由底图承担）
+ *   · `user` —— 手动添加，可编辑、可删除，正常显示颜色
+ *
+ * 坐标是**页面坐标系**（A4 794×1123），与笔迹共用同一套，缩放时不用换算。
+ */
+export interface PageText {
+  id: string;
+  source: "pdf" | "user";
+  /** 左端、基线位置（页面坐标） */
+  x: number;
+  y: number;
+  /** 文本内容；用户文字可以带 \n 换行 */
+  text: string;
+  /** 字号（页面坐标 px） */
+  size: number;
+  /** 颜色，仅 user 用 */
+  color?: string;
+  /** 字重，仅 user 用 */
+  bold?: boolean;
+  /** 原文在 PDF 里的宽度（页面坐标），仅 pdf 用，用于选中高亮对齐 */
+  width?: number;
 }
 
 export interface Layer {
@@ -76,10 +103,15 @@ export interface Page {
   activeLayerId: string;
   /** 底图（导入的 PDF / Word）；没有就是普通纸 */
   background?: PageBackground;
+  /**
+   * 页面上的文字：PDF 原文 + 手动添加的。
+   * 可选——没有文字的页面不写这个字段，省体积。
+   */
+  texts?: PageText[];
 }
 
 export interface InkBook {
-  /** 文件格式版本。当前支持 1，见 storage.ts 的 CURRENT_VERSION */
+  /** 文件格式版本。当前是 2（v2 起页面可以带 texts），见 storage.ts 的 CURRENT_VERSION */
   version: number;
   kind: "inkbook";
   title: string;

@@ -741,6 +741,76 @@
   cursor: grabbing;
 }
 
+/* ---------------------------- 文字层 ----------------------------
+ *
+ * PDF 原文 + 手动添加的文字都挂在这一层。
+ *
+ * 层序：canvas（底图+笔迹） → textlayer → overlay（草稿/光标）。
+ * 必须在 canvas 之后：底图是不透明白底，放下面会被整块盖住。
+ *
+ * 默认 pointer-events:none —— 写字时这一层必须完全穿透，
+ * 否则手指点上来会被文字吃掉，写不出笔。只有进入仅阅读才接管指针。
+ *
+ * 尺寸写死成页面坐标系（794×1123 之类），整层用 --mb-zoom 缩放：
+ * 这样缩放时不用重算每个字的位置。
+ */
+.mb-textlayer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 794px;
+  height: 1123px;
+  transform-origin: 0 0;
+  transform: scale(var(--mb-zoom, 1));
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+  overflow: hidden;
+}
+
+.mb-text {
+  position: absolute;
+  display: block;
+  line-height: 1;
+  white-space: pre;
+  transform-origin: 0 0;
+}
+
+/* PDF 原文：字是透明的，看到的是底图上的字；这一层只负责"能被选中" */
+.mb-text.is-pdf {
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+}
+
+/* 仅阅读模式才允许选字：这时本来就不写字，不会抢触摸 */
+.mb-root.is-reading .mb-textlayer {
+  pointer-events: auto;
+  user-select: text;
+  -webkit-user-select: text;
+  touch-action: auto;
+}
+
+.mb-root.is-reading .mb-text {
+  cursor: text;
+}
+
+/* 编辑框：覆盖在页面上，跟随缩放定位 */
+.mb-text-edit {
+  position: absolute;
+  z-index: 6;
+  margin: 0;
+  padding: 2px 4px;
+  border: 1px solid var(--interactive-accent, #6c5ce7);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 2px 10px -4px rgba(0, 0, 0, 0.4);
+  color: var(--text-normal, #1a1a1a);
+  outline: none;
+  resize: none;
+  overflow: hidden;
+  white-space: pre;
+}
+
 .mb-canvas,
 .mb-overlay {
   position: absolute;

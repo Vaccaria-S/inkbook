@@ -130,6 +130,87 @@ export async function renderPdfPage(
   return { bitmap, width: viewport.width, height: viewport.height };
 }
 
+/**
+ * 一页里的一行文字（坐标是 **viewport(scale=1)** 的，y 向下）。
+ *
+ * 调用方要按底图摆放比例映射到页面坐标系：
+ *   pageX = bg.x + line.x * (bg.width  / pdfW)
+ *   pageY = bg.y + line.y * (bg.height / pdfH)
+ */
+export interface PdfTextLine {
+  x: number;
+  y: number;
+  size: number;
+  text: string;
+  width: number;
+}
+
+/** 2×3 矩阵乘法，与 pdf.js 的 Util.transform 同义（不依赖内部导出） */
+function mulMatrix(m1: number[], m2: number[]): number[] {
+  return [
+    m1[0] * m2[0] + m1[2] * m2[1],
+    m1[1] * m2[0] + m1[3] * m2[1],
+    m1[0] * m2[2] + m1[2] * m2[3],
+    m1[1] * m2[2] + m1[3] * m2[3],
+    m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
+    m1[1] * m2[4] + m1[3] * m2[5] + m1[5],
+  ];
+}
+
+/**
+ * 抽取 PDF 一页的文字，按行合并。
+ *
+ * 目的不是"还原排版"，而是让这些字**能被选中、能被搜到**：
+ *   · 一行一个结果，坐标取行首基线；
+ *   · PDF 常把一句话拆成好几个 item（换字体、加粗、字距），
+ *     这里按 y 聚类、按 x 排序，间距大的地方补一个空格；
+ *   · 扫描版 PDF 没有文字层，返回空数组——那种只能等 OCR。
+ *
+ * 只解析文本，不光栅化，所以比 renderPdfPage 快一个量级。
+ */
+export async function extractPdfText(
+  doc: PdfDoc,
+  pageNo: number
+): Promise<PdfTextLine[]> {
+  const page = await doc.getPage(pageNo);
+  const viewport = page.getViewport({ scale: 1 });
+  const content = await page.getTextContent();
+  const items: Array<{ x: number; y: number; size: number; text: string; width: number }> = [];
+
+  for (const raw of (content?.items || []) as any[]) {
+    const str = typeof raw?.str === "string" ? raw.str : "";
+    if (!str.trim()) continue;
+    if (!Array.isArray(raw.transform)) continue;
+    const tr = mulMatrix(viewport.transform as number[], raw.transform as number[]);
+    const x = Number(tr[4]) || 0;
+    const y = Number(tr[5]) || 0;
+    // 字号 = 变换后竖直方向的长度；拿不到就退回 item.height
+    const size = Math.max(1, Math.hypot(tr[2], tr[3]) || Number(raw.height) || 10);
+    const width = Math.max(0, Number(raw.width) || 0);
+    items.push({ x, y, size, text: str, width });
+  }
+
+  page.cleanup();
+
+  // 先从左上到右下排一遍，再把同一水平线上的合并成行
+  items.sort((a, b) => a.y - b.y || a.x - b.x);
+  const lines: PdfTextLine[] = [];
+  for (const it of items) {
+    const last = lines[lines.length - 1];
+    if (last && Math.abs(last.y - it.y) <= Math.max(last.size, it.size) * 0.55) {
+      const gap = it.x - (last.x + last.width);
+      if (gap > it.size * 0.22 && !/\s$/.test(last.text) && !/^\s/.test(it.text)) {
+        last.text += " ";
+      }
+      last.text += it.text;
+      last.width = Math.max(last.width, it.x + it.width - last.x);
+    } else {
+      lines.push({ x: it.x, y: it.y, size: it.size, text: it.text, width: it.width });
+    }
+  }
+  return lines.filter((l) => l.text.trim().length > 0);
+}
+
 /** 读一页的尺寸，不渲染 */
 export async function pdfPageSize(
   doc: PdfDoc,

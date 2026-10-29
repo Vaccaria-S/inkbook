@@ -40,6 +40,7 @@ const TOOLS: Array<{ id: ToolId; icon: string; name: string; short: string }> = 
   { id: "ballpoint", icon: "pencil", name: "圆珠笔 (B)", short: "圆珠" },
   { id: "highlighter", icon: "highlighter", name: "荧光笔 (H)", short: "荧光" },
   { id: "eraser", icon: "eraser", name: "橡皮 (E)", short: "橡皮" },
+  { id: "text", icon: "type", name: "文字 (T)", short: "文字" },
   { id: "shape", icon: "square", name: "形状 (R)", short: "形状" },
   { id: "hand", icon: "hand", name: "拖动画布", short: "拖动" },
 ];
@@ -1234,6 +1235,13 @@ export class InkbookView extends FileView {
       return;
     }
 
+    if (s.tool === "text") {
+      this.dynEl.createSpan({
+        cls: "mb-hint",
+        text: "点页面输入文字；点已有文字可编辑，清空即删除",
+      });
+      return;
+    }
     if (s.tool === "hand") {
       this.dynEl.createSpan({ cls: "mb-hint", text: "拖动画布；滚轮 / 双指也可以" });
       return;
@@ -1552,9 +1560,9 @@ export class InkbookView extends FileView {
     };
     this.stylusBtn = inputRow.createEl("button", {
       cls: "mb-ib",
-      attr: { "aria-label": "只认触控笔 (T)" },
+      attr: { "aria-label": "只认触控笔 (I)" },
     });
-    this.stylusBtn.title = "只认触控笔：手指只滚动，掌根不落笔 (T)";
+    this.stylusBtn.title = "只认触控笔：手指只滚动，掌根不落笔 (I)";
     setIcon(this.stylusBtn, "tablet");
     this.stylusBtn.onclick = () => {
       const on = !this.plugin.settings.penOnly;
@@ -2192,7 +2200,8 @@ export class InkbookView extends FileView {
     else if (k === "h") this.editor.setTool("highlighter");
     else if (k === "e") this.editor.setTool("eraser");
     else if (k === "r") this.editor.setTool("shape");
-    else if (k === "t") {
+    else if (k === "t") this.editor.setTool("text");
+    else if (k === "i") {
       const on = !this.plugin.settings.penOnly;
       this.plugin.settings.penOnly = on;
       this.plugin.saveSettings();

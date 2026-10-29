@@ -2,6 +2,7 @@ import {
   activeLayer,
   type Page,
   type PageBackground,
+  type PageText,
   type PaperId,
   type Pt,
   type ShapeKind,
@@ -16,7 +17,7 @@ import { OneEuroFilter, shapePressure, speedWidthFactor } from "./filter";
 import { TouchArbiter, type PinchInfo, type PointerInfo, type TouchRole } from "./touch";
 import { drawPaper, paperBackground } from "./paper";
 import { BitmapCache } from "./cache";
-import { openPdf, renderPdfPage, type PdfDoc } from "./pdf";
+import { extractPdfText, openPdf, pdfPageSize, renderPdfPage, type PdfDoc } from "./pdf";
 import {
   clamp,
   splitStrokeByEraser,
@@ -69,6 +70,8 @@ interface PageRec {
   wrap: HTMLElement;
   pageEl: HTMLElement;
   canvas: HTMLCanvasElement | null;
+  /** 文字层：PDF 原文（透明）+ 手动添加的文字 */
+  textLayer: HTMLElement | null;
   overlay: HTMLCanvasElement | null;
   ctx: CanvasRenderingContext2D | null;
   octx: CanvasRenderingContext2D | null;
@@ -85,6 +88,16 @@ interface PageRec {
 }
 
 type Gesture = "none" | "draw" | "shape" | "erase" | "pan";
+
+/**
+ * 文字对象的字体栈。
+ *
+ * 屏幕渲染、编辑框、导出画布三处必须用同一个字符串，
+ * 否则"编辑时是这个宽度、保存后变另一个宽度"。
+ * 中文优先落到系统自带的黑体，不额外打包字体（导出矢量文字时才需要嵌，见三期）。
+ */
+const TEXT_FONT =
+  '-apple-system, BlinkMacSystemFont, "Noto Sans SC", "Microsoft YaHei", "PingFang SC", sans-serif';
 
 /**
  * 单张画布允许的最大像素数。
@@ -187,6 +200,18 @@ export class BookEditor {
   private observer: IntersectionObserver | null = null;
   private current = 0;
   private gesture: Gesture = "none";
+  /** 正在编辑的文字框（同一时刻只有一个） */
+  private textEdit: {
+    rec: PageRec;
+    el: HTMLTextAreaElement;
+    id: string | null;
+    x: number;
+    y: number;
+    size: number;
+    color: string;
+  } | null = null;
+  /** 正在补抽文字的页（防止重复触发） */
+  private textExtracting = new Set<number>();
   private pointerId: number | null = null;
   private draft: Stroke | null = null;
   private draftRec: PageRec | null = null;
@@ -622,6 +647,7 @@ export class BookEditor {
       wrap,
       pageEl,
       canvas: null,
+      textLayer: null,
       overlay: null,
       ctx: null,
       octx: null,
@@ -680,6 +706,8 @@ export class BookEditor {
   }
 
   renderPages(): void {
+    // 编辑框挂在页面 DOM 上，重建前先落盘，否则输入的内容跟着 DOM 一起消失
+    this.commitTextEdit();
     // 页面全部重建，旧的锚点索引失效
     this.lockedAnchor = null;
     this.draft = null;
@@ -743,6 +771,8 @@ export class BookEditor {
     // 一次写入，所有页继承
     this.docEl.style.setProperty("--mb-page-w", `${w}px`);
     this.docEl.style.setProperty("--mb-page-h", `${h}px`);
+    // 文字层按页面坐标写死尺寸，整体用这个变量缩放
+    this.docEl.style.setProperty("--mb-zoom", String(this.zoom));
     // 只重建已挂载页的 canvas（数量很少，通常 1-3 个）
     for (const rec of this.recs) {
       if (rec.mounted) this.resizeRec(rec);
@@ -1201,9 +1231,24 @@ export class BookEditor {
     overlay.className = "mb-overlay";
     rec.pageEl.insertBefore(overlay, rec.pageEl.firstChild);
     rec.pageEl.insertBefore(canvas, overlay);
+    /*
+     * 文字层夹在笔迹画布和 overlay 之间：
+     *   · 必须在 canvas 之后——底图（PDF 位图）就画在 canvas 上，不透明，
+     *     放到下面会被整块盖住；
+     *   · 必须在 overlay 之前——overlay 是草稿与光标，要压在文字上面。
+     */
+    const textLayer = document.createElement("div");
+    textLayer.className = "mb-textlayer";
+    // 层的尺寸跟着页面数据走（A4 是 794×1123，但别把这个数字写死两遍）
+    textLayer.style.width = `${this.store.data.width}px`;
+    textLayer.style.height = `${this.store.data.height}px`;
+    rec.pageEl.insertBefore(textLayer, overlay);
+    rec.textLayer = textLayer;
     rec.canvas = canvas;
     rec.overlay = overlay;
     rec.mounted = true;
+    this.renderTextLayer(rec);
+    this.ensurePageTexts(rec);
     this.resizeRec(rec);
   }
 
@@ -1211,9 +1256,12 @@ export class BookEditor {
     if (!rec.mounted) return;
     // 正在这一页写字时不卸载（会打断笔画）
     if (!force && rec.index === this.current && this.gesture !== "none") return;
+    this.commitTextEdit();
     rec.canvas?.remove();
+    rec.textLayer?.remove();
     rec.overlay?.remove();
     rec.canvas = null;
+    rec.textLayer = null;
     rec.overlay = null;
     rec.ctx = null;
     rec.octx = null;
@@ -1649,6 +1697,257 @@ export class BookEditor {
     }
   }
 
+  /* ------------------------------- 文字层 ------------------------------- */
+
+  /**
+   * 按页数据重建文字层的 DOM。
+   *
+   * 每段文字一个绝对定位的 span，坐标直接用**页面坐标系**，
+   * 整层再用 CSS 变量 --mb-zoom 缩放——这样缩放时不用重算每个字的位置。
+   *
+   * PDF 原文是透明的：视觉上的字由底图位图承担，这层只负责
+   * 「能被选中、能被复制、能被搜到」。用户添加的文字才真正显示颜色。
+   */
+  private renderTextLayer(rec: PageRec): void {
+    const layer = rec.textLayer;
+    if (!layer) return;
+    layer.textContent = "";
+    const page = this.store.data.pages[rec.index];
+    const texts = page?.texts;
+    if (!texts || !texts.length) return;
+
+    for (const t of texts) {
+      const el = document.createElement("span");
+      el.className = "mb-text " + (t.source === "user" ? "is-user" : "is-pdf");
+      /*
+       * PDF 原文每行末尾补一个换行：拖选多行时复制出来才是分开的句子。
+       * 绝对定位的 span 之间浏览器不会自动插入分隔符，不补就成了
+       * "Line 0 of page 1Line 1 of page 1" 一长串。
+       * 用户文字不补——它自己的 \n 就是用户想要的换行。
+       */
+      el.textContent = t.text + (t.source === "pdf" ? "\n" : "");
+      el.dataset.id = t.id;
+      el.style.left = `${t.x}px`;
+      el.style.top = `${t.y}px`;
+      el.style.fontSize = `${t.size}px`;
+      el.style.fontFamily = TEXT_FONT;
+      // 数据里 y 是基线，span 的定位点是顶边，往上挪约 0.82 个字高
+      el.style.transform = "translateY(-0.82em)";
+      if (t.source === "user") {
+        el.style.color = t.color || "#1A1A1A";
+        if (t.bold) el.style.fontWeight = "600";
+      }
+      layer.appendChild(el);
+    }
+  }
+
+  /**
+   * 给老本子补抽文字层。
+   *
+   * v2 之前的本子只记了「这页来自哪个 PDF」，没有 texts。
+   * 翻到这一页时后台抽一次并存下来，用户不用重新导入。
+   * 判别用「texts 是不是数组」而不是「有没有内容」：
+   * 抽过但没文字（扫描版）要写空数组，否则每次挂载都白抽一遍。
+   */
+  private ensurePageTexts(rec: PageRec): void {
+    const page = this.store.data.pages[rec.index];
+    const pdf = page?.background?.pdf;
+    if (!pdf) return;
+    if (Array.isArray(page.texts)) return;
+    if (this.textExtracting.has(rec.index)) return;
+    this.textExtracting.add(rec.index);
+
+    void (async () => {
+      try {
+        const doc = await this.openPdfDoc(pdf.path);
+        const [lines, size] = await Promise.all([
+          extractPdfText(doc, pdf.page),
+          pdfPageSize(doc, pdf.page),
+        ]);
+        const target = this.store.data.pages[rec.index];
+        const bg = target?.background;
+        if (!target || !bg || Array.isArray(target.texts)) return;
+        const sx = size.width > 0 ? bg.width / size.width : 1;
+        const sy = size.height > 0 ? bg.height / size.height : 1;
+        target.texts = lines.map((l) => ({
+          id: uid("text"),
+          source: "pdf" as const,
+          x: bg.x + l.x * sx,
+          y: bg.y + l.y * sy,
+          size: Math.max(1, l.size * sy),
+          text: l.text,
+          width: Math.max(0, l.width * sx),
+        }));
+        const live = this.recs[rec.index];
+        if (live) this.renderTextLayer(live);
+        this.store.touch();
+        this.changed();
+      } catch (_) {
+        // 抽不出来（PDF 被移走 / 扫描版）：记一个空数组，别每次挂载都重试
+        const target = this.store.data.pages[rec.index];
+        if (target && !Array.isArray(target.texts)) target.texts = [];
+      } finally {
+        this.textExtracting.delete(rec.index);
+      }
+    })();
+  }
+
+  /** 估算一段文字的宽度（页面坐标），用于点击命中，不追求像素级 */
+  private measureTextWidth(t: PageText): number {
+    let max = 0;
+    for (const line of t.text.split("\n")) max = Math.max(max, line.length);
+    // 中英混排按 0.62 个字宽估：宁可框大一点，也别点不中
+    return max * t.size * 0.62;
+  }
+
+  private hitText(texts: PageText[], x: number, y: number): PageText | null {
+    for (let i = texts.length - 1; i >= 0; i--) {
+      const t = texts[i];
+      if (t.source !== "user") continue;
+      const w = this.measureTextWidth(t);
+      const top = t.y - t.size * 1.18;
+      const h = t.size * 1.6 * Math.max(1, t.text.split("\n").length);
+      if (x >= t.x - 3 && x <= t.x + w + 8 && y >= top && y <= top + h) return t;
+    }
+    return null;
+  }
+
+  /**
+   * 开始编辑：点在已有文字上就改它，点在空白处就新建。
+   *
+   * 编辑框是页面里的一个 textarea，位置按当前缩放换算——
+   * 所见即所得，提交后交给文字层渲染。
+   */
+  private beginTextEdit(rec: PageRec, px: number, py: number): void {
+    if (this.readOnly) return;
+    this.commitTextEdit();
+    const page = this.store.data.pages[rec.index];
+    if (!page) return;
+
+    const hit = this.hitText(page.texts ?? [], px, py);
+    const size = hit?.size ?? 18;
+    const color = hit?.color ?? this.penColor;
+    const x = hit ? hit.x : px;
+    // 新建时让点击点落在文字中部（基线在下方约 0.82 字高）
+    const y = hit ? hit.y : py + size * 0.82;
+
+    const ta = document.createElement("textarea");
+    ta.className = "mb-text-edit";
+    ta.spellcheck = false;
+    ta.value = hit?.text ?? "";
+    ta.style.fontFamily = TEXT_FONT;
+    ta.style.fontSize = `${size * this.zoom}px`;
+    ta.style.lineHeight = "1.32";
+    ta.style.color = color;
+    ta.style.left = `${x * this.zoom}px`;
+    ta.style.top = `${(y - size * 0.82) * this.zoom}px`;
+    ta.style.minWidth = `${Math.max(96, (hit ? this.measureTextWidth(hit) : 140) * this.zoom)}px`;
+    rec.pageEl.appendChild(ta);
+
+    this.textEdit = { rec, el: ta, id: hit?.id ?? null, x, y, size, color };
+
+    let done = false;
+    const finish = (save: boolean) => {
+      if (done) return;
+      done = true;
+      this.commitTextEdit(save);
+    };
+
+    // 编辑框里的手势不交给画布（否则点一下会顺手画一笔）
+    ta.addEventListener("pointerdown", (e) => e.stopPropagation());
+    ta.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") {
+        e.preventDefault();
+        finish(false);
+      } else if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        finish(true);
+      }
+    });
+    ta.addEventListener("blur", () => finish(true));
+    // 高度跟着内容长，别让两行字挤在一行的高度里
+    ta.addEventListener("input", () => {
+      ta.style.height = "auto";
+      ta.style.height = `${ta.scrollHeight}px`;
+    });
+
+    requestAnimationFrame(() => {
+      ta.focus();
+      ta.select();
+      ta.style.height = `${ta.scrollHeight}px`;
+    });
+  }
+
+  /** 收掉编辑框。save=false 用于 Esc / 页面被卸载时丢弃 */
+  private commitTextEdit(save = true): void {
+    const ed = this.textEdit;
+    if (!ed) return;
+    this.textEdit = null;
+    const value = ed.el.value.replace(/\s+$/g, "");
+    ed.el.remove();
+    if (!save) return;
+
+    const rec = ed.rec;
+    const page = this.store.data.pages[rec.index];
+    if (!page) return;
+    const arr = page.texts ?? [];
+    const old = ed.id ? arr.find((t) => t.id === ed.id) : undefined;
+
+    if (old) {
+      if (!value) {
+        this.store.snapshotPage(rec.index);
+        page.texts = arr.filter((t) => t.id !== old.id);
+      } else if (value !== old.text) {
+        this.store.snapshotPage(rec.index);
+        old.text = value;
+      } else {
+        return; // 没改动
+      }
+    } else if (value) {
+      this.store.snapshotPage(rec.index);
+      const item: PageText = {
+        id: uid("text"),
+        source: "user",
+        x: ed.x,
+        y: ed.y,
+        size: ed.size,
+        color: ed.color,
+        text: value,
+      };
+      page.texts = arr.concat(item);
+    } else {
+      return; // 新建但没输入
+    }
+
+    this.store.touch();
+    this.changed();
+    this.renderTextLayer(rec);
+    this.emitState();
+  }
+
+  /**
+   * 导出时把用户添加的文字画进位图。
+   *
+   * PDF 原文不用画：底图位图里已经有那些字了。
+   * 用户文字不画就会"导出的文件里少了字"，这是必须补的一步。
+   */
+  private drawUserTexts(ctx: CanvasRenderingContext2D, page: Page): void {
+    const texts = page.texts?.filter((t) => t.source === "user");
+    if (!texts || !texts.length) return;
+    for (const t of texts) {
+      ctx.save();
+      ctx.fillStyle = t.color || "#1A1A1A";
+      ctx.font = `${t.bold ? "600 " : ""}${t.size}px ${TEXT_FONT}`;
+      ctx.textBaseline = "alphabetic";
+      const lines = t.text.split("\n");
+      for (let i = 0; i < lines.length; i++) {
+        ctx.fillText(lines[i], t.x, t.y + i * t.size * 1.32);
+      }
+      ctx.restore();
+    }
+  }
+
   private scheduleOverlay(rec: PageRec): void {
     if (this.overlayRaf) return;
     this.overlayRaf = requestAnimationFrame(() => {
@@ -1872,6 +2171,7 @@ export class BookEditor {
     this.readOnly = on;
     if (on) {
       this.cancelStroke();
+      this.commitTextEdit();
     }
     this.emitState();
   }
@@ -1916,6 +2216,18 @@ export class BookEditor {
     if (role === "pan") {
       // 单指：默认滚动页面（touch-action 已放开）
       if (this.arbiter.touchCountNow >= 2) return;
+      /*
+       * 文字工具例外：平板上用手指点一下就该出输入框，
+       * 不然"添加文字"在平板上等于不能用（手指只会滚动）。
+       */
+      if (this.tool === "text" && !this.readOnly) {
+        const p = this.pointFromEvent(e, rec);
+        this.current = rec.index;
+        this.store.setPage(rec.index);
+        this.beginTextEdit(rec, p[0], p[1]);
+        e.preventDefault();
+        return;
+      }
       this.gesture = "pan";
       this.pointerId = e.pointerId;
       this.pan = {
@@ -1938,6 +2250,10 @@ export class BookEditor {
      *   · 鼠标左键同理
      */
     if (this.readOnly) {
+      if ((e.target as HTMLElement)?.closest?.(".mb-textlayer")) {
+        // 文字层要能拖选：不捕获指针、不 preventDefault，让浏览器自己处理
+        return;
+      }
       this.gesture = "pan";
       this.pointerId = e.pointerId;
       this.pan = {
@@ -1962,6 +2278,12 @@ export class BookEditor {
     this.current = rec.index;
     this.store.setPage(rec.index);
     this.emitState();
+
+    if (this.tool === "text") {
+      const tp = this.pointFromEvent(e, rec);
+      this.beginTextEdit(rec, tp[0], tp[1]);
+      return;
+    }
 
     if (this.tool === "hand" || (e.pointerType === "mouse" && e.button === 1)) {
       this.gesture = "pan";
@@ -2468,7 +2790,15 @@ export class BookEditor {
       this.renderPages();
     } else {
       this.current = clamp(this.store.data.activePage, 0, this.recs.length - 1);
-      for (const rec of this.recs) if (rec.mounted) this.renderRec(rec);
+      /*
+       * 整页快照替换后 page 对象是新的，文字层必须跟着重建——
+       * 只重画 canvas 的话，撤销掉一段文字，纸面上那行字还在。
+       */
+      for (const rec of this.recs) {
+        if (!rec.mounted) continue;
+        this.renderRec(rec);
+        this.renderTextLayer(rec);
+      }
       const rec = this.recs[this.current];
       if (rec) this.renderOverlay(rec);
     }
@@ -2484,7 +2814,15 @@ export class BookEditor {
       this.renderPages();
     } else {
       this.current = clamp(this.store.data.activePage, 0, this.recs.length - 1);
-      for (const rec of this.recs) if (rec.mounted) this.renderRec(rec);
+      /*
+       * 整页快照替换后 page 对象是新的，文字层必须跟着重建——
+       * 只重画 canvas 的话，撤销掉一段文字，纸面上那行字还在。
+       */
+      for (const rec of this.recs) {
+        if (!rec.mounted) continue;
+        this.renderRec(rec);
+        this.renderTextLayer(rec);
+      }
       const rec = this.recs[this.current];
       if (rec) this.renderOverlay(rec);
     }
@@ -2545,6 +2883,8 @@ export class BookEditor {
       if (!layer.visible) continue;
       for (const s of layer.strokes) drawStroke(ctx, s, layer.opacity);
     }
+    // 文字最后画：跟屏幕上的层序一致（文字层在笔迹之上）
+    this.drawUserTexts(ctx, page);
     return canvas;
   }
 

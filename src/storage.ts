@@ -15,7 +15,12 @@ import {
  * 而不是照旧解析——老版本代码不认识新字段，normalizeBook 会把它们
  * 全丢掉，再保存一次就把新版本写的东西永久抹掉了。
  */
-export const CURRENT_VERSION = 1;
+export const CURRENT_VERSION = 2;
+/*
+ * 版本历史：
+ *   1 —— 初版（笔迹 + 底图）
+ *   2 —— 页面可以带 texts（PDF 原文文本层 + 手动添加的文字）
+ */
 
 /** 备份后缀：每次写正文前把旧内容抄到这里 */
 const BACKUP_SUFFIX = ".bak";
@@ -181,6 +186,40 @@ export function normalizeBook(raw: any, fallbackTitle: string): InkBook {
       layers,
       activeLayerId: active.id,
     };
+    /*
+     * 文字层（v2）：PDF 原文 + 手动添加的文字。
+     * 同样白名单重建——旧版文件没有这个字段，读出来就是空数组。
+     */
+    const texts = Array.isArray(p?.texts)
+      ? p.texts
+          .filter(
+            (t: any) =>
+              t &&
+              typeof t.text === "string" &&
+              t.text.length > 0 &&
+              Number.isFinite(Number(t.x)) &&
+              Number.isFinite(Number(t.y)) &&
+              Number.isFinite(Number(t.size))
+          )
+          .map((t: any) => {
+            const item: any = {
+              id: String(t.id || `text_${Math.random().toString(36).slice(2, 9)}`),
+              source: t.source === "user" ? "user" : "pdf",
+              x: Number(t.x),
+              y: Number(t.y),
+              text: String(t.text),
+              size: Math.max(1, Number(t.size)),
+            };
+            if (typeof t.color === "string") item.color = t.color;
+            if (t.bold === true) item.bold = true;
+            if (Number.isFinite(Number(t.width))) item.width = Number(t.width);
+            return item;
+          })
+      : [];
+    // 空数组也要保留：它表示"这页抽过了、只是没有文字"（扫描版），
+    // 丢掉的话每次挂载都会重新抽一遍。
+    if (Array.isArray(p?.texts)) page.texts = texts;
+
     // 底图（导入的 PDF / Word 页）要原样保留
     const bg = p?.background;
     if (bg && typeof bg === "object") {

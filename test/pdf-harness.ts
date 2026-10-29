@@ -8,7 +8,7 @@
  *   - 渲染有缓存，重复翻页不重复光栅化
  *   - 位图缓存按预算淘汰
  */
-import { openPdf, renderPdfPage, initPdfjs, pdfPageSize } from "../src/pdf";
+import { extractPdfText, fitBackground, openPdf, renderPdfPage, initPdfjs, pdfPageSize } from "../src/pdf";
 import { BitmapCache } from "../src/cache";
 
 const lines: string[] = [];
@@ -74,6 +74,76 @@ async function main() {
     pass(
       Math.abs(size.width - 595) < 2 && Math.abs(size.height - 842) < 2,
       "页面尺寸正确：" + size.width.toFixed(0) + "×" + size.height.toFixed(0)
+    );
+  }
+
+  /* -------------------- 文字层抽取 -------------------- */
+  {
+    const t = performance.now();
+    const rows = await extractPdfText(doc, 1);
+    const dt = performance.now() - t;
+    pass(rows.length > 0, "第 1 页抽出 " + rows.length + " 行文字（" + dt.toFixed(0) + "ms）");
+    pass(
+      rows.length > 0 && /[\u4e00-\u9fa5A-Za-z0-9]/.test(rows[0].text),
+      "第一行是可读文字：" + JSON.stringify(String(rows[0]?.text || "").slice(0, 40))
+    );
+    pass(
+      rows.every((r) => r.size > 0.5 && r.x >= 0 && r.y >= 0),
+      "每行都有正的字号和坐标"
+    );
+    pass(
+      rows.every((r, i) => i === 0 || r.y >= rows[i - 1].y - 1),
+      "按 y 从上到下排列（首行 " + (rows[0]?.y || 0).toFixed(0) + "）"
+    );
+    pass(
+      rows.every((r) => r.text.trim().length > 0),
+      "没有空行混进来"
+    );
+    // 同一行被拆成多段时应该合并（否则复制出来会断成一句一句）
+    const long = rows.filter((r) => r.text.length > 20).length;
+    pass(long > 0, "有 " + long + " 行长度 > 20 字（说明同行已合并）");
+  }
+
+  /* -------------------- 文字坐标映射到页面坐标系 -------------------- */
+  {
+    const size = await pdfPageSize(doc, 1);
+    const fit = fitBackground(size.width, size.height, 0);
+    const rows = await extractPdfText(doc, 1);
+    const sx = fit.width / size.width;
+    const sy = fit.height / size.height;
+    const mapped = rows.map((r) => ({
+      x: fit.x + r.x * sx,
+      y: fit.y + r.y * sy,
+      size: r.size * sy,
+    }));
+
+    pass(
+      mapped.every(
+        (m) =>
+          m.x >= fit.x - 1 &&
+          m.x <= fit.x + fit.width + 1 &&
+          m.y >= fit.y - 1 &&
+          m.y <= fit.y + fit.height + 1
+      ),
+      "映射后每行都落在底图范围内"
+    );
+    const first = mapped[0];
+    const last = mapped[mapped.length - 1];
+    pass(
+      !!first && first.y < fit.y + fit.height * 0.35,
+      "第一行在上三分之一（y 没有翻转）：" + (first ? first.y.toFixed(0) : "-")
+    );
+    pass(
+      !!last && last.y > fit.y + fit.height * 0.5,
+      "最后一行在下半页：" + (last ? last.y.toFixed(0) : "-")
+    );
+    pass(
+      mapped.every((m) => m.size > 3 && m.size < 80),
+      "字号换算到页面坐标后合理（" +
+        Math.min(...mapped.map((m) => m.size)).toFixed(1) +
+        "–" +
+        Math.max(...mapped.map((m) => m.size)).toFixed(1) +
+        "）"
     );
   }
 

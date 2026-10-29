@@ -2,7 +2,7 @@
  * 工具长条 + 右下角浮标 + 侧栏 回归测试。
  *
  * 覆盖六条主线：
- *   1. 顶栏工具行：6 个工具 + 立即保存 + 侧栏开关 + 阅读开关
+ *   1. 顶栏工具行：7 个工具 + 立即保存 + 侧栏开关 + 阅读开关
  *   2. 长条**不遮挡滚动条**（用户反馈"边上的框会挡住滑动页面的那个条"）
  *   3. 右下角浮标：翻页常驻、缩放**只在缩放时**浮现并显示确切倍数
  *   4. 侧栏收纳全部工具：导出 / 导入 / 撤销 / 输入方式都在里面
@@ -184,14 +184,14 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   pass(!root.querySelector(".mb-dock-tab"), "旧标签页已移除");
   pass(!root.querySelector(".mb-rail-more"), "旧「更多」按钮已移除");
 
-  // 6 个工具 + 3 个动作 = 9 个按钮，挤在同一行
+  // 7 个工具 + 3 个动作 = 10 个按钮，挤在同一行
   const tools = topRow.querySelectorAll(".mb-top-tool");
-  pass(tools.length === 6, "顶栏上 6 个工具按钮（" + tools.length + "）");
+  pass(tools.length === 7, "顶栏上 7 个工具按钮（" + tools.length + "）");
 
   const rowBtns = Array.from(
     topRow.querySelectorAll(".mb-topbtn")
   ) as HTMLElement[];
-  pass(rowBtns.length === 9, "一行里 9 个按钮（6 笔 + 3 动作）：" + rowBtns.length);
+  pass(rowBtns.length === 10, "一行里 10 个按钮（7 笔 + 3 动作）：" + rowBtns.length);
 
   /*
    * 用户要求："把钢笔、橡皮啊，侧边的这些东西都挪到最上面去"，
@@ -200,7 +200,7 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
    */
   const tops = rowBtns.map((b) => Math.round(b.getBoundingClientRect().top));
   const rowSpread = Math.max(...tops) - Math.min(...tops);
-  pass(rowSpread <= 2, "9 个按钮在同一水平线上（顶边最大差 " + rowSpread + "px）");
+  pass(rowSpread <= 2, "10 个按钮在同一水平线上（顶边最大差 " + rowSpread + "px）");
 
   // 顺序：笔在左，视图动作在右
   const lastToolRight = (
@@ -526,7 +526,7 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   const tTops = Array.from(tools).map(
     (t) => Math.round((t as HTMLElement).getBoundingClientRect().top)
   );
-  pass(new Set(tTops).size === 1, "平板端 6 个工具仍是一行（没有换行）");
+  pass(new Set(tTops).size === 1, "平板端 7 个工具仍是一行（没有换行）");
 
   root.classList.remove("is-tablet");
   headerEl.classList.remove("mb-tablet");
@@ -685,7 +685,7 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
     const bar = root.querySelector(".mb-topbar") as HTMLElement;
     pass(!!bar, "标题栏窄到放不下时，整行搬进自建顶栏条 .mb-topbar");
     const btns = bar ? bar.querySelectorAll(".mb-topbtn").length : 0;
-    pass(btns === 9, "搬下来后 9 个按钮都在（没被压扁）：" + btns);
+    pass(btns === 10, "搬下来后 10 个按钮都在（没被压扁）：" + btns);
     const rowNow = bar ? (bar.querySelector(".mb-toprow") as HTMLElement) : null;
     const rowW1 = rowNow ? rowNow.getBoundingClientRect().width : 0;
     pass(

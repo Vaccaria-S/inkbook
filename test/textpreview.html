@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <title>纸面 · 文字层预览</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <style>
+      :root {
+        --background-primary: #fff; --background-secondary: #f4f4f5; --background-primary-alt: #fafafa;
+        --text-normal: #222; --text-muted: #666; --text-faint: #999; --text-error: #d64545;
+        --text-warning: #b07d1f; --text-on-accent: #fff; --background-modifier-border: #e3e3e6;
+        --background-modifier-hover: rgba(0,0,0,.06); --interactive-accent: #6c5ce7; --radius-s: 4px;
+      }
+      body { margin: 0; font-family: system-ui, sans-serif; background: #f4f4f5; }
+      #view-host { width: 100vw; height: 100vh; display: flex; }
+      #view-host > .view-content { flex: 1 1 auto; min-height: 0; display: flex; }
+      /*
+       * 只在这个预览页生效：把 PDF 文字层染成红色，用来肉眼检查
+       * 「文字层」和「底图上的字」有没有对齐。真实界面里它是透明的。
+       */
+      .mb-text.is-pdf {
+        color: rgba(214, 0, 0, 0.62) !important;
+        -webkit-text-fill-color: rgba(214, 0, 0, 0.62) !important;
+        outline: 1px solid rgba(214, 0, 0, 0.18);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="view-host"></div>
+    <pre id="out" style="position:fixed;left:8px;bottom:8px;z-index:9999;background:#111;color:#0f0;font-size:11px;padding:6px;margin:0;max-width:60vw;white-space:pre-wrap"></pre>
+    <script type="module" src="/textpreview.js"></script>
+  </body>
+</html>
