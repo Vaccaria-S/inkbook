@@ -162,6 +162,12 @@
   align-items: center;
   gap: 2px;
   margin: 0 4px;
+  /*
+   * 绝对不能是 `1 1 auto`：标题栏的 action 容器窄的时候，
+   * flex 会把这一行一路压到只剩一个按钮宽——用户看到的就是"整排缩成一个"。
+   * 放不下由 JS 把整行搬到 .mb-topbar（见 fitTopRow），不靠压。
+   */
+  flex: 0 0 auto;
   min-width: 0;
 }
 
@@ -170,6 +176,7 @@
   display: flex;
   align-items: center;
   gap: 2px;
+  flex: 0 0 auto;
   min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;
@@ -180,6 +187,32 @@
 }
 
 /* 竖线：把「笔」和「视图动作」分开，十个按钮挨着不然糊成一片 */
+/*
+ * 标题栏里排不下十个按钮时，整行搬进这条自建顶栏。
+ *
+ * 宽度归我们自己：一行铺满，按钮按原尺寸排开，绝不挤成一团。
+ * 只在放不下时出现（fitTopRow 决定），窗口变宽会自动搬回标题栏。
+ */
+.mb-topbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.mb-topbar::-webkit-scrollbar {
+  height: 0;
+}
+
+.mb-topbar .mb-toprow {
+  margin: 0;
+}
+
 .mb-toprow .mb-sep {
   flex: 0 0 auto;
   width: 1px;

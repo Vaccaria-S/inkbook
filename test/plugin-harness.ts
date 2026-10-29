@@ -32,7 +32,17 @@ Object.assign(workspace, {
   getLeavesOfType: () => inkbookLeaves,
 });
 
+/** commands.executeCommandById 的调用记录（打桩：被拦下的不会走到这里） */
+const cmdCalls: string[] = [];
+const commandsApi: any = {
+  executeCommandById(id: string) {
+    cmdCalls.push(id);
+    return true;
+  },
+};
+
 const app: any = {
+  commands: commandsApi,
   viewRegistry: { typeByExtension: { pdf: "pdf", md: "markdown" }, trigger() {} },
   vault: {
     adapter: { exists: async () => false, read: async () => "", write: async () => {}, mkdir: async () => {}, writeBinary: async () => {}, readBinary: async () => new ArrayBuffer(0), getFullPath: (p: string) => p },
@@ -98,9 +108,40 @@ async function main() {
     log((fire() === 1 ? "PASS" : "FAIL") + " 开关关掉后即使活动文件是 .inkbook 也放行（1 次）");
     plugin.settings.blockEdgeSwipe = true;
 
+    /* ---- 派发层：墨本里屏蔽命令面板（平板拖滑条会误触它） ---- */
+    const fireCmd = (id: string): number => {
+      const b = cmdCalls.length;
+      commandsApi.executeCommandById(id);
+      return cmdCalls.length - b;
+    };
+    activeFile = { extension: "inkbook" };
+    plugin.settings.blockCommandPalette = true;
+    log(
+      (fireCmd("command-palette:open") === 0 ? "PASS" : "FAIL") +
+        " 墨本里命令面板被吞掉：宿主收到 0 次"
+    );
+    log(
+      (fireCmd("editor:save-file") === 1 ? "PASS" : "FAIL") + " 别的命令照常派发：1 次"
+    );
+    activeFile = { extension: "md" };
+    log(
+      (fireCmd("command-palette:open") === 1 ? "PASS" : "FAIL") +
+        " 非墨本文件里命令面板照常：1 次"
+    );
+    activeFile = { extension: "inkbook" };
+    plugin.settings.blockCommandPalette = false;
+    log(
+      (fireCmd("command-palette:open") === 1 ? "PASS" : "FAIL") + " 开关关掉后放行：1 次"
+    );
+    plugin.settings.blockCommandPalette = true;
+
     plugin.onunload();
     log(
       ((wsProto.trigger as any).__inkbookPatched ? "FAIL" : "PASS") + " 卸载后原型已还原（无残留补丁）"
+    );
+    log(
+      (fireCmd("command-palette:open") === 1 ? "PASS" : "FAIL") +
+        " 卸载后命令面板恢复（commands 未被残留包装）"
     );
     inkbookLeaves = leafWith(true);
     log((fire() === 1 ? "PASS" : "FAIL") + " 卸载后不再拦截：1 次");

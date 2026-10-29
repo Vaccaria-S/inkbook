@@ -112,6 +112,10 @@ export class InkbookView extends FileView {
   private topRowEl: HTMLElement | null = null;
   /** 顶栏里的工具组（仅阅读时整组收起） */
   private topToolsEl: HTMLElement | null = null;
+  /** 标题栏里原本挂 action 的那个容器（放不下时把整行搬回来用） */
+  private actionsHostEl: HTMLElement | null = null;
+  /** 放不下时，整行搬进视图自己画的这条顶栏条 */
+  private topBarEl: HTMLElement | null = null;
   /** 侧边可拖动滑条（替代系统滚动条，手指也抓得住） */
   private sbEl: HTMLElement | null = null;
   private sbTrack: HTMLElement | null = null;
@@ -222,6 +226,7 @@ export class InkbookView extends FileView {
     this.buildUI();
     this.renderEmpty();
     this.registerDomEvent(document, "keydown", (e) => this.onKeyDown(e));
+    this.registerDomEvent(window, "resize", () => this.scheduleTopRowFit());
   }
 
   async onClose(): Promise<void> {
@@ -424,6 +429,8 @@ export class InkbookView extends FileView {
     this.editor.penSize = this.plugin.settings.defaultPenSize || 2.8;
     this.editor.highlighterColor = this.plugin.settings.lastHighlighterColor || "#F6E05E";
     this.buildHeaderActions();
+    // 标题栏放不下十个按钮时（平板常见），下一帧会把整行搬到自建顶栏条
+    this.scheduleTopRowFit();
     this.buildFloat();
     this.buildScrollbar();
     this.buildSide();
@@ -435,6 +442,11 @@ export class InkbookView extends FileView {
   private destroyEditor(): void {
     this.editor?.destroy();
     this.editor = null;
+    // 顶栏那一行挂在标题栏/自建条上，不跟着 editorHost 走，得单独摘
+    this.topRowEl?.remove();
+    this.topBarEl?.remove();
+    this.topRowEl = null;
+    this.topBarEl = null;
     window.clearTimeout(this.hintTimer);
     window.clearTimeout(this.zoomHintTimer);
     this.floatEl?.remove();
@@ -623,6 +635,12 @@ export class InkbookView extends FileView {
    * 顶栏本来就有空位，一行排得下——纸面因此通栏。
    */
   private buildHeaderActions(): void {
+    // 同一视图里换文件会重装顶栏：先把上一轮的整行摘掉，否则越堆越多
+    this.topRowEl?.remove();
+    this.topBarEl?.remove();
+    this.topRowEl = null;
+    this.topBarEl = null;
+
     const mk = (icon: string, title: string, cls: string): HTMLElement => {
       let el: HTMLElement | null = null;
       const make = (this as unknown as {
@@ -676,6 +694,7 @@ export class InkbookView extends FileView {
     const row = document.createElement("div");
     row.className = "mb-toprow";
     const host = (save.parentElement as HTMLElement | null) || this.containerEl;
+    this.actionsHostEl = host;
     host.appendChild(row);
     this.buildToolRow(row);
     row.appendChild(row.createDiv("mb-sep"));
@@ -683,6 +702,77 @@ export class InkbookView extends FileView {
     row.appendChild(side);
     row.appendChild(read);
     this.topRowEl = row;
+  }
+
+  /* ------------------ 标题栏放不下时：整行搬到自建顶栏条 ------------------ */
+
+  private topFitRaf = 0;
+
+  private scheduleTopRowFit(): void {
+    if (this.topFitRaf) return;
+    const raf =
+      typeof window.requestAnimationFrame === "function"
+        ? window.requestAnimationFrame.bind(window)
+        : (fn: FrameRequestCallback) => window.setTimeout(() => fn(0), 16);
+    this.topFitRaf = raf(() => {
+      this.topFitRaf = 0;
+      this.fitTopRow();
+    });
+  }
+
+  /**
+   * 十个按钮在标题栏里排不下时怎么办。
+   *
+   * 平板真机：宿主的 action 容器比这一行窄得多，行被压成一小团，
+   * 看着就像"整排只剩一个按钮"。压着不是办法——那样按钮根本点不到。
+   * 所以量一下：越界就把整行搬到视图自己画的一条顶栏里（宽度我们自己说了算），
+   * 窗口变宽、标题栏装得下了再搬回去。
+   */
+  private fitTopRow(): void {
+    const row = this.topRowEl;
+    const host = this.actionsHostEl;
+    if (!row || !host || !host.isConnected) return;
+    const hr = host.getBoundingClientRect();
+    const view = this.containerEl.getBoundingClientRect();
+    if (!hr.width || !view.width) return;
+
+    const need = row.scrollWidth;
+    if (!need) return;
+
+    if (this.topBarEl && row.parentElement === this.topBarEl) {
+      // 已经搬下来了：容器装得下就搬回去
+      if (need <= hr.width + 1) this.undockTopRow();
+      return;
+    }
+
+    const rr = row.getBoundingClientRect();
+    if (rr.width <= 0) return;
+    /*
+     * 两种"放不下"都要认：
+     *   · 容器比整行窄（flex 把行压扁，看着像只剩一个按钮）
+     *   · 整行被挤出视图右缘（裁剪掉了，后面的按钮点不到）
+     */
+    if (need > hr.width + 1 || rr.right > view.right + 1 || rr.left < view.left - 1) {
+      this.dockTopRow(row);
+    }
+  }
+
+  private dockTopRow(row: HTMLElement): void {
+    const bar = this.contentEl.createDiv("mb-topbar");
+    bar.appendChild(row);
+    this.contentEl.insertBefore(bar, this.contentEl.firstChild);
+    this.topBarEl = bar;
+    this.contentEl.addClass("has-topbar");
+  }
+
+  private undockTopRow(): void {
+    const row = this.topRowEl;
+    const host = this.actionsHostEl;
+    if (!row || !host) return;
+    host.appendChild(row);
+    this.topBarEl?.remove();
+    this.topBarEl = null;
+    this.contentEl.removeClass("has-topbar");
   }
 
   private buildFloat(): void {
@@ -872,6 +962,29 @@ export class InkbookView extends FileView {
     };
     el.addEventListener("pointerup", finish, { signal: ac.signal });
     el.addEventListener("pointercancel", finish, { signal: ac.signal });
+
+    /*
+     * 触摸兜底：平板上从滑条往下拖，宿主会当成「下拉打开命令面板」。
+     *
+     * pointer 事件宿主未必看，touch 才是它认的东西——在元素捕获阶段
+     * 就把 touchstart / touchmove 吃掉（必须 passive:false 才能 preventDefault）。
+     * 注意：宿主若把监听挂在 window 捕获阶段，我们拦不住（它比插件早注册），
+     * 那种情况靠设置里的「屏蔽命令面板」在命令层兜底。
+     */
+    const eatTouch = (e: TouchEvent) => {
+      if (e.cancelable) e.preventDefault();
+      e.stopPropagation();
+    };
+    el.addEventListener("touchstart", eatTouch, {
+      passive: false,
+      capture: true,
+      signal: ac.signal,
+    });
+    el.addEventListener("touchmove", eatTouch, {
+      passive: false,
+      capture: true,
+      signal: ac.signal,
+    });
 
     this.requestScrollbarSync();
   }

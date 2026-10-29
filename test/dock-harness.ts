@@ -644,6 +644,46 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   (readBtn as HTMLElement).click(); // 退出仅阅读
   await sleep(200);
 
+  /* ============ 11. 标题栏放不下 → 整行搬进自建顶栏条 ============ */
+  /*
+   * 真机（平板）：宿主的 action 容器窄，十个按钮被 flex 压成一团，
+   * 看着就像"整排只剩一个按钮"。这里把容器压到 150px 复现，
+   * 断言整行会整体搬进 .mb-topbar 且宽度不变形。
+   */
+  const rowInHeader = headerEl.querySelector(".mb-toprow") as HTMLElement;
+  pass(!!rowInHeader, "默认整行挂在标题栏里");
+  const rowW0 = rowInHeader.getBoundingClientRect().width;
+  {
+    headerEl.style.width = "150px";
+    headerEl.style.overflow = "hidden";
+    window.dispatchEvent(new Event("resize"));
+    await sleep(200);
+
+    const bar = root.querySelector(".mb-topbar") as HTMLElement;
+    pass(!!bar, "标题栏窄到放不下时，整行搬进自建顶栏条 .mb-topbar");
+    const btns = bar ? bar.querySelectorAll(".mb-topbtn").length : 0;
+    pass(btns === 10, "搬下来后 10 个按钮都在（没被压扁）：" + btns);
+    const rowNow = bar ? (bar.querySelector(".mb-toprow") as HTMLElement) : null;
+    const rowW1 = rowNow ? rowNow.getBoundingClientRect().width : 0;
+    pass(
+      rowW1 >= rowW0 - 1,
+      "搬下来后整行宽度不变（" +
+        rowW0.toFixed(0) +
+        " → " +
+        rowW1.toFixed(0) +
+        "px）"
+    );
+
+    headerEl.style.width = "";
+    headerEl.style.overflow = "";
+    window.dispatchEvent(new Event("resize"));
+    await sleep(200);
+    pass(
+      !!headerEl.querySelector(".mb-toprow") && !root.querySelector(".mb-topbar"),
+      "窗口变宽后自动搬回标题栏"
+    );
+  }
+
   log("");
   const fails = lines.filter((l) => l.startsWith("FAIL")).length;
   log(fails === 0 ? "ALL PASS" : fails + " FAILED");

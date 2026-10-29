@@ -133,6 +133,21 @@ export class InkbookSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("在墨本里屏蔽「命令面板」")
+      .setDesc(
+        "开启后，在墨本笔记里命令面板打不开（快捷键 Ctrl/Cmd+P 同样拦下）。平板下拉手势、误触都算——拖右侧滑条时弹出的就是它。离开墨本文件即恢复。"
+      )
+      .addToggle((t) =>
+        t
+          .setValue(this.plugin.settings.blockCommandPalette !== false)
+          .onChange(async (v) => {
+            this.plugin.settings.blockCommandPalette = v;
+            await this.plugin.saveSettings();
+            this.plugin.refreshViews();
+          })
+      );
+
+    new Setting(containerEl)
       .setName("自动把直线画直")
       .setDesc(
         "开启后，用钢笔、圆珠笔或荧光笔画出的近似直线，抬手时会自动拉直（保留原来的粗细与压感）。只识别直线，圆圈、曲线、字迹不受影响。"

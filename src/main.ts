@@ -73,6 +73,7 @@ export default class InkbookPlugin extends Plugin {
     this.addSettingTab(new InkbookSettingTab(this.app, this));
 
     this.installSwipeGuard();
+    this.installPaletteGuard();
   }
 
   /** 被替换掉的原型方法，卸载时原样放回 */
@@ -108,19 +109,9 @@ export default class InkbookPlugin extends Plugin {
      * 代价：在墨本里用这个手势打开文件列表会失效（左侧栏按钮 / 命令面板仍可用），
      * 关掉设置里的开关即可恢复。
      */
-    const isInkbookActive = (): boolean => {
-      const file = this.app.workspace.getActiveFile?.();
-      if (file && (file.extension || "").toLowerCase() === "inkbook") return true;
-      const active: any = (this.app.workspace as any).activeLeaf?.view;
-      if (active && typeof active.getViewType === "function" && active.getViewType() === VIEW_TYPE) {
-        return true;
-      }
-      return false;
-    };
-
     const shouldBlock = (): boolean => {
       if (!this.settings.blockEdgeSwipe) return false;
-      if (isInkbookActive()) return true;
+      if (this.isInkbookActive()) return true;
       // 兜底：活动文件拿不到时，看有没有墨本编辑器刚记录过左缘起手
       for (const leaf of this.app.workspace.getLeavesOfType?.(VIEW_TYPE) || []) {
         const ed = (leaf.view as any)?.editor;
@@ -163,6 +154,79 @@ export default class InkbookPlugin extends Plugin {
     }
   }
 
+  /**
+   * 当前是不是停在墨本里。
+   *
+   * 两个判据都用：扩展名（最可靠）＋ 活动 leaf 的视图类型
+   * （文件刚切换、getActiveFile 还没跟上时兜底）。
+   */
+  private isInkbookActive(): boolean {
+    const file = this.app.workspace.getActiveFile?.();
+    if (file && (file.extension || "").toLowerCase() === "inkbook") return true;
+    const active: any = (this.app.workspace as any).activeLeaf?.view;
+    if (active && typeof active.getViewType === "function" && active.getViewType() === VIEW_TYPE) {
+      return true;
+    }
+    return false;
+  }
+
+  /** 被替换掉的 commands 方法，卸载时原样放回 */
+  private paletteRestore: Array<() => void> = [];
+
+  /**
+   * 在墨本里吞掉「打开命令面板」这条命令。
+   *
+   * 真机现象：平板上拖右缘滑条往下，宿主把这段触摸认成
+   * 「下拉打开命令面板」，一拖就弹一层搜索面板糊在纸上。
+   *
+   * 手势本身拦不住——它挂 window 捕获阶段，比插件早注册（右滑那条踩过一模一样的坑）。
+   * 但它最后一定要走 commands.executeCommandById("command-palette:open")，
+   * 在派发层把这条命令丢掉，比跟手势坐标较劲可靠得多；快捷键 Ctrl/Cmd+P 也一并失效。
+   */
+  private installPaletteGuard(): void {
+    if (this.paletteRestore.length) return;
+    const commands = (this.app as any)?.commands;
+    if (!commands || typeof commands.executeCommandById !== "function") return;
+
+    // 热重载时先剥掉上一次的包装，避免层层套娃
+    const orig =
+      (commands.executeCommandById as any).__inkbookOrig ?? commands.executeCommandById;
+    const self = this;
+    const patched = function (this: unknown, id: string, ...args: any[]) {
+      try {
+        if (
+          typeof id === "string" &&
+          id.indexOf("command-palette:") === 0 &&
+          self.settings.blockCommandPalette !== false &&
+          self.isInkbookActive()
+        ) {
+          return false;
+        }
+      } catch (_) {
+        // 判定出错时放行，不能把别的命令一起堵死
+      }
+      return orig.apply(this, [id, ...args]);
+    };
+    (patched as any).__inkbookPatched = true;
+    (patched as any).__inkbookOrig = orig;
+    commands.executeCommandById = patched;
+
+    this.paletteRestore.push(() => {
+      if (commands.executeCommandById === patched) commands.executeCommandById = orig;
+    });
+  }
+
+  private uninstallPaletteGuard(): void {
+    for (const restore of this.paletteRestore) {
+      try {
+        restore();
+      } catch (_) {
+        /* 卸载失败不影响禁用流程 */
+      }
+    }
+    this.paletteRestore = [];
+  }
+
   private uninstallSwipeGuard(): void {
     for (const restore of this.swipeRestore) {
       try {
@@ -176,6 +240,7 @@ export default class InkbookPlugin extends Plugin {
 
   onunload(): void {
     this.uninstallSwipeGuard();
+    this.uninstallPaletteGuard();
   }
 
   private openNewBook(): void {

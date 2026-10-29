@@ -130,6 +130,15 @@ export interface InkbookSettings {
    * 用触控笔从左往右写字会被误判成右滑。
    */
   blockEdgeSwipe: boolean;
+  /**
+   * 在墨本里屏蔽命令面板。
+   *
+   * 平板上拖右侧滑条（从屏幕上方往下拽的那种手势）会被宿主认成
+   * 「下拉打开命令面板」，一拖就弹一层面板出来，写不了字。
+   * 开启后命令面板在墨本视图里打不开（命令 id 前缀 command-palette: 一律丢掉），
+   * 快捷键 Ctrl/Cmd+P 同样拦下；离开墨本文件即恢复。
+   */
+  blockCommandPalette: boolean;
   /** 画完自动把笔直的笔迹拉直（只认直线） */
   straightLine: boolean;
   /** 浮层工具盘的位置与方向（缺省 = 左侧居中竖排） */
@@ -152,6 +161,7 @@ export const DEFAULT_SETTINGS: InkbookSettings = {
   lastPenColor: "#1A1A1A",
   lastHighlighterColor: "#F6E05E",
   blockEdgeSwipe: true,
+  blockCommandPalette: true,
   straightLine: false,
 };
 
