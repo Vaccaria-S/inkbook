@@ -336,8 +336,17 @@ export class BookEditor {
   private arbiter: TouchArbiter;
   /** 当前这一指的角色 */
   private role: TouchRole = "none";
-  /** 允许手指书写（平板没笔时也能写） */
-  touchDraw = true;
+  /**
+   * 允许手指书写（平板没笔时也能写）。
+   *
+   * **默认关**：手指的第一职责是滚动，笔才是用来写的。
+   * 开着它意味着单指不再滚页（一碰就落笔），滚动只能靠双指或右缘滑条——
+   * 这是用户主动打开「允许手指书写」时才该承担的代价，不能默认塞给他。
+   *
+   * 2026-10-30 之前它其实是死开关：`role === "pan"` 那一支无条件走滚动并
+   * return，而 arbiter 给单指 touch 的 role 永远是 "pan"，所以写不写都轮不到它。
+   */
+  touchDraw = false;
   /**
    * 仅阅读模式。
    *
@@ -2817,15 +2826,38 @@ export class BookEditor {
         e.preventDefault();
         return;
       }
-      this.gesture = "pan";
-      this.pointerId = e.pointerId;
-      this.pan = {
-        x: e.clientX,
-        y: e.clientY,
-        left: this.scrollEl.scrollLeft,
-        top: this.scrollEl.scrollTop,
-      };
-      return;
+
+      /*
+       * 手指落笔的判定必须放在这里。
+       *
+       * 2026-10-30 真机 bug：「允许手指写字」开关亮着，手指还是只能滚动，
+       * 一个字都写不出来。原因就在于这一支**无条件走滚动并 return**——
+       * 而 arbiter 给单指 touch 的 role 永远是 "pan"，永远不会是 "draw"，
+       * 所以下面那段「手指书写」的代码（`e.pointerType === "touch"`）
+       * 是彻底的死代码，从来执行不到。
+       *
+       * 现在把判定提到前面来：
+       *   · 允许手指书写 + 没开「只认触控笔」+ 非只读 + 不是手型工具 → 落笔
+       *   · 其余情况（含默认）一律滚动
+       */
+      const fingerDraws =
+        e.pointerType === "touch" &&
+        !this.readOnly &&
+        !this.opts.penOnly &&
+        this.touchDraw &&
+        this.tool !== "hand";
+      if (!fingerDraws) {
+        this.gesture = "pan";
+        this.pointerId = e.pointerId;
+        this.pan = {
+          x: e.clientX,
+          y: e.clientY,
+          left: this.scrollEl.scrollLeft,
+          top: this.scrollEl.scrollTop,
+        };
+        return;
+      }
+      // fingerDraws 为真：不 return，继续走下面共用的落笔流程
     }
 
     if (this.gesture !== "none") return;
@@ -2899,7 +2931,11 @@ export class BookEditor {
       return;
     }
 
-    // 手指书写：只在没开"只认触控笔"且允许触摸书写时
+    /*
+     * 兜底：正常路径已经在上面 role === "pan" 分支里分流过了
+     * （手指书写走落笔、其余走滚动），走到这里的 touch 属于异常情况。
+     * 留着这一条，防止以后重构时手指突然能写字。
+     */
     if (e.pointerType === "touch" && (this.opts.penOnly || !this.touchDraw)) {
       this.gesture = "pan";
       this.pointerId = e.pointerId;

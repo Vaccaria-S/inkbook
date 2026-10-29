@@ -411,9 +411,31 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
 
   /* ============ 6. 仅阅读模式 ============ */
   const isReading = () => root.classList.contains("is-reading");
+
+  /*
+   * 切模式不能动排版。
+   *
+   * 曾经 `is-reading` 把 .mb-scroll 的 padding 从 22/90 改成 10/22、
+   * .mb-doc 的 gap 从 24 改成 28：一进阅读模式，上半页少 12px、
+   * 下半页少 88px、每页间距多 4px，第 20 页偏出 80px。
+   * 真机表现就是「一开仅阅读，平板上的页面会变」。
+   */
+  const scrollEl = root.querySelector(".mb-scroll") as HTMLElement;
+  const docEl = root.querySelector(".mb-doc") as HTMLElement;
+  const layoutSig = () => {
+    const s = getComputedStyle(scrollEl);
+    const d = getComputedStyle(docEl);
+    return [s.paddingTop, s.paddingBottom, d.gap].join(" | ");
+  };
+  const layoutWrite = layoutSig();
+
   (readBtn as HTMLElement).click();
   await sleep(200);
   pass(isReading(), "点「阅读」按钮进入仅阅读模式");
+  pass(
+    layoutSig() === layoutWrite,
+    "仅阅读不改页面排版（padding/gap 前后一致：" + layoutSig() + "）"
+  );
   pass(
     (readBtn as HTMLElement).getAttribute("aria-pressed") === "true",
     "aria-pressed 同步为 true"
@@ -455,6 +477,49 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   (readBtn as HTMLElement).click();
   await sleep(200);
   pass(!isReading(), "再点一次退出仅阅读模式");
+
+  /* ============ 6.5 「允许手指书写」必须真的能写 ============ */
+  /*
+   * 真机 bug：开着仅阅读（或开着「只认触控笔」）时点「允许手指书写」，
+   * 开关亮了但手指还是写不出字——因为那两个状态各自都把落笔拦在前面
+   * （readOnly 直接 return，penOnly 把 touch 判成 pan）。
+   * 用户点的是"让我用手指写"，就该真的能写。
+   */
+  {
+    // 先造出"点了按钮也写不了"的两个前提
+    (view as any).plugin.settings.penOnly = true;
+    view.editor.setPenOnly(true);
+    view.editor.setTouchDraw(false);
+    (readBtn as HTMLElement).click();
+    await sleep(150);
+    pass(isReading(), "前置：仅阅读 + 只认触控笔 + 手指书写关闭");
+
+    const touchBtn = document.querySelector(
+      '.mb-ib[aria-label="允许手指书写"]'
+    ) as HTMLElement | null;
+    pass(!!touchBtn, "侧栏「输入方式」里有允许手指书写按钮");
+    touchBtn?.click();
+    await sleep(200);
+
+    pass(!isReading(), "点「允许手指书写」会自动退出仅阅读（否则根本落不了笔）");
+    pass(
+      (view as any).plugin.settings.penOnly === false,
+      "同时关掉「只认触控笔」（它也会把 touch 判成滚动）"
+    );
+    pass(view.editor.touchDraw === true, "手指书写开关已打开");
+
+    const n0 = strokeCountAll();
+    drawAt(240, 320, "touch");
+    await sleep(160);
+    pass(
+      strokeCountAll() > n0,
+      "手指真的写出了笔迹（" + n0 + " → " + strokeCountAll() + "）"
+    );
+
+    // 还原，别给后面的用例留下"允许手指书写"
+    view.editor.setTouchDraw(false);
+    await sleep(60);
+  }
   const beforeEdit = strokeCountAll();
   drawAt(200, 300);
   await sleep(200);

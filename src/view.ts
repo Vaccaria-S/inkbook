@@ -1655,9 +1655,44 @@ export class InkbookView extends FileView {
     setIcon(this.touchBtn, "hand");
     this.touchBtn.onclick = () => {
       const on = !this.editor?.touchDraw;
-      this.editor?.setTouchDraw(!!on);
+      if (!on) {
+        this.editor?.setTouchDraw(false);
+        this.updateUI();
+        new Notice("手指只负责滚动页面", 2200);
+        return;
+      }
+
+      /*
+       * 打开「手指书写」时，必须把另外两个会**抵消它**的状态一起处理掉。
+       *
+       * 真机反馈：「点了允许手指写字，还是没法用手指写字，只能用手写笔」——
+       * 因为这两个开关各管一段，任何一个开着都写不出来：
+       *   · 仅阅读模式：编辑器整个拒绝落笔（pointer 在 readOnly 分支就被拦了）
+       *   · 只认触控笔：touch 一落下就判成 pan，连落笔分支都进不去
+       * 用户点的是「让我用手指写」，那就该真的能写，别让他自己去猜还有哪个开关。
+       */
+      if (this.readOnly) {
+        this.warnReadOnly();
+        return;
+      }
+      const undone: string[] = [];
+      if (this.reading) {
+        this.setReading(false);
+        undone.push("已退出仅阅读模式");
+      }
+      if (this.plugin.settings.penOnly) {
+        this.plugin.settings.penOnly = false;
+        void this.plugin.saveSettings();
+        this.editor?.setPenOnly(false);
+        undone.push("已关闭「只认触控笔」");
+      }
+      this.editor?.setTouchDraw(true);
       this.updateUI();
-      new Notice(on ? "已允许手指书写" : "手指只负责滚动页面", 2200);
+      new Notice(
+        (undone.length ? "已允许手指书写（" + undone.join("，") + "）。" : "已允许手指书写。") +
+          "此时单指用来写字，滚动请用双指或右缘滑条。",
+        3600
+      );
     };
     this.stylusBtn = inputRow.createEl("button", {
       cls: "mb-ib",
@@ -1671,7 +1706,15 @@ export class InkbookView extends FileView {
       void this.plugin.saveSettings();
       this.editor?.setPenOnly(on);
       this.updateUI();
-      new Notice(on ? "只认触控笔：手指只滚动" : "手指和鼠标也能写", 2500);
+      // 打开"只认触控笔"等于把手指书写暂停掉，说清楚，否则用户会以为书写坏了
+      new Notice(
+        on
+          ? this.editor?.touchDraw
+            ? "只认触控笔：手指只滚动（手指书写已暂停）"
+            : "只认触控笔：手指只滚动"
+          : "手指和鼠标也能写",
+        2600
+      );
     };
 
     /* ---------------------------- 纸张 ---------------------------- */
