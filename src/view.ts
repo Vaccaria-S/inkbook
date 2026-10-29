@@ -602,8 +602,17 @@ export class InkbookView extends FileView {
     const wrap = row.createDiv("mb-top-tools");
     this.topToolsEl = wrap;
     for (const t of TOOLS) {
+      /*
+       * 用 `clickable-icon` 这一套，而不是裸 `<button>`。
+       *
+       * 真机教训（2026-10-29 平板）：同样是我们的 .mb-ic，宿主 addAction
+       * 造出来的三个动作按钮图标正常，自己 createElement 的七个笔全是空白。
+       * 唯一的结构差异就是少了这个类——Obsidian 对图标按钮的 svg 尺寸/颜色
+       * 是挂在 .clickable-icon 这条链上的，没有它就轮到别的全局规则说了算。
+       * 所以别"优化"成纯 button，这里就跟宿主保持一致。
+       */
       const b = document.createElement("button");
-      b.className = "mb-topbtn mb-top-tool";
+      b.className = "clickable-icon mb-topbtn mb-top-tool";
       b.type = "button";
       setIcon(b, t.icon);
       b.title = t.name;
