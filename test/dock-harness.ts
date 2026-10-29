@@ -652,6 +652,30 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
    */
   const rowInHeader = headerEl.querySelector(".mb-toprow") as HTMLElement;
   pass(!!rowInHeader, "默认整行挂在标题栏里");
+
+  /*
+   * 祖先裁剪判定（真机上"右边三个还在、左边七个笔没了"就是被父容器切掉）。
+   * 直接构造一个 overflow:hidden 的窄盒子来验，不依赖宿主布局。
+   */
+  {
+    const wrap = document.createElement("div");
+    wrap.style.cssText = "overflow:hidden;width:100px;height:40px";
+    const inner = document.createElement("div");
+    inner.style.cssText = "width:400px;height:20px";
+    wrap.appendChild(inner);
+    document.body.appendChild(wrap);
+    const innerRect = inner.getBoundingClientRect();
+    pass(
+      (view as any).isClippedByAncestor(inner, innerRect) === true,
+      "父容器 overflow:hidden 把右半切掉时能判出来"
+    );
+    wrap.style.overflow = "visible";
+    pass(
+      (view as any).isClippedByAncestor(inner, innerRect) === false,
+      "overflow:visible 时不误报"
+    );
+    wrap.remove();
+  }
   const rowW0 = rowInHeader.getBoundingClientRect().width;
   {
     headerEl.style.width = "150px";

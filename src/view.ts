@@ -749,21 +749,59 @@ export class InkbookView extends FileView {
     if (!need) return;
 
     if (this.topBarEl && row.parentElement === this.topBarEl) {
-      // 已经搬下来了：容器装得下就搬回去
-      if (need <= hr.width + 1) this.undockTopRow();
+      // 已经搬下来了：只有容器明显宽裕才搬回，免得跟裁剪判断来回横跳
+      if (need + 80 <= hr.width) this.undockTopRow();
       return;
     }
 
     const rr = row.getBoundingClientRect();
     if (rr.width <= 0) return;
     /*
-     * 两种"放不下"都要认：
+     * 三种"放不下"都要认：
      *   · 容器比整行窄（flex 把行压扁，看着像只剩一个按钮）
      *   · 整行被挤出视图右缘（裁剪掉了，后面的按钮点不到）
+     *   · **被祖先裁掉左半边**——真机上最常见：行里最右三个动作按钮还露着，
+     *     左边七个笔全被切走，看着像"笔没有图标"。父容器宽度可能正好等于整行，
+     *     量 rect 量不出来，只能点一下试试：那个位置现在是不是还属于这一行。
      */
-    if (need > hr.width + 1 || rr.right > view.right + 1 || rr.left < view.left - 1) {
-      this.dockTopRow(row);
+    const clipped =
+      need > hr.width + 1 ||
+      rr.right > view.right + 1 ||
+      rr.left < view.left - 1 ||
+      this.isClippedByAncestor(row, rr);
+    if (clipped) this.dockTopRow(row);
+  }
+
+  /**
+   * 这一行有没有被某个祖先裁掉一部分。
+   *
+   * 真机上最常见的形态不是"压扁"，而是被 `overflow:hidden` 的父容器
+   * 切掉左半边——右边三个动作按钮还露着，左边七个笔全没了，
+   * 看上去就像"笔没有图标"。父容器宽度可能正好等于整行，量 rect 量不出来，
+   * 只能顺着祖先往上找：谁家设了 overflow，就比一次框。
+   *
+   * 不用 elementFromPoint：测试页的输出面板是 fixed 盖在左上角的，
+   * 那种"被别人压着"不等于"被裁掉"，会误判。
+   */
+  private isClippedByAncestor(el: HTMLElement, rect: DOMRect): boolean {
+    let p = el.parentElement;
+    let guard = 0;
+    while (p && p !== document.body && guard++ < 40) {
+      const cs = getComputedStyle(p);
+      if (cs.overflowX !== "visible" || cs.overflowY !== "visible") {
+        const pr = p.getBoundingClientRect();
+        if (
+          rect.left < pr.left - 1 ||
+          rect.right > pr.right + 1 ||
+          rect.top < pr.top - 1 ||
+          rect.bottom > pr.bottom + 1
+        ) {
+          return true;
+        }
+      }
+      p = p.parentElement;
     }
+    return false;
   }
 
   private dockTopRow(row: HTMLElement): void {

@@ -197,16 +197,12 @@
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: center;
+  /* 再窄也不许裁：宁可换行，也不能把左边的笔切掉（真机上就是这么"消失"的） */
+  flex-wrap: wrap;
   padding: 3px 8px;
   border-bottom: 1px solid var(--background-modifier-border);
   background: var(--background-primary);
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-
-.mb-topbar::-webkit-scrollbar {
-  height: 0;
 }
 
 .mb-topbar .mb-toprow {
