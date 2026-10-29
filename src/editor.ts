@@ -1045,6 +1045,23 @@ export class BookEditor {
   /* ------------------------------- 惯性滚动 ------------------------------- */
 
   /**
+   * 松手后惯性的「加油系数」，按输入方式分。
+   *
+   * 平板真机反馈：一页 A4 有 1100px 高，原来甩一下只滑半页左右，
+   * 想翻两页得甩好几下——手指数要更"送得远"。
+   *
+   * 只对**触摸**加油（笔也加一点，鼠标不加）：
+   *   · 触摸 1.6 倍：滑行距离 ×1.6，停下前的总时长只多 ~70ms
+   *     （距离与初速成正比，时长只与初速的对数有关，所以"更远"不等于"更飘"）
+   *   · 鼠标 1.0：桌面用鼠标拖手柄/触控板时，原来的距离刚好
+   */
+  private static readonly FLING_GAIN: Record<string, number> = {
+    touch: 1.6,
+    pen: 1.35,
+    mouse: 1,
+  };
+
+  /**
    * 记一个滚动速度样本。
    *
    * 只保留最近 90ms 的样本：更早的样本代表不了抬手瞬间的真实速度。
@@ -1060,8 +1077,9 @@ export class BookEditor {
    *
    * @param upY 抬手时最后一次采样的滚动位置
    * @param upT 抬手时的时间戳
+   * @param pointerType 手指 / 笔 / 鼠标（决定要不要给惯性加油）
    */
-  private startFling(upY: number, upT: number): void {
+  private startFling(upY: number, upT: number, pointerType = "mouse"): void {
     this.stopFling();
 
     const s = this.velSamples;
@@ -1082,7 +1100,8 @@ export class BookEditor {
     // 太慢就不甩了：低于 0.05px/ms（约 3px/帧）几乎看不出差别
     if (Math.abs(vel) < 0.05) return;
 
-    this.fling = { vel, last: upT, raf: 0 };
+    const gain = BookEditor.FLING_GAIN[pointerType] ?? 1;
+    this.fling = { vel: vel * gain, last: upT, raf: 0 };
     this.fling.raf = requestAnimationFrame(this.stepFling);
   }
 
@@ -2255,7 +2274,11 @@ export class BookEditor {
     if (gesture === "pan") {
       const s = this.velSamples;
       if (s.length) {
-        this.startFling(s[s.length - 1].y, e.timeStamp || performance.now());
+        this.startFling(
+          s[s.length - 1].y,
+          e.timeStamp || performance.now(),
+          e.pointerType
+        );
       }
     }
     this.velSamples = [];

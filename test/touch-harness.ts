@@ -200,16 +200,30 @@ declare global {
     const before = scroll.scrollTop;
     // 立刻按住不放
     await touch("touchStart", [{ x: sx, y: sy - 300, id: 1 }]);
+    /*
+     * 按下之后再取一次基准。
+     *
+     * 从「读 before」到「按下真的生效」之间有一次 CDP 往返（几十 ms），
+     * 这期间页面**还在按惯性滑**——1.6 倍惯性下这一段就有十几 px。
+     * 那是测晚了，不是没打断。真正的判据是：按下之后不再移动。
+     */
+    const atPress = scroll.scrollTop;
     await sleep(260);
     const held = scroll.scrollTop;
     await touch("touchEnd", []);
     pass(
-      Math.abs(held - before) < 12,
-      "按下立刻打断惯性（按下前 " +
+      Math.abs(held - atPress) < 2,
+      "按下立刻打断惯性（按下后 260ms 只动 " +
+        Math.abs(held - atPress).toFixed(1) +
+        "px）"
+    );
+    pass(
+      Math.abs(held - before) < 80,
+      "打断点仍然在抬手附近（" +
         before.toFixed(0) +
-        " → 按住 260ms 后 " +
+        " → " +
         held.toFixed(0) +
-        "，几乎没动）"
+        "）"
     );
   }
 
