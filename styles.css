@@ -48,10 +48,6 @@
   color: var(--text-warning, #b07d1f);
 }
 
-.mb-del-sel {
-  color: var(--text-error);
-}
-
 .mb-colors {
   display: flex;
   align-items: center;

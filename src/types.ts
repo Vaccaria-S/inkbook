@@ -3,7 +3,7 @@ export type ToolId =
   | "ballpoint"
   | "highlighter"
   | "eraser"
-  | "lasso"
+  
   | "shape"
   | "hand";
 

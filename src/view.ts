@@ -40,7 +40,6 @@ const TOOLS: Array<{ id: ToolId; icon: string; name: string; short: string }> = 
   { id: "ballpoint", icon: "pencil", name: "圆珠笔 (B)", short: "圆珠" },
   { id: "highlighter", icon: "highlighter", name: "荧光笔 (H)", short: "荧光" },
   { id: "eraser", icon: "eraser", name: "橡皮 (E)", short: "橡皮" },
-  { id: "lasso", icon: "lasso", name: "套索 (L)", short: "套索" },
   { id: "shape", icon: "square", name: "形状 (R)", short: "形状" },
   { id: "hand", icon: "hand", name: "拖动画布", short: "拖动" },
 ];
@@ -130,7 +129,6 @@ export class InkbookView extends FileView {
   private statusEl!: HTMLElement;
   private undoBtn!: HTMLButtonElement;
   private redoBtn!: HTMLButtonElement;
-  private delSelBtn!: HTMLButtonElement;
   private stylusBtn!: HTMLButtonElement;
   private toolButtons = new Map<ToolId, HTMLButtonElement>();
   private sideBtn!: HTMLElement;
@@ -565,7 +563,7 @@ export class InkbookView extends FileView {
     box.createDiv({ cls: "mb-empty-mark", text: "墨" });
     box.createEl("h3", { text: "新建一本手写本" });
     box.createEl("p", {
-      text: "A4 纸、压感笔锋、纸张模板、图层、套索、连续翻页。写满一页就往下加。",
+      text: "A4 纸、压感笔锋、纸张模板、图层、连续翻页。写满一页就往下加。",
     });
     const btn = box.createEl("button", { cls: "mod-cta", text: "新建手写本" });
     btn.onclick = () => this.openNewBook();
@@ -1236,10 +1234,6 @@ export class InkbookView extends FileView {
       return;
     }
 
-    if (s.tool === "lasso") {
-      this.dynEl.createSpan({ cls: "mb-hint", text: "圈选笔迹，拖动可移动，Del 删除" });
-      return;
-    }
     if (s.tool === "hand") {
       this.dynEl.createSpan({ cls: "mb-hint", text: "拖动画布；滚轮 / 双指也可以" });
       return;
@@ -1460,13 +1454,6 @@ export class InkbookView extends FileView {
     this.redoBtn.title = "重做 (Ctrl+Shift+Z)";
     setIcon(this.redoBtn, "redo-2");
     this.redoBtn.onclick = () => this.editor?.redo();
-    this.delSelBtn = actRow.createEl("button", {
-      cls: "mb-ib mb-del-sel",
-      attr: { "aria-label": "删除选中的笔迹" },
-    });
-    this.delSelBtn.title = "删除选中的笔迹 (Delete)";
-    setIcon(this.delSelBtn, "trash-2");
-    this.delSelBtn.onclick = () => this.editor?.deleteSelection();
     const impBtn = actRow.createEl("button", {
       cls: "mb-ib",
       attr: { "aria-label": "导入 PDF / Word" },
@@ -1841,7 +1828,6 @@ export class InkbookView extends FileView {
     if (this.zoomLbl) this.zoomLbl.setText(Math.round(s.zoom * 100) + "%");
     if (this.undoBtn) this.undoBtn.toggleClass("is-disabled", !s.canUndo);
     if (this.redoBtn) this.redoBtn.toggleClass("is-disabled", !s.canRedo);
-    if (this.delSelBtn) this.delSelBtn.toggleClass("is-hidden", s.selectionCount === 0);
     if (this.stylusBtn) this.stylusBtn.toggleClass("is-active", s.penOnly);
     if (this.touchBtn) this.touchBtn.toggleClass("is-active", !!this.editor?.touchDraw);
     if (this.sideBtn) this.sideBtn.toggleClass("is-active", this.sideShown);
@@ -2192,18 +2178,9 @@ export class InkbookView extends FileView {
     if (mod || e.altKey) return;
 
     const k = e.key.toLowerCase();
-    if (e.key === "Delete" || e.key === "Backspace") {
-      if (this.editor.getState().selectionCount) {
-        e.preventDefault();
-        this.editor.deleteSelection();
-      }
-      return;
-    }
     if (e.key === "Escape") {
-      // 逐级退出：有选区先清选区 → 再收起侧栏 → 最后切仅阅读
-      if (this.editor.getState().selectionCount) {
-        this.editor.clearSelection();
-      } else if (this.sideShown) {
+      // 逐级退出：收起侧栏 → 最后切仅阅读
+      if (this.sideShown) {
         this.toggleSide();
       } else {
         this.setReading(!this.reading);
@@ -2214,7 +2191,6 @@ export class InkbookView extends FileView {
     else if (k === "b") this.editor.setTool("ballpoint");
     else if (k === "h") this.editor.setTool("highlighter");
     else if (k === "e") this.editor.setTool("eraser");
-    else if (k === "l") this.editor.setTool("lasso");
     else if (k === "r") this.editor.setTool("shape");
     else if (k === "t") {
       const on = !this.plugin.settings.penOnly;

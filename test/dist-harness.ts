@@ -340,13 +340,13 @@ async function main() {
   pass(!!view.containerEl.querySelector(".mb-rail-read"), "顶栏仅阅读按钮已渲染");
   pass(!!host.querySelector(".mb-float"), "右下角浮标已渲染");
   pass(
-    view.containerEl.querySelectorAll(".mb-top-tool").length === 7,
-    "7 个工具按钮已渲染：" +
+    view.containerEl.querySelectorAll(".mb-top-tool").length === 6,
+    "6 个工具按钮已渲染：" +
       view.containerEl.querySelectorAll(".mb-top-tool").length +
       " 个"
   );
   pass(
-    host.querySelectorAll(".mb-ic").length >= 7,
+    host.querySelectorAll(".mb-ic").length >= 6,
     "自绘图标已渲染：" + host.querySelectorAll(".mb-ic").length + " 个"
   );
   pass(host.querySelectorAll(".mb-page").length === 1, "A4 页面已渲染");

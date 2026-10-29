@@ -119,7 +119,7 @@ async function main() {
 
   pass(!!view.editor, "编辑器已挂载");
   pass(
-    view.containerEl.querySelectorAll(".mb-top-tool").length >= 7,
+    view.containerEl.querySelectorAll(".mb-top-tool").length >= 6,
     "顶栏工具按钮已生成"
   );
   pass(!!view.containerEl.querySelector(".mb-toprow"), "顶栏工具行已生成");

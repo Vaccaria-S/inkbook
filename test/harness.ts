@@ -131,21 +131,6 @@ async function main() {
   editor.undo();
   pass(store.strokeCount === 2, "局部擦可撤销");
 
-  /* 套索选中 / 删除 */
-  editor.setTool("lasso");
-  const loop: Array<[number, number]> = [];
-  for (let i = 0; i <= 20; i++) {
-    const a = (i / 20) * Math.PI * 2;
-    loop.push([320 + Math.cos(a) * 240, 331 + Math.sin(a) * 46]);
-  }
-  await draw(loop, 8);
-  const sel = editor.getState().selectionCount;
-  pass(sel >= 1, "套索选中 " + sel + " 条");
-  editor.deleteSelection();
-  pass(store.strokeCount === 1, "删除选中后剩 " + store.strokeCount + "（波浪线保留）");
-  editor.undo();
-  pass(store.strokeCount === 2, "删除选中可撤销");
-
   /* 形状 */
   editor.setTool("shape");
   editor.setShapeKind("arrow");

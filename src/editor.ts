@@ -19,15 +19,10 @@ import { BitmapCache } from "./cache";
 import { openPdf, renderPdfPage, type PdfDoc } from "./pdf";
 import {
   clamp,
-  polygonBounds,
-  selectionBounds,
   splitStrokeByEraser,
   straightenPoints,
   strokeBounds,
   strokeHit,
-  strokeInPolygon,
-  translateStroke,
-  type Bounds,
 } from "./geometry";
 
 export interface EditorState {
@@ -40,7 +35,6 @@ export interface EditorState {
   highlighterColor: string;
   highlighterSize: number;
   shapeKind: ShapeKind;
-  selectionCount: number;
   canUndo: boolean;
   canRedo: boolean;
   penOnly: boolean;
@@ -90,7 +84,7 @@ interface PageRec {
   ioVisible: boolean;
 }
 
-type Gesture = "none" | "draw" | "shape" | "erase" | "lasso" | "move" | "pan";
+type Gesture = "none" | "draw" | "shape" | "erase" | "pan";
 
 /**
  * 单张画布允许的最大像素数。
@@ -196,9 +190,6 @@ export class BookEditor {
   private pointerId: number | null = null;
   private draft: Stroke | null = null;
   private draftRec: PageRec | null = null;
-  private lassoPoints: Array<[number, number]> = [];
-  private selectedIds = new Set<string>();
-  private selectedBox: Bounds | null = null;
   private eraserPos: { x: number; y: number; r: number } | null = null;
   private undoPushed = false;
   private lastPoint: { x: number; y: number; t: number } | null = null;
@@ -232,7 +223,6 @@ export class BookEditor {
    * 用整段平均会让页面在已经慢下来时又猛地窜出去。
    */
   private velSamples: { t: number; y: number }[] = [];
-  private moveStart: { x: number; y: number } | null = null;
   private overlayRaf = 0;
   private scrollRaf = 0;
   private destroyed = false;
@@ -528,7 +518,6 @@ export class BookEditor {
       highlighterColor: this.highlighterColor,
       highlighterSize: this.highlighterSize,
       shapeKind: this.shapeKind,
-      selectionCount: this.selectedIds.size,
       canUndo: this.store.canUndo(),
       canRedo: this.store.canRedo(),
       penOnly: !!this.opts.penOnly,
@@ -572,7 +561,6 @@ export class BookEditor {
     if (this.tool === tool) return;
     this.tool = tool;
     this.eraserPos = null;
-    if (tool !== "lasso" && tool !== "hand") this.clearSelection();
     this.applyTouchAction();
     this.emitState();
   }
@@ -696,9 +684,6 @@ export class BookEditor {
     this.lockedAnchor = null;
     this.draft = null;
     this.draftRec = null;
-    this.lassoPoints = [];
-    this.selectedIds.clear();
-    this.selectedBox = null;
     this.gesture = "none";
     this.pointerId = null;
     this.eraserPos = null;
@@ -1636,45 +1621,6 @@ export class BookEditor {
       if (preview) drawStroke(ctx, preview);
     }
 
-    if (this.lassoPoints.length > 1) {
-      ctx.save();
-      ctx.beginPath();
-      ctx.moveTo(this.lassoPoints[0][0], this.lassoPoints[0][1]);
-      for (let i = 1; i < this.lassoPoints.length; i++) {
-        ctx.lineTo(this.lassoPoints[i][0], this.lassoPoints[i][1]);
-      }
-      ctx.closePath();
-      ctx.fillStyle = "rgba(92, 80, 214, 0.08)";
-      ctx.fill();
-      ctx.strokeStyle = "#6C5CE7";
-      ctx.lineWidth = 1.3 / this.zoom;
-      ctx.setLineDash([6 / this.zoom, 4 / this.zoom]);
-      ctx.stroke();
-      ctx.restore();
-    }
-
-    if (this.selectedBox) {
-      const b = this.selectedBox;
-      ctx.save();
-      ctx.strokeStyle = "#6C5CE7";
-      ctx.lineWidth = 1.3 / this.zoom;
-      ctx.setLineDash([5 / this.zoom, 4 / this.zoom]);
-      ctx.strokeRect(b.minX, b.minY, b.maxX - b.minX, b.maxY - b.minY);
-      ctx.setLineDash([]);
-      const s = 4 / this.zoom;
-      ctx.fillStyle = "#FFFFFF";
-      for (const [x, y] of [
-        [b.minX, b.minY],
-        [b.maxX, b.minY],
-        [b.minX, b.maxY],
-        [b.maxX, b.maxY],
-      ]) {
-        ctx.fillRect(x - s, y - s, s * 2, s * 2);
-        ctx.strokeRect(x - s, y - s, s * 2, s * 2);
-      }
-      ctx.restore();
-    }
-
     if (this.hoverPos && this.gesture === "none") {
       const h = this.hoverPos;
       const r = Math.max(3, (this.penSize * (0.35 + h.p * 0.65)) / 2);
@@ -1918,15 +1864,14 @@ export class BookEditor {
   /**
    * 切换仅阅读模式。
    *
-   * 进阅读模式时清掉选区——选区是用橡皮/套索选出来的，
-   * 那些手势在阅读模式下已经失效，留着选区会让人以为还能操作。
+   * 进阅读模式时收掉未完成的笔画：手势已经失效，
+   * 留着半截草稿会让人以为还能继续写。
    */
   setReadOnly(on: boolean): void {
     if (this.readOnly === on) return;
     this.readOnly = on;
     if (on) {
       this.cancelStroke();
-      this.clearSelection();
     }
     this.emitState();
   }
@@ -2014,7 +1959,6 @@ export class BookEditor {
       return;
     }
 
-    if (this.current !== rec.index) this.clearSelection();
     this.current = rec.index;
     this.store.setPage(rec.index);
     this.emitState();
@@ -2069,20 +2013,6 @@ export class BookEditor {
     if (this.tool === "eraser") {
       this.gesture = "erase";
       this.eraseAt(rec, p[0], p[1], e);
-      return;
-    }
-
-    if (this.tool === "lasso") {
-      if (this.selectedBox && this.pointInBox(p[0], p[1], this.selectedBox)) {
-        this.gesture = "move";
-        this.moveStart = { x: p[0], y: p[1] };
-        this.lastPoint = { x: p[0], y: p[1], t: e.timeStamp || performance.now() };
-        return;
-      }
-      this.clearSelection();
-      this.gesture = "lasso";
-      this.lassoPoints = [[p[0], p[1]]];
-      this.scheduleOverlay(rec);
       return;
     }
 
@@ -2166,46 +2096,10 @@ export class BookEditor {
       return;
     }
 
-    if (this.tool === "eraser" && this.gesture !== "draw" && this.gesture !== "lasso") {
+    if (this.tool === "eraser" && this.gesture !== "draw") {
       this.eraserPos = { x: p[0], y: p[1], r: this.eraserSize / 2 };
       this.scheduleOverlay(rec);
       if (this.gesture === "erase") this.eraseAt(rec, p[0], p[1], e);
-      return;
-    }
-
-    if (this.gesture === "lasso") {
-      const last = this.lassoPoints[this.lassoPoints.length - 1];
-      if (!last || Math.hypot(p[0] - last[0], p[1] - last[1]) > 2) {
-        this.lassoPoints.push([p[0], p[1]]);
-        this.scheduleOverlay(rec);
-      }
-      return;
-    }
-
-    if (this.gesture === "move" && this.moveStart) {
-      const dx = p[0] - this.moveStart.x;
-      const dy = p[1] - this.moveStart.y;
-      if (!dx && !dy) return;
-      if (!this.undoPushed) {
-        // 移动是**原地改坐标**，增量方案覆盖不了，这里仍用全量快照。
-        // 但它只在拖动套索时发生一次，不是每次落笔都付这个代价。
-        this.store.snapshotPage(rec.index);
-        this.undoPushed = true;
-      }
-      const page = this.store.data.pages[rec.index];
-      const layer = activeLayer(page);
-      for (const s of layer.strokes) {
-        if (this.selectedIds.has(s.id)) {
-          translateStroke(s, dx, dy);
-          invalidateStroke(s);
-        }
-      }
-      this.moveStart = { x: p[0], y: p[1] };
-      this.selectedBox = selectionBounds(
-        layer.strokes.filter((s) => this.selectedIds.has(s.id))
-      );
-      this.renderRec(rec);
-      this.scheduleOverlay(rec);
       return;
     }
 
@@ -2300,14 +2194,6 @@ export class BookEditor {
       this.eraseAfter = null;
       this.undoPushed = false;
       this.renderOverlay(rec);
-    } else if (gesture === "lasso") {
-      this.finishLasso(rec);
-    } else if (gesture === "move") {
-      this.moveStart = null;
-      if (this.undoPushed) {
-        this.store.touch();
-        this.changed();
-      }
     }
     this.emitState();
   }
@@ -2351,60 +2237,6 @@ export class BookEditor {
       // addStroke 自己记增量撤销
       this.store.addStroke(stroke, rec.index);
     }
-    this.renderRec(rec);
-    this.renderOverlay(rec);
-    this.changed();
-    this.emitState();
-  }
-
-  private finishLasso(rec: PageRec): void {
-    const poly = this.lassoPoints;
-    this.lassoPoints = [];
-    if (poly.length < 3) {
-      this.renderOverlay(rec);
-      return;
-    }
-    const page = this.store.data.pages[rec.index];
-    const layer = activeLayer(page);
-    const ids = new Set<string>();
-    for (const s of layer.strokes) {
-      if (strokeInPolygon(s, poly)) ids.add(s.id);
-    }
-    this.selectedIds = ids;
-    this.selectedBox = selectionBounds(layer.strokes.filter((s) => ids.has(s.id)));
-    this.renderOverlay(rec);
-    this.emitState();
-  }
-
-  clearSelection(): void {
-    if (!this.selectedIds.size && !this.selectedBox) return;
-    this.selectedIds.clear();
-    this.selectedBox = null;
-    const rec = this.recs[this.current];
-    if (rec) this.scheduleOverlay(rec);
-    this.emitState();
-  }
-
-  private pointInBox(x: number, y: number, b: Bounds): boolean {
-    return x >= b.minX && x <= b.maxX && y >= b.minY && y <= b.maxY;
-  }
-
-  deleteSelection(): void {
-    if (this.readOnly) return;
-    if (!this.selectedIds.size) return;
-    const rec = this.recs[this.current];
-    if (!rec) return;
-    const page = this.store.data.pages[rec.index];
-    /*
-     * 一次删除 = 一条历史记录。
-     * 删除可能横跨多个图层，所以用整页快照最稳妥——
-     * 层条目只覆盖单层，多层同时删时撤销会不完整。
-     */
-    if (page) this.store.snapshotPage(rec.index);
-    this.store.removeStrokes(this.selectedIds, rec.index, true);
-    this.store.touch();
-    this.selectedIds.clear();
-    this.selectedBox = null;
     this.renderRec(rec);
     this.renderOverlay(rec);
     this.changed();
@@ -2529,7 +2361,6 @@ export class BookEditor {
 
   setActiveLayer(id: string): void {
     this.store.setActiveLayer(this.current, id);
-    this.clearSelection();
     this.emitState();
   }
 
@@ -2560,7 +2391,6 @@ export class BookEditor {
   scrollToPage(index: number, smooth = true): void {
     const rec = this.recs[clamp(index, 0, this.recs.length - 1)];
     if (!rec) return;
-    if (this.current !== rec.index) this.clearSelection();
     this.current = rec.index;
     this.store.setPage(rec.index);
     this.mount(rec);
@@ -2613,7 +2443,6 @@ export class BookEditor {
     if (best !== this.current) {
       this.current = best;
       this.store.setPage(best);
-      this.clearSelection();
       /*
        * 兜底挂载：翻页时保证当前页一定有画布。
        *

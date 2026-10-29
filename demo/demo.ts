@@ -196,7 +196,6 @@ document.addEventListener("keydown", (e) => {
   else if (k === "b") editor.setTool("ballpoint");
   else if (k === "h") editor.setTool("highlighter");
   else if (k === "e") editor.setTool("eraser");
-  else if (k === "l") editor.setTool("lasso");
   else if (k === "r") editor.setTool("shape");
   else if (k === "0") editor.fit();
   else if (k === "+" || k === "=") editor.zoomBy(1.15);
