@@ -4,39 +4,72 @@ import type { InkBook, Page } from "./types";
 /**
  * 全局搜索用的「文字索引」。
  *
- * 为什么要单独生成一份 md：
- *   Obsidian 的全局搜索只索引它能读的文本文件，`.inkbook` 是自定义格式
- *   （本质是 JSON），里面的字既搜不到也没有可读的上下文。
- *   所以在同一目录写一份 `本子名.墨本文字.md`，把每页的文字原样铺进去，
- *   搜索命中它，再点里面的链接跳回本子的某一页。
+ * 为什么不能直接搜 `.inkbook`：
+ *   Obsidian 的全局搜索只索引它能读的文本文件，`.inkbook` 是 JSON，
+ *   既搜不到，也没有可读的定位信息。
  *
- * 取舍：
- *   · 索引文件是**派生数据**，删掉不影响本子（下次保存会重建）；
- *   · 只放文字，不放笔迹、不放底图；
- *   · 每页限长，防止一本 300 页的 PDF 生成几 MB 的索引拖慢搜索。
+ * 为什么**一页一个 md**，而不是一本一个大 md：
+ *   一个大 md 的问题是：搜到了「第 12 页」，点开却停在索引文件里，
+ *   还得再点一次链接才回到本子——用户原话是「还是会跳到 Markdown，
+ *   而不是直接跳到我的笔记文件」。
+ *   一页一个文件之后，可以监听 file-open：打开索引页就立刻换成
+ *   对应的 `.inkbook` 并滚到那一页——搜索 → 点结果 → 直接落在纸上。
+ *
+ * 代价是文件多（有文字的页才有文件，通常远少于总页数），
+ * 集中放在 `<本子名>.墨本索引/` 目录里，不影响本子本身。
  */
+export const INDEX_DIR_SUFFIX = ".墨本索引";
 
-/** 索引文件后缀。带「墨本」两字，用户一眼知道它是怎么来的 */
-export const INDEX_SUFFIX = ".墨本文字.md";
+/** 旧方案（一本一个 md）的文件名后缀，遇到就删掉 */
+export const LEGACY_INDEX_SUFFIX = ".墨本文字.md";
 
-/** 单页最多索引这么多字符（约 200 行中文），超出的部分截断 */
+/** 索引页文件名：`第 12 页.md` */
+const PAGE_FILE_RE = /^第 (\d+) 页\.md$/;
+
+/** 单页最多索引这么多字符（约 200 行中文），超出截断 */
 const MAX_PAGE_CHARS = 12000;
 
-/** 一整本最多索引这么多字符，防止极端文件把库拖垮 */
-const MAX_BOOK_CHARS = 800000;
+function dirOf(file: TFile): string {
+  return file.parent && file.parent.path && file.parent.path !== "/" ? `${file.parent.path}/` : "";
+}
 
-/** 索引文件的路径：与本子同目录、同名前缀 */
-export function indexPathFor(file: TFile): string {
-  const dir = file.parent && file.parent.path && file.parent.path !== "/" ? `${file.parent.path}/` : "";
-  const base = (file.basename || "未命名").replace(/\.inkbook$/i, "");
-  return `${dir}${base}${INDEX_SUFFIX}`;
+function baseOf(file: TFile): string {
+  return (file.basename || "未命名").replace(/\.inkbook$/i, "");
+}
+
+/** 索引目录：与本子同目录、同名前缀 */
+export function indexDirFor(file: TFile): string {
+  return `${dirOf(file)}${baseOf(file)}${INDEX_DIR_SUFFIX}`;
+}
+
+/** 某一页的索引文件路径 */
+export function indexPagePath(file: TFile, pageNo: number): string {
+  return `${indexDirFor(file)}/第 ${pageNo} 页.md`;
+}
+
+/** 旧方案的单文件路径（用于清理） */
+export function legacyIndexPath(file: TFile): string {
+  return `${dirOf(file)}${baseOf(file)}${LEGACY_INDEX_SUFFIX}`;
 }
 
 /**
- * 一页里可以搜的文字。
+ * 从索引页路径反查「本子路径 + 页码」。
  *
- * 按 y 从上到下排，PDF 原文与手动添加的文字混在一起——
- * 用户在纸上看到什么顺序，索引里就是什么顺序。
+ * main.ts 的 file-open 钩子用它：打开的是索引页时，换成对应本子那一页。
+ * 不是索引页就返回 null。
+ */
+export function parseIndexPath(path: string): { bookPath: string; page: number } | null {
+  const m = path.match(/^(.*)\.墨本索引\/第 (\d+) 页\.md$/);
+  if (!m) return null;
+  const page = Number(m[2]);
+  if (!Number.isFinite(page) || page < 1) return null;
+  return { bookPath: `${m[1]}.inkbook`, page };
+}
+
+/**
+ * 一页里可以搜的文字，按 y 从上到下。
+ *
+ * PDF 原文与手动添加的文字混在一起——纸上什么顺序，索引里就是什么顺序。
  */
 function pageText(page: Page): string {
   const items = (page.texts ?? [])
@@ -52,79 +85,103 @@ function pageText(page: Page): string {
 }
 
 /**
- * 生成索引 md 的正文。
+ * 生成一页索引 md。
  *
- * 纯函数、不碰磁盘：测试里可以直接比字符串。
- * 跳页链接用 `obsidian://inkbook?file=…&page=N`，
- * 由 main.ts 的协议处理器接住（打开本子并滚到那一页）。
+ * 第一行标题带本子名与页码，搜索结果里一眼能看出是「哪本的哪一页」。
+ * 末尾保留一条协议链接：万一自动跳转没生效（比如从别的客户端打开），
+ * 还能手动点回本子。
  */
-export function buildIndexMarkdown(file: TFile, book: InkBook): string {
-  const lines: string[] = [];
-  lines.push(`# ${file.basename || "未命名"} · 文字索引`);
-  lines.push("");
-  lines.push("> 这个文件由**墨本**自动生成，用来让 Obsidian 的全局搜索能搜到这本手写本里的文字。");
-  lines.push("> 删掉它不影响本子；下次保存会自动重建。");
-  lines.push("");
-
+export function buildPageIndex(file: TFile, book: InkBook, pageIndex: number): string {
+  const text = pageText(book.pages[pageIndex] || ({} as Page));
+  const pageNo = pageIndex + 1;
   const path = encodeURIComponent(file.path);
-  let budget = MAX_BOOK_CHARS;
-  let pages = 0;
-
-  book.pages.forEach((page, i) => {
-    if (budget <= 0) return;
-    const text = pageText(page);
-    if (!text) return;
-    const clipped = text.length > budget ? text.slice(0, budget) : text;
-    budget -= clipped.length;
-    pages += 1;
-    lines.push(`## 第 ${i + 1} 页`);
-    lines.push("");
-    lines.push(clipped);
-    lines.push("");
-    lines.push(`[打开第 ${i + 1} 页](obsidian://inkbook?file=${path}&page=${i + 1})`);
-    lines.push("");
-  });
-
-  if (!pages) {
-    lines.push("（这本还没有可搜索的文字：普通纸页只有笔迹；导入的 PDF 若是扫描版，也没有文字层。）");
-    lines.push("");
-  } else if (budget <= 0) {
-    lines.push("> 索引已达长度上限，后面的页面没有收进来。");
+  const lines: string[] = [];
+  lines.push(`# ${file.basename || "未命名"} · 第 ${pageNo} 页`);
+  lines.push("");
+  lines.push("> 墨本自动生成的索引页。打开它会直接跳回手写本对应页；删掉不影响本子，下次保存会重建。");
+  lines.push("");
+  if (text) {
+    lines.push(text);
     lines.push("");
   }
-
+  lines.push(`[回到「${file.basename || "未命名"}」第 ${pageNo} 页](obsidian://inkbook?file=${path}&page=${pageNo})`);
+  lines.push("");
   return lines.join("\n");
 }
 
+interface AdapterLike {
+  exists: (path: string) => Promise<boolean>;
+  read: (path: string) => Promise<string>;
+  write: (path: string, data: string) => Promise<void>;
+  mkdir?: (path: string) => Promise<void>;
+  remove?: (path: string) => Promise<void>;
+  list?: (path: string) => Promise<{ files: string[]; folders: string[] }>;
+}
+
 /**
- * 写索引文件。
+ * 写索引：有文字的页各写一个文件，清掉多余的旧页与旧版单文件。
  *
- * 内容没变就不写：每次保存都重写一遍会让同步盘一直忙，
- * 也会让 Obsidian 反复重解析这个 md。
- *
- * 失败只记日志、不抛给调用方——索引是附属品，不能因为它坏了就报「保存失败」。
+ * 内容没变就不写（省同步与重解析）。失败只记日志——
+ * 索引是附属品，不能因为它坏了就把「保存成功」报成失败。
  */
 export async function writeTextIndex(app: App, file: TFile, book: InkBook): Promise<void> {
-  const path = indexPathFor(file);
-  const content = buildIndexMarkdown(file, book);
-  const adapter = app.vault.adapter;
+  const dir = indexDirFor(file);
+  const adapter = app.vault.adapter as unknown as AdapterLike;
   try {
-    if (await adapter.exists(path)) {
-      const old = await adapter.read(path);
-      if (old === content) return;
+    if (!(await adapter.exists(dir))) {
+      if (typeof adapter.mkdir !== "function") return;
+      await adapter.mkdir(dir);
     }
-    await adapter.write(path, content);
+
+    const wanted = new Set<string>();
+    for (let i = 0; i < book.pages.length; i += 1) {
+      const pageNo = i + 1;
+      const path = indexPagePath(file, pageNo);
+      const content = buildPageIndex(file, book, i);
+      // 没有文字的页不生成文件，但仍标记为「不该存在」，下面会清掉旧文件
+      const hasText = (book.pages[i]?.texts ?? []).some((t) => (t.text || "").trim());
+      if (!hasText) continue;
+      wanted.add(path);
+      if (await adapter.exists(path)) {
+        const old = await adapter.read(path);
+        if (old === content) continue;
+      }
+      await adapter.write(path, content);
+    }
+
+    // 页数变少 / 某页文字被清空：删掉对应的索引页
+    if (typeof adapter.list === "function" && typeof adapter.remove === "function") {
+      const listed = await adapter.list(dir);
+      for (const p of listed?.files || []) {
+        const name = p.split("/").pop() || "";
+        if (!PAGE_FILE_RE.test(name)) continue;
+        if (!wanted.has(p)) await adapter.remove(p);
+      }
+    }
+
+    // 旧方案留下的一本一个大 md：迁移时删掉，免得搜索结果里出现两份
+    const legacy = legacyIndexPath(file);
+    if (typeof adapter.remove === "function" && (await adapter.exists(legacy))) {
+      await adapter.remove(legacy);
+    }
   } catch (e) {
     console.warn("[inkbook] 写文字索引失败（不影响本子保存）", e);
   }
 }
 
-/** 删掉索引（本子被删/改名时用；失败也无所谓，它只是派生数据） */
+/** 删掉整份索引（本子被删/改名时用；失败也无所谓，它只是派生数据） */
 export async function removeTextIndex(app: App, file: TFile): Promise<void> {
-  const path = indexPathFor(file);
+  const adapter = app.vault.adapter as unknown as AdapterLike;
   try {
-    const adapter = app.vault.adapter;
-    if (await adapter.exists(path)) await adapter.remove(path);
+    const legacy = legacyIndexPath(file);
+    if (typeof adapter.remove === "function" && (await adapter.exists(legacy))) {
+      await adapter.remove(legacy);
+    }
+    const dir = indexDirFor(file);
+    if (typeof adapter.list !== "function" || typeof adapter.remove !== "function") return;
+    if (!(await adapter.exists(dir))) return;
+    const listed = await adapter.list(dir);
+    for (const p of listed?.files || []) await adapter.remove(p);
   } catch (_) {
     /* 派生数据，删不掉不算错 */
   }

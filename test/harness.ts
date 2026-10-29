@@ -3,7 +3,13 @@ import { BookStore } from "../src/store";
 import { createBook, createPage, type Pt, type Stroke } from "../src/types";
 import { readBook, writeBook } from "../src/storage";
 import { straightenPoints } from "../src/geometry";
-import { buildIndexMarkdown, indexPathFor, writeTextIndex } from "../src/indexer";
+import {
+  buildPageIndex,
+  indexDirFor,
+  indexPagePath,
+  parseIndexPath,
+  writeTextIndex,
+} from "../src/indexer";
 
 const lines: string[] = [];
 const out = document.getElementById("out")!;
@@ -457,7 +463,7 @@ async function main() {
     pass(straightenPoints(loop) === null, "圆圈不被误判为直线");
   }
 
-  /* 全局搜索索引（纯函数，不碰磁盘） */
+  /* 全局搜索索引：一页一个 md，打开即跳回本子 */
   {
     const mockFile = {
       path: "笔记/数学.inkbook",
@@ -475,67 +481,88 @@ async function main() {
       { id: "p3", source: "pdf", x: 90, y: 100, size: 12, text: "第二页正文" },
     ];
 
-    const md = buildIndexMarkdown(mockFile, bk);
-    pass(md.includes("傅里叶变换的定义"), "索引 md 含 PDF 原文");
-    pass(md.includes("我的批注"), "索引 md 含手动添加的文字");
-    pass(md.includes("## 第 1 页") && md.includes("## 第 2 页"), "索引 md 按页分节");
+    const p1 = buildPageIndex(mockFile, bk, 0);
+    pass(p1.includes("傅里叶变换的定义"), "第 1 页索引含 PDF 原文");
+    pass(p1.includes("我的批注"), "第 1 页索引含手动添加的文字");
+    pass(p1.includes("# 数学 · 第 1 页"), "索引页标题带本子名与页码");
     pass(
-      md.includes("obsidian://inkbook?file=") && md.includes("page=2"),
-      "索引 md 带跳页链接（含第 2 页）"
+      p1.includes("obsidian://inkbook?file=") && p1.includes("page=1"),
+      "索引页带跳页链接"
     );
     pass(
-      md.indexOf("傅里叶变换的定义") < md.indexOf("我的批注") &&
-        md.indexOf("我的批注") < md.indexOf("下半页的原文"),
+      p1.indexOf("傅里叶变换的定义") < p1.indexOf("我的批注") &&
+        p1.indexOf("我的批注") < p1.indexOf("下半页的原文"),
       "同一页内按 y 从上到下排列"
     );
-    pass(!md.includes("undefined") && !md.includes("null"), "索引 md 没有 undefined/null");
-    pass(
-      indexPathFor(mockFile) === "笔记/数学.墨本文字.md",
-      "索引文件与本子同目录、同名前缀：" + indexPathFor(mockFile)
-    );
-    // 没有文字的书也不能崩
-    const empty = buildIndexMarkdown(mockFile, createBook("空", "grid", "white"));
-    pass(empty.includes("还没有可搜索的文字"), "没有文字的本子给出说明而不是空文件");
+    pass(!p1.includes("undefined") && !p1.includes("null"), "索引页没有 undefined/null");
 
-    /* 真的写一遍：用内存 adapter 替身，验"内容没变就不重写" */
+    const p2 = buildPageIndex(mockFile, bk, 1);
+    pass(
+      p2.includes("第二页正文") && !p2.includes("傅里叶"),
+      "每页各写各的内容，不串页"
+    );
+
+    pass(
+      indexDirFor(mockFile) === "笔记/数学.墨本索引",
+      "索引目录与本子同目录、同名前缀：" + indexDirFor(mockFile)
+    );
+    pass(
+      indexPagePath(mockFile, 12) === "笔记/数学.墨本索引/第 12 页.md",
+      "索引页文件名带页码：" + indexPagePath(mockFile, 12)
+    );
+
+    const parsed = parseIndexPath("笔记/数学.墨本索引/第 12 页.md");
+    pass(
+      parsed?.bookPath === "笔记/数学.inkbook" && parsed?.page === 12,
+      "索引页路径能反查出本子与页码"
+    );
+    pass(parseIndexPath("笔记/数学.md") === null, "普通 md 不会被当成索引页");
+    pass(parseIndexPath("笔记/数学.墨本索引/说明.md") === null, "索引目录里的非页文件不误判");
+
+    /* 真的写一遍：内存 adapter 替身 */
     const fsMap = new Map<string, string>();
+    const dirs = new Set<string>();
     let writes = 0;
-    const mockApp = {
-      vault: {
-        adapter: {
-          exists: async (p: string) => fsMap.has(p),
-          read: async (p: string) => fsMap.get(p) || "",
-          write: async (p: string, d: string) => {
-            writes += 1;
-            fsMap.set(p, d);
-          },
-          remove: async (p: string) => {
-            fsMap.delete(p);
-          },
-        },
+    const adapter = {
+      exists: async (p: string) => fsMap.has(p) || dirs.has(p),
+      read: async (p: string) => fsMap.get(p) || "",
+      write: async (p: string, d: string) => {
+        writes += 1;
+        fsMap.set(p, d);
       },
-    } as any;
+      remove: async (p: string) => {
+        fsMap.delete(p);
+      },
+      mkdir: async (p: string) => {
+        dirs.add(p);
+      },
+      list: async (p: string) => ({
+        files: [...fsMap.keys()].filter((k) => k.startsWith(p + "/")),
+        folders: [],
+      }),
+    };
+    const mockApp = { vault: { adapter } } as any;
+
+    // 旧方案的一本一个大 md：迁移时要被删掉
+    fsMap.set("笔记/数学.墨本文字.md", "旧索引");
 
     await writeTextIndex(mockApp, mockFile, bk);
-    const written = fsMap.get("笔记/数学.墨本文字.md") || "";
-    pass(written.includes("傅里叶变换的定义"), "writeTextIndex 真的写出了索引文件");
+    const f1 = fsMap.get("笔记/数学.墨本索引/第 1 页.md") || "";
+    pass(
+      dirs.has("笔记/数学.墨本索引") && f1.includes("傅里叶变换的定义"),
+      "writeTextIndex 建好索引目录并写出第 1 页"
+    );
+    pass(fsMap.has("笔记/数学.墨本索引/第 2 页.md"), "有文字的第 2 页也生成了索引页");
+    pass(!fsMap.has("笔记/数学.墨本索引/第 3 页.md"), "没有文字的页不生成文件");
+    pass(!fsMap.has("笔记/数学.墨本文字.md"), "旧版单文件索引被清理掉");
+
     const w1 = writes;
     await writeTextIndex(mockApp, mockFile, bk);
     pass(writes === w1, "内容没变化时不重复写（省同步与重解析）");
 
-    bk.pages[0].texts!.push({
-      id: "u2",
-      source: "user",
-      x: 100,
-      y: 500,
-      size: 18,
-      text: "新加的一句",
-    });
+    bk.pages[1].texts = [];
     await writeTextIndex(mockApp, mockFile, bk);
-    pass(
-      writes === w1 + 1 && (fsMap.get("笔记/数学.墨本文字.md") || "").includes("新加的一句"),
-      "文字变了会更新索引"
-    );
+    pass(!fsMap.has("笔记/数学.墨本索引/第 2 页.md"), "某页文字清空后删掉对应索引页");
   }
 
   log("DONE");

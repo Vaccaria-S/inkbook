@@ -86,6 +86,7 @@ async function main() {
       addCommand(c){ this.__cmds.push(c); }
       addSettingTab(t){ this.__settingsTab = t; }
       registerObsidianProtocolHandler(action, handler){ this.__protocols[action] = handler; }
+      registerEvent(){ return () => {}; }
       async loadData(){
         // 没有 data.json 时给一份默认设置，和真实插件一致
         if (!this.__data || !Object.keys(this.__data).length) {
@@ -344,13 +345,13 @@ async function main() {
   pass(!!view.containerEl.querySelector(".mb-rail-read"), "顶栏仅阅读按钮已渲染");
   pass(!!host.querySelector(".mb-float"), "右下角浮标已渲染");
   pass(
-    view.containerEl.querySelectorAll(".mb-top-tool").length === 7,
-    "7 个工具按钮已渲染：" +
+    view.containerEl.querySelectorAll(".mb-top-tool").length === 8,
+    "8 个工具按钮已渲染：" +
       view.containerEl.querySelectorAll(".mb-top-tool").length +
       " 个"
   );
   pass(
-    host.querySelectorAll(".mb-ic").length >= 7,
+    host.querySelectorAll(".mb-ic").length >= 8,
     "自绘图标已渲染：" + host.querySelectorAll(".mb-ic").length + " 个"
   );
   pass(host.querySelectorAll(".mb-page").length === 1, "A4 页面已渲染");

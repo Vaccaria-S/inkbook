@@ -42,6 +42,7 @@ const TOOLS: Array<{ id: ToolId; icon: string; name: string; short: string }> = 
   { id: "highlighter", icon: "highlighter", name: "荧光笔 (H)", short: "荧光" },
   { id: "eraser", icon: "eraser", name: "橡皮 (E)", short: "橡皮" },
   { id: "text", icon: "type", name: "文字 (T)", short: "文字" },
+  { id: "select", icon: "cursor", name: "选择 / 移动 (V)", short: "选择" },
   { id: "shape", icon: "square", name: "形状 (R)", short: "形状" },
   { id: "hand", icon: "hand", name: "拖动画布", short: "拖动" },
 ];
@@ -1305,6 +1306,13 @@ export class InkbookView extends FileView {
       }
       return;
     }
+    if (s.tool === "select") {
+      this.dynEl.createSpan({
+        cls: "mb-hint",
+        text: "点文字选中后可拖动；双击改内容，Delete 删除",
+      });
+      return;
+    }
     if (s.tool === "hand") {
       this.dynEl.createSpan({ cls: "mb-hint", text: "拖动画布；滚轮 / 双指也可以" });
       return;
@@ -2332,6 +2340,7 @@ export class InkbookView extends FileView {
     else if (k === "b") this.editor.setTool("ballpoint");
     else if (k === "h") this.editor.setTool("highlighter");
     else if (k === "e") this.editor.setTool("eraser");
+    else if (k === "v") this.editor.setTool("select");
     else if (k === "r") this.editor.setTool("shape");
     else if (k === "t") this.editor.setTool("text");
     else if (k === "i") {

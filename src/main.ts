@@ -3,6 +3,7 @@ import { InkbookView, VIEW_TYPE } from "./view";
 import { InkbookSettingTab, DEFAULT_SETTINGS } from "./settings";
 import { NewBookModal } from "./modals";
 import type { InkbookSettings } from "./types";
+import { parseIndexPath } from "./indexer";
 
 class BookPickerModal extends FuzzySuggestModal<TFile> {
   private choose: (file: TFile) => void;
@@ -84,6 +85,25 @@ export default class InkbookPlugin extends Plugin {
     this.registerObsidianProtocolHandler("inkbook", (params) => {
       void this.openFromLink(params);
     });
+
+    /*
+     * 打开索引页 = 想回本子那一页。
+     *
+     * 索引是「一页一个 md」，所以 file-open 时能直接从路径反查出
+     * 本子与页码，立刻换成 .inkbook 并滚过去——用户从全局搜索点结果，
+     * 落在纸上而不是停在 md 里。这是「搜索直接跳笔记」的实现方式。
+     */
+    this.registerEvent(
+      this.app.workspace.on("file-open", (file: TFile | null) => {
+        if (!file) return;
+        const hit = parseIndexPath(file.path);
+        if (!hit) return;
+        // 等这一轮 md 打开流程走完再切，否则 Obsidian 会把我们刚打开的视图顶掉
+        window.setTimeout(() => {
+          void this.openBookAt(hit.bookPath, hit.page);
+        }, 60);
+      })
+    );
   }
 
   /** 处理 obsidian://inkbook?file=…&page=N */
@@ -98,12 +118,25 @@ export default class InkbookPlugin extends Plugin {
         /* 解不开就用原值 */
       }
     }
+    await this.openBookAt(path, Number(params.page || "1") || 1);
+  }
+
+  /** 打开指定路径的手写本并跳到第 page 页（1 起） */
+  private async openBookAt(path: string, page: number): Promise<void> {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) {
       new Notice("墨本：找不到这本手写本 —— " + path);
       return;
     }
-    const page = Number(params.page || "1") || 1;
+    // 已经停在这本上：不重新打开，直接翻页（避免闪一下）
+    const active = this.app.workspace.getActiveFile?.();
+    if (active && active.path === file.path) {
+      const open = this.app.workspace.getActiveViewOfType?.(InkbookView);
+      if (open) {
+        open.gotoPageFromLink(page);
+        return;
+      }
+    }
     const leaf = this.app.workspace.getLeaf(false);
     await leaf.openFile(file);
     const view = leaf.view;

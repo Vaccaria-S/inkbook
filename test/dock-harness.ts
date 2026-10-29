@@ -2,7 +2,7 @@
  * 工具长条 + 右下角浮标 + 侧栏 回归测试。
  *
  * 覆盖六条主线：
- *   1. 顶栏工具行：7 个工具 + 立即保存 + 侧栏开关 + 阅读开关
+ *   1. 顶栏工具行：8 个工具 + 立即保存 + 侧栏开关 + 阅读开关
  *   2. 长条**不遮挡滚动条**（用户反馈"边上的框会挡住滑动页面的那个条"）
  *   3. 右下角浮标：翻页常驻、缩放**只在缩放时**浮现并显示确切倍数
  *   4. 侧栏收纳全部工具：导出 / 导入 / 撤销 / 输入方式都在里面
@@ -184,14 +184,14 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   pass(!root.querySelector(".mb-dock-tab"), "旧标签页已移除");
   pass(!root.querySelector(".mb-rail-more"), "旧「更多」按钮已移除");
 
-  // 7 个工具 + 3 个动作 = 10 个按钮，挤在同一行
+  // 8 个工具 + 3 个动作 = 11 个按钮，挤在同一行
   const tools = topRow.querySelectorAll(".mb-top-tool");
-  pass(tools.length === 7, "顶栏上 7 个工具按钮（" + tools.length + "）");
+  pass(tools.length === 8, "顶栏上 8 个工具按钮（" + tools.length + "）");
 
   const rowBtns = Array.from(
     topRow.querySelectorAll(".mb-topbtn")
   ) as HTMLElement[];
-  pass(rowBtns.length === 10, "一行里 10 个按钮（7 笔 + 3 动作）：" + rowBtns.length);
+  pass(rowBtns.length === 11, "一行里 11 个按钮（8 工具 + 3 动作）：" + rowBtns.length);
 
   /*
    * 用户要求："把钢笔、橡皮啊，侧边的这些东西都挪到最上面去"，
@@ -200,7 +200,7 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
    */
   const tops = rowBtns.map((b) => Math.round(b.getBoundingClientRect().top));
   const rowSpread = Math.max(...tops) - Math.min(...tops);
-  pass(rowSpread <= 2, "10 个按钮在同一水平线上（顶边最大差 " + rowSpread + "px）");
+  pass(rowSpread <= 2, "11 个按钮在同一水平线上（顶边最大差 " + rowSpread + "px）");
 
   // 顺序：笔在左，视图动作在右
   const lastToolRight = (
@@ -526,7 +526,7 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   const tTops = Array.from(tools).map(
     (t) => Math.round((t as HTMLElement).getBoundingClientRect().top)
   );
-  pass(new Set(tTops).size === 1, "平板端 7 个工具仍是一行（没有换行）");
+  pass(new Set(tTops).size === 1, "平板端 8 个工具仍是一行（没有换行）");
 
   root.classList.remove("is-tablet");
   headerEl.classList.remove("mb-tablet");
@@ -685,7 +685,7 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
     const bar = root.querySelector(".mb-topbar") as HTMLElement;
     pass(!!bar, "标题栏窄到放不下时，整行搬进自建顶栏条 .mb-topbar");
     const btns = bar ? bar.querySelectorAll(".mb-topbtn").length : 0;
-    pass(btns === 10, "搬下来后 10 个按钮都在（没被压扁）：" + btns);
+    pass(btns === 11, "搬下来后 11 个按钮都在（没被压扁）：" + btns);
     const rowNow = bar ? (bar.querySelector(".mb-toprow") as HTMLElement) : null;
     const rowW1 = rowNow ? rowNow.getBoundingClientRect().width : 0;
     pass(
@@ -758,6 +758,60 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
     view.editor!.undo();
     await sleep(100);
     pass((view.store!.data.pages[0].texts || []).length === 1, "Delete 删除可撤销");
+
+    // 选择工具：点中可拖，拖动可撤销
+    view.editor!.setTool("select");
+    await sleep(80);
+    const beforeXY = { x: view.store!.data.pages[0].texts![0].x, y: view.store!.data.pages[0].texts![0].y };
+    const pageEl = root.querySelector(".mb-page") as HTMLElement;
+    const pr = pageEl.getBoundingClientRect();
+    const k = pr.width / 794;
+    const put = (type: string, x: number, y: number, id: number) =>
+      pageEl.dispatchEvent(
+        new PointerEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          pointerId: id,
+          pointerType: "mouse",
+          button: 0,
+          buttons: type === "pointerup" ? 0 : 1,
+          clientX: Math.round(pr.left + x * k),
+          clientY: Math.round(pr.top + y * k),
+        })
+      );
+    put("pointerdown", 130, 234, 41);
+    put("pointerup", 130, 234, 41);
+    await sleep(80);
+    pass(
+      view.editor!.selectedText?.id === "t_dock",
+      "选择工具点文字就选中（不必先切文字工具）"
+    );
+
+    put("pointerdown", 130, 234, 42);
+    put("pointermove", 190, 300, 42);
+    await sleep(80);
+    put("pointerup", 190, 300, 42);
+    await sleep(120);
+    const moved = view.store!.data.pages[0].texts![0];
+    pass(
+      Math.abs(moved.x - beforeXY.x) > 20 && Math.abs(moved.y - beforeXY.y) > 20,
+      "拖动文字改坐标（" +
+        beforeXY.x +
+        "," +
+        beforeXY.y +
+        " -> " +
+        Math.round(moved.x) +
+        "," +
+        Math.round(moved.y) +
+        "）"
+    );
+    view.editor!.undo();
+    await sleep(120);
+    const back = view.store!.data.pages[0].texts![0];
+    pass(
+      Math.abs(back.x - beforeXY.x) < 2 && Math.abs(back.y - beforeXY.y) < 2,
+      "拖动可撤销回原位"
+    );
 
     // 形状面板：颜色点（粗细滑杆本来就有）
     view.editor!.setTool("shape");

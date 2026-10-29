@@ -100,7 +100,7 @@ interface PageRec {
   ioVisible: boolean;
 }
 
-type Gesture = "none" | "draw" | "shape" | "erase" | "pan";
+type Gesture = "none" | "draw" | "shape" | "erase" | "pan" | "moveText";
 
 /**
  * 文字可用字体。
@@ -263,8 +263,20 @@ export class BookEditor {
   /** 新建文字用的字体 id 与颜色 */
   private textFontValue = "sans";
   private textColorValue = "#1A1A1A";
-  /** 当前选中的文字对象 id（只在文字工具下有意义） */
+  /** 当前选中的文字对象 id（文字 / 选择工具下有意义） */
   private selectedTextId: string | null = null;
+  /** 正在拖动的文字（选择工具） */
+  private moveText: {
+    rec: PageRec;
+    id: string;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+    moved: boolean;
+  } | null = null;
+  /** 上一次点文字的时间，用来识别双击（双击进编辑） */
+  private lastTextTap: { id: string; t: number } | null = null;
   /** 选中文字后浮在纸上方的属性条 */
   private textBarEl: HTMLElement | null = null;
   private pointerId: number | null = null;
@@ -423,6 +435,10 @@ export class BookEditor {
   } | null = null;
   /** 捏合手势进行中（屏蔽锚点锁的「用户滚动」判定） */
   private pinchActive = false;
+  /** 捏合开始时的当前页（手势结束后要锁回它，缩放不是翻页） */
+  private pinchStartPage = 0;
+  /** 手势结束后继续冻结页码判定的定时器（补偿还会再触发几帧 scroll） */
+  private pinchReleaseTimer = 0;
   /**
    * 锁定锚点时的 scrollTop。
    *
@@ -667,8 +683,8 @@ export class BookEditor {
     if (this.tool === tool) return;
     this.tool = tool;
     this.eraserPos = null;
-    // 离开文字工具就没有"选中文字"这回事了，属性条一并收掉
-    if (tool !== "text") this.selectText(null);
+    // 离开文字/选择工具就没有"选中文字"这回事了，属性条一并收掉
+    if (tool !== "text" && tool !== "select") this.selectText(null);
     this.applyTouchAction();
     this.emitState();
   }
@@ -1043,6 +1059,7 @@ export class BookEditor {
     this.pointerId = null;
     this.eraserPos = null;
     this.hoverPos = null;
+    this.moveText = null;
     this.arbiter.reset();
     if (this.observer) {
       this.observer.disconnect();
@@ -1331,17 +1348,41 @@ export class BookEditor {
      * 如果不屏蔽，锚点会在第一次缩放后就被判为失效，
      * 下一帧重新 pickAnchor → 锚点漂移 → 跳页。
      */
+    this.pinchStartPage = this.current;
+    window.clearTimeout(this.pinchReleaseTimer);
+    this.pinchReleaseTimer = 0;
     this.pinchActive = true;
   }
 
-  /** 捏合手势结束 */
+  /**
+   * 捏合手势结束。
+   *
+   * 这里**不能**用视口中线重算当前页：缩放补偿有 1px 误差就会落到相邻页，
+   * 用户看到的就是「一放大缩小，页码跳到别的页」。
+   * 缩放是围绕锚点做的，没有翻页意图，所以直接锁回手势开始时的页。
+   */
   private endPinch(): void {
+    const keep = clamp(this.pinchStartPage, 0, Math.max(0, this.recs.length - 1));
     this.pinch = null;
-    this.pinchActive = false;
-    // 手势期间冻结了当前页判定，这里补算一次（页码/缩略图/状态栏都靠它）
     this.measurePageMetrics();
-    this.updateCurrentFromScroll();
+
+    if (this.recs.length && this.current !== keep) {
+      this.current = keep;
+      this.store.setPage(keep);
+      this.mount(this.recs[keep]);
+    }
     this.emitState();
+
+    /*
+     * 补偿引起的 scroll 事件还会再跑几帧。若这里立刻把 pinchActive 放开，
+     * 那些 scroll 会走 updateCurrentFromScroll，前面锁的页白锁了。
+     * 冻结 240ms，等滚动彻底停下来。
+     */
+    window.clearTimeout(this.pinchReleaseTimer);
+    this.pinchReleaseTimer = window.setTimeout(() => {
+      this.pinchReleaseTimer = 0;
+      this.pinchActive = false;
+    }, 240);
   }
 
   /**
@@ -2039,7 +2080,8 @@ export class BookEditor {
      * 画在 overlay 而不是用 DOM：overlay 本来就按页面坐标缩放好了，
      * 缩放、滚动都不用管；而且它压在文字层之上，框不会被字盖住。
      */
-    const sel = this.tool === "text" ? this.selectedText : null;
+    const sel =
+      this.tool === "text" || this.tool === "select" ? this.selectedText : null;
     if (sel) {
       const bw = Math.max(24, this.measureTextWidth(sel));
       const lines = Math.max(1, sel.text.split("\n").length);
@@ -2175,6 +2217,41 @@ export class BookEditor {
    * 编辑框是页面里的一个 textarea，位置按当前缩放换算——
    * 所见即所得，提交后交给文字层渲染。
    */
+  /**
+   * 选择工具下点了一下页面：选中 + 准备拖动，双击进编辑。
+   *
+   * 为什么单独做一个工具而不是扛在文字工具上：
+   * 文字工具的第一下必须是「新建」，否则想随手加一段字就得先点空白。
+   * 选择和移动是另一种意图，混在一起两边都不好用。
+   */
+  private handleSelectPointer(rec: PageRec, px: number, py: number, e: PointerEvent): void {
+    if (this.readOnly) return;
+    const page = this.store.data.pages[rec.index];
+    if (!page) return;
+    const hit = this.hitText(page.texts ?? [], px, py);
+
+    if (!hit) {
+      this.selectText(null);
+      return;
+    }
+    this.selectText(hit.id);
+    this.gesture = "moveText";
+    this.pointerId = e.pointerId;
+    this.moveText = {
+      rec,
+      id: hit.id,
+      startX: px,
+      startY: py,
+      originX: hit.x,
+      originY: hit.y,
+      moved: false,
+    };
+    try {
+      rec.pageEl.setPointerCapture?.(e.pointerId);
+    } catch (_) {}
+    e.preventDefault();
+  }
+
   /**
    * 文字工具下点了一下页面。
    *
@@ -2543,7 +2620,15 @@ export class BookEditor {
     // 用 docEl 上的 data 属性统一控制，CSS 里靠继承生效——
     // 逐页写的话几百页时每次切换工具都要几百次样式写入。
     this.docEl.dataset.tool = this.tool;
-    this.docEl.style.touchAction = "pan-x pan-y pinch-zoom";
+    /*
+     * 不再放 `pinch-zoom`：那会让安卓 WebView 自己再缩放一层视觉视口，
+     * 与我们的 pinch 补偿叠加——用户看到的就是「捏合时跳到别的页」。
+     * 缩放完全由 BookEditor 的 pointer 手势接管。
+     *
+     * 选择工具下关掉滚动：拖动文字的手指移动如果同时滚页面，
+     * 文字会跟着页面跑，怎么都拖不准。双指捏合/平移仍由 pointer 处理。
+     */
+    this.docEl.style.touchAction = this.tool === "select" ? "none" : "pan-x pan-y";
   }
 
   /**
@@ -2614,6 +2699,14 @@ export class BookEditor {
         e.preventDefault();
         return;
       }
+      if (this.tool === "select" && !this.readOnly) {
+        const p = this.pointFromEvent(e, rec);
+        this.current = rec.index;
+        this.store.setPage(rec.index);
+        this.handleSelectPointer(rec, p[0], p[1], e);
+        e.preventDefault();
+        return;
+      }
       this.gesture = "pan";
       this.pointerId = e.pointerId;
       this.pan = {
@@ -2668,6 +2761,12 @@ export class BookEditor {
     if (this.tool === "text") {
       const tp = this.pointFromEvent(e, rec);
       this.handleTextPointer(rec, tp[0], tp[1]);
+      return;
+    }
+
+    if (this.tool === "select") {
+      const sp = this.pointFromEvent(e, rec);
+      this.handleSelectPointer(rec, sp[0], sp[1], e);
       return;
     }
 
@@ -2759,6 +2858,29 @@ export class BookEditor {
   }
 
   private onMove(e: PointerEvent, rec: PageRec): void {
+    /* 拖动文字：每帧改坐标，重建文字层（文字条数很少，重建比逐节点改省心） */
+    if (this.gesture === "moveText" && this.moveText) {
+      const m = this.moveText;
+      const p = this.pointFromEvent(e, m.rec);
+      const dx = p[0] - m.startX;
+      const dy = p[1] - m.startY;
+      if (!m.moved && Math.hypot(dx, dy) < 3) return;
+      if (!m.moved) {
+        // 第一次真正拖动才记历史：点一下（没动）不该产生一条撤销
+        this.store.snapshotPage(m.rec.index);
+        m.moved = true;
+      }
+      const target = this.store.data.pages[m.rec.index]?.texts?.find((t) => t.id === m.id);
+      if (!target) return;
+      target.x = clamp(m.originX + dx, 0, this.store.data.width - 12);
+      target.y = clamp(m.originY + dy, target.size, this.store.data.height - 4);
+      this.renderTextLayer(m.rec);
+      this.renderOverlay(m.rec);
+      this.positionTextBar();
+      e.preventDefault();
+      return;
+    }
+
     /*
      * 捏合时**不能**按 pointerId 过滤。
      *
@@ -2890,7 +3012,32 @@ export class BookEditor {
     }
     this.velSamples = [];
 
-    if (gesture === "draw" || gesture === "shape") {
+    if (gesture === "moveText") {
+      const m = this.moveText;
+      this.moveText = null;
+      if (m?.moved) {
+        // 拖动结束：一条撤销记录
+        this.store.touch();
+        this.changed();
+        this.emitState();
+      } else if (m) {
+        /*
+         * 拖动判定放在抬手时，而不是按下时：
+         * 用户「点一下选中，再按住同一处拖」时，两次按下相隔可能只有 100ms，
+         * 按下就判双击会直接弹出输入框，拖都拖不了。
+         * 抬手时没移动过，才是真正的「点了第二下」。
+         */
+        const now = e.timeStamp || performance.now();
+        const last = this.lastTextTap;
+        if (last && last.id === m.id && now - last.t < 300) {
+          this.lastTextTap = null;
+          const t = this.store.data.pages[m.rec.index]?.texts?.find((x) => x.id === m.id);
+          if (t) this.beginTextEdit(m.rec, t.x + 4, t.y - t.size * 0.4);
+        } else {
+          this.lastTextTap = { id: m.id, t: now };
+        }
+      }
+    } else if (gesture === "draw" || gesture === "shape") {
       this.commitDraft(rec);
     } else if (gesture === "erase") {
       this.eraserPos = null;
@@ -3348,6 +3495,9 @@ export class BookEditor {
       void p.then((doc) => doc?.destroy?.()).catch(() => {});
     }
     this.pdfDocs.clear();
+    window.clearTimeout(this.pinchReleaseTimer);
+    this.pinchReleaseTimer = 0;
+    this.moveText = null;
     this.textBarEl = null;
     this.selectedTextId = null;
     this.host.innerHTML = "";

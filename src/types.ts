@@ -4,6 +4,7 @@ export type ToolId =
   | "highlighter"
   | "eraser"
   | "text"
+  | "select"
   | "shape"
   | "hand";
 
