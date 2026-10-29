@@ -147,6 +147,26 @@ async function main() {
     }
     await sleep(60);
 
+    // 字号：新建的文字应该用当前设定
+    editor.setTextSize(24);
+    editor.setTool("pen");
+    editor.setTool("text");
+    pageEl().dispatchEvent(ev("pointerdown", 300, 420, 1, 23));
+    pageEl().dispatchEvent(ev("pointerup", 300, 420, 0, 23));
+    await sleep(60);
+    const taBig = pageEl().querySelector(".mb-text-edit") as HTMLTextAreaElement;
+    if (taBig) {
+      taBig.value = "大字";
+      taBig.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    }
+    await sleep(60);
+    const big = (store.data.pages[0].texts || []).find((t) => t.text === "大字");
+    pass(big?.size === 24, "字号按设定写入（" + (big?.size ?? "-") + "）");
+    editor.setTextSize(18);
+    // 收尾：只留前面那条，后面的断言按 1 条算
+    editor.undo();
+    await sleep(40);
+
     const texts = store.data.pages[0].texts || [];
     pass(texts.length === 1, "文字已写入页面数据（" + texts.length + " 条）");
     pass(texts[0]?.source === "user", "来源标记为 user");

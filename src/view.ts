@@ -1240,6 +1240,19 @@ export class InkbookView extends FileView {
         cls: "mb-hint",
         text: "点页面输入文字；点已有文字可编辑，清空即删除",
       });
+      /*
+       * 字号：只作用于**新建**的文字。编辑已有文字时保留它自己的字号，
+       * 不然点开一段旧字再点一下别的字号，会把已排好的版弄乱。
+       * 颜色跟随当前笔色（侧栏的调色板）。
+       */
+      const seg = this.dynEl.createDiv("mb-seg");
+      for (const n of [14, 18, 24, 32]) {
+        const b = seg.createEl("button", {
+          cls: "mb-seg-btn" + (this.editor.textSize === n ? " is-active" : ""),
+          text: String(n),
+        });
+        b.onclick = () => this.editor?.setTextSize(n);
+      }
       return;
     }
     if (s.tool === "hand") {

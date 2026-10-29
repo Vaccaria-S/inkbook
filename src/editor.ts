@@ -212,6 +212,8 @@ export class BookEditor {
   } | null = null;
   /** 正在补抽文字的页（防止重复触发） */
   private textExtracting = new Set<number>();
+  /** 新建文字用的字号（页面坐标）；已有文字编辑时保持它自己的字号 */
+  private textSizeValue = 18;
   private pointerId: number | null = null;
   private draft: Stroke | null = null;
   private draftRec: PageRec | null = null;
@@ -587,6 +589,17 @@ export class BookEditor {
     this.tool = tool;
     this.eraserPos = null;
     this.applyTouchAction();
+    this.emitState();
+  }
+
+  get textSize(): number {
+    return this.textSizeValue;
+  }
+
+  setTextSize(size: number): void {
+    const v = clamp(Math.round(size), 8, 96);
+    if (v === this.textSizeValue) return;
+    this.textSizeValue = v;
     this.emitState();
   }
 
@@ -1825,7 +1838,7 @@ export class BookEditor {
     if (!page) return;
 
     const hit = this.hitText(page.texts ?? [], px, py);
-    const size = hit?.size ?? 18;
+    const size = hit?.size ?? this.textSizeValue;
     const color = hit?.color ?? this.penColor;
     const x = hit ? hit.x : px;
     // 新建时让点击点落在文字中部（基线在下方约 0.82 字高）
