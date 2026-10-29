@@ -105,6 +105,7 @@ function makeBook(pages = 3) {
   // 强制成需要的设备形态
   const root = view.contentEl as HTMLElement;
   root.classList.toggle("is-tablet", MODE === "tablet");
+  view.containerEl.classList.toggle("mb-tablet", MODE === "tablet");
   if (params.get("theme") === "dark") document.body.classList.add("dark");
 
   // 指定侧栏开合状态

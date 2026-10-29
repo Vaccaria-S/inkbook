@@ -119,10 +119,10 @@ async function main() {
 
   pass(!!view.editor, "编辑器已挂载");
   pass(
-    view.contentEl.querySelectorAll(".mb-rail-tool").length >= 7,
-    "墨具坞工具按钮已生成"
+    view.containerEl.querySelectorAll(".mb-top-tool").length >= 7,
+    "顶栏工具按钮已生成"
   );
-  pass(!!view.contentEl.querySelector(".mb-rail"), "墨具坞工具长条已生成");
+  pass(!!view.containerEl.querySelector(".mb-toprow"), "顶栏工具行已生成");
   pass(!!view.containerEl.querySelector(".mb-rail-side"), "顶栏侧栏开关已生成");
   pass(!!view.containerEl.querySelector(".mb-rail-read"), "顶栏仅阅读按钮已生成");
   pass(view.sideEl.textContent!.includes("笔盒"), "侧栏有笔盒");

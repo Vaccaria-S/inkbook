@@ -335,13 +335,15 @@ async function main() {
    * 产物级断言：验证用户真正装到 Obsidian 里的那个文件里，
    * 墨具坞的圆钮、标签页、工具按钮都在。
    */
-  pass(!!host.querySelector(".mb-rail"), "工具长条已渲染");
+  pass(!!view.containerEl.querySelector(".mb-toprow"), "顶栏工具行已渲染");
   pass(!!view.containerEl.querySelector(".mb-rail-side"), "顶栏侧栏开关已渲染");
   pass(!!view.containerEl.querySelector(".mb-rail-read"), "顶栏仅阅读按钮已渲染");
   pass(!!host.querySelector(".mb-float"), "右下角浮标已渲染");
   pass(
-    host.querySelectorAll(".mb-rail-tool").length === 7,
-    "7 个工具按钮已渲染：" + host.querySelectorAll(".mb-rail-tool").length + " 个"
+    view.containerEl.querySelectorAll(".mb-top-tool").length === 7,
+    "7 个工具按钮已渲染：" +
+      view.containerEl.querySelectorAll(".mb-top-tool").length +
+      " 个"
   );
   pass(
     host.querySelectorAll(".mb-ic").length >= 7,

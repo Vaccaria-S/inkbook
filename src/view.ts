@@ -90,16 +90,13 @@ export class InkbookView extends FileView {
   store: BookStore | null = null;
   editor: BookEditor | null = null;
 
-  private railEl!: HTMLElement;
   private railReadBtn!: HTMLElement;
   private railSideBtn!: HTMLElement;
-  /** 浮层工具盘的拖动手柄 */
-  private railHandleBtn!: HTMLElement;
   /**
-   * 长条上的「立即保存」按钮。
+   * 顶栏上的「立即保存」按钮。
    *
    * 自动保存有 850ms 防抖：写完最后一笔想马上确认"已经存住了"时没有入口。
-   * 按钮常驻在长条上，不用先展开侧栏。
+   * 按钮常驻在顶栏上，不用先展开侧栏。
    */
   private railSaveBtn!: HTMLElement;
   private readHintEl!: HTMLElement;
@@ -111,6 +108,20 @@ export class InkbookView extends FileView {
   private sideEl!: HTMLElement;
   private dynEl!: HTMLElement;
   private pageLbl!: HTMLElement;
+  /** 顶栏那一行：7 支笔 + 保存/侧栏/仅阅读，全部挤在标题栏同一行 */
+  private topRowEl: HTMLElement | null = null;
+  /** 顶栏里的工具组（仅阅读时整组收起） */
+  private topToolsEl: HTMLElement | null = null;
+  /** 侧边可拖动滑条（替代系统滚动条，手指也抓得住） */
+  private sbEl: HTMLElement | null = null;
+  private sbTrack: HTMLElement | null = null;
+  private sbThumb: HTMLElement | null = null;
+  private sbTip: HTMLElement | null = null;
+  private sbAbort: AbortController | null = null;
+  private sbRaf = 0;
+  private sbThumbH = 0;
+  private sbThumbTop = 0;
+  private sbDrag: { pid: number; grab: number } | null = null;
   private zoomLbl!: HTMLElement;
   private statusEl!: HTMLElement;
   private undoBtn!: HTMLButtonElement;
@@ -413,8 +424,8 @@ export class InkbookView extends FileView {
     this.editor.penSize = this.plugin.settings.defaultPenSize || 2.8;
     this.editor.highlighterColor = this.plugin.settings.lastHighlighterColor || "#F6E05E";
     this.buildHeaderActions();
-    this.buildRail();
     this.buildFloat();
+    this.buildScrollbar();
     this.buildSide();
     this.updateUI();
     this.saveState = "saved";
@@ -426,11 +437,24 @@ export class InkbookView extends FileView {
     this.editor = null;
     window.clearTimeout(this.hintTimer);
     window.clearTimeout(this.zoomHintTimer);
-    this.railEl?.remove();
     this.floatEl?.remove();
+    // 滑条挂在 paperHost 上，跟着编辑器一起拆；监听器走 AbortController 一并断掉
+    this.sbAbort?.abort();
+    this.sbAbort = null;
+    if (this.sbRaf) {
+      window.cancelAnimationFrame?.(this.sbRaf);
+      this.sbRaf = 0;
+    }
+    this.sbEl?.remove();
+    this.sbEl = null;
+    this.sbTrack = null;
+    this.sbThumb = null;
+    this.sbTip = null;
+    this.sbDrag = null;
+    this.sbThumbH = 0;
+    this.sbThumbTop = 0;
     this.sideEl?.empty();
     this.toolButtons.clear();
-    this.railEl = null as any;
     this.floatEl = null as any;
     this.layerListEl = null;
     this.pageListEl = null;
@@ -479,6 +503,13 @@ export class InkbookView extends FileView {
 
   private applyTabletMode(): void {
     this.contentEl.toggleClass("is-tablet", this.tabletMode);
+    /*
+     * 顶栏那一行挂在视图头部（containerEl）里，不在 .mb-root 内部——
+     * 所以「平板上按钮放大、间距拉开」的规则必须挂在 containerEl 上，
+     * 之前写在 .mb-root.is-tablet 下面，选择器根本匹配不到，
+     * 平板一直是电脑尺寸（用户反馈"平板上这 3 个图标间距有点近"）。
+     */
+    this.containerEl.toggleClass("mb-tablet", this.tabletMode);
     this.applySideVisibility();
   }
 
@@ -515,7 +546,6 @@ export class InkbookView extends FileView {
 
   private renderEmpty(): void {
     if (!this.editorHost) return;
-    this.railEl?.remove();
     this.floatEl?.remove();
     this.sideEl?.empty();
     this.editorHost.empty();
@@ -543,197 +573,54 @@ export class InkbookView extends FileView {
     el.createEl("p", { text: msg });
   }
 
-  /* ------------------------------- 竖长条 ------------------------------- */
+  /* ------------------------------- 工具行 ------------------------------- */
 
   /**
-   * 构建右侧的**竖长条**（工具栏）。
+   * 顶栏那一行里的**工具组**：7 支笔，横着排。
    *
-   * 布局上是编辑区右缘的一整列，不是浮在纸上的浮层——
-   * 之前浮层压在滚动条上，想拖滚动条得先把工具挪开，
-   * 用户反馈"边上的那个框会挡住滑动页面的那个条"。
+   * 之前它们是浮在纸上的一块可拖动浮层（还能横竖切换、记位置），
+   * 平板上一列 86px 全是纸的损失，而顶栏明明还有空。
+   * 挪上来之后：纸面通栏，笔也还在拇指够得着的地方。
    *
-   * 长条上只留四样东西：
-   *   · 7 个笔工具（大图标 + 文字标签）
-   *   · 立即保存（点一下马上落盘，不等 850ms 防抖）
-   *   · 侧栏开关（展开/收起右侧栏）
-   *   · 仅阅读开关
-   *
-   * 其余功能（颜色、导出、导入、模板、图层……）全在右侧栏里，
-   * 不再塞进长条，也不再有"更多"抽屉。
+   * 只放图标不放文字——顶栏高度撑不起「钢笔」两个字，
+   * 全名放在 title 里，长按 / 悬停能看到。
    */
-  private buildRail(): void {
-    this.railEl?.remove();
-    const rail = this.editorHost.createDiv("mb-rail");
-    this.railEl = rail;
+  private buildToolRow(row: HTMLElement): void {
     this.toolButtons.clear();
-
-    /*
-     * 手柄：拖动移动，单击切换横竖。
-     *
-     * 长条从"占一列的固定栏"改成浮层——把宽度还给纸张。
-     * 只让手柄可抓：拖着笔写字时不该把整个工具盘带跑。
-     */
-    const handle = rail.createEl("button", {
-      cls: "mb-rail-handle",
-      attr: { "aria-label": "拖动移动，单击切换横竖" },
-    });
-    setIcon(handle, "drag");
-    handle.title = "拖动移动 · 单击切换横竖";
-    this.railHandleBtn = handle;
-
-    const toolCol = rail.createDiv("mb-rail-tools");
+    const wrap = row.createDiv("mb-top-tools");
+    this.topToolsEl = wrap;
     for (const t of TOOLS) {
-      const b = toolCol.createEl("button", {
-        cls: "mb-rail-tool",
-        attr: { "aria-label": t.name },
-      });
+      const b = document.createElement("button");
+      b.className = "mb-topbtn mb-top-tool";
+      b.type = "button";
       setIcon(b, t.icon);
-      b.createSpan({ cls: "mb-rail-lbl", text: t.short });
       b.title = t.name;
+      b.setAttribute("aria-label", t.name);
       b.onclick = () => this.editor?.setTool(t.id);
+      wrap.appendChild(b);
       this.toolButtons.set(t.id, b);
     }
 
-    rail.dataset.orient = this.plugin.settings.toolPanel?.vertical === false ? "h" : "v";
-    this.bindRailHandle(rail, handle);
-    this.applyRailPosition(rail);
-
     /* ---------------------------- 仅阅读提示 ---------------------------- */
-    const hint = this.editorHost.createDiv({
-      cls: "mb-read-hint",
-      text: "仅阅读模式 · 点顶栏的眼睛图标开始书写",
-    });
-    this.readHintEl = hint;
-
-    this.setReading(this.reading);
-  }
-
-  /* ------------------------- 浮层工具盘的位置与方向 ------------------------- */
-
-  /** 默认停在左侧中部（右侧留给滚动条，之前浮层压住滚动条被用户提过） */
-  private applyRailPosition(rail: HTMLElement): void {
-    const p = this.plugin.settings.toolPanel;
-    if (p && Number.isFinite(p.left) && Number.isFinite(p.top)) {
-      rail.addClass("is-placed");
-      rail.style.left = p.left + "px";
-      rail.style.top = p.top + "px";
-    } else {
-      rail.removeClass("is-placed");
-      rail.style.left = "";
-      rail.style.top = "";
+    // 自愈重装顶栏时别再挂一条重复的提示
+    if (!this.readHintEl || !this.readHintEl.parentElement) {
+      this.readHintEl = this.editorHost.createDiv({
+        cls: "mb-read-hint",
+        text: "仅阅读模式 · 点顶栏的眼睛图标开始书写",
+      });
     }
-    this.clampRail(rail);
   }
 
-  private clampRail(rail: HTMLElement): void {
-    if (!rail.classList.contains("is-placed")) return;
-    const host = this.editorHost.getBoundingClientRect();
-    if (!host.width || !host.height) return;
-    const maxLeft = Math.max(0, host.width - rail.offsetWidth);
-    const maxTop = Math.max(0, host.height - rail.offsetHeight);
-    const left = Math.min(Math.max(0, parseFloat(rail.style.left || "0")), maxLeft);
-    const top = Math.min(Math.max(0, parseFloat(rail.style.top || "0")), maxTop);
-    rail.style.left = left + "px";
-    rail.style.top = top + "px";
-  }
-
-  private saveRailPosition(rail: HTMLElement): void {
-    let left = parseFloat(rail.style.left);
-    let top = parseFloat(rail.style.top);
-    // 还没定位过（比如一上来就点了手柄切换方向）：把当前位置固化成像素
-    if (!Number.isFinite(left) || !Number.isFinite(top)) {
-      const r = rail.getBoundingClientRect();
-      const host = this.editorHost.getBoundingClientRect();
-      left = r.left - host.left;
-      top = r.top - host.top;
-      rail.addClass("is-placed");
-      rail.style.left = Math.round(left) + "px";
-      rail.style.top = Math.round(top) + "px";
-    }
-    this.plugin.settings.toolPanel = {
-      left: Math.round(left),
-      top: Math.round(top),
-      vertical: rail.dataset.orient !== "h",
-    };
-    void this.plugin.saveSettings();
-  }
+  /* --------------------------- 顶栏上的那一行 --------------------------- */
 
   /**
-   * 手柄交互：按住拖动 = 移动；单击 = 横竖切换。
-   *
-   * 用位移 > 6px 判定「拖动」，否则一次轻微抖动会被当成拖动，
-   * 用户想切换方向反而切不动。
-   */
-  private bindRailHandle(rail: HTMLElement, handle: HTMLElement): void {
-    let pid = -1;
-    let sx = 0;
-    let sy = 0;
-    let baseL = 0;
-    let baseT = 0;
-    let moved = false;
-    let active = false;
-
-    handle.addEventListener("pointerdown", (e) => {
-      if (e.pointerType === "mouse" && e.button !== 0) return;
-      active = true;
-      moved = false;
-      pid = e.pointerId;
-      sx = e.clientX;
-      sy = e.clientY;
-      const r = rail.getBoundingClientRect();
-      const host = this.editorHost.getBoundingClientRect();
-      baseL = r.left - host.left;
-      baseT = r.top - host.top;
-      try {
-        handle.setPointerCapture(e.pointerId);
-      } catch (_) {}
-      e.preventDefault();
-      e.stopPropagation();
-    });
-
-    handle.addEventListener("pointermove", (e) => {
-      if (!active || e.pointerId !== pid) return;
-      const dx = e.clientX - sx;
-      const dy = e.clientY - sy;
-      if (!moved && Math.hypot(dx, dy) < 6) return;
-      moved = true;
-      const host = this.editorHost.getBoundingClientRect();
-      const maxLeft = Math.max(0, host.width - rail.offsetWidth);
-      const maxTop = Math.max(0, host.height - rail.offsetHeight);
-      const l = Math.min(Math.max(0, baseL + dx), maxLeft);
-      const t = Math.min(Math.max(0, baseT + dy), maxTop);
-      rail.addClass("is-placed");
-      rail.style.left = l + "px";
-      rail.style.top = t + "px";
-      e.preventDefault();
-    });
-
-    const finish = (e: PointerEvent) => {
-      if (!active || e.pointerId !== pid) return;
-      active = false;
-      pid = -1;
-      try {
-        handle.releasePointerCapture(e.pointerId);
-      } catch (_) {}
-      if (!moved) {
-        rail.dataset.orient = rail.dataset.orient === "h" ? "v" : "h";
-        this.clampRail(rail);
-        this.saveRailPosition(rail);
-        return;
-      }
-      this.saveRailPosition(rail);
-    };
-    handle.addEventListener("pointerup", finish);
-    handle.addEventListener("pointercancel", finish);
-  }
-
-  /* --------------------------- 顶栏上的三个按钮 --------------------------- */
-
-  /**
-   * 保存 / 侧栏 / 仅阅读挂到视图标题栏（就是显示「墨本试用」那条）。
+   * 顶栏那一行：**7 支笔 + 保存 / 侧栏 / 仅阅读**，一起挂到标题栏。
    *
    * 用宿主的 addAction 拿到原生位置与点击区域，再把图标换成自绘的：
    * 宿主图标集里查不到的 name 会画成空框，这个坑踩过。
+   *
+   * 笔原先浮在纸上（可拖动、可切横竖），平板上一列 86px 白白占掉；
+   * 顶栏本来就有空位，一行排得下——纸面因此通栏。
    */
   private buildHeaderActions(): void {
     const mk = (icon: string, title: string, cls: string): HTMLElement => {
@@ -757,6 +644,7 @@ export class InkbookView extends FileView {
         if (host && typeof host.appendChild === "function") host.appendChild(el);
       }
       el.addClass(cls);
+      el.addClass("mb-topbtn");
       el.empty();
       setIcon(el, icon);
       el.setAttr("aria-label", title);
@@ -779,6 +667,22 @@ export class InkbookView extends FileView {
     read.setAttr("aria-pressed", "false");
     read.onclick = () => this.setReading(!this.reading);
     this.railReadBtn = read;
+
+    /*
+     * 组装：宿主 action 原本挂在 .view-actions 里，
+     * 把整行塞进同一个父容器，才能和宿主自己的按钮并排成一行。
+     * 父容器摸不到（测试桩 / 老旧版本）就退到视图自己身上。
+     */
+    const row = document.createElement("div");
+    row.className = "mb-toprow";
+    const host = (save.parentElement as HTMLElement | null) || this.containerEl;
+    host.appendChild(row);
+    this.buildToolRow(row);
+    row.appendChild(row.createDiv("mb-sep"));
+    row.appendChild(save);
+    row.appendChild(side);
+    row.appendChild(read);
+    this.topRowEl = row;
   }
 
   private buildFloat(): void {
@@ -874,6 +778,158 @@ export class InkbookView extends FileView {
       if (this.zoomHintHover) return;
       this.floatZoomEl?.removeClass("is-show");
     }, 2600);
+  }
+
+  /* ---------------------------- 侧边拖动滑条 ---------------------------- */
+
+  /**
+   * 纸面右缘一条自己画的滑条。
+   *
+   * 为什么不用系统滚动条：
+   *   · 平板上系统滚动条只有鼠标滚轮/手指甩动，**拖不了**
+   *   · 几十页的本子想从第 3 页跳到第 27 页，只能一页页滑
+   *   · 触屏上它还会自己淡出，连"这里能拖"都看不见
+   *
+   * 所以自己画一条常驻的：滑块高度按可视比例算，拖它按比例改 scrollTop，
+   * 拖动时旁边浮一枚页码，松手就消失。
+   */
+  private buildScrollbar(): void {
+    this.sbAbort?.abort();
+    const ac = new AbortController();
+    this.sbAbort = ac;
+
+    const el = this.paperHost.createDiv("mb-sb is-idle");
+    this.sbEl = el;
+    const track = el.createDiv("mb-sb-track");
+    this.sbTrack = track;
+    const thumb = track.createDiv("mb-sb-thumb");
+    this.sbThumb = thumb;
+    this.sbTip = el.createDiv("mb-sb-tip");
+
+    const sc = this.editor?.scrollEl;
+    if (!sc) return;
+
+    sc.addEventListener("scroll", () => this.requestScrollbarSync(), {
+      passive: true,
+      signal: ac.signal,
+    });
+    window.addEventListener("resize", () => this.requestScrollbarSync(), {
+      signal: ac.signal,
+    });
+
+    /*
+     * 拖到哪算哪：抓滑块时保持"手指在滑块上的相对位置"，
+     * 直接点轨道则把滑块中心挪过去——两种都符合直觉。
+     */
+    const apply = (clientY: number, grab: number) => {
+      const range = sc.scrollHeight - sc.clientHeight;
+      const usable = Math.max(1, track.clientHeight - this.sbThumbH);
+      const y = clientY - track.getBoundingClientRect().top - grab;
+      const r = Math.min(1, Math.max(0, y / usable));
+      sc.scrollTop = r * range;
+      this.updateSbTip();
+    };
+
+    el.addEventListener(
+      "pointerdown",
+      (e) => {
+        if (e.pointerType === "mouse" && e.button !== 0) return;
+        const tr = thumb.getBoundingClientRect();
+        const inside = e.clientY >= tr.top && e.clientY <= tr.bottom;
+        const grab = inside ? e.clientY - tr.top : tr.height / 2;
+        this.sbDrag = { pid: e.pointerId, grab };
+        el.addClass("is-drag");
+        try {
+          el.setPointerCapture(e.pointerId);
+        } catch (_) {}
+        e.preventDefault();
+        e.stopPropagation();
+        apply(e.clientY, grab);
+        this.updateSbTip();
+      },
+      { signal: ac.signal }
+    );
+
+    el.addEventListener(
+      "pointermove",
+      (e) => {
+        const d = this.sbDrag;
+        if (!d || e.pointerId !== d.pid) return;
+        apply(e.clientY, d.grab);
+        e.preventDefault();
+      },
+      { signal: ac.signal }
+    );
+
+    const finish = (e: PointerEvent) => {
+      const d = this.sbDrag;
+      if (!d || e.pointerId !== d.pid) return;
+      this.sbDrag = null;
+      el.removeClass("is-drag");
+      try {
+        el.releasePointerCapture(e.pointerId);
+      } catch (_) {}
+    };
+    el.addEventListener("pointerup", finish, { signal: ac.signal });
+    el.addEventListener("pointercancel", finish, { signal: ac.signal });
+
+    this.requestScrollbarSync();
+  }
+
+  /** 滚动事件很密：合并到一帧里算，别每次都读 clientHeight */
+  private requestScrollbarSync(): void {
+    if (this.sbRaf) return;
+    const raf =
+      typeof window.requestAnimationFrame === "function"
+        ? window.requestAnimationFrame.bind(window)
+        : (fn: FrameRequestCallback) => window.setTimeout(() => fn(0), 16);
+    this.sbRaf = raf(() => {
+      this.sbRaf = 0;
+      this.syncScrollbar();
+    });
+  }
+
+  /** 按「可视高度 / 内容高度」摆滑块 */
+  private syncScrollbar(): void {
+    const sc = this.editor?.scrollEl;
+    const el = this.sbEl;
+    const track = this.sbTrack;
+    const thumb = this.sbThumb;
+    if (!sc || !el || !track || !thumb) return;
+
+    const vh = sc.clientHeight;
+    const sh = sc.scrollHeight;
+    const range = sh - vh;
+    // 内容没超出一屏就不给拖：一条拖不动的滑条只会让人以为坏了
+    if (vh < 60 || range <= 2) {
+      el.addClass("is-idle");
+      this.sbThumbH = 0;
+      return;
+    }
+    el.removeClass("is-idle");
+
+    const trackH = track.clientHeight || el.clientHeight;
+    const thumbH = Math.max(28, Math.round((trackH * vh) / sh));
+    const top = Math.round(
+      (trackH - thumbH) * Math.min(1, Math.max(0, sc.scrollTop / range))
+    );
+    this.sbThumbH = thumbH;
+    this.sbThumbTop = top;
+    thumb.style.height = thumbH + "px";
+    thumb.style.transform = "translateY(" + top + "px)";
+    if (this.sbDrag) this.updateSbTip();
+  }
+
+  /** 拖动页数提示：跟着滑块走，平时不可见 */
+  private updateSbTip(): void {
+    const tip = this.sbTip;
+    if (!tip) return;
+    if (this.editor) {
+      const s = this.editor.getState();
+      tip.setText(s.pageIndex + 1 + " / " + s.pageCount);
+    }
+    const y = this.sbThumbTop + this.sbThumbH / 2 - 13;
+    tip.style.transform = "translateY(" + Math.max(0, y) + "px)";
   }
 
   /** 切换侧栏展开 / 收起（兼容旧命令入口） */
@@ -1617,6 +1673,11 @@ export class InkbookView extends FileView {
     for (const [id, btn] of this.toolButtons) btn.toggleClass("is-active", id === s.tool);
 
     if (this.pageLbl) this.pageLbl.setText(`${s.pageIndex + 1} / ${s.pageCount}`);
+    if (this.sbTip) this.sbTip.setText(`${s.pageIndex + 1} / ${s.pageCount}`);
+    // 页数变了滑条的高度比例也变了；合并到一帧里算，别每笔都量一遍
+    this.requestScrollbarSync();
+    // 宿主重建标题栏时会把我们那一行一起清掉，发现掉了就重装
+    if (this.topRowEl && !this.topRowEl.parentElement) this.buildHeaderActions();
     if (this.zoomLbl) this.zoomLbl.setText(Math.round(s.zoom * 100) + "%");
     if (this.undoBtn) this.undoBtn.toggleClass("is-disabled", !s.canUndo);
     if (this.redoBtn) this.redoBtn.toggleClass("is-disabled", !s.canRedo);

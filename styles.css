@@ -142,14 +142,14 @@
   white-space: nowrap;
 }
 
-/* ============================== 工具长条 ==============================
+/* ============================== 顶栏工具行 ==============================
  *
- * 右侧那一列常驻工具栏（钢笔 / 圆珠 / 荧光 / 橡皮 / 套索 / 形状 / 拖动），
- * 加上侧栏开关和仅阅读开关。
+ * 7 支笔（钢笔 / 圆珠 / 荧光 / 橡皮 / 套索 / 形状 / 拖动）+ 三个视图动作，
+ * 一起挤在标题栏那一行里。
  *
- * 现在是**浮层**：默认停左侧中部，右侧留给滚动条。
- *   （早前浮层压住过滚动条，所以默认位置刻意避开右边；
- *     用户拖动后的位置会记在 settings.toolPanel 里。）
+ * 这些笔原先浮在纸上（可拖动、可横竖切换、位置记在 settings.toolPanel），
+ * 平板上等于白占一列 86px 的纸宽；顶栏本来就有空位，一行排得下。
+ * 代价是图标下面写不了字，全名放进 title。
  *
  * 图标尺寸：
  *   Obsidian 默认的 .svg-icon 是 16px，荧光笔、套索那种细线条造型
@@ -157,125 +157,57 @@
  *   主题也改不动（主题不认识这个 class）。
  */
 
-/* 浮层工具盘（可拖动 / 可横竖切换）
- *
- * 以前它是右侧固定一列，占掉 74–86px 的纸张宽度。
- * 现在浮在纸面上：宽度全还给纸张，位置和方向由用户自己定。
- * 默认停左侧中部——右侧要让给滚动条（浮层压住滚动条被用户提过一次）。
- */
-.mb-rail {
-  position: absolute;
-  z-index: 30;
-  left: 12px;
-  top: 50%;
-  transform: translateY(-50%);
-  box-sizing: border-box;
+.mb-toprow {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: 4px;
-  padding: 6px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 18px;
-  background: color-mix(in srgb, var(--background-primary) 88%, transparent);
-  backdrop-filter: blur(6px);
-  box-shadow: 0 8px 22px -12px rgba(0, 0, 0, 0.55);
-  max-height: calc(100% - 16px);
-  overflow-y: auto;
-  overscroll-behavior: contain;
+  gap: 2px;
+  margin: 0 4px;
+  min-width: 0;
+}
+
+/* 工具组：窗口窄的时候自己横向滚，绝不把动作按钮挤出去 */
+.mb-top-tools {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  overflow-x: auto;
   scrollbar-width: none;
 }
 
-/* 用户拖动过：位置来自保存的像素值，不再垂直居中 */
-.mb-rail.is-placed {
-  transform: none;
+.mb-top-tools::-webkit-scrollbar {
+  height: 0;
 }
 
-/* 横放：手柄在最左，工具排成一行 */
-.mb-rail[data-orient="h"] {
-  flex-direction: row;
-  align-items: center;
-}
-
-/* 手柄：拖动移动，单击切换横竖 */
-.mb-rail-handle {
+/* 竖线：把「笔」和「视图动作」分开，十个按钮挨着不然糊成一片 */
+.mb-toprow .mb-sep {
   flex: 0 0 auto;
-  width: 32px;
-  height: 20px;
-  margin: 0 0 2px;
-  padding: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: none;
-  background: transparent;
-  color: var(--text-faint);
-  cursor: grab;
-  touch-action: none;
+  width: 1px;
+  height: 16px;
+  margin: 0 5px;
+  background: var(--background-modifier-border);
 }
 
-.mb-rail[data-orient="h"] .mb-rail-handle {
-  margin: 0 2px 0 0;
-}
-
-.mb-rail-handle:active {
-  cursor: grabbing;
-}
-
-.mb-root .mb-rail-handle .mb-ic {
+/* 顶栏里的图标统一 18px：比宿主的 16px 略大，又不撑爆 30px 的按钮 */
+.mb-root .mb-toprow .mb-ic {
+  display: block;
+  flex: 0 0 auto;
   width: 18px;
   height: 18px;
+  stroke-width: 1.8;
 }
-
-
-.mb-rail::-webkit-scrollbar {
-  width: 0;
-}
-
-.mb-rail-tools {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 4px;
-}
-
-.mb-rail[data-orient="h"] .mb-rail-tools {
-  flex-direction: row;
-}
-
 
 /*
- * 工具磁贴：图标 + 文字竖着摞。
+ * 选中的工具：填主色，一眼看出当前用的哪支笔。
  *
- * 30px 的图标是 Obsidian 默认 16px 的近两倍。
+ * 必须写成 `.mb-toprow .mb-top-tool.is-active`（三段）：下面那条通用按钮规则
+ * `.mb-toprow .mb-topbtn` 也是两段，靠"后来者赢"会把底色改回透明——
+ * 实测选中的钢笔一点高亮都没有。
  */
-.mb-rail-tool {
-  width: 60px;
-  padding: 7px 2px 6px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 3px;
-  border: 1px solid transparent;
-  border-radius: 14px;
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-  box-shadow: none;
-  transition:
-    background 0.16s ease,
-    color 0.16s ease,
-    transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1);
-}
-
-.mb-rail-tool:hover {
-  background: color-mix(in srgb, var(--background-modifier-hover) 90%, transparent);
-  color: var(--text-normal);
-}
-
-.mb-rail-tool:active {
-  transform: scale(0.93);
+.mb-toprow .mb-top-tool.is-active,
+.mb-toprow .mb-top-tool.is-active:hover {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
 }
 
 /*
@@ -294,29 +226,6 @@
   stroke-width: 1.8;
 }
 
-.mb-root .mb-rail-lbl {
-  font-size: 11.5px;
-  line-height: 1;
-  font-weight: 500;
-  letter-spacing: 0.01em;
-  white-space: nowrap;
-}
-
-/* 选中的工具：填主色，一眼看出当前用的哪支笔 */
-.mb-rail-tool.is-active {
-  background: var(--interactive-accent);
-  border-color: color-mix(in srgb, var(--interactive-accent) 70%, #000);
-  color: var(--text-on-accent);
-  box-shadow:
-    0 5px 14px -4px color-mix(in srgb, var(--interactive-accent) 60%, transparent),
-    inset 0 1px 0 rgba(255, 255, 255, 0.22);
-}
-
-.mb-rail-tool.is-active:hover {
-  background: var(--interactive-accent);
-  color: var(--text-on-accent);
-}
-
 /*
  * 长条上的三个"方按钮"：立即保存 / 侧栏开关 / 仅阅读。
  *
@@ -328,13 +237,12 @@
  * 由 addAction 提供位置和点击区，图标换成自绘的 .mb-ic。
  * 尺寸按视图头的图标钮来（30×30），和宿主其他 action 视觉一致。
  */
-.mb-rail-save,
-.mb-rail-side,
-.mb-rail-read {
+.mb-toprow .mb-topbtn {
   position: relative;
+  flex: 0 0 auto;
   width: 30px;
   height: 30px;
-  margin: 0 1px;
+  margin: 0;
   padding: 0;
   display: flex;
   align-items: center;
@@ -351,33 +259,17 @@
     transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1);
 }
 
-.mb-rail-save:hover,
-.mb-rail-side:hover,
-.mb-rail-read:hover {
+.mb-toprow .mb-topbtn:hover {
   color: var(--text-normal);
   background: var(--background-modifier-hover);
 }
 
-.mb-rail-save:active,
-.mb-rail-side:active,
-.mb-rail-read:active {
+.mb-toprow .mb-topbtn:active {
   transform: scale(0.93);
 }
 
-.mb-rail-save .mb-ic {
-  width: 20px;
-  height: 20px;
-}
 
-.mb-rail-side .mb-ic {
-  width: 20px;
-  height: 20px;
-}
 
-.mb-rail-read .mb-ic {
-  width: 20px;
-  height: 20px;
-}
 
 /*
  * 有未保存改动：右上角一个小点。
@@ -420,7 +312,7 @@
  * 只留一枚小圆钮（笔的图标），点它回到书写。
  * 纸面干干净净，一个干扰都没有。
  */
-.mb-root.is-reading .mb-rail {
+.mb-root.is-reading .mb-top-tools {
   display: none;
 }
 
@@ -585,21 +477,17 @@
 
 /* 尊重系统的「减少动态效果」设置 */
 @media (prefers-reduced-motion: reduce) {
-  .mb-rail,
-  .mb-rail-tool,
-  .mb-rail-save,
-  .mb-rail-side,
-  .mb-rail-read,
+  .mb-toprow,
+  .mb-top-tool,
+  .mb-topbtn,
   .mb-float,
   .mb-float-zoom,
   .mb-read-hint,
   .mb-ib {
     transition-duration: 0.01ms !important;
   }
-  .mb-rail-tool:active,
-  .mb-rail-save:active,
-  .mb-rail-side:active,
-  .mb-rail-read:active {
+  .mb-top-tool:active,
+  .mb-toprow .mb-topbtn:active {
     transform: none;
   }
 }
@@ -675,6 +563,96 @@
    * 所以让浏览器别插手。
    */
   overflow-anchor: none;
+}
+
+/* 纵向系统滚动条藏掉——右缘那条是我们自己画的（见 .mb-sb）。
+ * 横向留着：放大到纸比屏宽时还得靠它。 */
+.mb-scroll::-webkit-scrollbar:vertical {
+  width: 0;
+  height: 0;
+}
+
+/* ---------------------------- 侧边拖动滑条 ----------------------------
+ *
+ * 系统滚动条在平板上拖不动（只有滚轮 / 甩动），几十页的本子想从第 3 页
+ * 跳到第 27 页只能一页页滑。这条是自己画的：拖滑块按比例改 scrollTop，
+ * 拖动时旁边浮一枚页码。所有设备都常显——藏起来就没人知道它能拖。
+ */
+.mb-sb {
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  right: 2px;
+  width: 16px;
+  z-index: 9;
+  display: flex;
+  justify-content: center;
+  touch-action: none;
+  transition: opacity 0.18s ease;
+}
+
+/* 内容没超出一屏：藏掉，免得拖了个寂寞 */
+.mb-sb.is-idle {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.mb-sb-track {
+  position: relative;
+  width: 6px;
+  height: 100%;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-muted) 16%, transparent);
+}
+
+.mb-sb-thumb {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text-muted) 60%, transparent);
+  will-change: transform;
+}
+
+.mb-sb.is-drag .mb-sb-thumb,
+.mb-sb:active .mb-sb-thumb {
+  background: var(--interactive-accent);
+}
+
+/* 拖动时跟着滑块走的页码 */
+.mb-sb-tip {
+  position: absolute;
+  right: 20px;
+  top: 0;
+  padding: 4px 9px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--background-primary) 92%, transparent);
+  box-shadow: 0 6px 18px -8px rgba(0, 0, 0, 0.5);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.14s ease;
+}
+
+.mb-sb.is-drag .mb-sb-tip {
+  opacity: 1;
+}
+
+/* 平板：热区加宽到 22px，轨道仍细——手指按得着，纸面也不花 */
+.mb-root.is-tablet .mb-sb {
+  width: 22px;
+  right: 0;
+}
+
+.mb-root.is-tablet .mb-sb-track,
+.mb-root.is-tablet .mb-sb-thumb {
+  width: 8px;
 }
 
 .mb-doc {
@@ -1442,58 +1420,33 @@
  */
 
 /*
- * 平板上长条更大：
- *   · 磁贴 68px 宽（电脑 60px）
- *   · 图标 32px（电脑 30px，Obsidian 默认只有 16px）
- *   · 触摸目标远超 44px 的下限
+ * 平板上顶栏按钮再大一档，手指点得准：
+ *   · 按钮 34px（电脑 30px）
+ *   · 图标 22px（电脑 18px，Obsidian 默认只有 16px）
+ *   · 间距 7px——电脑上 2px 挨得刚好，手指上就太挤了
  */
-.mb-root.is-tablet .mb-rail {
-  width: 86px;
-  padding: 9px 7px;
+/* 顶栏按钮在视图头部里，不在 .mb-root 内，所以用 containerEl 上的 .mb-tablet */
+.mb-tablet .mb-toprow {
+  gap: 7px;
 }
 
-.mb-root.is-tablet .mb-rail-tools {
-  gap: 5px;
+.mb-tablet .mb-top-tools {
+  gap: 7px;
 }
 
-.mb-root.is-tablet .mb-rail-tool {
-  width: 68px;
-  padding: 8px 2px 7px;
-  border-radius: 15px;
-  gap: 4px;
-}
-
-.mb-root.is-tablet .mb-rail-tool .mb-ic {
-  width: 32px;
-  height: 32px;
-}
-
-.mb-root.is-tablet .mb-rail-lbl {
-  font-size: 12px;
-}
-
-/* 平板上顶栏图标稍大一档，手指更好点 */
-.mb-root.is-tablet .mb-rail-save,
-.mb-root.is-tablet .mb-rail-side,
-.mb-root.is-tablet .mb-rail-read {
+.mb-tablet .mb-toprow .mb-topbtn {
   width: 34px;
   height: 34px;
   border-radius: 9px;
 }
 
-.mb-root.is-tablet .mb-rail-save .mb-ic,
-.mb-root.is-tablet .mb-rail-side .mb-ic,
-.mb-root.is-tablet .mb-rail-read .mb-ic {
+.mb-tablet .mb-toprow .mb-ic {
   width: 22px;
   height: 22px;
 }
 
 /* 触摸设备没有 hover，激活态要更明显 */
 @media (hover: none) {
-  .mb-root .mb-rail-tool.is-active {
-    background: var(--interactive-accent);
-    color: var(--text-on-accent);
-  }
   .mb-root .mb-swatch.is-active {
     box-shadow: 0 0 0 3px var(--interactive-accent);
   }
@@ -1552,12 +1505,12 @@
  */
 .mb-root.is-tablet .mb-side {
   position: absolute;
-  right: 94px;
+  right: 0;
   top: 0;
   bottom: 0;
   z-index: 35;
-  width: min(320px, calc(100vw - 102px));
-  flex-basis: min(320px, calc(100vw - 102px));
+  width: min(340px, calc(100vw - 24px));
+  flex-basis: min(340px, calc(100vw - 24px));
   border-right: 1px solid var(--background-modifier-border);
   border-left: 1px solid var(--background-modifier-border);
   border-radius: 16px 0 0 16px;

@@ -160,172 +160,128 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   await view.onLoadFile(file);
   await sleep(700);
 
-  /* ============ 1. 竖长条结构 ============ */
+  /* ============ 1. 顶栏工具行 ============ */
   pass(!!view.editor, "编辑器已挂载");
 
-  const rail = root.querySelector(".mb-rail") as HTMLElement;
   const paper = root.querySelector(".mb-paper") as HTMLElement;
   const scroll = root.querySelector(".mb-scroll") as HTMLElement;
   const sideEl = root.querySelector(".mb-side") as HTMLElement;
   const headerEl = view.containerEl as HTMLElement;
+  const topRow = headerEl.querySelector(".mb-toprow") as HTMLElement;
   const sideBtn = headerEl.querySelector(".mb-rail-side") as HTMLElement;
   const readBtn = headerEl.querySelector(".mb-rail-read") as HTMLElement;
 
-  pass(!!rail, "存在工具长条 .mb-rail");
+  pass(!!topRow, "标题栏里有 .mb-toprow 一行");
   pass(!!paper, "存在纸面列 .mb-paper");
   pass(!!sideBtn, "顶栏上有「侧栏」开关");
   pass(!!readBtn, "顶栏上有「仅阅读」按钮");
+
+  // 工具搬上顶栏后，纸上那块可拖动浮层必须彻底消失
+  pass(!root.querySelector(".mb-rail"), "纸上不再有浮层工具盘 .mb-rail");
 
   // 旧的抽屉结构必须已经消失
   pass(!root.querySelector(".mb-dock-panel"), "旧抽屉面板已移除");
   pass(!root.querySelector(".mb-dock-tab"), "旧标签页已移除");
   pass(!root.querySelector(".mb-rail-more"), "旧「更多」按钮已移除");
 
+  // 7 个工具 + 3 个动作 = 10 个按钮，挤在同一行
+  const tools = topRow.querySelectorAll(".mb-top-tool");
+  pass(tools.length === 7, "顶栏上 7 个工具按钮（" + tools.length + "）");
+
+  const rowBtns = Array.from(
+    topRow.querySelectorAll(".mb-topbtn")
+  ) as HTMLElement[];
+  pass(rowBtns.length === 10, "一行里 10 个按钮（7 笔 + 3 动作）：" + rowBtns.length);
+
   /*
-   * 手柄：单击切换横竖，按住拖动改位置并记住。
-   * 这是这次「长条变浮层」的核心交互，必须锁住。
+   * 用户要求："把钢笔、橡皮啊，侧边的这些东西都挪到最上面去"，
+   * 而且要先看看"到底能不能放得下"。放不下的表现就是换行——
+   * 所以直接量顶边：同一行的话差不超过 2px，换行会差一整行。
    */
-  const handle = rail.querySelector(".mb-rail-handle") as HTMLElement;
-  pass(!!handle, "浮层上有拖动手柄");
-  {
-    // 默认位置要在拖动之前测：下面的拖拽会把它挪走
-    const gap = Math.abs(
-      rail.getBoundingClientRect().left - scroll.getBoundingClientRect().left
-    );
-    pass(gap <= 24, "浮层默认停在左侧（左沿距滚动区 " + gap.toFixed(0) + "px ≤ 24）");
-  }
+  const tops = rowBtns.map((b) => Math.round(b.getBoundingClientRect().top));
+  const rowSpread = Math.max(...tops) - Math.min(...tops);
+  pass(rowSpread <= 2, "10 个按钮在同一水平线上（顶边最大差 " + rowSpread + "px）");
+
+  // 顺序：笔在左，视图动作在右
+  const lastToolRight = (
+    tools[tools.length - 1] as HTMLElement
+  ).getBoundingClientRect().right;
+  const firstActionLeft = (
+    headerEl.querySelector(".mb-rail-save") as HTMLElement
+  ).getBoundingClientRect().left;
+  pass(lastToolRight <= firstActionLeft, "笔在左、保存/侧栏/阅读在右");
+
+  // 顶栏塞不下文字，全名必须进 title（悬停 / 长按能看到）
   pass(
-    rail.dataset.orient === "v",
-    "默认竖排（data-orient=" + rail.dataset.orient + "）"
+    Array.from(tools).every((t) => (t.getAttribute("title") || "").length > 0),
+    "每个工具都有 title 全名（顶栏只放图标）"
   );
 
-  const pe = (type: string, x: number, y: number) =>
+  /* ============ 2. 工具搬走后纸面通栏 ============ */
+  /*
+   * 长条原来在纸面右边占一整列（平板 86px）。
+   * 现在工具上顶栏，那一列整块还给纸——这才是用户要的"塞到最上面去"。
+   */
+  const editorRect = (
+    root.querySelector(".mb-editor") as HTMLElement
+  ).getBoundingClientRect();
+  const scrollRect = scroll.getBoundingClientRect();
+  pass(
+    editorRect.width - scrollRect.width <= 2,
+    "纸面通栏（编辑区 " +
+      editorRect.width.toFixed(0) +
+      " − 纸宽 " +
+      scrollRect.width.toFixed(0) +
+      " ≤ 2px）"
+  );
+
+  /* ============ 2.5 侧边拖动滑条 ============ */
+  /*
+   * 系统滚动条在平板上拖不动（只能甩），几十页的本子想跳页只能一页页滑。
+   * 这条自己画的滑条必须：常显、贴右缘、拖得动、松手退出拖动态。
+   */
+  const sb = root.querySelector(".mb-sb") as HTMLElement;
+  const thumb = sb?.querySelector(".mb-sb-thumb") as HTMLElement;
+  const track = sb?.querySelector(".mb-sb-track") as HTMLElement;
+  pass(!!sb, "纸面右缘有拖动滑条 .mb-sb");
+  pass(!!thumb, "滑条上有滑块 .mb-sb-thumb");
+
+  const sbRect = sb.getBoundingClientRect();
+  pass(
+    !sb.classList.contains("is-idle") && sbRect.width >= 10,
+    "多页时滑条常显（宽 " + sbRect.width.toFixed(0) + "px）"
+  );
+  pass(
+    Math.abs(sbRect.right - scrollRect.right) <= 16,
+    "滑条贴着滚动区右缘（差 " +
+      (scrollRect.right - sbRect.right).toFixed(0) +
+      "px）"
+  );
+
+  const peSb = (type: string, y: number) =>
     new PointerEvent(type, {
       bubbles: true,
       cancelable: true,
-      pointerId: 1,
+      pointerId: 9,
       pointerType: "touch",
-      clientX: x,
-      clientY: y,
+      clientX: Math.round(track.getBoundingClientRect().left + 3),
+      clientY: Math.round(y),
     });
-  const hr = handle.getBoundingClientRect();
-
-  // 单击（不移动）→ 切横排
-  handle.dispatchEvent(pe("pointerdown", hr.left + 10, hr.top + 10));
-  handle.dispatchEvent(pe("pointerup", hr.left + 10, hr.top + 10));
-  await sleep(60);
+  const tr = track.getBoundingClientRect();
+  const beforeTop = scroll.scrollTop;
+  sb.dispatchEvent(peSb("pointerdown", tr.top + 8));
+  sb.dispatchEvent(peSb("pointermove", tr.bottom - 8));
+  await sleep(150);
+  const afterTop = scroll.scrollTop;
+  sb.dispatchEvent(peSb("pointerup", tr.bottom - 8));
+  await sleep(120);
   pass(
-    rail.dataset.orient === "h",
-    "单击手柄切到横排（data-orient=" + rail.dataset.orient + "）"
+    afterTop > beforeTop + 50,
+    "拖滑条能一路滚下去（" + beforeTop.toFixed(0) + " → " + afterTop.toFixed(0) + "）"
   );
-  pass(
-    plugin.settings.toolPanel?.vertical === false,
-    "方向已记进设置（vertical=" + plugin.settings.toolPanel?.vertical + "）"
-  );
-
-  // 再点一次 → 回到竖排
-  const hr2 = handle.getBoundingClientRect();
-  handle.dispatchEvent(pe("pointerdown", hr2.left + 10, hr2.top + 10));
-  handle.dispatchEvent(pe("pointerup", hr2.left + 10, hr2.top + 10));
-  await sleep(60);
-  pass(rail.dataset.orient === "v", "再单击一次回到竖排");
-
-  // 按住拖动 → 位置变化并落进设置
-  const railBoxBefore = rail.getBoundingClientRect();
-  const hr3 = handle.getBoundingClientRect();
-  handle.dispatchEvent(pe("pointerdown", hr3.left + 10, hr3.top + 10));
-  handle.dispatchEvent(pe("pointermove", hr3.left + 130, hr3.top + 90));
-  handle.dispatchEvent(pe("pointerup", hr3.left + 130, hr3.top + 90));
-  await sleep(80);
-  const railBoxAfter = rail.getBoundingClientRect();
-  pass(
-    Math.abs(railBoxAfter.left - railBoxBefore.left) > 40 ||
-      Math.abs(railBoxAfter.top - railBoxBefore.top) > 40,
-    "按住手柄拖动会移动浮层（Δx=" +
-      (railBoxAfter.left - railBoxBefore.left).toFixed(0) +
-      " Δy=" +
-      (railBoxAfter.top - railBoxBefore.top).toFixed(0) +
-      "）"
-  );
-  pass(
-    Number.isFinite(plugin.settings.toolPanel?.left) &&
-      plugin.settings.toolPanel!.left ===
-        Math.round(
-          railBoxAfter.left -
-            (root.querySelector(".mb-editor") as HTMLElement).getBoundingClientRect().left
-        ),
-    "拖动后的位置写进设置（left=" + plugin.settings.toolPanel?.left + "）"
-  );
-
-  // 7 个工具
-  const tools = root.querySelectorAll(".mb-rail-tool");
-  pass(tools.length === 7, "长条上 7 个工具按钮（" + tools.length + "）");
-
-  // 每个工具都有字（图标下面有名字，不靠猜）
-  const labelled = Array.from(tools).every(
-    (t) => !!t.querySelector(".mb-rail-lbl")?.textContent?.trim()
-  );
-  pass(labelled, "每个工具都有文字标签");
-
-  // 工具在长条上是竖排的
-  const toolTops = Array.from(tools).map(
-    (t) => Math.round((t as HTMLElement).getBoundingClientRect().top)
-  );
-  pass(
-    new Set(toolTops).size === toolTops.length,
-    "工具在长条上是竖着排的（每个都有不同的 top）"
-  );
-
-  /* ============ 2. 长条不遮挡滚动条 ============ */
-  /*
-   * 用户反馈："边上的框会挡住滑动页面的那个条"。
-   *
-   * 旧实现里长条是浮在纸上的（absolute），正好压在滚动条上，
-   * 想拖滚动条得先把长条挪开。
-   * 现在长条是纸面列**右边的一整列**，滚动条在纸面列自己的右缘，
-   * 两者永远不重叠。
-   */
-  const scrollRect = scroll.getBoundingClientRect();
-  const railRect = rail.getBoundingClientRect();
-
-  /*
-   * 浮层不许压住滚动条。
-   *
-   * 早期版本浮在纸上、压在滚动条上，用户反馈"边上的框会挡住滑动页面的那个条"。
-   * 现在浮层默认停左侧中部，右沿离滚动区右沿必须留出滚动条的宽度。
-   */
-  pass(
-    scrollRect.right - railRect.right >= 12,
-    "浮层右沿离开滚动条（滚动区右沿 " +
-      scrollRect.right.toFixed(0) +
-      " − 浮层右沿 " +
-      railRect.right.toFixed(0) +
-      " = " +
-      (scrollRect.right - railRect.right).toFixed(0) +
-      "px ≥ 12）"
-  );
-
-  // 现在它确实是浮层：叠在滚动区上方，而不是占一列
-  pass(
-    railRect.right > scrollRect.left,
-    "浮层叠在纸面上（不再占用固定的一列宽度）"
-  );
-  pass(
-    railRect.left >= scrollRect.left - 1 && railRect.right <= scrollRect.right + 1,
-    "拖动后浮层仍在编辑区内（不越界）"
-  );
-  pass(
-    getComputedStyle(rail).position === "absolute",
-    "浮层是 absolute 定位（实测 " + getComputedStyle(rail).position + "）"
-  );
-
-  /*
-   * 浮层宽度要收得住：它压在纸上，太宽会挡住正文。
-   */
-  pass(
-    railRect.width <= 78,
-    "浮层宽度符合设计值（实测 " + railRect.width.toFixed(0) + "px ≤ 78px）"
-  );
+  pass(!sb.classList.contains("is-drag"), "松手后退出拖动态");
+  scroll.scrollTop = 0;
+  await sleep(120);
 
   /* ============ 3. 图标真的看得见 ============ */
   /*
@@ -348,8 +304,8 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   // 尺寸真的被撑起来了（不是 0，也不是被主题压回 16px）
   const iconSizes = icons.map((i) => (i ? i.getBoundingClientRect().width : 0));
   pass(
-    iconSizes.every((w) => w >= 24),
-    "电脑端图标 ≥ 24px（实测 " + Math.min(...iconSizes).toFixed(1) + "px）"
+    iconSizes.every((w) => w >= 17),
+    "电脑端图标 ≥ 17px（实测 " + Math.min(...iconSizes).toFixed(1) + "px）"
   );
 
   // 图标真的有绘制内容（路径非空），不是空白方框
@@ -541,44 +497,40 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
 
   /* ============ 9. 平板形态 ============ */
   root.classList.add("is-tablet");
+  headerEl.classList.add("mb-tablet");
   await sleep(250);
 
   const tIcon = tools[0].querySelector(".mb-ic") as SVGElement;
   const tIconRect = tIcon.getBoundingClientRect();
   pass(
-    tIconRect.width >= 28,
-    "平板端图标 ≥ 28px（实测 " + tIconRect.width.toFixed(1) + "px）"
+    tIconRect.width >= 20,
+    "平板端图标 ≥ 20px（实测 " + tIconRect.width.toFixed(1) + "px）"
   );
   const tRect = (tools[0] as HTMLElement).getBoundingClientRect();
   pass(
-    tRect.height >= 48,
-    "平板端工具按钮 ≥ 48px（实测 " + tRect.height.toFixed(0) + "px）"
+    tRect.height >= 32,
+    "平板端按钮 ≥ 32px（实测 " + tRect.height.toFixed(0) + "px）"
   );
 
-  // 平板上工具仍然是竖排（不换行）
+  /*
+   * 用户反馈："平板上这 3 个图标间距有点近"。
+   * 平板一律把间距拉到 7px，这一条专门盯着它。
+   */
+  const t0 = (tools[0] as HTMLElement).getBoundingClientRect();
+  const t1 = (tools[1] as HTMLElement).getBoundingClientRect();
+  pass(
+    t1.left - t0.right >= 5,
+    "平板端按钮间距 ≥ 5px（实测 " + (t1.left - t0.right).toFixed(1) + "px）"
+  );
+
+  // 平板上也得挤在一行里（放不下就会换行）
   const tTops = Array.from(tools).map(
     (t) => Math.round((t as HTMLElement).getBoundingClientRect().top)
   );
-  pass(
-    new Set(tTops).size === tTops.length,
-    "平板端工具依然是竖排（没有挤成两行）"
-  );
-
-  // 平板上长条仍然不挡滚动条
-  const tScrollRect = (
-    root.querySelector(".mb-scroll") as HTMLElement
-  ).getBoundingClientRect();
-  const tRailRect = (
-    root.querySelector(".mb-rail") as HTMLElement
-  ).getBoundingClientRect();
-  pass(
-    tScrollRect.right - tRailRect.right >= 12,
-    "平板端浮层也不挡滚动条（留出 " +
-      (tScrollRect.right - tRailRect.right).toFixed(0) +
-      "px）"
-  );
+  pass(new Set(tTops).size === 1, "平板端 7 个工具仍是一行（没有换行）");
 
   root.classList.remove("is-tablet");
+  headerEl.classList.remove("mb-tablet");
   await sleep(200);
 
   /* ============ 10. 长条「立即保存」 ============ */
