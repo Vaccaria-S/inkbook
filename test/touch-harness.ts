@@ -110,6 +110,17 @@ declare global {
   const ed = view.editor as any;
   const scroll = ed.scrollEl as HTMLElement;
 
+  /*
+   * 手指惯性倍率是用户明确要求过的体感参数（"还是不够远" → 调到 3）。
+   * 钉一条断言不是测实现细节，是防止以后重构时被顺手改回 1。
+   */
+  pass(
+    (view.editor as any).constructor.FLING_GAIN.touch >= 3,
+    "手指惯性倍率 ≥ 3（当前 " +
+      (view.editor as any).constructor.FLING_GAIN.touch +
+      "）"
+  );
+
   if (!window.__cdpTouch) {
     log("SKIP 没有 CDP 触摸桥，跳过端到端触摸断言");
     log("");
@@ -204,7 +215,7 @@ declare global {
      * 按下之后再取一次基准。
      *
      * 从「读 before」到「按下真的生效」之间有一次 CDP 往返（几十 ms），
-     * 这期间页面**还在按惯性滑**——1.6 倍惯性下这一段就有十几 px。
+     * 这期间页面**还在按惯性滑**——手指惯性放大到 3 倍后，这一段能有上百 px。
      * 那是测晚了，不是没打断。真正的判据是：按下之后不再移动。
      */
     const atPress = scroll.scrollTop;
