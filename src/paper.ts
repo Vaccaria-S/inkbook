@@ -42,13 +42,22 @@ export function drawPaper(
   paper: PaperId,
   w: number,
   h: number,
-  lineWidth = 1
+  lineWidth = 1,
+  /**
+   * 是否填充纸张底色。
+   *
+   * 导出 PDF 时要关掉：矢量页底下就是原 PDF 内容，铺一层纸色会把原文盖死。
+   * 关掉之后只剩纸面线条（横线 / 网格 / 点阵），叠在原文上正好。
+   */
+  fill = true
 ): void {
   const p = PALETTES[paper] || PALETTES.white;
   const lw = Math.max(0.35, lineWidth);
   ctx.save();
-  ctx.fillStyle = p.bg;
-  ctx.fillRect(0, 0, w, h);
+  if (fill) {
+    ctx.fillStyle = p.bg;
+    ctx.fillRect(0, 0, w, h);
+  }
   if (template === "blank") {
     ctx.restore();
     return;

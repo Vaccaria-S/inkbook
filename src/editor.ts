@@ -3694,6 +3694,68 @@ export class BookEditor {
   }
 
   /**
+   * 导出用的**透明叠加层**：只有"纸上的墨"，没有纸张底色和底图。
+   *
+   * 给矢量导出（INK-102 三期）用：新 PDF 里那一页是**原 PDF 的矢量页**，
+   * 原文保持可选中、可搜索；这层透明 PNG 只负责笔迹、手写文字、
+   * 纸面线（横线/网格），叠在原文上面。
+   *
+   * 所以这里**不能**调 drawPaper 的默认行为——它会填一层纸色，
+   * 整页原文就被糊死了。`fill = false` 只画线条。
+   */
+  exportOverlayCanvas(index: number, scale = 2): HTMLCanvasElement {
+    const page = this.store.data.pages[index];
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(this.store.data.width * scale);
+    canvas.height = Math.round(this.store.data.height * scale);
+    const ctx = canvas.getContext("2d")!;
+    ctx.scale(scale, scale);
+    // 纸面线（不填底色）；模板是 blank 时什么也不画
+    drawPaper(
+      ctx,
+      page.template,
+      page.paper,
+      this.store.data.width,
+      this.store.data.height,
+      1,
+      false
+    );
+    for (const layer of page.layers) {
+      if (!layer.visible) continue;
+      for (const s of layer.strokes) drawStroke(ctx, s, layer.opacity);
+    }
+    this.drawUserTexts(ctx, page);
+    return canvas;
+  }
+
+  /**
+   * 某页 PDF 底图的可读字节（导出矢量页要用原始 PDF 文件）。
+   *
+   * `bg.pdf.path` 存的是**库内路径**（导入时记的是 `file.path`），
+   * 所以直接走 vault.adapter.readBinary 最可靠——不依赖 app:// 能否 fetch。
+   */
+  async readPdfBytes(pdfPath: string): Promise<Uint8Array | null> {
+    const app: any = this.opts.app;
+    const adapter = app?.vault?.adapter;
+    try {
+      if (adapter?.readBinary) {
+        const buf = await adapter.readBinary(pdfPath);
+        return new Uint8Array(buf);
+      }
+      if (adapter?.read) {
+        const text = await adapter.read(pdfPath);
+        const bin = atob(text);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out;
+      }
+    } catch (e) {
+      console.warn("[inkbook] 读原 PDF 失败，这一页退回位图导出", pdfPath, e);
+    }
+    return null;
+  }
+
+  /**
    * 底图是否都已加载完（导出前需要）。
    *
    * PDF 页是按需渲染的，所以这里要**主动等它渲染完**——
