@@ -38,6 +38,12 @@ const mainOptions = {
     // pdf.js 的 worker 源码当文本内联，运行时转成 Blob URL。
     // 这样不需要在插件目录里放任何额外资源文件。
     ".worker.min.mjs": "text",
+    /*
+     * 导出的中文批注要能选中/搜索，就必须嵌一份中文字体（pdf-lib 只带西文）。
+     * 同样走内联：Obsidian 移动端没有 fs，插件目录里的独立字体文件读不到。
+     * 子集只有 1.85MB（见 src/fontasset.ts 的说明）。
+     */
+    ".ttf": "dataurl",
   },
 };
 

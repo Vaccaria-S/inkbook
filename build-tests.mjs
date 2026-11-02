@@ -71,6 +71,8 @@ for (const entry of HARNESSES) {
     plugins: [obsidianAlias],
     loader: {
       ".worker.min.mjs": "text",
+      // 导出用的中文字体（见 src/fontasset.ts）同样是内联的
+      ".ttf": "dataurl",
     },
   });
   console.log(`[test] ${entry} → ${path.basename(out)}`);

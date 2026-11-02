@@ -3674,7 +3674,13 @@ export class BookEditor {
     }
   }
 
-  exportPageCanvas(index: number, scale = 2): HTMLCanvasElement {
+  /**
+   * 导出整页位图。
+   *
+   * `withText = false` 时不画用户文字——给"文字要矢量输出"的场景用：
+   * 文字改成 PDF 的 drawText 叠在上面，这里再画一遍就重影了。
+   */
+  exportPageCanvas(index: number, scale = 2, withText = true): HTMLCanvasElement {
     const page = this.store.data.pages[index];
     const canvas = document.createElement("canvas");
     canvas.width = Math.round(this.store.data.width * scale);
@@ -3689,7 +3695,7 @@ export class BookEditor {
       for (const s of layer.strokes) drawStroke(ctx, s, layer.opacity);
     }
     // 文字最后画：跟屏幕上的层序一致（文字层在笔迹之上）
-    this.drawUserTexts(ctx, page);
+    if (withText) this.drawUserTexts(ctx, page);
     return canvas;
   }
 
@@ -3702,8 +3708,10 @@ export class BookEditor {
    *
    * 所以这里**不能**调 drawPaper 的默认行为——它会填一层纸色，
    * 整页原文就被糊死了。`fill = false` 只画线条。
+   *
+   * `withText = false` 时用户文字不进位图（改用 PDF 的 drawText 矢量输出）。
    */
-  exportOverlayCanvas(index: number, scale = 2): HTMLCanvasElement {
+  exportOverlayCanvas(index: number, scale = 2, withText = true): HTMLCanvasElement {
     const page = this.store.data.pages[index];
     const canvas = document.createElement("canvas");
     canvas.width = Math.round(this.store.data.width * scale);
@@ -3724,7 +3732,7 @@ export class BookEditor {
       if (!layer.visible) continue;
       for (const s of layer.strokes) drawStroke(ctx, s, layer.opacity);
     }
-    this.drawUserTexts(ctx, page);
+    if (withText) this.drawUserTexts(ctx, page);
     return canvas;
   }
 
