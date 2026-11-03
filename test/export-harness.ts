@@ -131,6 +131,29 @@ async function main() {
     },
   ];
   book.pages.push(p3);
+  /*
+   * 第 4 页：一段**比纸还宽**的长批注。
+   *
+   * 用户原话是「我自己打的那个字，导出到 PDF 之后，那段字并不完整」——
+   * 不折行的实现会把整句排在一条基线上，超出 /MediaBox 的部分阅读器直接
+   * 不显示，抽回来的文字就少了一截。这一页专门盯这个回归。
+   * 60 个常用汉字（不碰生僻字/emoji，否则这页会按设计退回位图）。
+   */
+  const LONG_TEXT =
+    "这一段批注故意写得比纸还长，用来验证导出时会按纸宽自动折行，而不是被页面右边界裁掉，那样内容就不完整了，用户会以为字丢了";
+  const p4 = createPage("blank", "white");
+  p4.texts = [
+    {
+      id: "t4",
+      source: "user",
+      x: 100,
+      y: 400,
+      size: 20,
+      text: LONG_TEXT,
+      color: "#1A1A1A",
+    },
+  ];
+  book.pages.push(p4);
 
   /* -------------------- vault 桩 -------------------- */
   const written = new Map<string, Uint8Array>();
@@ -168,7 +191,7 @@ async function main() {
   /* -------------------- 用 pdf.js 读回来验原文 -------------------- */
   const pdfjs = initPdfjs();
   const doc = await pdfjs.getDocument({ data: bytes!.slice() }).promise;
-  pass(doc.numPages === 3, "导出的 PDF 有 " + doc.numPages + " 页");
+  pass(doc.numPages === 4, "导出的 PDF 有 " + doc.numPages + " 页");
 
   const page1 = await doc.getPage(1);
   const tc = await page1.getTextContent();
@@ -296,6 +319,42 @@ async function main() {
     pass(op3.fnArray.length > 5, "退回位图的页内容仍在（绘制指令 " + op3.fnArray.length + "）");
   }
 
+  /*
+   * 第 4 页：长批注必须**按纸宽折行**，一个字都不能少、一行都不能出纸。
+   *
+   * 三条断言是同一个 bug 的三面：
+   *   1. 拼起来等于原文 → 没被页边界裁掉（裁掉就少字）；
+   *   2. 每个 item 右缘 ≤ 页宽 → 折行后每行都在纸内；
+   *   3. 基线不止一条 → 真的折了行，而不是硬画一条超长基线。
+   * 比较前先去掉所有空白：pdf.js 在两条指令间距较大时会自己插空格，
+   * 那是它为了"复制出来像人话"，不是我们少画了字。
+   */
+  {
+    const page4 = await doc.getPage(4);
+    const tc4 = await page4.getTextContent();
+    const items4 = ((tc4.items as any[]) || []).filter((it) => String(it.str || "").trim());
+    const joined4 = items4.map((it) => String(it.str || "")).join("");
+    const PAGE_W = 595.28;
+
+    pass(
+      joined4.replace(/\s+/g, "") === LONG_TEXT,
+      "长批注导出后一个字都不少（" + joined4.replace(/\s+/g, "").length + " / " + LONG_TEXT.length + " 字）"
+    );
+
+    const right = items4.map((it) => Number(it.transform[4]) + Number(it.width || 0));
+    const maxRight = right.length ? Math.max(...right) : 0;
+    pass(
+      items4.length > 0 && maxRight <= PAGE_W + 0.5,
+      "长批注每行都在纸内（最右缘 " + maxRight.toFixed(1) + " ≤ " + PAGE_W + "）"
+    );
+
+    const baselines = new Set(items4.map((it) => Math.round(Number(it.transform[5]) * 10) / 10));
+    pass(
+      items4.length > 1 && baselines.size > 1,
+      "长批注被折成多行（" + items4.length + " 段 / " + baselines.size + " 条基线）"
+    );
+  }
+
   try {
     await doc.destroy();
   } catch (_) {}
@@ -327,6 +386,130 @@ async function main() {
     pass(n2 === 0, "没有批注的本子不嵌字体（字体资源 " + n2 + " 个）");
     ed2.destroy();
     cleanup2();
+  }
+
+  /*
+   * 越界扫描：横向贴右缘、纵向贴页底，一个字都不能丢。
+   *
+   * 上一版只夹住了"每行多宽"，没夹"起点多靠右 / 整段多靠下"：
+   *   · x=700 时"至少 120 宽"把每行右端推到 820 > 794，被页边界裁掉；
+   *   · y=1100 时折出的下面几行整行落到 /MediaBox 之外，阅读器不显示。
+   * 两个都是同一个用户症状"我自己打的那段字不完整"。
+   *
+   * 每一档都用**同一本单页本子**改文字后重新导出：一是省掉重复挂载，
+   * 二是每档只有一段批注，抽回来的字数可以直接跟原文逐字比。
+   */
+  {
+    const scanBook = createBook("越界扫描", "blank", "white");
+    scanBook.pages = [createPage("blank", "white")];
+    const scanStore = new BookStore(scanBook);
+    const [scanHost, scanCleanup] = makeHost();
+    const scanEd = new BookEditor(scanHost, scanStore, { app, smoothing: 0.5 });
+    await sleep(300);
+    const scanFile = { path: "越界扫描.inkbook", basename: "越界扫描", parent: { path: "" } } as any;
+
+    /** 导出这一页、抽回文字，返回"正文 / 段数 / 基线数 / 最右缘 / 基线范围" */
+    const probe = async (t: { x: number; y: number; size: number; text: string }) => {
+      scanStore.data.pages[0].texts = [{ id: "scan", source: "user", color: "#1A1A1A", ...t }];
+      const path = await exportBookPdf(vault, scanEd, scanFile, 1);
+      const d = await pdfjs.getDocument({ data: written.get(path)!.slice() }).promise;
+      const pg = await d.getPage(1);
+      const tc = await pg.getTextContent();
+      const items = ((tc.items as any[]) || []).filter((it) => String(it.str || "").trim());
+      const joined = items.map((it) => String(it.str || "")).join("").replace(/\s+/g, "");
+      const rights = items.map((it) => Number(it.transform[4]) + Number(it.width || 0));
+      const baselines = items.map((it) => Number(it.transform[5]));
+      await d.destroy();
+      return {
+        joined,
+        n: items.length,
+        maxRight: rights.length ? Math.max(...rights) : 0,
+        maxBaseline: baselines.length ? Math.max(...baselines) : 0,
+        minBaseline: baselines.length ? Math.min(...baselines) : 0,
+        rows: new Set(baselines.map((b) => b.toFixed(1))).size,
+      };
+    };
+
+    // 54 字 / 108 字：够长，旧实现下必然要折行、必然被裁
+    const LONG_H = "横向越界扫描用的长句不能让纸边把它裁掉".repeat(3);
+    const LONG_V = "纵向越界扫描用的长句不能落到纸张外面去再也看不见".repeat(4);
+    const PAGE_W = 595.28;
+    const PAGE_H = 841.89;
+
+    for (const x of [634, 660, 674, 680, 700, 760]) {
+      const r = await probe({ x, y: 300, size: 16, text: LONG_H });
+      pass(
+        r.joined === LONG_H,
+        "横向边界 x=" + x + "：字数完整（" + r.joined.length + "/" + LONG_H.length + "）"
+      );
+      pass(
+        r.n > 0 && r.maxRight <= PAGE_W + 0.5,
+        "横向边界 x=" + x + "：每行都在纸内（最右缘 " + r.maxRight.toFixed(1) + " ≤ " + PAGE_W + "）"
+      );
+    }
+
+    /*
+     * 纵向：贴页底 + 负 y。
+     *
+     * 负 y 是「往上拖过头」存下来的老数据（上一版拖到 y=-198，整段跑到
+     * 纸顶之上）。这是所有丢字形态里最彻底的一种：屏幕被 .mb-page 裁掉、
+     * 导出后基线全在 /MediaBox 之外，阅读器一个字节都不显示——所以
+     * 除了贴底，还要专门扫一遍负数。
+     */
+    for (const y of [1050, 1100, 1110, 1120, -100, -198, -1000]) {
+      const r = await probe({ x: 60, y, size: 20, text: LONG_V });
+      pass(
+        r.joined === LONG_V,
+        "纵向边界 y=" + y + "：字数完整（" + r.joined.length + "/" + LONG_V.length + "）"
+      );
+      pass(
+        r.rows > 1,
+        "纵向边界 y=" + y + "：确实折成多行（" + r.rows + " 条基线）"
+      );
+      pass(
+        r.minBaseline >= -0.5 && r.maxBaseline <= PAGE_H + 0.5,
+        "纵向边界 y=" + y + "：所有基线都在页内（" +
+          r.minBaseline.toFixed(1) + " ~ " + r.maxBaseline.toFixed(1) + " ⊂ 0~" + PAGE_H + "）"
+      );
+    }
+
+    /*
+     * 位图/画布这一路（纯手写页的批注是烤进位图的）也得在纸内：
+     * 画布跟纸一样大，出了纸就是被裁掉，所以直接查最右边/最下面
+     * 那个"非底色"像素。底色取左上角像素——blank 纸只有一层底色。
+     */
+    scanStore.data.pages[0].texts = [
+      { id: "scan", source: "user", x: 700, y: 1100, size: 16, color: "#1A1A1A", text: LONG_H },
+    ];
+    {
+      const cv = scanEd.exportPageCanvas(0, 1);
+      const data = cv.getContext("2d")!.getImageData(0, 0, cv.width, cv.height).data;
+      const bg = [data[0], data[1], data[2]];
+      let maxX = -1;
+      let maxY = -1;
+      for (let py = 0; py < cv.height; py++) {
+        for (let px = 0; px < cv.width; px++) {
+          const i = (py * cv.width + px) * 4;
+          const diff =
+            Math.abs(data[i] - bg[0]) + Math.abs(data[i + 1] - bg[1]) + Math.abs(data[i + 2] - bg[2]);
+          if (diff > 60) {
+            if (px > maxX) maxX = px;
+            if (py > maxY) maxY = py;
+          }
+        }
+      }
+      pass(
+        maxX >= 0 && maxX <= cv.width - 8,
+        "画布：画出来的字不出右边界（最右像素 " + maxX + " ≤ " + (cv.width - 8) + "）"
+      );
+      pass(
+        maxY >= 0 && maxY <= cv.height - 1,
+        "画布：画出来的字不出下边界（最下像素 " + maxY + " ≤ " + (cv.height - 1) + "）"
+      );
+    }
+
+    scanEd.destroy();
+    scanCleanup();
   }
 
   log("");

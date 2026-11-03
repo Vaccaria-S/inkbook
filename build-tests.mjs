@@ -50,6 +50,8 @@ const HARNESSES = [
   "thumb-harness.ts",
   // 导出 PDF 的矢量保真（原文可选中）
   "export-harness.ts",
+  // QA 独立验证：批注折行（屏幕 DOM / 画布 / 导出三处断字一致 + 不越界）
+  "qa-wrap-harness.ts",
   // P1 数据安全（指纹 / 原子写 / 版本闸门 / 冲突 / 完整性）
   "p1-harness.ts",
 ];

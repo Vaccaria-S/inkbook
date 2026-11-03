@@ -3,6 +3,7 @@ import { BookStore } from "../src/store";
 import { createBook, createPage, type Pt, type Stroke } from "../src/types";
 import { readBook, writeBook } from "../src/storage";
 import { straightenPoints } from "../src/geometry";
+import { availableTextWidth, layoutUserText, wrapText } from "../src/textwrap";
 import {
   buildPageIndex,
   indexDirFor,
@@ -663,6 +664,297 @@ async function main() {
         "✓ 磁盘上已有但未登记的索引页会被重建成登记态（旧版遗留能救回来）"
       );
     }
+  }
+
+  /*
+   * 批注折行（wrapText）。
+   *
+   * 用「每个字符固定 20 宽」的假 measure 测，折行逻辑跟真实字体解耦——
+   * 真字体的宽度会随系统装了什么字而变，拿它做断言就会在别人机器上红。
+   * 真正的「导出不丢字」由 export 套件用真实字体端到端验。
+   */
+  {
+    const m = (s: string) => Array.from(s).length * 20;
+
+    const short = wrapText("短句", 400, m);
+    pass(short.length === 1 && short[0] === "短句", "折行：短文本不折（" + short.length + " 行）");
+
+    const long = "墨本把批注按纸宽自动折行以后，长句子不会再画到纸外面被裁掉了";
+    const lines = wrapText(long, 200, m);
+    pass(lines.length > 1, "折行：长中文按宽度折行（" + lines.length + " 行）");
+    pass(lines.join("") === long, "折行：一个字都不丢（拼回去等于原文）");
+    pass(
+      lines.every((l) => m(l) <= 200),
+      "折行：每行都不超宽（最宽 " + Math.max(...lines.map(m)) + " ≤ 200）"
+    );
+
+    const hard = wrapText("第一行\n第二行", 400, m);
+    pass(
+      hard.length === 2 && hard[0] === "第一行" && hard[1] === "第二行",
+      "折行：用户敲的回车保留（" + JSON.stringify(hard) + "）"
+    );
+
+    const blank = wrapText("A\n\nB", 400, m);
+    pass(
+      blank.length === 3 && blank[1] === "" && blank[0] === "A" && blank[2] === "B",
+      "折行：空行保留（" + JSON.stringify(blank) + "）"
+    );
+
+    // 英文优先在空格处断：宽 100 = 10 个字符，正好断在 "the quick " 后面
+    const en = wrapText("the quick brown fox jumps", 100, (s) => s.length * 10);
+    pass(
+      en.length > 1 && en[0].replace(/\s+$/, "") === "the quick",
+      "折行：英文在空格处断（" + JSON.stringify(en) + "）"
+    );
+    pass(en.join("") === "the quick brown fox jumps", "折行：英文断行不吞空格（断点处的空格留在行尾）");
+
+    /*
+     * 为了凑空格会把行断得太短时，宁可硬断：
+     * 宽 100 时 "ab cdefghi" 正好塞满，接着要放 'j' 就得回退到空格处，
+     * 那只有 30 宽（< 100×0.6），所以应该直接硬断成 10 个字。
+     */
+    const hardBreak = wrapText("ab cdefghijklmn", 100, (s) => s.length * 10);
+    pass(
+      hardBreak[0] === "ab cdefghi",
+      "折行：空格断行会让这行太短时改硬断（" + JSON.stringify(hardBreak) + "）"
+    );
+    pass(hardBreak.join("") === "ab cdefghijklmn", "折行：硬断同样不丢字");
+
+    // maxWidth 极小（比一个字还窄）：每个字单独一行，绝不能死循环
+    const tiny = wrapText("极小宽度也不能卡住", 1, m);
+    pass(
+      tiny.length === 9 && tiny.join("") === "极小宽度也不能卡住",
+      "折行：maxWidth 极小时逐字成行且不死循环（" + tiny.length + " 行）"
+    );
+
+    const zero = wrapText("abc", 0, m);
+    pass(zero.length === 1 && zero[0] === "abc", "折行：maxWidth=0 当作不折行");
+  }
+
+  /*
+   * 越界夹取（availableTextWidth / layoutUserText）。
+   *
+   * 这两条是上一版漏掉的：折行只夹了"每行多宽"，没夹"起点多靠右"和
+   * "整段多靠下"，于是 x=700 时每行右端被推到 820 出纸、y=1100 时折出的
+   * 下面几行整行落到页外——症状还是"字不完整"，只是从横向换成了纵向。
+   * 用"每个字 = 字号宽"的假度量，规则跟真实字体解耦。
+   */
+  {
+    const W = 794;
+    const H = 1123;
+    const bySize = (size: number) => (s: string) => Array.from(s).length * size;
+
+    const w700 = availableTextWidth(W, 700);
+    pass(
+      700 + w700 <= W - 8 + 0.01,
+      "右缘夹取：x=700 时每行右缘 " + (700 + w700).toFixed(0) + " ≤ 786（可用宽度 " + w700.toFixed(0) + "）"
+    );
+    const w760 = availableTextWidth(W, 760);
+    pass(
+      w760 >= 1 && 760 + w760 <= W - 8 + 0.01,
+      "右缘夹取：x=760 时既不出纸也不会退成 0 宽（可用 " + w760.toFixed(0) + "）"
+    );
+    pass(
+      availableTextWidth(W, 634) === 120,
+      "右缘夹取：纸还够宽时仍保底 120（x=634 → " + availableTextWidth(W, 634).toFixed(0) + "）"
+    );
+
+    const longH = "横向越界扫描用的长句不能让纸边裁掉".repeat(3);
+    for (const x of [634, 674, 700, 760]) {
+      const l = layoutUserText({ x, y: 300, size: 16, text: longH }, W, H, bySize(16));
+      const widest = Math.max(...l.lines.map(bySize(16)));
+      pass(l.lines.join("") === longH, "右缘夹取：x=" + x + " 一个字都不丢（起点收到 " + l.x.toFixed(0) + "）");
+      pass(
+        l.x + widest <= W - 8 + 0.01,
+        "右缘夹取：x=" + x + " 排版后最宽行右缘 " + (l.x + widest).toFixed(0) + " ≤ 786"
+      );
+    }
+
+    const longV = "纵向越界扫描用的长句不能落到纸张外面".repeat(4);
+    for (const y of [1050, 1100, 1120]) {
+      const l = layoutUserText({ x: 60, y, size: 20, text: longV }, W, H, bySize(20));
+      const lastBaseline = l.y + (l.lines.length - 1) * l.lineHeight;
+      pass(
+        lastBaseline <= H - 8 + 0.01,
+        "纵向夹取：y=" + y + " 最后一行基线 " + lastBaseline.toFixed(0) + " ≤ 1115（首行压到 " + l.y.toFixed(0) + "）"
+      );
+      pass(l.lines.join("") === longV, "纵向夹取：y=" + y + " 一个字都不丢");
+      pass(l.y >= 20 * 1.2 - 0.01, "纵向夹取：y=" + y + " 不会为了塞下而顶出页顶");
+    }
+
+    /*
+     * 负 y（往上拖过头的老数据）也必须被兜住。
+     * 这是上一版漏得最狠的一处：y 是负数时 `Math.min(t.y, …)` 原样放行，
+     * 整段跑到纸顶之上，屏幕上被 .mb-page 裁掉、导出后基线在 /MediaBox 之外，
+     * 54 字变 0 字。
+     */
+    for (const y of [-100, -198, -1000]) {
+      const l = layoutUserText({ x: 60, y, size: 20, text: longV }, W, H, bySize(20));
+      pass(
+        l.y >= 20 * 1.2 - 0.01,
+        "负 y 夹取：y=" + y + " 首行基线被抬到 " + l.y.toFixed(0) + " ≥ 24（否则整段在纸外）"
+      );
+      pass(l.lines.join("") === longV, "负 y 夹取：y=" + y + " 一个字都不丢");
+      const lastBaseline = l.y + (l.lines.length - 1) * l.lineHeight;
+      pass(lastBaseline <= H - 8 + 0.01, "负 y 夹取：y=" + y + " 最后一行仍在纸内（" + lastBaseline.toFixed(0) + " ≤ 1115）");
+    }
+
+    /*
+     * 内容比纸还高（超大字号 + 超长文本）：物理上装不下，不做分页也不截断，
+     * 但必须「从页顶开始画、首行在纸内」，不能反过来被推到纸外。
+     */
+    {
+      const huge = "超高内容".repeat(50); // 200 字
+      const l = layoutUserText({ x: 40, y: 500, size: 96, text: huge }, W, H, bySize(96));
+      pass(
+        Math.abs(l.y - 96 * 1.2) < 0.01,
+        "超高内容：首行基线落在 " + l.y.toFixed(1) + "（= 字号×1.2），从页顶开始画"
+      );
+      pass(l.lines.join("") === huge, "超高内容：一个字都不丢（不做截断）");
+    }
+  }
+
+  /*
+   * 屏幕侧：越界的老批注渲染时被夹回纸内。
+   *
+   * 这条查的是 DOM span 的真实几何（不是再算一遍 layoutUserText）——
+   * 屏幕、画布、导出必须落在同一个框里，否则"屏幕上看没事、导出缺一段"
+   * 这种割裂会一直在。
+   */
+  {
+    const page = store.data.pages[0];
+    page.texts = [
+      {
+        id: "t_clip",
+        source: "user",
+        x: 700,
+        y: 1100,
+        size: 20,
+        color: "#1A1A1A",
+        text: "屏幕侧越界扫描的长批注不能让纸边裁掉也不能落到页脚外面",
+      },
+    ];
+    editor.renderPages();
+    await sleep(150);
+
+    const el = pageEl().querySelector(".mb-text.is-user") as HTMLElement | null;
+    const pr = pageEl().getBoundingClientRect();
+    const sr = el?.getBoundingClientRect();
+    const zoom = pr.width / 794;
+    const lineH = 20 * 1.32 * zoom;
+    pass(!!sr, "屏幕：批注 span 渲染出来了");
+    if (sr) {
+      pass(
+        sr.right <= pr.right + 0.5,
+        "屏幕：贴右缘起的批注不出纸（span 右缘 " + (sr.right - pr.left).toFixed(0) + " ≤ " + pr.width.toFixed(0) + "）"
+      );
+      pass(
+        sr.bottom <= pr.bottom + 0.5,
+        "屏幕：贴页底的长批注最后一行仍在纸内（span 底 " + (sr.bottom - pr.top).toFixed(0) + " ≤ " + pr.height.toFixed(0) + "）"
+      );
+      pass(
+        sr.height / lineH > 1.5,
+        "屏幕：长批注被折成多行（约 " + (sr.height / lineH).toFixed(1) + " 行高）"
+      );
+    }
+
+    page.texts = [];
+    editor.renderPages();
+    await sleep(80);
+  }
+
+  /*
+   * 拖动批注：上 / 下 / 左 / 右各拖过头一次，落点必须还在纸内。
+   *
+   * 上一版把拖动原来的 `clamp(…, size, height-4)` 换成了 `target.y = l.y`，
+   * 而当时 l.y 只有上限没有下限，于是往上猛拖能把整块滑出纸顶：
+   * 数据存成 y=-198，屏幕被裁、导出 0 字。夹取补全后再拖就不该出去了。
+   */
+  {
+    const page = store.data.pages[0];
+    const longDrag = "拖动越界扫描的长批注不能被拖出纸外也不能整块消失掉";
+    page.texts = [
+      { id: "t_drag", source: "user", x: 200, y: 300, size: 20, color: "#1A1A1A", text: longDrag },
+    ];
+    editor.setTool("select");
+    editor.renderPages();
+    await sleep(120);
+
+    const dragTo = async (toX: number, toY: number) => {
+      const el = pageEl();
+      const item = (store.data.pages[0].texts || [])[0];
+      const lay = (editor as any).textLayout(item);
+      el.dispatchEvent(ev("pointerdown", lay.x + 6, lay.y - 4, 1, 31));
+      el.dispatchEvent(ev("pointermove", toX, toY, 1, 31));
+      el.dispatchEvent(ev("pointerup", toX, toY, 0, 31));
+      await sleep(70);
+      return (store.data.pages[0].texts || [])[0];
+    };
+
+    const size = 20;
+    const cases: Array<[string, number, number]> = [
+      ["往上拖过头", 200, -500],
+      ["往下拖过头", 200, 5000],
+      ["往左拖过头", -600, 300],
+      ["往右拖过头", 2000, 300],
+    ];
+    for (const [label, tx, ty] of cases) {
+      const item = await dragTo(tx, ty);
+      const lay = (editor as any).textLayout(item);
+      const lastBaseline = lay.y + (lay.lines.length - 1) * lay.lineHeight;
+      const sp = pageEl().querySelector(".mb-text.is-user") as HTMLElement | null;
+      const pr = pageEl().getBoundingClientRect();
+      const sr = sp?.getBoundingClientRect();
+      pass(
+        lay.y >= size * 1.2 - 0.01 && lastBaseline <= 1123 - 8 + 0.01,
+        "拖动" + label + "：落点 (x=" + item.x.toFixed(0) + ", y=" + item.y.toFixed(0) + ") 仍在纸内（首行 " +
+          lay.y.toFixed(0) + " / 末行基线 " + lastBaseline.toFixed(0) + "）"
+      );
+      pass(
+        item.x >= -0.01 && item.x <= 794 - 120 + 0.01,
+        "拖动" + label + "：横向落点被夹住（x=" + item.x.toFixed(0) + " ⊂ 0~674）"
+      );
+      pass(
+        !!sr && sr.right <= pr.right + 0.5 && sr.bottom <= pr.bottom + 0.5 && sr.top >= pr.top - 0.5,
+        "拖动" + label + "：屏幕上的 span 没出纸（上/右/下都在纸内）"
+      );
+    }
+
+    editor.setTool("pen");
+    page.texts = [];
+    editor.renderPages();
+    await sleep(80);
+  }
+
+  /*
+   * 点太靠右新建：x 会被夹到 634，编辑框必须**出现在夹取后的位置**，
+   * 否则用户点了 750 却在 634 看到框，会觉得"字跑了"。
+   */
+  {
+    const page = store.data.pages[0];
+    page.texts = [];
+    editor.setTool("text");
+    editor.renderPages();
+    await sleep(100);
+
+    const el = pageEl();
+    el.dispatchEvent(ev("pointerdown", 750, 400, 1, 41));
+    el.dispatchEvent(ev("pointerup", 750, 400, 0, 41));
+    await sleep(80);
+
+    const ta = pageEl().querySelector(".mb-text-edit") as HTMLTextAreaElement | null;
+    const zoom = pageEl().getBoundingClientRect().width / 794;
+    const left = ta ? parseFloat(ta.style.left) : -1;
+    pass(
+      !!ta && Math.abs(left - 634 * zoom) < 2,
+      "点在 x=750 新建：编辑框出现在夹取后的 634（" + (ta ? left.toFixed(0) + "px / zoom " + zoom.toFixed(2) : "没有编辑框") + "）"
+    );
+    ta?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await sleep(60);
+    pass((store.data.pages[0].texts || []).length === 0, "Esc 取消后没有留下空批注");
+    editor.setTool("pen");
+    editor.renderPages();
+    await sleep(60);
   }
 
   log("DONE");

@@ -4,6 +4,7 @@ import fontkit from "@pdf-lib/fontkit";
 import type { BookEditor } from "./editor";
 import { chineseFontBytes } from "./fontasset";
 import type { Page } from "./types";
+import { layoutUserText } from "./textwrap";
 
 function safeName(s: string): string {
   return String(s).replace(/[\\/:*?"<>|#^[\]]/g, "_").trim() || "手写本";
@@ -44,9 +45,6 @@ const PT_PER_UNIT = 595.28 / 794;
 const A4_W = 595.28;
 const A4_H = 841.89;
 
-/** 画布上的行高倍数（跟 editor.drawUserTexts 保持一致） */
-const LINE_HEIGHT = 1.32;
-
 function parseColor(hex?: string): RGB {
   const s = String(hex || "#1A1A1A").replace("#", "").trim();
   const full = s.length === 3 ? s[0] + s[0] + s[1] + s[1] + s[2] + s[2] : s;
@@ -71,18 +69,37 @@ function parseColor(hex?: string): RGB {
 function drawUserTextsPdf(page: PDFPage, src: Page, font: PDFFont, pageH: number): void {
   const texts = (src.texts || []).filter((t) => t.source === "user" && (t.text || "").trim());
   if (!texts.length) return;
+  /*
+   * 纸宽换回页面坐标（794 那套）：textwrap 里的排版规则全程用页面坐标，
+   * 量的宽度也换成页面坐标（除以 PT_PER_UNIT），画的时候再乘回去。
+   * 混着单位算的话，「折行宽度」和「字体度量」会差 25%，右边一截照样出纸。
+   */
+  const pageWUnits = page.getWidth() / PT_PER_UNIT;
   for (const t of texts) {
-    const size = (t.size || 14) * PT_PER_UNIT;
+    const sizePt = (t.size || 14) * PT_PER_UNIT;
     const color = parseColor(t.color);
-    const lines = t.text.split("\n");
-    for (let i = 0; i < lines.length; i += 1) {
-      const line = lines[i];
+    /*
+     * 折行 + 位置夹取都交给 layoutUserText。
+     *
+     * 只折行不夹位置是不够的：pdf-lib 不认页边界，基线排在 y=1100 的批注
+     * 折成 4 行后，下面 3 行整个落在 /MediaBox 之外，阅读器直接不显示
+     * ——横向裁字的问题解决了，纵向又漏一行，症状一样是「字不完整」。
+     */
+    const l = layoutUserText(
+      { x: t.x, y: t.y, size: t.size || 14, text: t.text },
+      pageWUnits,
+      pageH,
+      // 度量换算成页面坐标，跟 maxWidth / x / y 同一套单位
+      (s) => font.widthOfTextAtSize(s, sizePt) / PT_PER_UNIT
+    );
+    for (let i = 0; i < l.lines.length; i += 1) {
+      const line = l.lines[i];
       if (!line) continue;
-      const y = t.y + i * (t.size || 14) * LINE_HEIGHT;
+      const y = l.y + i * l.lineHeight;
       page.drawText(line, {
-        x: t.x * PT_PER_UNIT,
+        x: l.x * PT_PER_UNIT,
         y: (pageH - y) * PT_PER_UNIT,
-        size,
+        size: sizePt,
         font,
         color,
       });

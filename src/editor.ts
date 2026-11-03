@@ -26,6 +26,13 @@ import {
   strokeBounds,
   strokeHit,
 } from "./geometry";
+import {
+  availableTextWidth,
+  layoutUserText,
+  maxTextStartX,
+  TEXT_LINE_HEIGHT,
+  type TextLayout,
+} from "./textwrap";
 
 export interface EditorState {
   pageIndex: number;
@@ -143,6 +150,44 @@ export function textFontStack(id?: string): string {
 
 /** 兼容旧代码里的单字体引用（PDF 原文也用黑体） */
 const TEXT_FONT = TEXT_FONTS[0].stack;
+
+/**
+ * 新建批注的编辑框宽度（页面坐标）。
+ *
+ * 太窄了打字体验很差（一上来就折行），太宽了又会顶到纸边，
+ * 所以取「可用宽度」和这个值里的小者。
+ */
+const TEXT_EDIT_WIDTH = 320;
+
+/** 编辑框的左右内边距 + 边框（CSS px）：算 width 时要补上，否则折行位置比渲染早一步 */
+const TEXT_EDIT_CHROME = 10;
+
+/**
+ * 量文字宽度用的离屏 canvas。
+ *
+ * 整个模块复用一块：measureTextWidth 会被命中判定、选中框、属性条
+ * 反复调用，每次 new 一块 canvas 比测量本身贵两个数量级。
+ * ctx.font 只在字体串变化时才重设——赋值会让浏览器重新解析整条字体栈。
+ */
+let measureCanvas: HTMLCanvasElement | null = null;
+let measureCtx: CanvasRenderingContext2D | null = null;
+let measureFontKey = "";
+
+/** 拿到按 font 配好的测量 ctx；环境不支持 canvas 时返回 null（调用方退回估算） */
+function measureContext(font: string): CanvasRenderingContext2D | null {
+  if (!measureCanvas) {
+    measureCanvas = document.createElement("canvas");
+    measureCanvas.width = 8;
+    measureCanvas.height = 8;
+    measureCtx = measureCanvas.getContext("2d");
+  }
+  if (!measureCtx) return null;
+  if (measureFontKey !== font) {
+    measureCtx.font = font;
+    measureFontKey = font;
+  }
+  return measureCtx;
+}
 
 /**
  * 单张画布允许的最大像素数。
@@ -964,9 +1009,17 @@ export class BookEditor {
     const pageW = this.store.data.width * z;
     const w = bar.offsetWidth || 320;
     const h = bar.offsetHeight || 32;
-    const left = Math.max(4, Math.min(sel.x * z, pageW - w - 4));
-    const above = (sel.y - sel.size * 1.18) * z - h - 8;
-    const top = above >= 4 ? above : (sel.y + sel.size * 0.5) * z + 8;
+    // 跟着排版后的位置走：越界的老批注渲染时被夹回纸内，属性条也得跟进去
+    const l = this.textLayout(sel);
+    const left = Math.max(4, Math.min(l.x * z, pageW - w - 4));
+    const above = (l.y - sel.size * 1.18) * z - h - 8;
+    /*
+     * 「放到文字下方」要躲开**最后一行**：折行的长批注有好几行，
+     * 按第一行算高度会让属性条压在文字身上。
+     */
+    const lines = Math.max(1, l.lines.length);
+    const below = (l.y + (lines - 1) * l.lineHeight + sel.size * 0.5) * z + 8;
+    const top = above >= 4 ? above : below;
     bar.style.left = `${left}px`;
     bar.style.top = `${top}px`;
   }
@@ -2195,15 +2248,19 @@ export class BookEditor {
     const sel =
       this.tool === "text" || this.tool === "select" ? this.selectedText : null;
     if (sel) {
-      const bw = Math.max(24, this.measureTextWidth(sel));
-      const lines = Math.max(1, sel.text.split("\n").length);
-      const top = sel.y - sel.size * 1.18;
-      const bh = sel.size * 1.32 * lines + sel.size * 0.24;
+      /*
+       * 位置和高度都按**排版后**的几何：折了行的长批注有好几行，
+       * 越界的老批注还会被夹回纸内——框要跟着走，否则框在纸外、字在纸内。
+       */
+      const l = this.textLayout(sel);
+      const bw = Math.max(24, this.measureTextWidth(sel, l.lines));
+      const top = l.y - sel.size * 1.18;
+      const bh = l.lineHeight * Math.max(1, l.lines.length) + sel.size * 0.24;
       ctx.save();
       ctx.strokeStyle = "#6C5CE7";
       ctx.lineWidth = 1.4 / this.zoom;
       ctx.setLineDash([5 / this.zoom, 4 / this.zoom]);
-      ctx.strokeRect(sel.x - 3, top, bw + 8, bh);
+      ctx.strokeRect(l.x - 3, top, bw + 8, bh);
       ctx.restore();
     }
   }
@@ -2247,6 +2304,22 @@ export class BookEditor {
       if (t.source === "user") {
         el.style.color = t.color || "#1A1A1A";
         if (t.bold) el.style.fontWeight = "600";
+        /*
+         * 长批注在屏幕上也要按纸宽折行。
+         *
+         * 之前 span 不设宽度，一直往右长，超出纸面的部分被 .mb-textlayer
+         * 的 overflow:hidden 吃掉——屏幕上就已经"少半句"了，只是没人细看。
+         * 宽度定成可用宽度交给 CSS 的 pre-wrap 折；位置也用**排版后**的
+         * x/y（越界的老批注会被夹回纸内），这样屏幕和导出看到的是同一份排版。
+         * 折行后的行距要跟画布/导出对齐（TEXT_LINE_HEIGHT），
+         * 所以 transform 用 0.82 + 半个行距补偿基线上移。
+         */
+        const l = this.textLayout(t);
+        el.style.left = `${l.x}px`;
+        el.style.top = `${l.y}px`;
+        el.style.width = `${this.textAvailWidth(l.x)}px`;
+        el.style.lineHeight = String(TEXT_LINE_HEIGHT);
+        el.style.transform = `translateY(-${0.82 + (TEXT_LINE_HEIGHT - 1) / 2}em)`;
       }
       layer.appendChild(el);
     }
@@ -2303,22 +2376,100 @@ export class BookEditor {
     })();
   }
 
-  /** 估算一段文字的宽度（页面坐标），用于点击命中，不追求像素级 */
-  private measureTextWidth(t: PageText): number {
+  /** 这段批注在屏幕上用的 CSS font 串（屏幕测量、画布绘制共用） */
+  private textFontCss(t: { size: number; font?: string; bold?: boolean }): string {
+    return `${t.bold ? "600 " : ""}${t.size}px ${textFontStack(t.font)}`;
+  }
+
+  /**
+   * 批注可用的横向宽度（页面坐标）。
+   *
+   * 规则在 textwrap 里（屏幕/画布/导出共用一份），这里只是把本子的纸宽喂进去。
+   */
+  private textAvailWidth(x: number): number {
+    return availableTextWidth(this.store.data.width, x);
+  }
+
+  /**
+   * 一段批注的最终排版（折行 + 位置夹取）。
+   *
+   * 渲染、命中判定、选中框、属性条、编辑框全部走这一份结果——
+   * 各算各的必然出现「看着两行、点不中第二行」，或者屏幕上在纸内、
+   * 导出的 PDF 里下面几行掉到页外。
+   * 生产环境里 measure 用模块级那块离屏 canvas，没有 canvas 时退回硬换行。
+   */
+  private textLayout(t: {
+    x: number;
+    y: number;
+    size: number;
+    text: string;
+    font?: string;
+    bold?: boolean;
+  }): TextLayout {
+    const ctx = measureContext(this.textFontCss(t));
+    if (!ctx) {
+      const lines = String(t.text ?? "").split("\n");
+      return { x: t.x, y: t.y, lines, lineHeight: t.size * TEXT_LINE_HEIGHT };
+    }
+    return layoutUserText(
+      t,
+      this.store.data.width,
+      this.store.data.height,
+      (s) => ctx.measureText(s).width
+    );
+  }
+
+  /**
+   * 折行后的行数组（页面坐标）。
+   *
+   * 多数调用方只关心「断在哪」，不想要整个 TextLayout，所以留这个薄入口；
+   * 排版规则仍然只有 textLayout 一份。
+   */
+  private textLines(t: {
+    x: number;
+    y: number;
+    size: number;
+    text: string;
+    font?: string;
+    bold?: boolean;
+  }): string[] {
+    return this.textLayout(t).lines;
+  }
+
+  /**
+   * 一段批注的宽度（页面坐标），取折行后最宽的那行。
+   *
+   * 原来是 `字数 × 字号 × 0.62` 估的：中文实际接近 1 个字宽，
+   * 0.62 严重低估，选中框和编辑框只有实际宽度的一半多点。
+   * 现在按真实字体测量，量出来就是画出来/导出时占的宽度。
+   */
+  private measureTextWidth(t: PageText, lines?: string[]): number {
+    // PDF 原文带的是抽出来的真实行宽，比重新量一遍准（也省一次测量）
+    if (t.source === "pdf" && t.width) return t.width;
+    const ctx = measureContext(this.textFontCss(t));
+    const text = String(t.text ?? "");
+    if (!ctx) return Math.max(1, text.length * t.size * 0.62);
     let max = 0;
-    for (const line of t.text.split("\n")) max = Math.max(max, line.length);
-    // 中英混排按 0.62 个字宽估：宁可框大一点，也别点不中
-    return max * t.size * 0.62;
+    for (const line of lines ?? this.textLines(t)) {
+      max = Math.max(max, ctx.measureText(line).width);
+    }
+    return Math.max(1, max);
   }
 
   private hitText(texts: PageText[], x: number, y: number): PageText | null {
     for (let i = texts.length - 1; i >= 0; i--) {
       const t = texts[i];
       if (t.source !== "user") continue;
-      const w = this.measureTextWidth(t);
-      const top = t.y - t.size * 1.18;
-      const h = t.size * 1.6 * Math.max(1, t.text.split("\n").length);
-      if (x >= t.x - 3 && x <= t.x + w + 8 && y >= top && y <= top + h) return t;
+      /*
+       * 命中区要按**排版后**的几何算，不能按数据里的 x/y：
+       * 越界的老批注渲染时被夹回纸内了，命中区还留在纸外的话，
+       * 用户点得到字却选不中（或者反过来）。
+       */
+      const l = this.textLayout(t);
+      const w = this.measureTextWidth(t, l.lines);
+      const top = l.y - t.size * 1.18;
+      const h = t.size * 1.6 * Math.max(1, l.lines.length);
+      if (x >= l.x - 3 && x <= l.x + w + 8 && y >= top && y <= top + h) return t;
     }
     return null;
   }
@@ -2349,13 +2500,19 @@ export class BookEditor {
     this.selectText(hit.id);
     this.gesture = "moveText";
     this.pointerId = e.pointerId;
+    /*
+     * 拖动起点用**屏幕上看到的位置**（排版后的 x/y），不是数据里的原值：
+     * 越界的老批注渲染时已经被夹回纸内，如果按数据的 x 起算，
+     * 一开始拖就会"往回跳"或者几像素内完全不动。
+     */
+    const l = this.textLayout(hit);
     this.moveText = {
       rec,
       id: hit.id,
       startX: px,
       startY: py,
-      originX: hit.x,
-      originY: hit.y,
+      originX: l.x,
+      originY: l.y,
       moved: false,
     };
     try {
@@ -2401,9 +2558,24 @@ export class BookEditor {
     const size = hit?.size ?? this.textSizeValue;
     const color = hit?.color ?? this.textColorValue;
     const font = hit?.font ?? this.textFontValue;
-    const x = hit ? hit.x : px;
-    // 新建时让点击点落在文字中部（基线在下方约 0.82 字高）
-    const y = hit ? hit.y : py + size * 0.82;
+    /*
+     * 新建时的位置要先夹一下，否则"打出来的字不完整"从第一秒就注定了：
+     *   · 横向：点击点贴着右边缘时可用宽度只剩几十像素，甚至一个字都放不下，
+     *     存进去的就是一列竖字或者干脆在纸外；
+     *   · 纵向：点击点贴近页底时基线就在页脚，折行后下面几行整行掉出纸外。
+     * 夹取规则跟渲染共用 layoutUserText（单行时的 yMax 就是"最后一行在纸内"）。
+     */
+    const layout = hit
+      ? this.textLayout(hit)
+      : this.textLayout({
+          x: Math.min(px, maxTextStartX(this.store.data.width)),
+          y: py + size * 0.82,
+          size,
+          text: "",
+          font,
+        });
+    const x = layout.x;
+    const y = layout.y;
 
     const ta = document.createElement("textarea");
     ta.className = "mb-text-edit";
@@ -2411,11 +2583,30 @@ export class BookEditor {
     ta.value = hit?.text ?? "";
     ta.style.fontFamily = textFontStack(font);
     ta.style.fontSize = `${size * this.zoom}px`;
-    ta.style.lineHeight = "1.32";
+    ta.style.lineHeight = String(TEXT_LINE_HEIGHT);
     ta.style.color = color;
     ta.style.left = `${x * this.zoom}px`;
     ta.style.top = `${(y - size * 0.82) * this.zoom}px`;
-    ta.style.minWidth = `${Math.max(96, (hit ? this.measureTextWidth(hit) : 140) * this.zoom)}px`;
+    /*
+     * 编辑框宽度不再是「min-width 140 / 撑到内容有多宽」。
+     *
+     * 以前只给 min-width（140px），textarea 的 `white-space: pre` 又不折行，
+     * 于是长句一路向右滚、看着像打完了，提交后超出纸面的部分才被裁掉
+     * ——用户看到的就是「导出后那段字不完整」。
+     * 现在按可用宽度定死 + CSS 用 pre-wrap，框里折在哪、提交后就折在哪。
+     * 补 TEXT_EDIT_CHROME 是因为 CSS 用 border-box：内边距会吃掉内容宽度。
+     */
+    const avail = this.textAvailWidth(x);
+    /*
+     * 新建：给个不算窄的初始框；改已有文字：至少放得下它自己。
+     * 本来要折行的长批注直接给满可用宽度——只有宽度等于可折行宽度，
+     * 框里断字的位置才跟提交后的渲染一致（这是这个 bug 的关键）。
+     * 两者都封顶 avail，不顶出纸面。
+     */
+    const wantW = hit
+      ? Math.min(avail, Math.max(TEXT_EDIT_WIDTH, this.measureTextWidth(hit) + 24))
+      : Math.min(avail, TEXT_EDIT_WIDTH);
+    ta.style.width = `${wantW * this.zoom + TEXT_EDIT_CHROME}px`;
     rec.pageEl.appendChild(ta);
 
     this.textEdit = { rec, el: ta, id: hit?.id ?? null, x, y, size, color, font };
@@ -2468,6 +2659,13 @@ export class BookEditor {
     const arr = page.texts ?? [];
     const old = ed.id ? arr.find((t) => t.id === ed.id) : undefined;
 
+    /*
+     * 改的是"已有文字"，但数组里已经没有它了（撤销、快照恢复把 texts 整个换掉了）。
+     * 这时如果继续走下面的"新建"分支，就会用新 id 把这段字复活成**第二条**——
+     * 用户按了 Esc/撤销，纸上却多出一个副本。宁可丢掉这次输入。
+     */
+    if (ed.id && !old) return;
+
     if (old) {
       if (!value) {
         this.store.snapshotPage(rec.index);
@@ -2513,11 +2711,23 @@ export class BookEditor {
     for (const t of texts) {
       ctx.save();
       ctx.fillStyle = t.color || "#1A1A1A";
-      ctx.font = `${t.bold ? "600 " : ""}${t.size}px ${textFontStack(t.font)}`;
+      ctx.font = this.textFontCss(t);
       ctx.textBaseline = "alphabetic";
-      const lines = t.text.split("\n");
-      for (let i = 0; i < lines.length; i++) {
-        ctx.fillText(lines[i], t.x, t.y + i * t.size * 1.32);
+      /*
+       * 排版（折行 + 位置夹取）走 textwrap 里那唯一一份规则。
+       *
+       * 不折行的话长句会一路画到画布外——画布宽度就是纸宽，超出的部分
+       * 直接被裁掉，导出的 PDF 里那段字就"不完整"了；只折行不夹 y 的话，
+       * 页底的长批注会折成好几行，下面几行整行掉到纸外，一样是丢字。
+       *
+       * 单位说明：这块 ctx 已经按 zoom×dpr scale 过，measureText 返回的是
+       * **页面坐标**下的宽度（跟 t.x、t.size、纸宽同一套单位），
+       * 所以不用再乘缩放。
+       */
+      const l = this.textLayout(t);
+      for (let i = 0; i < l.lines.length; i++) {
+        if (!l.lines[i]) continue;
+        ctx.fillText(l.lines[i], l.x, l.y + i * l.lineHeight);
       }
       ctx.restore();
     }
@@ -3021,8 +3231,20 @@ export class BookEditor {
       }
       const target = this.store.data.pages[m.rec.index]?.texts?.find((t) => t.id === m.id);
       if (!target) return;
-      target.x = clamp(m.originX + dx, 0, this.store.data.width - 12);
-      target.y = clamp(m.originY + dy, target.size, this.store.data.height - 4);
+      /*
+       * 拖动后的落点同样要过一遍排版夹取：拖到纸边时不光横向会顶出去，
+       * 拖到页底时折行后的下面几行也会整行掉出纸外。
+       */
+      const l = this.textLayout({
+        x: m.originX + dx,
+        y: m.originY + dy,
+        size: target.size,
+        text: target.text,
+        font: target.font,
+        bold: target.bold,
+      });
+      target.x = l.x;
+      target.y = l.y;
       this.renderTextLayer(m.rec);
       this.renderOverlay(m.rec);
       this.positionTextBar();

@@ -782,6 +782,19 @@
   -webkit-text-fill-color: transparent;
 }
 
+/*
+ * 用户批注：宽度由 renderTextLayer 按页面可用宽度写在 inline style 上，
+ * 这里负责折行。pre-wrap 而不是 pre —— pre 不折行，长句会一直往右长，
+ * 超出纸面的部分被 .mb-textlayer 的 overflow:hidden 裁掉。
+ * 折行后用 1.32 的行距跟画布/导出对齐，屏幕上看到的就是最终排出来的样子。
+ */
+.mb-text.is-user {
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  line-height: 1.32;
+}
+
 /* 仅阅读模式才允许选字：这时本来就不写字，不会抢触摸 */
 .mb-root.is-reading .mb-textlayer {
   pointer-events: auto;
@@ -798,6 +811,8 @@
 .mb-text-edit {
   position: absolute;
   z-index: 6;
+  /* 宽度由 beginTextEdit 按页面可用宽度写死，border-box 让宽度就是"能排字的地方" */
+  box-sizing: border-box;
   margin: 0;
   padding: 2px 4px;
   border: 1px solid var(--interactive-accent, #6c5ce7);
@@ -808,7 +823,13 @@
   outline: none;
   resize: none;
   overflow: hidden;
-  white-space: pre;
+  /*
+   * 必须折行：pre 不折行 + 只给 min-width 时，长句在框里一路向右滚，
+   * 用户以为"打完了"，提交后才被纸边裁掉——这里折行才看得见会断在哪。
+   */
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
 
 /* -------------------- 选中文字的属性条 --------------------
