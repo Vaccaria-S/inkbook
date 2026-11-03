@@ -5,6 +5,13 @@ import { NewBookModal } from "./modals";
 import type { InkbookSettings } from "./types";
 import { parseIndexPath, writeTextIndex } from "./indexer";
 import { readBook } from "./storage";
+import {
+  disposeEmbeds,
+  invalidateEmbedCache,
+  refreshEmbedsForPath,
+  registerEmbed,
+  type EmbedHost,
+} from "./embed";
 
 class BookPickerModal extends FuzzySuggestModal<TFile> {
   private choose: (file: TFile) => void;
@@ -47,6 +54,16 @@ export default class InkbookPlugin extends Plugin {
 
     this.addRibbonIcon("notebook", "墨本：新建手写本", () => this.openNewBook());
     this.addRibbonIcon("book-open", "墨本：打开手写本", () => this.openPicker());
+
+    /*
+     * 笔记里 `![[本子.inkbook]]` 的渲染（INK-105）。
+     *
+     * 之前整个插件没有 postprocessor，md 里只能看到一个宿主自带的嵌入占位
+     * ——双击能进本子，但“引用/预览”这条路是断的。
+     * 现在把一整页画成位图贴进去：只做预览，要写就点进去写。
+     */
+    registerEmbed(this as unknown as EmbedHost);
+    this.registerEmbedCacheEvents();
 
     this.addCommand({
       id: "inkbook-new",
@@ -161,6 +178,47 @@ export default class InkbookPlugin extends Plugin {
     return { books, pages, failed };
   }
 
+  /**
+   * 本子改动 / 改名前清掉笔记内嵌入的缓存，并让视口内的嵌入重画。
+   *
+   * 注意「显示旧图」不是风险：缓存键里带着 mtime，文件一改就是另一个键，
+   * 下次渲染自然重画。这里清的是**旧的那一份**——不清的话，一本书改十次
+   * 就留下十份位图和十份页面 JSON，一直占着内存到进程结束；
+   * rename 之后旧路径的条目更是永远命中不了，纯泄漏。
+   *
+   * modify 还额外叫醒已经画好的那些块（1.5s 防抖，见 embed.ts）：
+   * 用户在墨本里写了两笔、切回笔记，看到的不该是旧图。
+   */
+  private registerEmbedCacheEvents(): void {
+    const vault: any = this.app?.vault as any;
+    // 测试桩里的 vault 未必有事件总线；真机上一定有
+    if (!vault || typeof vault.on !== "function") return;
+
+    const dropIfBook = (f: any): void => {
+      if (f && String(f.extension || "").toLowerCase() === "inkbook") {
+        invalidateEmbedCache(f.path);
+      }
+    };
+
+    this.registerEvent(
+      vault.on("modify", (f: any) => {
+        if (!f || String(f.extension || "").toLowerCase() !== "inkbook") return;
+        // 先同步清缓存：内存立刻释放，也保证随后任何一次读取都不会命中旧位图
+        invalidateEmbedCache(f.path);
+        // 再排队把视口内的块重画（1.5s 防抖，内部还会再清一次缓存 → 幂等）
+        refreshEmbedsForPath(f.path);
+      })
+    );
+    this.registerEvent(vault.on("delete", dropIfBook));
+    this.registerEvent(
+      vault.on("rename", (f: any, oldPath: string) => {
+        // 旧路径下的缓存再也命中不了，直接丢掉（不清会一直占着内存）
+        if (oldPath) invalidateEmbedCache(oldPath);
+        dropIfBook(f);
+      })
+    );
+  }
+
   /** 处理 obsidian://inkbook?file=…&page=N */
   private async openFromLink(params: Record<string, string>): Promise<void> {
     let path = params.file || "";
@@ -176,23 +234,36 @@ export default class InkbookPlugin extends Plugin {
     await this.openBookAt(path, Number(params.page || "1") || 1);
   }
 
-  /** 打开指定路径的手写本并跳到第 page 页（1 起） */
-  private async openBookAt(path: string, page: number): Promise<void> {
+  /**
+   * 打开指定路径的手写本并跳到第 page 页（1 起）。
+   *
+   * 公开：笔记内嵌入（embed.ts）点一下要落到链接里写的那一页。
+   *
+   * `opts.newTab` 来自点击时的修饰键（Ctrl/Cmd / 中键）：默认沿用 Obsidian
+   * 原生内部链接的语义——替换当前 leaf；带修饰键才另开一个标签页。
+   */
+  async openBookAt(path: string, page: number, opts?: { newTab?: boolean }): Promise<void> {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (!(file instanceof TFile)) {
       new Notice("墨本：找不到这本手写本 —— " + path);
       return;
     }
-    // 已经停在这本上：不重新打开，直接翻页（避免闪一下）
-    const active = this.app.workspace.getActiveFile?.();
-    if (active && active.path === file.path) {
-      const open = this.app.workspace.getActiveViewOfType?.(InkbookView);
-      if (open) {
-        open.gotoPageFromLink(page);
-        return;
+    const newTab = opts?.newTab === true;
+    // 已经停在这本上：不重新打开，直接翻页（避免闪一下）。
+    // 要求新开标签时跳过这条捷径——用户明确表达了"另开一页看"。
+    if (!newTab) {
+      const active = this.app.workspace.getActiveFile?.();
+      if (active && active.path === file.path) {
+        const open = this.app.workspace.getActiveViewOfType?.(InkbookView);
+        if (open) {
+          open.gotoPageFromLink(page);
+          return;
+        }
       }
     }
-    const leaf = this.app.workspace.getLeaf(false);
+    const leaf = newTab
+      ? this.app.workspace.getLeaf("tab")
+      : this.app.workspace.getLeaf(false);
     await leaf.openFile(file);
     const view = leaf.view;
     if (view instanceof InkbookView) view.gotoPageFromLink(page);
@@ -363,6 +434,9 @@ export default class InkbookPlugin extends Plugin {
   onunload(): void {
     this.uninstallSwipeGuard();
     this.uninstallPaletteGuard();
+    // 笔记内嵌入：停掉懒加载观察器并释放位图/页面缓存
+    disposeEmbeds();
+    invalidateEmbedCache();
   }
 
   private openNewBook(): void {

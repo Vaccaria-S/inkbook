@@ -54,6 +54,16 @@ const HARNESSES = [
   "qa-wrap-harness.ts",
   // P1 数据安全（指纹 / 原子写 / 版本闸门 / 冲突 / 完整性）
   "p1-harness.ts",
+  // 笔记内嵌入（INK-105）：链接解析 / 一页渲染 / 缓存 / postprocessor 端到端
+  "embed-harness.ts",
+  // QA 独立验证（INK-105）：真实布局量尺寸 / 解析边界外推 / LRU / 失败路径 / 幂等
+  "qa-embed2-harness.ts",
+  // QA 独立验证（INK-105）：main.ts 真接线（postprocessor 注册 + vault 事件清缓存）
+  "qa-embed3-harness.ts",
+  // QA 终验（INK-105 第二轮）：F1 宽度天花板 / F2 不越栏 / 点击落点 / 保存后重画 / 角标
+  "qa-embed4-harness.ts",
+  // QA 量测（不是断言套件）：dpr=1 vs dpr=2 下嵌入的**显示宽度**差多少
+  "qa-dprcheck-harness.ts",
 ];
 
 const only = process.argv[2];

@@ -1,0 +1,17 @@
+<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>running</title>
+<link rel="stylesheet" href="/styles.css">
+<style>
+:root{
+  --background-primary:#fff;--background-primary-alt:#fafafa;--background-secondary:#f4f4f4;
+  --background-modifier-border:#d9d9d9;--background-modifier-error:rgba(214,69,69,.12);
+  --text-normal:#1a1a1a;--text-muted:#666;--text-faint:#999;--text-error:#d64545;
+  --text-on-accent:#fff;--interactive-accent:#6c5ce7;
+}
+html,body{margin:0;font-family:system-ui;background:#fff}
+#pp{display:flex;align-items:flex-start;gap:8px;width:700px;padding:6px;box-sizing:border-box}
+#pp > div{width:300px;flex:0 0 300px}
+#out{position:fixed;left:0;bottom:0;width:100%;max-height:46vh;overflow:auto;z-index:9999;background:#111;color:#0f0;font-size:12px;padding:6px;margin:0;white-space:pre-wrap}
+</style></head><body>
+<div id="pp"></div>
+<pre id="out">running…</pre>
+<script type="module" src="/qa-embed3-harness.js"></script></body></html>

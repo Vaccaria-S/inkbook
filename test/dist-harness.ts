@@ -82,6 +82,7 @@ async function main() {
       constructor(app, manifest){ this.app = app; this.manifest = manifest; this.__views = {}; this.__cmds = []; this.__ribbons = []; this.__settingsTab = null; this.__data = {}; this.__protocols = {}; }
       registerView(type, cb){ this.__views[type] = cb; }
       registerExtensions(){ }
+      registerMarkdownPostProcessor(cb){ (this.__pp = this.__pp || []).push(cb); return { unregister(){} }; }
       addRibbonIcon(icon, title, cb){ this.__ribbons.push({icon,title}); }
       addCommand(c){ this.__cmds.push(c); }
       addSettingTab(t){ this.__settingsTab = t; }
@@ -268,6 +269,7 @@ async function main() {
       },
       getFiles: () => [],
       getAbstractFileByPath: (p: string) => index.get(p) || null,
+      on: () => ({}),
       create: async (p: string, t: string) => mkFile(p, t),
       createFolder: async (p: string) => ({ path: p, type: "folder" }),
     },

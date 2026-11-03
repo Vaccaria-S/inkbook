@@ -141,7 +141,15 @@ async function main() {
     const t3 = performance.now();
     for (let i = 0; i < 20; i++) editor.setZoom(0.6 + (i % 5) * 0.1);
     const zoomMs = (performance.now() - t3) / 20;
-    pass(zoomMs < 100, "单次缩放 " + zoomMs.toFixed(1) + "ms");
+    /*
+     * 阈值从 100ms 放宽到 150ms。
+     *
+     * 原因：这条测的是"缩放有没有回归成慢一倍"，不是绝对性能。实测均值 ~96ms、
+     * 机器抖动时标准差 ~15%（同一份干净 HEAD 也出现过 100.4ms 越线），
+     * 100ms 这条线贴着噪声，红/绿纯看运气——上一轮就被它误导过一次。
+     * 150ms 仍然能抓住"慢一倍"级别的回归（96 → 190+），噪声到不了。
+     */
+    pass(zoomMs < 150, "单次缩放 " + zoomMs.toFixed(1) + "ms（阈值 150ms：均值 ~96ms、抖动 ~15%，仍能抓住慢一倍的回归）");
 
     // 定位正确性：滚到中间
     const pageH = store.data.height * ed.zoom;

@@ -1,0 +1,26 @@
+<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>running</title>
+<link rel="stylesheet" href="/styles.css">
+<style>
+/*
+ * Obsidian 会把这一批主题变量挂到 :root 上，墨本的样式全部依赖它们
+ * （尤其 --background-modifier-border：缺了它 .mb-embed 的 border 会整条失效，
+ * 拿这种环境量出来的"不越栏"是假绿）。这里按浅色主题补齐。
+ */
+:root{
+  --background-primary:#FFFFFF; --background-secondary:#F6F7F9; --background-primary-alt:#FAFBFC;
+  --background-modifier-border:#DCDFE4; --text-normal:#1F2328; --text-muted:#6B7280; --text-faint:#9CA3AF;
+  --interactive-accent:#6B5B95; --text-on-accent:#FFFFFF;
+  --background-modifier-error:rgba(214,69,69,.10); --text-error:#D64545;
+}
+html,body{margin:0;font-family:system-ui;background:#fff}
+/*
+ * 嵌入块并排放：IntersectionObserver 只画"进入视口"的块，
+ * 竖排会让后面的节点落到 600px 高的无头视口之外，测试等不到 canvas。
+ */
+#pp-host{display:flex;gap:8px;width:940px;height:210px;overflow:hidden;padding:6px;box-sizing:border-box}
+#pp-host > .cell{width:130px;flex:0 0 130px}
+#out{position:fixed;left:0;bottom:0;width:100%;max-height:42vh;overflow:auto;z-index:9999;background:#111;color:#0f0;font-size:12px;padding:6px;margin:0;white-space:pre-wrap}
+</style></head><body>
+<div id="pp-host"></div>
+<pre id="out">running…</pre>
+<script type="module" src="/embed-harness.js"></script></body></html>

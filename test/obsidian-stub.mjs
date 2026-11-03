@@ -301,6 +301,16 @@ export class Plugin {
   registerEvent() {}
   registerDomEvent() {}
   /**
+   * Markdown 后处理器：Obsidian 在渲染 md 段落时回调。
+   *
+   * 桩里只把回调收集起来（window.__markdownPostProcessors），
+   * 测试可以手动拿它渲染手工构造的 DOM——见 test/embed-harness.ts。
+   */
+  registerMarkdownPostProcessor(cb) {
+    (window.__markdownPostProcessors = window.__markdownPostProcessors || []).push(cb);
+    return { unregister() {} };
+  }
+  /**
    * 协议处理器：Obsidian 的 `obsidian://inkbook?file=…&page=N` 走这里。
    * 桩里只记下来，测试可以手动触发（window.__protocolHandlers）。
    */

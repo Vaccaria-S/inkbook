@@ -1952,3 +1952,159 @@
   font-size: 8px;
   color: var(--text-faint);
 }
+
+/* ==================== 笔记内嵌入（.inkbook → 位图预览，INK-105） ==================== */
+
+/*
+ * 嵌入块的容器。
+ *
+ * 全部用 Obsidian 的 CSS 变量而不是写死白底/黑字：暗色主题下写死 #fff 的
+ * 嵌入块会亮得像一块补光灯，比"没渲染出来"更难看。
+ */
+.mb-embed-host.internal-embed {
+  display: block;
+  padding: 0;
+}
+
+.mb-embed {
+  position: relative;
+  display: block;
+  width: 100%;
+  /*
+   * 必须显式写 border-box。
+   *
+   * 浏览器默认是 content-box：`width: 100%` + 左右各 1px 边框，整块会比
+   * 栏宽宽 2px，里面的 canvas（同样按 100% 算）右缘就多出 1px——
+   * 表现为"嵌入块右边压着正文/滚动条"。宿主是否全局设了 border-box
+   * 不可靠（主题、版本、其它插件都能改），写死这一行就与宿主无关了。
+   */
+  box-sizing: border-box;
+  /*
+   * 边框必须带 fallback。
+   *
+   * `var()` 没有 fallback 且宿主没定义该变量时，这条声明在计算值阶段
+   * 会整条失效（不是"变成透明边框"，而是 border-width 回到 0）——
+   * 嵌入块直接没有边框，跟设计稿差一个视觉层级。宿主是否提供这个变量
+   * 不该由我们赌。
+   */
+  border: 1px solid var(--background-modifier-border, rgba(128, 128, 128, 0.28));
+  border-radius: 8px;
+  background: var(--background-secondary);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.mb-embed:hover {
+  border-color: var(--interactive-accent);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
+}
+
+.mb-embed:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 1px;
+}
+
+/*
+ * 位图本身。
+ *
+ * 宽高由脚本按 `|宽`（或栏宽）写进 inline style，这里的 100% 只是兜底；
+ * max-width 保证窄栏里不会横向溢出。
+ */
+.mb-embed-canvas {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  border-radius: 7px;
+  background: var(--background-primary);
+}
+
+/* 占位：还没进入视口 / 正在渲染时的浅灰块，比例跟纸一致，不跳版 */
+.mb-embed-ph {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  aspect-ratio: 794 / 1123;
+  background: var(--background-primary-alt, var(--background-secondary));
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.mb-embed-ph-name {
+  max-width: 90%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--text-normal);
+}
+
+.mb-embed-ph-page {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* 找不到文件 / 读不出来 */
+.mb-embed-ph-err {
+  gap: 0;
+  padding: 0 12px;
+  color: var(--text-error, #d64545);
+  background: var(--background-modifier-error, rgba(214, 69, 69, 0.12));
+}
+
+.mb-embed-ph-err .mb-embed-ph-name {
+  white-space: normal;
+  text-align: center;
+  font-weight: 500;
+  color: var(--text-error, #d64545);
+}
+
+/*
+ * 角落的页码角标。
+ *
+ * 平时**不显示**：嵌入块是笔记里的一段内容，常驻一个"第 1 页"标签只会
+ * 添噪。鼠标移到块上才浮出来。
+ * 例外是页码越界（`is-clamped`）——那时用户看到的页和他要的页不是同一页，
+ * 这个信息必须当场说清，所以常显 + 警示色。
+ */
+.mb-embed-badge {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  padding: 1px 6px;
+  border-radius: 9px;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--text-on-accent, #fff);
+  background: var(--interactive-accent);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  pointer-events: none;
+}
+
+.mb-embed:hover .mb-embed-badge {
+  opacity: 0.85;
+}
+
+.mb-embed-badge.is-clamped {
+  opacity: 1;
+  background: var(--text-warning, #b7791f);
+  color: #fff;
+}
+
+/*
+ * 越界 + hover 的组合要单独写。
+ *
+ * `.mb-embed:hover .mb-embed-badge`（0,3,0）会压过
+ * `.mb-embed-badge.is-clamped`（0,2,0），鼠标一放上去越界角标就从 1 掉到
+ * 0.85——正好是用户最需要看清那行字的时候。这条特异性（0,4,0）把它钉回 1。
+ */
+.mb-embed:hover .mb-embed-badge.is-clamped {
+  opacity: 1;
+}

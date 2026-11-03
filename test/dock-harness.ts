@@ -891,4 +891,9 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   log("");
   const fails = lines.filter((l) => l.startsWith("FAIL")).length;
   log(fails === 0 ? "ALL PASS" : fails + " FAILED");
+  /*
+   * 必须置 DONE：run.mjs 靠 document.title 判断结束。
+   * 漏了这一行时，整套明明跑完了也要把 180s 超时耗光（每次全量跑白等 3 分钟）。
+   */
+  document.title = "DONE";
 })();
