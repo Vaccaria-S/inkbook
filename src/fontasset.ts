@@ -14,9 +14,11 @@
  *
  * 生成方式见 `tools/mksubset.mjs`；字体为 Noto Sans SC（SIL OFL 1.1）。
  */
+import fontkit from "@pdf-lib/fontkit";
 import dataUrl from "../assets/NotoSansSC-subset.ttf";
 
 let cached: Uint8Array | null = null;
+let cachedCharset: Set<number> | null = null;
 
 /** 取出字体字节（只解码一次，之后复用同一份 Uint8Array） */
 export function chineseFontBytes(): Uint8Array {
@@ -27,6 +29,36 @@ export function chineseFontBytes(): Uint8Array {
   for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i);
   cached = out;
   return out;
+}
+
+/**
+ * 字体能写出的 Unicode 码点集合（直接从字体文件解析）。
+ *
+ * 为什么不用 `PDFFont.getCharacterSet()`：那是 pdf-lib 挂在 PDFFont 上的
+ * 非公开方法，具体实现随 embedder 变（subset 走 CustomFontSubsetEmbedder、
+ * 非 subset 走 CustomFontEmbedder）。INK-118 把导出改成 `subset:false` 之后，
+ * 继续依赖它等于把「集外字能否退回位图」这层兜底押在私有 API 上：哪天方法
+ * 没了或返回空，`charset` 就是 null，而旧代码的 `if (!charset) return false`
+ * 是**乐观放行** —— 集外字会被当矢量硬画成 .notdef 方块/空白，同时
+ * `canvasWithText=false`（位图不画），字就真的丢了。
+ *
+ * 这里改用 fontkit 直接解析同一份字体字节：与导出用哪个 embedder 完全无关。
+ * 拿不到就返回 null，由导出端按「保守」处理（退回位图），绝不静默放行。
+ * 结果与 pdf-lib 的 getCharacterSet() 一致（实测都是 6182 个码点）。
+ * 结果缓存：一本本子可能导出多次，没必要每次重解析 1.85MB 的 cmap。
+ */
+export function chineseCharacterSet(): Set<number> | null {
+  if (cachedCharset) return cachedCharset;
+  try {
+    const font = fontkit.create(chineseFontBytes());
+    const points = font.characterSet;
+    if (!Array.isArray(points) || points.length === 0) return null;
+    cachedCharset = new Set(points);
+    return cachedCharset;
+  } catch (e) {
+    console.warn("[inkbook] 解析中文字体字符集失败，批注将按图片导出", e);
+    return null;
+  }
 }
 
 /** 字体名（写进 PDF 的 BaseFont，仅作展示） */

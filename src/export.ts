@@ -2,8 +2,8 @@ import { Notice, type TFile, type Vault } from "obsidian";
 import { PDFDocument, rgb, type PDFFont, type PDFPage, type RGB } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
 import type { BookEditor } from "./editor";
-import { chineseFontBytes } from "./fontasset";
-import type { Page } from "./types";
+import { chineseCharacterSet, chineseFontBytes } from "./fontasset";
+import type { Page, PageText } from "./types";
 import { layoutUserText } from "./textwrap";
 
 function safeName(s: string): string {
@@ -38,6 +38,35 @@ export async function exportPagePng(
   await vault.adapter.writeBinary(folder + name, bytes.buffer as ArrayBuffer);
   new Notice(`已导出：${folder}${name}`, 6000);
   return folder + name;
+}
+
+/**
+ * 一页的 user 批注里是否含字体写不出的字符（生僻字 / emoji / 代理对）。
+ *
+ * 纯函数：导出链路和测试共用同一份判定，避免"代码里保守、测试里乐观"漂移。
+ *
+ * `charset === null` 表示字符集没解析出来（字体文件异常、fontkit 不可用等），
+ * 这时**一律返回 true**：宁可整页退回位图（字都在、只是选不中），也不能把
+ * 集外字送进矢量层硬画成 .notdef 方块/空白 —— 后者位图层又不画，字就真丢了。
+ *
+ * \n / \r 是排版用的硬换行，不是要画的字，跳过。
+ * 用 codePointAt(0) 而不是 charCodeAt(0)，保证 emoji 这类代理对按整码点判定。
+ */
+export function pageHasUnsupportedChars(
+  texts: PageText[] | undefined,
+  charset: Set<number> | null
+): boolean {
+  if (!charset) return true;
+  for (const t of texts || []) {
+    if (t.source !== "user") continue;
+    for (const ch of t.text || "") {
+      if (ch === "\n" || ch === "\r") continue;
+      const cp = ch.codePointAt(0);
+      if (cp === undefined) continue;
+      if (!charset.has(cp)) return true;
+    }
+  }
+  return false;
 }
 
 /** 页面坐标系（794×1123）→ A4 的 pt（595.28×841.89），比例正好 0.7497 */
@@ -138,15 +167,38 @@ export async function exportBookPdf(
     (p?.texts || []).some((t) => t.source === "user" && (t.text || "").trim())
   );
   let zhFont: PDFFont | null = null;
-  /** 字体能写出的码点集合；拿不到就当作"全支持"（乐观） */
-  let charset: Set<number> | null = null;
+  /*
+   * 字体能写出的码点集合。必须来自 fontkit 直接解析字体文件（见 fontasset.ts），
+   * 不能依赖 PDFFont.getCharacterSet()：那是随 embedder 变的非公开 API。
+   * 拿不到时**按保守处理**（当作"全都不支持" → 整页退回位图），绝不乐观放行。
+   */
+  let charset: Set<number> | null = hasUserText ? chineseCharacterSet() : null;
   if (hasUserText) {
     try {
       doc.registerFontkit(fontkit);
-      // subset: true —— 只嵌真正用到的字形，一份批注通常几十 KB
-      zhFont = await doc.embedFont(chineseFontBytes(), { subset: true });
-      const cs = (zhFont as unknown as { getCharacterSet?: () => number[] }).getCharacterSet?.();
-      if (Array.isArray(cs) && cs.length) charset = new Set(cs);
+      /*
+       * 这里必须是 subset: false —— 不能再对已经手工子集化的 TTF 做二次子集化。
+       *
+       * INK-118（用户真机：「打了 4 个字，导出 PDF 只显示 2 个，字体断断续续」）：
+       * assets/NotoSansSC-subset.ttf 是构建期按 GB2312 手工子集好的 TTF，
+       * 它的 glyf 各字形长度可以是奇数。pdf-lib 的 subset:true 会调 fontkit 的
+       * TTFSubset，把这些字形「按原始字节长度原样拼接」成一份新字体；新字体较小，
+       * head.indexToLocFormat 会退化成 0（short loca），而 loca.preEncode() 对每个
+       * offset 做 `>>> 1`（只存半偏移）。奇数长度的字形会把后面所有边界向左吞掉
+       * 1 字节，CID 读到的是错位的 numberOfContours（实测 -28160 / 11776 之类），
+       * 阅读器画不出这些字形 —— 于是「4 个字只显示 2 个」，且缺哪些字随整本书的
+       * 字形登记顺序变化，看起来断断续续。
+       *
+       * 更要命的是 ToUnicode CMap 是按「登记过的字符」生成的，跟 glyf 字节无关：
+       * 抽回的文字一个不少，视觉上却是空白。上一轮只验 getTextContent() 的断言
+       * 因此全绿也没抓到（见 test/pdftext-harness.ts 的像素级逐字检查）。
+       *
+       * 关掉二次子集化后，嵌入的就是构建期那份完整手工子集字体（long loca，
+       * indexToLocFormat=1），字形边界不再被截断。代价是每份导出 PDF 多约
+       * 1.2MB（字体本来就已内联进 main.js，插件包体积不变）；相对「看得见的字
+       * 导出后消失」，按「内容不丢第一原则」这个体积可以接受。
+       */
+      zhFont = await doc.embedFont(chineseFontBytes(), { subset: false });
     } catch (e) {
       // 嵌字体失败不能让导出整个失败：退回"文字烤进位图"，至少内容不丢
       console.warn("[inkbook] 嵌入中文字体失败，批注将按图片导出", e);
@@ -160,20 +212,16 @@ export async function exportBookPdf(
    * 子集只覆盖 GB2312，遇到集外字硬画会变成空白或方块——
    * 那比"文字不可选"更糟（内容看起来像丢了）。这种页整页退回位图，
    * 批注照样看得见，只是选不中。
+   *
+   * `charset` 为 null 表示字符集解析失败（字体文件异常 / fontkit 不可用）：
+   * 此时返回 true（**保守**），让所有带批注的页都退回位图。绝不能返回 false
+   * 乐观放行 —— 那会把集外字送进矢量层画成 .notdef，同时位图层又不画，字就丢了。
+   *
+   * 抽成纯函数是为了能在 pdftext-harness.ts 里直接断言这个保守分支，
+   * 而不是只能靠"字体正常时侥幸没走到"来间接验证。
    */
-  const hasUnsupported = (p: Page | undefined): boolean => {
-    if (!charset) return false;
-    for (const t of p?.texts || []) {
-      if (t.source !== "user") continue;
-      for (const ch of t.text || "") {
-        if (ch === "\n" || ch === "\r") continue;
-        const cp = ch.codePointAt(0);
-        if (cp === undefined) continue;
-        if (!charset.has(cp)) return true;
-      }
-    }
-    return false;
-  };
+  const hasUnsupported = (p: Page | undefined): boolean =>
+    pageHasUnsupportedChars(p?.texts, charset);
 
   /** 原 PDF 文件只解析一次（同一份 PDF 可能有很多页） */
   const srcDocs = new Map<string, PDFDocument | null>();

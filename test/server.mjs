@@ -33,6 +33,9 @@ http
     if (p === '/pdf.html') return send(res, path.join(root, 'test/pdf.html'));
     if (p === '/pdf-harness.js') return send(res, path.join(root, 'test/pdf-harness.js'));
     if (p === '/test/sample.pdf') return send(res, path.join(root, 'test/sample.pdf'));
+    // INK-118 复现用的空白 A4 底图：走 copyPages 那条导出路径时，
+    // 底下不能带原文文字，否则渲染出来的深色像素没法区分是谁的墨。
+    if (p === '/test/blank.pdf') return send(res, path.join(root, 'test/blank.pdf'));
     if (p === '/bigpdf.html') return send(res, path.join(root, 'test/bigpdf.html'));
     if (p === '/bigpdf-harness.js') return send(res, path.join(root, 'test/bigpdf-harness.js'));
     if (p === '/test/big.pdf') return send(res, path.join(root, 'test/big.pdf'));

@@ -14,7 +14,14 @@ import { BookStore } from "../src/store";
 import { createBook, createPage, type Stroke } from "../src/types";
 import { exportBookPdf } from "../src/export";
 import { chineseFontBytes } from "../src/fontasset";
-import { PDFDict, PDFDocument, PDFName } from "pdf-lib";
+import {
+  PDFArray,
+  PDFDict,
+  PDFDocument,
+  PDFName,
+  PDFRawStream,
+  decodePDFRawStream,
+} from "pdf-lib";
 import { fitBackground, initPdfjs, openPdf } from "../src/pdf";
 
 const lines: string[] = [];
@@ -259,15 +266,61 @@ async function main() {
   );
 
   /*
-   * 字体子集化的护栏。
+   * INK-118 的结构护栏：**绝不能对已手工子集化的 TTF 再做二次子集化**。
    *
-   * 真字体是 1.85MB，如果 embedFont 没做 subset（或以后谁改成 subset:false），
-   * 每一份导出都会白白胖一圈——这条断言就是盯着这个回归。
-   * 反过来，中文能抽出来 + 没退回 Helvetica，已经证明字体确实嵌进去了。
+   * 旧断言是「导出件 < 400KB」，盯着的是 subset:true 的体积收益。但正是
+   * subset:true 让 fontkit 重新拼 glyf，short loca 的 `offset >>> 1` 把奇数长度
+   * 字形之后的边界吞掉 1 字节，一半 CID 解码成垃圾 → 用户真机「4 个字只显示 2 个」。
+   * ToUnicode CMap 不受影响，所以只验抽字的话全绿也抓不到（详见 pdftext-harness.ts）。
+   *
+   * 现在改成直接检查导出件里嵌的字体程序：必须是构建期那份**完整**手工子集字体
+   * （1.85MB、head.indexToLocFormat=1 即 long loca）。二次子集化出来的字体只有几 KB、
+   * indexToLocFormat=0（short loca），一眼就能分辨。体积上限放宽到 2MB，
+   * 既容纳完整字体，也仍能挡住「把好几份字体重复塞进去」这类回归。
    */
+  {
+    const reload = await PDFDocument.load(bytes!);
+    const fonts = reload.getPages()[1].node.Resources()?.lookupMaybe(PDFName.of("Font"), PDFDict);
+    let program: Uint8Array | null = null;
+    if (fonts) {
+      for (const key of fonts.keys()) {
+        const fd = fonts.lookup(key, PDFDict);
+        const descendants = fd.lookupMaybe(PDFName.of("DescendantFonts"), PDFArray);
+        const cid = descendants?.lookup(0, PDFDict);
+        const desc = cid?.lookupMaybe(PDFName.of("FontDescriptor"), PDFDict);
+        const file = desc?.lookupMaybe(PDFName.of("FontFile2"), PDFRawStream);
+        if (file) {
+          program = decodePDFRawStream(file).decode();
+          break;
+        }
+      }
+    }
+    pass(!!program, "导出件里能取到嵌入的中文 TTF 字体程序");
+    if (program) {
+      const view = new DataView(program.buffer, program.byteOffset, program.byteLength);
+      const tableCount = view.getUint16(4, false);
+      let headOff = -1;
+      for (let i = 0; i < tableCount; i += 1) {
+        const off = 12 + i * 16;
+        const tag = String.fromCharCode(
+          program[off], program[off + 1], program[off + 2], program[off + 3]
+        );
+        if (tag === "head") headOff = view.getUint32(off + 8, false);
+      }
+      const locaFormat = headOff >= 0 ? view.getInt16(headOff + 50, false) : -1;
+      pass(
+        program.length > 1024 * 1024,
+        "嵌的是完整手工子集字体（" + Math.round(program.length / 1024) + " KB），不是二次裁剪的碎片"
+      );
+      pass(
+        locaFormat === 1,
+        "字体用 long loca（indexToLocFormat=" + locaFormat + "），不会因为 odd glyf 截断边界"
+      );
+    }
+  }
   pass(
-    bytes!.length < 400 * 1024,
-    "字体按需子集化：导出件只有 " + Math.round(bytes!.length / 1024) + " KB（没把整包字体塞进去）"
+    bytes!.length < 2 * 1024 * 1024,
+    "导出件体积 " + Math.round(bytes!.length / 1024) + " KB（完整字体只嵌一次，不重复塞包）"
   );
   const raw = new TextDecoder("latin1").decode(bytes!);
   pass(
@@ -364,7 +417,7 @@ async function main() {
 
   /*
    * 反向护栏：**没有批注的本子不该多背一份字体**。
-   * 字体是 1.85MB，就算 subset 后只剩几十 KB，也没理由为纯手写本嵌它。
+   * 字体是 1.85MB（INK-118 后整份嵌入，不再二次裁剪），纯手写本更没理由为它胖一圈。
    */
   {
     const plain = createBook("无批注", "lined", "white");
@@ -510,6 +563,86 @@ async function main() {
 
     scanEd.destroy();
     scanCleanup();
+  }
+
+  /*
+   * INK-118：短批注「隔字缺字」的像素级常驻护栏（export 套件内）。
+   *
+   * 上面所有「字数完整」断言都只走 getTextContent()（ToUnicode CMap）。
+   * 二次子集化把 glyf 边界截断时，抽字依然 100% 完整、视觉上却是一排空格，
+   * 所以这里必须再渲染成 canvas，在**每个字自己的矩形**里数深色像素。
+   * 用纯中文 4 字：CJK 全角等宽，按 item.width/4 切格就是精确的逐字边界。
+   * 完整矩阵（26 个样本 × 两条导出路径）见 pdftext-harness.ts。
+   */
+  {
+    const SHORT = "大承气汤";
+    const shortBook = createBook("短批注像素", "blank", "white");
+    shortBook.pages = [createPage("blank", "white")];
+    shortBook.pages[0].texts = [
+      { id: "st", source: "user", x: 80, y: 300, size: 20, text: SHORT, color: "#1A1A1A" },
+    ];
+    const shortStore = new BookStore(shortBook);
+    const [shortHost, shortCleanup] = makeHost();
+    const shortEd = new BookEditor(shortHost, shortStore, { app, smoothing: 0.5 });
+    await sleep(300);
+    const shortPath = await exportBookPdf(
+      vault,
+      shortEd,
+      { path: "短批注像素.inkbook", basename: "短批注像素", parent: { path: "" } } as any,
+      1
+    );
+    const shortBytes = written.get(shortPath)!;
+    const shortDoc = await pdfjs.getDocument({ data: shortBytes.slice() }).promise;
+    const shortPage = await shortDoc.getPage(1);
+    const shortTc = await shortPage.getTextContent();
+    const shortItems = ((shortTc.items as any[]) || []).filter((it) => String(it.str || "").trim());
+    const shortJoined = shortItems.map((it) => String(it.str || "")).join("").replace(/\s+/g, "");
+    pass(shortJoined === SHORT, "短批注：抽回文字完整（" + shortJoined.length + "/" + SHORT.length + " 字）");
+
+    const vp = shortPage.getViewport({ scale: 2 });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.ceil(vp.width);
+    canvas.height = Math.ceil(vp.height);
+    const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
+    await shortPage.render({ canvasContext: ctx, viewport: vp, background: "#ffffff" }).promise;
+
+    const hit = shortItems.find((it) => String(it.str || "").replace(/\s+/g, "") === SHORT);
+    let inks: number[] = [];
+    if (hit) {
+      const tr = hit.transform as number[];
+      const x0 = Number(tr[4]);
+      const yBase = Number(tr[5]);
+      const sizePt = 20 * (595.28 / 794);
+      const cellW = Number(hit.width || 0) / SHORT.length;
+      inks = Array.from({ length: SHORT.length }, (_, i) => {
+        const rect: [number, number, number, number] = [
+          x0 + i * cellW,
+          yBase - 0.12 * sizePt,
+          x0 + (i + 1) * cellW,
+          yBase + 0.9 * sizePt,
+        ];
+        const v = vp.convertToViewportRectangle(rect);
+        const rx0 = Math.max(0, Math.floor(Math.min(v[0], v[2])));
+        const ry0 = Math.max(0, Math.floor(Math.min(v[1], v[3])));
+        const rx1 = Math.min(canvas.width, Math.ceil(Math.max(v[0], v[2])));
+        const ry1 = Math.min(canvas.height, Math.ceil(Math.max(v[1], v[3])));
+        if (rx1 <= rx0 || ry1 <= ry0) return 0;
+        const data = ctx.getImageData(rx0, ry0, rx1 - rx0, ry1 - ry0).data;
+        let n = 0;
+        for (let k = 0; k < data.length; k += 4) {
+          if ((data[k] + data[k + 1] + data[k + 2]) / 3 < 170) n++;
+        }
+        return n;
+      });
+    }
+    pass(inks.length === SHORT.length, "短批注：找到 " + SHORT.length + " 个逐字取样格");
+    pass(
+      inks.length === SHORT.length && inks.every((n) => n >= 5),
+      "短批注：4 个字每个都有字形像素（逐字墨 [" + inks.join(",") + "]）"
+    );
+    await shortDoc.destroy();
+    shortEd.destroy();
+    shortCleanup();
   }
 
   log("");
