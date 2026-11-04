@@ -815,6 +815,59 @@ async function main() {
   }
 
   /*
+   * 手动框宽（PageText.width，INK-121）。
+   *
+   * 核心性质：显式宽度只改「一行放多少字」，不改 x/y 夹取、不丢字、
+   * 更不能把字推出纸右缘。老数据没有 width 时行为必须和改造前逐字一致
+   * ——这是防「改了默认行为」的回归闸门。
+   */
+  {
+    const W = 794;
+    const H = 1123;
+    const bySize = (size: number) => (s: string) => Array.from(s).length * size;
+    const text = "手动拖窄以后一行放不下的字就会自动换到下一行继续写完".repeat(2);
+
+    const wide = layoutUserText({ x: 60, y: 300, size: 16, text, width: 600 }, W, H, bySize(16));
+    const narrow = layoutUserText({ x: 60, y: 300, size: 16, text, width: 160 }, W, H, bySize(16));
+    pass(wide.width === Math.min(600, availableTextWidth(W, wide.x)), "框宽：显式宽度进 l.width（" + wide.width.toFixed(0) + "）");
+    pass(narrow.width === 160, "框宽：窄框 l.width = 160");
+    pass(narrow.lines.length > wide.lines.length, "框宽：窄框行数更多（" + wide.lines.length + " → " + narrow.lines.length + "）");
+    pass(narrow.lines.join("") === text && wide.lines.join("") === text, "框宽：宽窄两种都不丢字");
+    pass(
+      narrow.lines.every((ln) => bySize(16)(ln) <= narrow.width + 0.01),
+      "框宽：窄框每行都不超折行宽度"
+    );
+    pass(wide.x === narrow.x && wide.y === narrow.y, "框宽：改宽度不动 x/y 夹取结果");
+
+    // 老数据无 width → 完全回落自动算法
+    const auto = layoutUserText({ x: 60, y: 300, size: 16, text }, W, H, bySize(16));
+    pass(auto.width === availableTextWidth(W, auto.x), "框宽：无 width 时 l.width = availableTextWidth(x)");
+    pass(auto.lines.join("") === text, "框宽：无 width 时折行结果与改造前一致（不丢字）");
+    const autoAt634 = layoutUserText({ x: 634, y: 300, size: 16, text }, W, H, bySize(16));
+    pass(autoAt634.width === 120, "框宽：贴右缘无 width 仍保底 120");
+
+    // 显式宽度超过 x 到纸右缘的物理余量时必须被夹住（INK-116 回归）
+    for (const x of [634, 660, 674, 700, 760]) {
+      const l = layoutUserText({ x, y: 300, size: 16, text, width: 600 }, W, H, bySize(16));
+      const avail = availableTextWidth(W, l.x);
+      pass(l.width <= avail + 0.01, "框宽：x=" + x + " 显式 600 被夹到 " + l.width.toFixed(0) + " ≤ " + avail.toFixed(0));
+      const widest = Math.max(...l.lines.map(bySize(16)));
+      pass(l.x + widest <= W - 8 + 0.01, "框宽：x=" + x + " 最宽行右缘 " + (l.x + widest).toFixed(0) + " ≤ 786（不出纸）");
+      pass(l.lines.join("") === text, "框宽：x=" + x + " 一个字都不丢");
+    }
+
+    // 极端值：非法值回落、合法值夹到 [MIN_BOX_WIDTH, avail]，绝不喂 0 给 wrapText
+    for (const bad of [0, -50, NaN, Infinity, -Infinity]) {
+      const l = layoutUserText({ x: 60, y: 300, size: 16, text, width: bad }, W, H, bySize(16));
+      pass(l.width === availableTextWidth(W, l.x), "框宽：width=" + String(bad) + " 回落自动算法且不抛错");
+      pass(l.lines.join("") === text, "框宽：width=" + String(bad) + " 不死循环、不丢字");
+    }
+    const tinyBox = layoutUserText({ x: 60, y: 300, size: 16, text, width: 1 }, W, H, bySize(16));
+    pass(tinyBox.width >= 24, "框宽：width=1 被夹到下限 24（不会退化成一行一个字）");
+    pass(tinyBox.lines.join("") === text, "框宽：极窄框仍一个字都不丢");
+  }
+
+  /*
    * 屏幕侧：越界的老批注渲染时被夹回纸内。
    *
    * 这条查的是 DOM span 的真实几何（不是再算一遍 layoutUserText）——

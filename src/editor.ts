@@ -30,6 +30,7 @@ import {
   availableTextWidth,
   layoutUserText,
   maxTextStartX,
+  MIN_BOX_WIDTH,
   TEXT_LINE_HEIGHT,
   type TextLayout,
 } from "./textwrap";
@@ -107,7 +108,7 @@ interface PageRec {
   ioVisible: boolean;
 }
 
-type Gesture = "none" | "draw" | "shape" | "erase" | "pan" | "moveText";
+type Gesture = "none" | "draw" | "shape" | "erase" | "pan" | "moveText" | "resizeText";
 
 /**
  * 文字可用字体。
@@ -325,6 +326,14 @@ export class BookEditor {
     startY: number;
     originX: number;
     originY: number;
+    moved: boolean;
+  } | null = null;
+  /** 正在拖右下角手柄改宽度（选择工具） */
+  private resizeText: {
+    rec: PageRec;
+    id: string;
+    startX: number;
+    originW: number;
     moved: boolean;
   } | null = null;
   /** 上一次点文字的时间，用来识别双击（双击进编辑） */
@@ -944,6 +953,15 @@ export class BookEditor {
     bar.append(dec, sizeLbl, inc);
     bar.appendChild(this.textBarSep());
 
+    // 宽度只读显示：拖手柄时给个精确反馈，但不开放输入——
+    // 输入框和拖动是两套状态，同步起来只会出「改了没反应」的怪事
+    const widthLbl = document.createElement("span");
+    widthLbl.className = "mb-tb-width";
+    widthLbl.title = "一行能放多少字：拖动选中框右下角的手柄调整";
+    widthLbl.textContent = `宽 ${Math.round(this.textLayout(sel).width)}`;
+    bar.appendChild(widthLbl);
+    bar.appendChild(this.textBarSep());
+
     // 字体
     const fontSel = document.createElement("select");
     fontSel.className = "mb-tb-font";
@@ -1151,6 +1169,7 @@ export class BookEditor {
     this.eraserPos = null;
     this.hoverPos = null;
     this.moveText = null;
+    this.resizeText = null;
     this.arbiter.reset();
     if (this.observer) {
       this.observer.disconnect();
@@ -1218,10 +1237,23 @@ export class BookEditor {
     this.emitState();
   }
 
+  /*
+   * 缩放后页码滞旧（INK-107）：页高变了，但 current 只有 scroll 事件才重算，
+   * 于是页码要等用户再滚一下才跟上。缩放结束后按新 zoom 现算一次（纯算术、
+   * 不触发重排）。**只放在真正的缩放入口**：applyLayout 还被 renderPages /
+   * mount / resize 调用，在那儿刷 current 会把测试预设的当前页拉走，
+   * 选中文字、编辑框、拖动全跟着失效。
+   */
+  private refreshCurrentAfterZoom(): void {
+    this.updateCurrentFromScroll(true);
+    this.emitState();
+  }
+
   setZoom(z: number): void {
     this.fitMode = false;
     this.zoom = clamp(z, 0.3, 2.8);
     this.applyLayout();
+    this.refreshCurrentAfterZoom();
   }
 
   zoomBy(factor: number): void {
@@ -1231,6 +1263,7 @@ export class BookEditor {
   fit(): void {
     this.fitMode = true;
     this.applyLayout();
+    this.refreshCurrentAfterZoom();
   }
 
   /**
@@ -1296,7 +1329,11 @@ export class BookEditor {
 
     // 4. 布局变了，间距和基准要重新量
     this.measurePageMetrics();
-    this.emitState();
+    /*
+     * restoreAnchor 刚把 scrollTop 挪过，且捏合期间 scroll 事件被冻结，
+     * 必须按补偿后的位置现算一次，页码才不会停在错页（INK-107）。
+     */
+    this.refreshCurrentAfterZoom();
   }
 
   /**
@@ -1458,6 +1495,9 @@ export class BookEditor {
     this.gesture = "none";
     this.pointerId = null;
     this.pan = null;
+    // 捏合开始前若拖着改宽手柄，残留状态会让余指一动就继续改宽度（INK-112 同类坑）
+    this.moveText = null;
+    this.resizeText = null;
 
     /*
      * 锚点取两指中心正下方的内容点。
@@ -2198,6 +2238,41 @@ export class BookEditor {
     return { ...draft, points: draft.points.concat(tail) };
   }
 
+  /**
+   * 选中文字的框几何：虚线框 + 右下角改宽手柄。
+   *
+   * 画和命中都读这一份，避免手柄画在一个位置、却去另一个位置判命中。
+   * 框宽用**实测最长行**（点文字按字的实际占位命中），手柄用**排版宽度**
+   * l.width（折行边界）——两者各司其职，不能合并成一个数。
+   */
+  private textSelGeom(t: PageText): {
+    left: number;
+    top: number;
+    boxW: number;
+    boxH: number;
+    handleX: number;
+    handleY: number;
+    handleR: number;
+  } {
+    const l = this.textLayout(t);
+    const boxW = Math.max(24, this.measureTextWidth(t, l.lines)) + 8;
+    const top = l.y - t.size * 1.18;
+    const boxH = l.lineHeight * Math.max(1, l.lines.length) + t.size * 0.24;
+    // 手柄贴在折行边界的右端，而不是实测文字右缘：拖它才是在改「一行放多少字」
+    const handleX = l.x + l.width;
+    const handleY = top + boxH;
+    // 半径按 zoom 反算，屏幕上恒为 6px；命中半径放大到 10px 照顾手指
+    return {
+      left: l.x - 3,
+      top,
+      boxW,
+      boxH,
+      handleX,
+      handleY,
+      handleR: 6 / this.zoom,
+    };
+  }
+
   private renderOverlay(rec: PageRec): void {
     if (!rec.octx) return;
     const ctx = rec.octx;
@@ -2252,16 +2327,29 @@ export class BookEditor {
        * 位置和高度都按**排版后**的几何：折了行的长批注有好几行，
        * 越界的老批注还会被夹回纸内——框要跟着走，否则框在纸外、字在纸内。
        */
-      const l = this.textLayout(sel);
-      const bw = Math.max(24, this.measureTextWidth(sel, l.lines));
-      const top = l.y - sel.size * 1.18;
-      const bh = l.lineHeight * Math.max(1, l.lines.length) + sel.size * 0.24;
+      const g = this.textSelGeom(sel);
       ctx.save();
       ctx.strokeStyle = "#6C5CE7";
       ctx.lineWidth = 1.4 / this.zoom;
       ctx.setLineDash([5 / this.zoom, 4 / this.zoom]);
-      ctx.strokeRect(l.x - 3, top, bw + 8, bh);
+      ctx.strokeRect(g.left, g.top, g.boxW, g.boxH);
       ctx.restore();
+
+      /*
+       * 改宽手柄只在选择工具下画：文字工具的第一下必须是「新建」，
+       * 画了手柄就会被 handleTextPointer 当成空白处，反而弹一个空输入框。
+       */
+      if (this.tool === "select") {
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(g.handleX, g.handleY, g.handleR, 0, Math.PI * 2);
+        ctx.fillStyle = "#FFFFFF";
+        ctx.fill();
+        ctx.strokeStyle = "#6C5CE7";
+        ctx.lineWidth = 1.6 / this.zoom;
+        ctx.stroke();
+        ctx.restore();
+      }
     }
   }
 
@@ -2317,7 +2405,8 @@ export class BookEditor {
         const l = this.textLayout(t);
         el.style.left = `${l.x}px`;
         el.style.top = `${l.y}px`;
-        el.style.width = `${this.textAvailWidth(l.x)}px`;
+        // 宽度直接吃排版结果：手动调过框宽的批注，屏幕折行必须和导出一致
+        el.style.width = `${l.width}px`;
         el.style.lineHeight = String(TEXT_LINE_HEIGHT);
         el.style.transform = `translateY(-${0.82 + (TEXT_LINE_HEIGHT - 1) / 2}em)`;
       }
@@ -2405,11 +2494,16 @@ export class BookEditor {
     text: string;
     font?: string;
     bold?: boolean;
+    width?: number;
   }): TextLayout {
     const ctx = measureContext(this.textFontCss(t));
     if (!ctx) {
+      // 没有离屏 canvas 时也要返回同一套宽度语义，否则退化路径和正常路径会折得不一样
       const lines = String(t.text ?? "").split("\n");
-      return { x: t.x, y: t.y, lines, lineHeight: t.size * TEXT_LINE_HEIGHT };
+      const avail = availableTextWidth(this.store.data.width, t.x);
+      const custom = Number.isFinite(t.width) ? (t.width as number) : 0;
+      const width = custom > 0 ? Math.min(Math.max(custom, MIN_BOX_WIDTH), avail) : avail;
+      return { x: t.x, y: t.y, lines, lineHeight: t.size * TEXT_LINE_HEIGHT, width };
     }
     return layoutUserText(
       t,
@@ -2491,6 +2585,36 @@ export class BookEditor {
     if (this.readOnly) return;
     const page = this.store.data.pages[rec.index];
     if (!page) return;
+
+    /*
+     * 改宽手柄必须先判：它落在文字命中框的 +8 容差里，
+     * 不先判就会被当成「拖动文字」，宽度永远拖不动。
+     * 命中半径按屏幕 10px 反算（照顾手指），与画出来的 6px 分开。
+     */
+    const sel0 = this.selectedText;
+    if (sel0) {
+      const g = this.textSelGeom(sel0);
+      const hitR = 10 / this.zoom;
+      if (Math.hypot(px - g.handleX, py - g.handleY) <= hitR) {
+        const l = this.textLayout(sel0);
+        this.gesture = "resizeText";
+        this.pointerId = e.pointerId;
+        // 起点取排版后的有效宽：老数据没有 width 字段，取 t.width 会是 undefined
+        this.resizeText = {
+          rec,
+          id: sel0.id,
+          startX: px,
+          originW: l.width,
+          moved: false,
+        };
+        try {
+          rec.pageEl.setPointerCapture?.(e.pointerId);
+        } catch (_) {}
+        e.preventDefault();
+        return;
+      }
+    }
+
     const hit = this.hitText(page.texts ?? [], px, py);
 
     if (!hit) {
@@ -2596,16 +2720,16 @@ export class BookEditor {
      * 现在按可用宽度定死 + CSS 用 pre-wrap，框里折在哪、提交后就折在哪。
      * 补 TEXT_EDIT_CHROME 是因为 CSS 用 border-box：内边距会吃掉内容宽度。
      */
-    const avail = this.textAvailWidth(x);
+    // 可折行宽度取排版结果：手动拖窄过的批注，编辑框要跟框一样窄，
+    // 否则框里断字的位置和提交后的渲染对不上（INK-116 的老坑）。
+    const avail = layout.width;
     /*
      * 新建：给个不算窄的初始框；改已有文字：至少放得下它自己。
      * 本来要折行的长批注直接给满可用宽度——只有宽度等于可折行宽度，
      * 框里断字的位置才跟提交后的渲染一致（这是这个 bug 的关键）。
      * 两者都封顶 avail，不顶出纸面。
      */
-    const wantW = hit
-      ? Math.min(avail, Math.max(TEXT_EDIT_WIDTH, this.measureTextWidth(hit) + 24))
-      : Math.min(avail, TEXT_EDIT_WIDTH);
+    const wantW = hit ? avail : Math.min(avail, TEXT_EDIT_WIDTH);
     ta.style.width = `${wantW * this.zoom + TEXT_EDIT_CHROME}px`;
     rec.pageEl.appendChild(ta);
 
@@ -3242,12 +3366,41 @@ export class BookEditor {
         text: target.text,
         font: target.font,
         bold: target.bold,
+        width: target.width,
       });
       target.x = l.x;
       target.y = l.y;
       this.renderTextLayer(m.rec);
       this.renderOverlay(m.rec);
       this.positionTextBar();
+      e.preventDefault();
+      return;
+    }
+
+    /* 拖右下角手柄改宽度：一次拖动一条撤销，照抄 moveText 的骨架 */
+    if (this.gesture === "resizeText" && this.resizeText) {
+      // 捏合/多指时别的指针的 move 也会进来，必须自校验，别继承 moveText 的缺陷
+      if (e.pointerId !== this.pointerId) return;
+      const m = this.resizeText;
+      const p = this.pointFromEvent(e, m.rec);
+      const dx = p[0] - m.startX;
+      if (!m.moved && Math.abs(dx) < 3) return;
+      if (!m.moved) {
+        this.store.snapshotPage(m.rec.index);
+        m.moved = true;
+      }
+      const target = this.store.data.pages[m.rec.index]?.texts?.find((t) => t.id === m.id);
+      if (!target) return;
+      // 上限用排版后的 x 现算：拖到纸右缘时不能把每行右端推出纸外（INK-116）
+      const l = this.textLayout(target);
+      const avail = availableTextWidth(this.store.data.width, l.x);
+      target.width = Math.min(avail, Math.max(MIN_BOX_WIDTH, m.originW + dx));
+      this.renderTextLayer(m.rec);
+      this.renderOverlay(m.rec);
+      this.positionTextBar();
+      // 每帧只改宽度标签的文字，不重建整条属性条（重建十几个节点会拖平板手感）
+      const lbl = this.textBarEl?.querySelector(".mb-tb-width");
+      if (lbl) lbl.textContent = `宽 ${Math.round(this.textLayout(target).width)}`;
       e.preventDefault();
       return;
     }
@@ -3407,6 +3560,16 @@ export class BookEditor {
         } else {
           this.lastTextTap = { id: m.id, t: now };
         }
+      }
+    } else if (gesture === "resizeText") {
+      const m = this.resizeText;
+      this.resizeText = null;
+      // 拖完宽度就清掉双击计时：否则 300ms 内点一下会被误判成「双击进编辑」
+      this.lastTextTap = null;
+      if (m?.moved) {
+        this.store.touch();
+        this.changed();
+        this.emitState();
       }
     } else if (gesture === "draw" || gesture === "shape") {
       this.commitDraft(rec);
@@ -3644,7 +3807,7 @@ export class BookEditor {
    *
    * 一次滚动只读一次 scrollTop，不触发任何重排。
    */
-  private updateCurrentFromScroll(): void {
+  private updateCurrentFromScroll(quiet = false): void {
     if (!this.recs.length) return;
     const n = this.recs.length;
     const pageH = this.store.data.height * this.zoom;
@@ -3669,6 +3832,13 @@ export class BookEditor {
     if (best !== this.current) {
       this.current = best;
       this.store.setPage(best);
+      /*
+       * quiet 只用于「缩放后刷新页码」（INK-107）：那时页面没真的翻过去，
+       * 不能顺手 mount / 广播翻页回调，否则测试里预设的 current 会被拉走，
+       * 选中文字、编辑框、拖动全跟着失效。emitState 由调用方在后面统一发。
+       * 正常滚动路径仍走完整的兜底挂载。
+       */
+      if (quiet) return;
       /*
        * 兜底挂载：翻页时保证当前页一定有画布。
        *
@@ -4066,6 +4236,7 @@ export class BookEditor {
     window.clearTimeout(this.pinchReleaseTimer);
     this.pinchReleaseTimer = 0;
     this.moveText = null;
+    this.resizeText = null;
     this.textBarEl = null;
     this.selectedTextId = null;
     this.host.innerHTML = "";

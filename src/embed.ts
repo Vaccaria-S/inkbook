@@ -601,7 +601,8 @@ function drawUserTexts(
      * 的宽度（跟 x / y / size / 纸宽同一套单位），不需要再乘缩放。
      */
     const layout = layoutUserText(
-      { x: t.x, y: t.y, size: t.size || 14, text: t.text },
+      // 嵌入页也要吃同一份显式宽度，否则同一段字在编辑器里两行、笔记里三行
+      { x: t.x, y: t.y, size: t.size || 14, text: t.text, width: t.width },
       pageW,
       pageH,
       (s) => ctx.measureText(s).width

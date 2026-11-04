@@ -887,6 +887,14 @@
   color: var(--text-muted);
 }
 
+/* 拖宽度手柄时的数值反馈；数字等宽，拖动时不会左右跳 */
+.mb-tb-width {
+  padding: 0 2px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
 .mb-tb-font {
   height: 24px;
   max-width: 76px;

@@ -355,6 +355,18 @@ async function main() {
       Math.abs(ed.current - before) <= 1,
       `缩放后当前页不跳（${before} → ${ed.current}）`
     );
+    /*
+     * INK-107：页码要在缩放结束的那一刻就正确，不能等下一次 scroll。
+     * 拿「缩放后立刻读到的 current」和「补派一次 scroll 后再读」比：
+     * 旧实现前者滞旧、后者才刷新，两者会差一页。
+     */
+    const rightAfterZoom = ed.current;
+    scroll.dispatchEvent(new Event("scroll"));
+    await sleep(80);
+    pass(
+      ed.current === rightAfterZoom,
+      `缩放后页码即时刷新，不必等一次滚动（缩放后 ${rightAfterZoom} / 补派 scroll 后 ${ed.current}）`
+    );
   }
 
   /* ---------------- 场景 8：横向锚定（页面溢出时） ---------------- */

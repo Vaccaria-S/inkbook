@@ -115,7 +115,8 @@ function drawUserTextsPdf(page: PDFPage, src: Page, font: PDFFont, pageH: number
      * ——横向裁字的问题解决了，纵向又漏一行，症状一样是「字不完整」。
      */
     const l = layoutUserText(
-      { x: t.x, y: t.y, size: t.size || 14, text: t.text },
+      // width 必须一起传：屏幕侧按用户拖过的宽度折行，导出不传就会静默按纸宽折
+      { x: t.x, y: t.y, size: t.size || 14, text: t.text, width: t.width },
       pageWUnits,
       pageH,
       // 度量换算成页面坐标，跟 maxWidth / x / y 同一套单位

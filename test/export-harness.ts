@@ -462,7 +462,7 @@ async function main() {
     const scanFile = { path: "越界扫描.inkbook", basename: "越界扫描", parent: { path: "" } } as any;
 
     /** 导出这一页、抽回文字，返回"正文 / 段数 / 基线数 / 最右缘 / 基线范围" */
-    const probe = async (t: { x: number; y: number; size: number; text: string }) => {
+    const probe = async (t: { x: number; y: number; size: number; text: string; width?: number }) => {
       scanStore.data.pages[0].texts = [{ id: "scan", source: "user", color: "#1A1A1A", ...t }];
       const path = await exportBookPdf(vault, scanEd, scanFile, 1);
       const d = await pdfjs.getDocument({ data: written.get(path)!.slice() }).promise;
@@ -524,6 +524,38 @@ async function main() {
         "纵向边界 y=" + y + "：所有基线都在页内（" +
           r.minBaseline.toFixed(1) + " ~ " + r.maxBaseline.toFixed(1) + " ⊂ 0~" + PAGE_H + "）"
       );
+    }
+
+    /*
+     * INK-121：用户手动拖窄的框宽，导出必须跟屏幕吃同一份 width 语义。
+     * 关键反证是「导出侧的 layoutUserText 忘了传 width」——那会静默按纸宽折，
+     * 屏幕上两行、导出来一行，且这一行还可能被纸右缘裁掉。
+     */
+    for (const x of [60, 634, 700, 760]) {
+      const auto = await probe({ x, y: 300, size: 16, text: LONG_H });
+      const narrow = await probe({ x, y: 300, size: 16, text: LONG_H, width: 160 });
+      pass(narrow.joined === LONG_H, "框宽导出 x=" + x + "：窄框一个字都不丢（" + narrow.n + " 行）");
+      /*
+       * 贴右缘时纸面物理余量本来就小于 160，width 被 min(width, avail) 夹成
+       * 跟自动宽度一样，行数相同是**正确行为**，不是「忘了传 width」。
+       * 只有纸够宽时才要求窄框折得更多。
+       */
+      const avail = 794 - x - 40;
+      if (avail > 160) {
+        pass(narrow.rows > auto.rows, "框宽导出 x=" + x + "：窄框比自动宽度折得更多（" + auto.rows + " → " + narrow.rows + "）");
+      } else {
+        pass(narrow.rows === auto.rows, "框宽导出 x=" + x + "：显式宽度被纸面余量夹住，行数与自动一致（" + auto.rows + " 行）");
+      }
+      pass(
+        narrow.n > 0 && narrow.maxRight <= PAGE_W + 0.5,
+        "框宽导出 x=" + x + "：窄框每行都在纸内（最右缘 " + narrow.maxRight.toFixed(1) + " ≤ " + PAGE_W + "）"
+      );
+    }
+    // 显式宽度超过纸面余量时同样要被夹住，不能因为"用户拖得宽"就出纸
+    for (const x of [634, 700, 760]) {
+      const r = await probe({ x, y: 300, size: 16, text: LONG_H, width: 600 });
+      pass(r.joined === LONG_H, "框宽导出 x=" + x + "：超宽被夹后仍不丢字");
+      pass(r.maxRight <= PAGE_W + 0.5, "框宽导出 x=" + x + "：超宽被夹后不出纸（" + r.maxRight.toFixed(1) + "）");
     }
 
     /*

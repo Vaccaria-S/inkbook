@@ -50,7 +50,12 @@ export interface PageText {
   font?: string;
   /** 字重，仅 user 用 */
   bold?: boolean;
-  /** 原文在 PDF 里的宽度（页面坐标），仅 pdf 用，用于选中高亮对齐 */
+  /**
+   * 宽度（页面坐标），两种 source 含义不同：
+   * · pdf —— 从 PDF 抽出来的真实行宽，用于选中高亮对齐，比重新量一遍准；
+   * · user —— 用户手动拖出来的折行宽度上限，决定「一行能放多少字」。
+   * 老文件没有这个字段，渲染时按 x 到纸右缘自动算，不升版本、不迁移。
+   */
   width?: number;
 }
 

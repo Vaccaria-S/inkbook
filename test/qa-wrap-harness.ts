@@ -1056,6 +1056,72 @@ async function main() {
     }
   }
 
+  /* ---- 5g. INK-121：手动框宽的屏幕 / 导出 A/B（两条链路不共享代码） ---- */
+  {
+    /*
+     * 同一段中文，三档宽度：自动 / 窄 160 / 宽 600。
+     * 导出的行数必须随 width 变化，且逐行字数与 ed2.textLayout 的结果一致
+     * ——这是防「导出侧忘了传 width、静默按纸宽折」的独立验证：
+     * 这里不复用 layoutUserText 的任何中间量，只拿 PDF item 自己的字符串量。
+     */
+    const WIDTH_TEXT = CN54.repeat(2);
+    const widthCases = [
+      { label: "自动", width: undefined as number | undefined, idx: pages.length },
+      { label: "窄160", width: 160, idx: pages.length + 1 },
+      { label: "宽600", width: 600, idx: pages.length + 2 },
+    ];
+    // pages 数组是导出前就定好的，这里补的三页没进那次导出，
+    // 因此另起一份单页导出：改同一本本子的 texts 重导三次。
+    const probe = async (width?: number) => {
+      // 必须改 ed2 的 store：文件开头那个 store 属于 A~K 段的第一个 editor，
+      // 导出用的是 ed2，改错本子会抽回旧页的文字（假绿）
+      ed2.store.data.pages[0].texts = [
+        { id: "wq", source: "user" as const, x: 60, y: 300, size: 16, text: WIDTH_TEXT, color: "#111", width },
+      ];
+      const p = await exportBookPdf(vault, ed2 as any, file, 1);
+      const d = await pdfjs.getDocument({ data: written.get(p)!.slice() }).promise;
+      const pg = await d.getPage(1);
+      const tc = await pg.getTextContent();
+      const items = ((tc.items as any[]) || []).filter((it) => String(it.str || "").trim());
+      const rights = items.map((it) => Number(it.transform[4]) + Number(it.width || 0));
+      const tops = items.map((it) => Number(it.transform[5]));
+      const r = {
+        joined: items.map((it) => String(it.str || "")).join(""),
+        lens: items.map((it) => Array.from(String(it.str || "").replace(/\s+/g, "")).length),
+        rows: new Set(tops.map((v) => v.toFixed(1))).size,
+        maxRight: rights.length ? Math.max(...rights) : 0,
+      };
+      await d.destroy();
+      return r;
+    };
+    const auto = await probe(undefined);
+    const narrow = await probe(160);
+    const wide = await probe(600);
+    pass(auto.joined === WIDTH_TEXT && narrow.joined === WIDTH_TEXT && wide.joined === WIDTH_TEXT,
+      "框宽 A/B：三档宽度导出都不丢字");
+    pass(narrow.rows > wide.rows, `框宽 A/B：窄框比宽框折得多（${wide.rows} → ${narrow.rows} 行）`);
+    pass(auto.rows >= wide.rows && auto.rows <= narrow.rows,
+      `框宽 A/B：自动宽度落在两者之间（${wide.rows} ≤ ${auto.rows} ≤ ${narrow.rows}）`);
+    pass(Math.max(auto.maxRight, narrow.maxRight, wide.maxRight) <= A4_W + 0.5,
+      "框宽 A/B：三档每行右缘都不超纸宽");
+    // 逐行字数跟屏幕排版对齐（ed2.textLayout 用系统字体，纯中文允许 ±1 行）
+    for (const c of widthCases) {
+      const L = (ed2 as any).textLayout({ x: 60, y: 300, size: 16, text: WIDTH_TEXT, width: c.width });
+      const screenLens = L.lines.map((l: string) => Array.from(String(l).replace(/\s+/g, "")).length).filter((n: number) => n > 0);
+      const pdfLens = c.label === "自动" ? auto.lens : c.label === "窄160" ? narrow.lens : wide.lens;
+      note(`框宽 ${c.label}：屏幕 ${screenLens.length} 行 ${JSON.stringify(screenLens)} ｜ PDF ${pdfLens.length} 段 ${JSON.stringify(pdfLens)}`);
+      pass(Math.abs(screenLens.length - pdfLens.length) <= 1,
+        `框宽 ${c.label}：屏幕与 PDF 行数差 ≤ 1（${screenLens.length} vs ${pdfLens.length}）`);
+      if (screenLens.length === pdfLens.length) {
+        pass(Math.max(...screenLens.map((n: number, i: number) => Math.abs(n - pdfLens[i]))) <= 1,
+          `框宽 ${c.label}：逐行字数一致（纯中文 ≤1）`);
+      }
+      pass(L.width === (c.width ? Math.min(c.width, availableTextWidth(PAGE_W, L.x)) : availableTextWidth(PAGE_W, L.x)),
+        `框宽 ${c.label}：l.width 语义正确（${L.width.toFixed(0)}）`);
+    }
+    ed2.store.data.pages[0].texts = [note1];
+  }
+
   try {
     await doc.destroy();
   } catch (_) {}

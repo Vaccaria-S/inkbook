@@ -21,6 +21,14 @@ export const TEXT_RIGHT_MARGIN = 40;
 /** 折行允许的最小可用宽度：贴着右边缘写的字，至少还能放几个 */
 export const MIN_TEXT_WIDTH = 120;
 
+/**
+ * 用户手动拖出来的框宽下限（页面坐标）。
+ * 不能沿用 MIN_TEXT_WIDTH：那是"自动排版"保证一行还能放几个字，
+ * 而用户要的正是"一行只放 4 个字"这种窄框，120 会把窄框直接弹回去。
+ * 取一个汉字多一点，保证 wrapText 不会因为宽度为 0 退化成一行一字。
+ */
+export const MIN_BOX_WIDTH = 24;
+
 /** 纸张四边的物理安全边（页面坐标）：怎么折、怎么挪都不能画到这条线外 */
 export const PAGE_SAFE_INSET = 8;
 
@@ -63,6 +71,12 @@ export interface TextLayout {
   lines: string[];
   /** 行高（页面坐标 px，已乘字号）：相邻两行基线相差这么多 */
   lineHeight: number;
+  /**
+   * 实际生效的折行宽度（页面坐标）。
+   * 屏幕绘制、命中判定、选中框、编辑框、文字层、导出、嵌入全部读这个值，
+   * 不许各自再按 x 算一遍——算散了就会出现「屏幕上两行、导出三行」。
+   */
+  width: number;
 }
 
 /**
@@ -78,14 +92,24 @@ export interface TextLayout {
  * 用户不用重新排一遍，文件格式和版本都不用动。
  */
 export function layoutUserText(
-  t: { x: number; y: number; size: number; text: string },
+  t: { x: number; y: number; size: number; text: string; width?: number },
   pageWidth: number,
   pageHeight: number,
   measure: (s: string) => number
 ): TextLayout {
   const size = t.size > 0 ? t.size : 1;
   const x = reserveTextX(pageWidth, t.x);
-  const lines = wrapText(t.text, availableTextWidth(pageWidth, x), measure);
+  const avail = availableTextWidth(pageWidth, x);
+  /*
+   * 显式宽度优先，但仍要过纸面物理上限：
+   * 用户把框拖到右边、或老数据 x 越界时，t.width 若超过 x 到纸右缘的余量，
+   * 每行右端会被推出纸外，重演 INK-116 的「导出后那段字不完整」。
+   * 非法值（0 / 负 / NaN / 非有限）一律当"没写"，回落自动算法，
+   * 绝不把 0 喂给 wrapText（虽然它有兜底，但会退化成一行一个字）。
+   */
+  const custom = Number.isFinite(t.width) ? (t.width as number) : 0;
+  const wrapW = custom > 0 ? Math.min(Math.max(custom, MIN_BOX_WIDTH), avail) : avail;
+  const lines = wrapText(t.text, wrapW, measure);
   const lineHeight = size * TEXT_LINE_HEIGHT;
   const last = Math.max(0, lines.length - 1);
   /*
@@ -101,7 +125,7 @@ export function layoutUserText(
   const yLow = size * 1.2;
   const yHigh = Math.max(yLow, pageHeight - PAGE_SAFE_INSET - last * lineHeight);
   const y = Math.min(Math.max(t.y, yLow), yHigh);
-  return { x, y, lines, lineHeight };
+  return { x, y, lines, lineHeight, width: wrapW };
 }
 
 /**
