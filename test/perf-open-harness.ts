@@ -170,6 +170,17 @@ function traced(
   });
 }
 
+/**
+ * 取最小值；全是 0/负数（说明每一轮都没测出来）就返回 -1。
+ *
+ * 不能直接 Math.min(...[])：空数组返回 Infinity，`Infinity <= limit` 虽然是
+ * false（断言会红），但打印出来是 "最快 Infinity ms"，看不出是"没测到"还是"很慢"。
+ */
+const minOrNeg = (xs: number[]): number => {
+  const ok = xs.filter((v) => v > 0);
+  return ok.length ? Math.min(...ok) : -1;
+};
+
 const median = (xs: number[]): number => {
   const s = [...xs].sort((a, b) => a - b);
   const m = Math.floor(s.length / 2);
@@ -476,6 +487,13 @@ async function openViewOnce(sample: Sample, collectProbe: boolean): Promise<View
     errors.push("滚到最后一页: " + (e?.message || e));
   }
 
+  /*
+   * store 为空 = readBook 抛错、页面已经切到错误态。
+   * 最常见的原因是测试服务在跑到一半时挂了（fetch failed），
+   * 这时必须明确报"读不出来"，否则后面的数字会变成一堆无意义的 2ms/0 条。
+   */
+  if (!view.store) errors.push("onLoadFile 后 store 为空（读盘/解析失败，检查测试服务是否还在）");
+
   const thumbs = view.contentEl.querySelectorAll(".mb-thumb").length;
   const pageCountOk = view.store?.pageCount === sample.expectPages;
   for (const fn of undo) fn();
@@ -521,14 +539,14 @@ async function measureView(sample: Sample): Promise<ViewResult> {
     key: sample.key,
     label: sample.label,
     openTotal: pick("openTotal"),
-    openBest: Math.min(...warm.map((r) => r.openTotal).filter((v) => v > 0)),
+    openBest: minOrNeg(warm.map((r) => r.openTotal)),
     openBook: pick("openBook"),
     buildUI: pick("buildUI"),
     mountEditor: pick("mountEditor"),
     buildSide: pick("buildSide"),
     renderPageList: pick("renderPageList"),
     firstReady: pick("firstReady"),
-    firstReadyBest: Math.min(...warm.map((r) => r.firstReady).filter((v) => v > 0)),
+    firstReadyBest: minOrNeg(warm.map((r) => r.firstReady)),
     thumbs: warm[warm.length - 1].thumbs,
     pageCountOk: warm.every((r) => r.pageCountOk),
     lastPageOk: warm.every((r) => r.lastPageOk),
