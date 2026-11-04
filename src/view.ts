@@ -205,6 +205,8 @@ export class InkbookView extends FileView {
   private saveAgain = false;
   private readOnly = false;
   private saveState: "saved" | "dirty" | "saving" = "saved";
+  /** 打开中的占位（见 showLoading）；没有占位时是 null */
+  private loadingEl: HTMLElement | null = null;
   private _loadToken = 0;
   private saveDebounce = debounce(() => this.saveNow(), 850);
   private thumbDebounce = debounce(() => this.refreshThumbs(), 320);
@@ -302,6 +304,7 @@ export class InkbookView extends FileView {
   /** 丢掉当前书的全部内存状态（读失败时用，避免旧 store 绑到新文件路径上） */
   private dropBook(): void {
     this.destroyEditor();
+    this.loadingEl = null;
     this.store = null;
     this.fp = null;
     this.recoveredCopyName = null;
@@ -349,6 +352,16 @@ export class InkbookView extends FileView {
       return;
     }
     const adapter = this.app.vault.adapter;
+    /*
+     * 先立占位再读盘。
+     *
+     * 顺序很关键：占位必须在 `readBook` **之前**进 DOM。
+     * `adapter.read` 是异步的，那段时间事件循环是空的，浏览器正好能把占位画出来；
+     * 等 `JSON.parse` 一开始（大本子几百毫秒），主线程就再也不出帧了——
+     * 那时候再想加占位已经晚了，用户看到的只会是白屏。
+     */
+    this.showLoading(file.basename, await this.fileSizeHint(file.path));
+    if (token !== this._loadToken) return;
     try {
       const book = await readBook(adapter, file.path, file.basename);
       if (token !== this._loadToken) return;
@@ -560,6 +573,7 @@ export class InkbookView extends FileView {
 
   private buildUI(): void {
     const root = this.contentEl;
+    this.loadingEl = null;
     root.empty();
     root.addClass("mb-root");
     this.tabletMode = this.detectTablet();
@@ -586,6 +600,7 @@ export class InkbookView extends FileView {
 
   private renderEmpty(): void {
     if (!this.editorHost) return;
+    this.loadingEl = null;
     this.floatEl?.remove();
     this.sideEl?.empty();
     this.editorHost.empty();
@@ -606,11 +621,67 @@ export class InkbookView extends FileView {
   }
 
   private showError(msg: string): void {
+    this.loadingEl = null;
     if (!this.editorHost) return;
     this.editorHost.empty();
     const el = this.editorHost.createDiv("mb-error");
     el.createEl("h3", { text: "打不开" });
     el.createEl("p", { text: msg });
+  }
+
+  /* ----------------------------- 打开中的占位 ----------------------------- */
+
+  /**
+   * 显示「正在打开…」占位。
+   *
+   * 为什么需要它：`.inkbook` 是**单个 JSON 文件**，打开时必须整份读出来、
+   * 整份 `JSON.parse`。这两步没有任何办法分片——实测 13MB 的本子约 130ms，
+   * 72MB 的约 960ms，其中 85% 花在读盘和解析上（解析期间主线程一帧都出不来）。
+   *
+   * 也就是说：页数一多，用户点开之后**必然**有一段时间什么都看不到。
+   * 这段时间在同步盘 / 网络盘上会更长。没有占位，用户看到的是白屏，
+   * 会以为插件卡死了，然后开始反复点、反复切——那才是真的灾难。
+   *
+   * 有了占位，同一段等待就变成"它在干活"，能等下去。
+   *
+   * 注意：这里**只**影响观感，不改变任何打开逻辑；
+   * 占位会被 buildUI / showError / renderEmpty 里的 empty() 顺带清掉。
+   */
+  private showLoading(name: string, bytes: number): void {
+    this.loadingEl = null;
+    if (!this.editorHost) return;
+    // 上一本书的编辑器和浮层必须先收掉，否则占位会盖在纸上
+    this.destroyEditor();
+    this.floatEl = null as any;
+    this.editorHost.empty();
+    const box = this.editorHost.createDiv("mb-loading");
+    box.createDiv({ cls: "mb-loading-mark", text: "墨" });
+    box.createEl("h3", { text: `正在打开「${name}」` });
+    // 体积是**真实**读到的文件大小；拿不到就说"页数较多"，
+    // 不编造页数——页数要解析完才知道。
+    const sizeText =
+      bytes > 0 ? `${(bytes / 1048576).toFixed(1)}MB` : "页数较多";
+    box.createEl("p", {
+      text: `${sizeText} · 正在读取并解析整本笔记，页数多时需要一两秒。`,
+    });
+    this.loadingEl = box;
+  }
+
+  /**
+   * 只为占位显示文件大小而取一次 stat。
+   *
+   * 拿不到（适配器没有 stat / 报错）就返回 0，占位退化成"页数较多"的文案，
+   * 绝不因为拿不到体积而影响打开。
+   */
+  private async fileSizeHint(path: string): Promise<number> {
+    const adapter = this.app.vault.adapter as any;
+    if (typeof adapter?.stat !== "function") return 0;
+    try {
+      const st = await adapter.stat(path);
+      return st ? Number(st.size) || 0 : 0;
+    } catch (_) {
+      return 0;
+    }
   }
 
   /* ------------------------------- 工具行 ------------------------------- */

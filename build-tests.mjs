@@ -34,6 +34,12 @@ const HARNESSES = [
   "view-harness.ts",
   "tablet-harness.ts",
   "perf-harness.ts",
+  // 打开 300+ 页大本子的分阶段计时 + 首屏/阻塞上界（"打开很慢"回归闸门）
+  "perf-open-harness.ts",
+  // QA 独立验证（不是断言套件的重复）：占位的真实生命周期 / 失败路径 /
+  // 连点切书 / 同进程二次打开的资源残留 / 最后一页是否真的画出来。
+  // 和 perf-open 互补，不改 run-all 的基线条数（要进闸门就在 PAGES 里加 ["qa-open.html", 49]）。
+  "qa-open-harness.ts",
   "zoom-harness.ts",
   "pdf-harness.ts",
   "bigpdf-harness.ts",

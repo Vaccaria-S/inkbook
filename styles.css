@@ -1565,6 +1565,67 @@
   color: var(--text-muted);
 }
 
+/* -------------------------------- 打开中 -------------------------------- */
+
+/*
+ * 打开大本子时的占位。
+ *
+ * 为什么要有：.inkbook 是单个 JSON 文件，打开必须整份读出 + 整份 parse，
+ * 这两步没法分片。300 页 13MB 约 130ms，300 页 72MB 约 960ms，
+ * 解析期间主线程一帧都出不来。没有占位，用户看到的就是白屏。
+ *
+ * 标记块用一点呼吸动画，让它看起来"在动"——静止的占位和白屏一样让人怀疑卡死。
+ */
+.mb-loading {
+  margin: auto;
+  max-width: 420px;
+  padding: 24px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.mb-loading-mark {
+  width: 54px;
+  height: 54px;
+  margin: 0 auto 12px;
+  border-radius: 14px;
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+  font-size: 24px;
+  line-height: 54px;
+  font-family: var(--font-serif, Georgia, serif);
+  animation: mb-loading-pulse 1.15s ease-in-out infinite;
+}
+
+.mb-loading h3 {
+  margin: 0 0 6px;
+}
+
+.mb-loading p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+@keyframes mb-loading-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.55;
+    transform: scale(0.94);
+  }
+}
+
+/* 系统设置里关掉动效的用户不该被这个脉冲打扰 */
+@media (prefers-reduced-motion: reduce) {
+  .mb-loading-mark {
+    animation: none;
+  }
+}
+
 /* -------------------------------- 弹窗 -------------------------------- */
 
 .mb-new-modal {

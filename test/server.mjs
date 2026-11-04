@@ -43,6 +43,27 @@ http
     if (p === '/zoom-harness.js') return send(res, path.join(root, 'test/zoom-harness.js'));
     if (p === '/perf.html') return send(res, path.join(root, 'test/perf.html'));
     if (p === '/perf-harness.js') return send(res, path.join(root, 'test/perf-harness.js'));
+    if (p === '/perf-open.html') return send(res, path.join(root, 'test/perf-open.html'));
+    if (p === '/perf-open-harness.js') return send(res, path.join(root, 'test/perf-open-harness.js'));
+    // 打开大本子的性能样本（由 test/make-open-samples.mjs 生成，不入库）
+    if (p.startsWith('/test/samples/') && p.endsWith('.inkbook')) {
+      const cand = path.join(root, p.replace(/^\/+/, ''));
+      if (cand.startsWith(path.join(root, 'test', 'samples') + path.sep)) {
+        return send(res, cand);
+      }
+    }
+    /*
+     * 样本里 background.pdf 引用的那两个 PDF 文件名。
+     *
+     * 必须给到**页数够多**的 PDF（test/make-open-samples.mjs 生成的 900 页那份）：
+     * 只给 1 页的空白 PDF 时，pdf.js 会对第 2~300 页全部报
+     * `Invalid page request`，C 档就变成在测"底图加载失败"的路径，
+     * 底图这条链路等于没测。900 页同时覆盖 C（300 页）和 D（857 页）。
+     */
+    if (p === '/大文档.pdf' || p === '/中西医结合妇产科学.pdf') {
+      const samplePdf = path.join(root, 'test/samples/大文档.pdf');
+      return send(res, fs.existsSync(samplePdf) ? samplePdf : path.join(root, 'test/blank.pdf'));
+    }
     if (p === '/view.html') return send(res, path.join(root, 'test/view.html'));
     if (p === '/view-harness.js') return send(res, path.join(root, 'test/view-harness.js'));
     if (p === '/jumptest.html') return send(res, path.join(root, 'test/jumptest.html'));

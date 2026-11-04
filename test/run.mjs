@@ -16,9 +16,17 @@ const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const CDP_PORT = Number(process.env.CDP_PORT || 9343);
 const profile = path.resolve(process.env.CDP_PROFILE || '.edge-run');
 fs.mkdirSync(profile, { recursive: true });
+/**
+ * 额外启动参数，空格分隔（默认没有）。
+ *
+ * 用来按需打开 Chrome 的可选能力，比如 performance.memory 的精确读数：
+ *   CHROME_ARGS=--enable-precise-memory-info node test/run.mjs ...
+ * 默认不改任何行为——别的套件拿到的浏览器跟以前完全一样。
+ */
+const extraArgs = (process.env.CHROME_ARGS || '').split(' ').filter(Boolean);
 const child = spawn(EDGE, [
   '--headless=new', '--disable-gpu', '--no-first-run', '--no-proxy-server',
-  `--remote-debugging-port=${CDP_PORT}`, `--user-data-dir=${profile}`, url,
+  `--remote-debugging-port=${CDP_PORT}`, `--user-data-dir=${profile}`, ...extraArgs, url,
 ], { stdio: 'ignore' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let page;
