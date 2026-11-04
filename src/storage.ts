@@ -256,7 +256,9 @@ export function normalizeBook(raw: any, fallbackTitle: string): InkBook {
             // 免得旧文件里的脏数据把 font-family 拼成奇怪的东西
             if (typeof t.font === "string" && t.font.length <= 16) item.font = t.font;
             if (t.bold === true) item.bold = true;
-            if (Number.isFinite(Number(t.width))) item.width = Number(t.width);
+            // width 只留正的有限值：0 / 负 / NaN 在渲染层一律当「没写」回落自动算法，
+            // 落盘时就不该把脏值写回去（否则每次保存都带着一个无意义的字段）
+            if (Number.isFinite(Number(t.width)) && Number(t.width) > 0) item.width = Number(t.width);
             return item;
           })
       : [];

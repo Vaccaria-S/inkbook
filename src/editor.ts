@@ -2592,7 +2592,9 @@ export class BookEditor {
      * 命中半径按屏幕 10px 反算（照顾手指），与画出来的 6px 分开。
      */
     const sel0 = this.selectedText;
-    if (sel0) {
+    // 捏合期间不认手柄：双指第一根落下的位置可能正好压在柄上，
+    // 一旦起 resizeText 手势，会和 beginPinch 抢 pointerId
+    if (sel0 && !this.pinchActive) {
       const g = this.textSelGeom(sel0);
       const hitR = 10 / this.zoom;
       if (Math.hypot(px - g.handleX, py - g.handleY) <= hitR) {

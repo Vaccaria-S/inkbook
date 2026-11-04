@@ -568,7 +568,10 @@ async function D12() {
       color: "#D64545",
       font: "kai",
       text: "我加的字",
+      width: 260,
     },
+    // 脏宽度：渲染层一律当「没写」，落盘也不该带回来
+    { id: "t3", source: "user", x: 150, y: 320, size: 20, text: "脏宽度", width: 0 },
   ];
   // 空数组表示"抽过但没文字"（扫描版），必须原样保留，否则每次挂载都重抽
   b.pages[1].texts = [];
@@ -596,8 +599,20 @@ async function D12() {
   );
   pass(typeof saved?.version === "number" && saved.version === 2, "D12 version 是 number 且=2（v2 起有 texts）：" + JSON.stringify(saved?.version));
   pass(
-    saved?.pages?.[0]?.texts?.length === 2,
-    "D12 文字层往返：2 条（" + JSON.stringify(saved?.pages?.[0]?.texts?.length) + "）"
+    saved?.pages?.[0]?.texts?.length === 3,
+    "D12 文字层往返：3 条（" + JSON.stringify(saved?.pages?.[0]?.texts?.length) + "）"
+  );
+  pass(
+    saved?.pages?.[0]?.texts?.[0]?.width === 80,
+    "D12 pdf 原文 width 往返保住（" + JSON.stringify(saved?.pages?.[0]?.texts?.[0]?.width) + "）"
+  );
+  pass(
+    saved?.pages?.[0]?.texts?.[1]?.width === 260,
+    "D12 user 手动宽度 width 往返保住（" + JSON.stringify(saved?.pages?.[0]?.texts?.[1]?.width) + "）"
+  );
+  pass(
+    saved?.pages?.[0]?.texts?.[2]?.width === undefined,
+    "D12 脏宽度（0）被 normalizeBook 丢弃，不写回文件"
   );
   pass(
     saved?.pages?.[0]?.texts?.[0]?.source === "pdf" &&

@@ -367,6 +367,27 @@ async function main() {
       ed.current === rightAfterZoom,
       `缩放后页码即时刷新，不必等一次滚动（缩放后 ${rightAfterZoom} / 补派 scroll 后 ${ed.current}）`
     );
+    /*
+     * 再硬一层：直接按 DOM 算「视口中线落在哪一页」，与缩放后立刻读到的 current 比。
+     * 不复用 updateCurrentFromScroll 的算术，避免用被测逻辑验自己。
+     */
+    const midY = scroll.getBoundingClientRect().top + Math.min(scroll.clientHeight * 0.42, 460);
+    let expected = 0;
+    for (let i = 0; i < ed.recs.length; i++) {
+      const r = ed.recs[i].pageEl.getBoundingClientRect();
+      if (r.top <= midY && midY <= r.bottom) {
+        expected = i;
+        break;
+      }
+      if (r.top > midY) {
+        expected = i;
+        break;
+      }
+    }
+    pass(
+      Math.abs(rightAfterZoom - expected) <= 1,
+      `缩放后页码等于视口中线所在页（current ${rightAfterZoom} / DOM 算出 ${expected}）`
+    );
   }
 
   /* ---------------- 场景 8：横向锚定（页面溢出时） ---------------- */
