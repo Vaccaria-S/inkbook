@@ -12,7 +12,7 @@
 import { BookEditor } from "../src/editor";
 import { BookStore } from "../src/store";
 import { createBook, createPage, type Stroke } from "../src/types";
-import { exportBookPdf } from "../src/export";
+import { exportBookPdf, pageHasUserText } from "../src/export";
 import { chineseFontBytes } from "../src/fontasset";
 import {
   PDFArray,
@@ -675,6 +675,31 @@ async function main() {
     await shortDoc.destroy();
     shortEd.destroy();
     shortCleanup();
+  }
+
+  /*
+   * 导出完成后的 Notice 会报「N 页的批注文字可选中」。
+   * 以前是无条件按页累加：300 页的本子只有 2 页写了批注也会报 300 页。
+   * 这里直接钉判定函数（Notice 的计数只按它来），防止又退回按页数算。
+   */
+  {
+    const pUser = createPage("blank", "white");
+    pUser.texts = [
+      { id: "u1", source: "user", x: 60, y: 300, size: 16, text: "有字" },
+      { id: "p1", source: "pdf", x: 60, y: 340, size: 16, text: "原文" },
+    ];
+    const pPdfOnly = createPage("blank", "white");
+    pPdfOnly.texts = [{ id: "p2", source: "pdf", x: 60, y: 300, size: 16, text: "只有原文" }];
+    const pBlank = createPage("blank", "white");
+    pBlank.texts = [];
+    const pSpaces = createPage("blank", "white");
+    pSpaces.texts = [{ id: "u3", source: "user", x: 60, y: 300, size: 16, text: "   \n " }];
+
+    pass(pageHasUserText(pUser), "Notice 计数：有用户批注的页算 1 页");
+    pass(!pageHasUserText(pPdfOnly), "Notice 计数：只有 PDF 原文的页不算（原文不是批注）");
+    pass(!pageHasUserText(pBlank), "Notice 计数：空 texts 的页不算");
+    pass(!pageHasUserText(pSpaces), "Notice 计数：只有空白字符的批注不算");
+    pass(!pageHasUserText(undefined), "Notice 计数：缺页数据不抛错、不算");
   }
 
   log("");

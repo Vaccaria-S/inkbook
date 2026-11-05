@@ -25,7 +25,7 @@ const only = process.argv[2] || "";
  */
 const PAGES = [
   ["test.html", 194],
-  ["export.html", 80],
+  ["export.html", 85],
   ["p1.html", 54],
   ["view.html", 28],
   ["tablet.html", 26],
@@ -47,7 +47,7 @@ const PAGES = [
   ["embed.html", 111],
   ["qa-embed2.html", 115],
   ["qa-embed3.html", 16],
-  ["qa-embed4.html", 117],
+  ["qa-embed4.html", 122],
   ["pdftext.html", 177],
   ["qa-ink118-visual.html", 296],
 ];

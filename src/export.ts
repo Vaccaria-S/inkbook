@@ -95,6 +95,19 @@ function parseColor(hex?: string): RGB {
  * Noto Sans SC，`bold` 也不描粗——PDF 里没有对应的字重文件。
  * 这是有意的取舍：优先保证「能选中、能搜索」，字形一致度次之。
  */
+/**
+ * 这一页有没有**真正会被画出来**的批注。
+ *
+ * 条件与 drawUserTextsPdf 里的过滤保持一致（source === "user" 且 trim 后非空）。
+ * Notice 的「N 页的批注文字可选中」必须按这个算：以前是无条件按页累加，
+ * 300 页的本子只有 2 页写了批注也会报「300 页」，用户会以为每页都有字。
+ */
+export function pageHasUserText(p?: Page): boolean {
+  return (p?.texts || []).some(
+    (t) => t.source === "user" && (t.text || "").trim().length > 0
+  );
+}
+
 function drawUserTextsPdf(page: PDFPage, src: Page, font: PDFFont, pageH: number): void {
   const texts = (src.texts || []).filter((t) => t.source === "user" && (t.text || "").trim());
   if (!texts.length) return;
@@ -164,9 +177,7 @@ export async function exportBookPdf(
    *
    * 字体只在真有批注时才嵌：一本纯手写的本子不该为它多背一份字体。
    */
-  const hasUserText = pages.some((p) =>
-    (p?.texts || []).some((t) => t.source === "user" && (t.text || "").trim())
-  );
+  const hasUserText = pages.some((p) => pageHasUserText(p));
   let zhFont: PDFFont | null = null;
   /*
    * 字体能写出的码点集合。必须来自 fontkit 直接解析字体文件（见 fontasset.ts），
@@ -288,7 +299,8 @@ export async function exportBookPdf(
             out.drawImage(png, { x: 0, y: 0, width: A4_W, height: A4_H });
             if (vectorText && zhFont) {
               drawUserTextsPdf(out, page, zhFont, pageH);
-              textPages += 1;
+              // 只统计真有批注的页：否则 Notice 会把整本页数都算进去
+              if (pageHasUserText(page)) textPages += 1;
             }
             vectorPages += 1;
             done = true;
@@ -306,7 +318,7 @@ export async function exportBookPdf(
       out.drawImage(png, { x: 0, y: 0, width: A4_W, height: A4_H });
       if (vectorText && zhFont) {
         drawUserTextsPdf(out, page, zhFont, pageH);
-        textPages += 1;
+        if (pageHasUserText(page)) textPages += 1;
       }
     }
   }

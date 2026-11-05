@@ -874,6 +874,13 @@ interface EmbedState {
   rendering: boolean;
   /** 渲染期间又被要求重画（本子刚保存）：画完立刻补一轮，别丢请求 */
   repaintQueued: boolean;
+  /**
+   * 本子保存过、但这一块当时在视口外，没重画。
+   *
+   * 不能只靠观察器「滚回来再画」：块第一次画完就 unobserve 了，
+   * 之后不会再有回调。标脏并在滚进视口时按新内容重画。
+   */
+  stale: boolean;
 }
 
 /** 键是容器 `.mb-embed` 本身：重画时直接在 DOM 里按容器找状态 */
@@ -1016,10 +1023,11 @@ function measureContainerWidth(container: HTMLElement): number {
 async function paintEmbed(state: EmbedState, force = false): Promise<void> {
   if (state.rendering) {
     // 正在画又有新请求：记一笔，画完立刻补一轮（否则这次保存就白丢了）
-    if (force) state.repaintQueued = true;
+    if (force || state.stale) state.repaintQueued = true;
     return;
   }
-  if (state.rendered && !force) return;
+  // stale = 保存时在视口外，滚回来必须用新内容重画（不能因为 rendered 就跳过）
+  if (state.rendered && !force && !state.stale) return;
 
   state.rendering = true;
   try {
@@ -1047,6 +1055,7 @@ async function paintEmbed(state: EmbedState, force = false): Promise<void> {
 
     applyBadge(state.container, result.actualPage, result.pageCount, result.clamped);
     state.rendered = true;
+    state.stale = false;
   } catch (e) {
     console.warn("[inkbook] 嵌入：这一页渲染失败（占位保留，点开可以试试）", state.file.path, e);
     if (state.placeholder) {
@@ -1103,6 +1112,7 @@ function mountEmbed(host: EmbedHost, node: HTMLElement, sourcePath: string): voi
     rendered: false,
     rendering: false,
     repaintQueued: false,
+    stale: false,
   };
   states.set(container, state);
 
@@ -1187,8 +1197,9 @@ function isEmbedVisible(el: HTMLElement): boolean {
 /**
  * 把一批路径的嵌入重画一遍。
  *
- * 只画**视口内**的：屏幕外的块等用户滚回来时本来就要重画（观察器一轮游），
- * 现在提前光栅化只是白烧 CPU。
+ * 只**现在画**视口内的：屏幕外的块提前光栅化只是白烧 CPU。
+ * 但屏幕外的不能就这么算了——块第一次画完就 unobserve 了，滚回来不会再有回调，
+ * 只跳过的话它会永远停在旧图上。所以标脏并重新挂观察器，进视口时再画。
  */
 function redrawPaths(paths: string[]): void {
   for (const path of paths) {
@@ -1197,8 +1208,15 @@ function redrawPaths(paths: string[]): void {
     for (const container of findEmbedsByPath(path)) {
       const state = states.get(container);
       if (!state) continue;
-      if (!isEmbedVisible(container)) continue;
-      void paintEmbed(state, true);
+      if (isEmbedVisible(container)) {
+        void paintEmbed(state, true);
+        continue;
+      }
+      state.stale = true;
+      const io = ensureObserver();
+      // 没有 IntersectionObserver 的老环境只能现在就画（宁可多烧一点）
+      if (io) io.observe(container);
+      else void paintEmbed(state, true);
     }
   }
 }

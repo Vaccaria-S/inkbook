@@ -903,6 +903,44 @@ async function main() {
     check(added <= 2, "补的一轮没有变成无限重画（" + added + " ≤ 2）");
   }
 
+  /* ============ 4c2. 视口外且**已经渲染过**的块：保存后滚回来必须补画 ============ */
+  group("4c2. 视口外已渲染的块：保存 → 不提前光栅化，滚回来按新内容重画");
+  {
+    const near = document.getElementById("refresh-host")!;
+    const far = document.getElementById("far-host")!;
+    near.innerHTML = "";
+    far.innerHTML = "";
+    invalidateEmbedCache();
+
+    const node = mkEmbed(near, P_REFRESH, 120);
+    pp(near, ctx);
+    const ok0 = await waitFor(() => !!node.querySelector(".mb-embed-canvas"));
+    check(ok0, "4c2 前提：块先在视口内渲染过一次");
+    const cont = node.querySelector(".mb-embed") as HTMLElement;
+    const before = node.querySelector(".mb-embed-canvas");
+    check(!!cont && !!before, "4c2 前提：拿到容器与初始 canvas");
+
+    /*
+     * 关键：搬到 6000px 之外（容器元素本身不变，WeakMap 里的 state 仍然认它）。
+     * 它第一次画完就被 unobserve 了 —— 如果只跳过不标脏，滚回来永远停在这张旧图。
+     */
+    far.appendChild(cont);
+    await sleep(150);
+    emit("modify", fileOf[P_REFRESH]);
+    await sleep(2600);
+    const stillOld = cont.querySelector(".mb-embed-canvas");
+    check(stillOld === before, "4c2 保存时在视口外：没有提前光栅化（canvas 还是原来那张）");
+
+    // 滚回来：观察器应该重新收到交集，按新内容重画
+    near.appendChild(cont);
+    const repainted = await waitFor(() => {
+      const c = cont.querySelector(".mb-embed-canvas");
+      return !!c && c !== before;
+    }, 8000);
+    check(repainted, "4c2 滚回视口后确实重画了（canvas 换新，不是永远停在旧图）");
+    check(cont.querySelectorAll("canvas").length === 1, "4c2 重画后仍只有 1 张 canvas（没叠层）");
+  }
+
   /* ============ 4d. 20 轮不泄漏 ============ */
   group("4d. 20 轮重画：DOM 不增长、定时器只剩 0/1 个");
   {
