@@ -10,9 +10,14 @@
  *   完整 Noto Sans SC 转 TTF 有 8MB+，base64 内联进 main.js 会到 11MB。
  *   这里按 GB2312（6763 汉字 + 常用符号，共 8280 字符）做子集，
  *   落到 ~1.85MB → base64 约 2.4MB，日常输入够用。
- *   子集里没有的生僻字会画成方块（不会让整段消失）。
  *
- * 生成方式见 `tools/mksubset.mjs`；字体为 Noto Sans SC（SIL OFL 1.1）。
+ * 子集里没有的生僻字 / emoji：**不会画成方块**。导出时逐页扫批注，
+ * 只要有一个码点不在字符集里，该页整页退回位图（看得见、但选不中）——
+ * 见 `pageHasUnsupportedChars()` 与 INK-118。字符集拿不到时同样退回位图（保守）。
+ *
+ * 字体为 Noto Sans SC（SIL OFL 1.1），由构建期一次性子集化得到；
+ * 生成脚本当时没有入库（`tools/mksubset.mjs` 已不存在），要重新生成得照
+ * `assets/README.md` 记的来源与字符集重写一份。
  */
 import fontkit from "@pdf-lib/fontkit";
 import dataUrl from "../assets/NotoSansSC-subset.ttf";
