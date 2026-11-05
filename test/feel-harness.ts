@@ -1,6 +1,6 @@
 import { OneEuroFilter, shapePressure, speedWidthFactor } from "../src/filter";
-import { predictTail, effectivePressures } from "../src/ink";
-import type { Pt } from "../src/types";
+import { predictTail, effectivePressures, strokePath, drawStroke, paintStroke, invalidateStroke } from "../src/ink";
+import type { Pt, Stroke } from "../src/types";
 
 const lines: string[] = [];
 const out = document.getElementById("out")!;
@@ -127,6 +127,151 @@ async function main() {
     const dot: Pt[] = [[0, 0, 0.7], [1, 0, 0.7], [2, 0, 0.7], [3, 0, 0.7]];
     const dps = effectivePressures({ ...stroke, points: dot });
     pass(Math.min(...dps) > 0.3, "短笔画不被包络吃掉：" + Math.min(...dps).toFixed(3));
+  }
+
+  /* -------------------- 轮廓几何（INK-109：边缘发毛） -------------------- */
+  {
+    const mk = (points: Pt[], size = 6): Stroke => ({
+      id: "outline",
+      tool: "pen",
+      color: "#000000",
+      size,
+      opacity: 1,
+      points,
+    });
+    /** 画一条笔迹，返回深色素引集合与包围盒 */
+    const render = (s: Stroke, w = 400, h = 300) => {
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d")!;
+      ctx.fillStyle = "#000";
+      ctx.fill(strokePath(s));
+      const data = ctx.getImageData(0, 0, w, h).data;
+      let minX = w, minY = h, maxX = -1, maxY = -1, dark = 0;
+      const cols = new Map<number, number>();
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          if (data[(y * w + x) * 4 + 3] > 100) {
+            dark++;
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+            cols.set(x, (cols.get(x) ?? 0) + 1);
+          }
+        }
+      }
+      return { dark, minX, minY, maxX, maxY, cols, data, w, h };
+    };
+
+    // 1) 闭合缝：画一个首尾相接的圆环笔迹，闭合处不应出现「缝外突然判内」的空洞
+    {
+      const pts: Pt[] = [];
+      for (let i = 0; i <= 48; i++) {
+        const a = (i / 48) * Math.PI * 2;
+        pts.push([200 + 90 * Math.cos(a), 150 + 90 * Math.sin(a), 0.7]);
+      }
+      const r = render(mk(pts, 5));
+      /*
+       * 沿圆环一周采样笔迹带。起收笔各约 1/12 圈是 perfect-freehand 的 taper
+       * 收尖区，本来就没墨，不该算「缺口」；这里只验中段连续。
+       * 另外「硬折角」的特征是**连续**掉一段，所以额外断言缺口不相邻。
+       */
+      let gaps = 0;
+      let consecutive = 0;
+      let maxConsecutive = 0;
+      for (let i = 0; i < 48; i++) {
+        if (i < 4 || i > 43) {
+          consecutive = 0; // taper 区跳过，不算连续
+          continue;
+        }
+        const a = (i / 48) * Math.PI * 2;
+        const x = Math.round(200 + 90 * Math.cos(a));
+        const y = Math.round(150 + 90 * Math.sin(a));
+        if (r.data[(y * r.w + x) * 4 + 3] <= 100) {
+          gaps++;
+          consecutive++;
+          maxConsecutive = Math.max(maxConsecutive, consecutive);
+        } else {
+          consecutive = 0;
+        }
+      }
+      pass(gaps === 0, "闭合轮廓中段一圈无空洞/硬折（缺口 " + gaps + " 处）");
+      pass(maxConsecutive <= 1, "闭合缝没有连续掉一段（最大连续缺口 " + maxConsecutive + "）");
+      pass(r.dark > 2000, "闭合轮廓确实画出来了（深色像素 " + r.dark + "）");
+    }
+
+    // 2) 不丢细节：带快速转折的笔迹，包围盒与深色像素量在合理区间（没被抹圆/缩细）
+    {
+      const pts: Pt[] = [];
+      for (let i = 0; i < 60; i++) {
+        const t = i / 59;
+        // 一段横 + 一个直角转折 + 一段竖
+        const x = t < 0.5 ? 40 + t * 2 * 160 : 200;
+        const y = t < 0.5 ? 80 : 80 + (t - 0.5) * 2 * 140;
+        pts.push([x, y, 0.7]);
+      }
+      const r = render(mk(pts, 7));
+      pass(r.maxX - r.minX > 150 && r.maxY - r.minY > 130,
+        "转折笔迹的包围盒没被平滑抹小（" + (r.maxX - r.minX) + "×" + (r.maxY - r.minY) + "）");
+      // 直角拐点附近仍要有墨（没被抹成圆角缺口）
+      const cx = 200, cy = 80;
+      let cornerInk = 0;
+      for (let dy = -4; dy <= 4; dy++)
+        for (let dx = -4; dx <= 4; dx++)
+          if (r.data[((cy + dy) * r.w + cx + dx) * 4 + 3] > 100) cornerInk++;
+      pass(cornerInk > 20, "直角拐点仍保留笔迹（拐点邻域深色像素 " + cornerInk + "）");
+    }
+
+    // 3) 宽度抖动：给压力塞高频小噪声，画出来的轮廓宽度高频抖动应小于输入噪声幅度
+    {
+      const pts: Pt[] = [];
+      for (let i = 0; i < 120; i++) {
+        // 相邻点压力 ±0.18 的高频噪声，正是 120Hz 手写笔的设备噪声
+        pts.push([20 + i * 3, 150, 0.7 + (i % 2 === 0 ? 0.18 : -0.18)]);
+      }
+      const r = render(mk(pts, 10));
+      const widths: number[] = [];
+      for (const [, cnt] of r.cols) widths.push(cnt);
+      let jump = 0;
+      for (let i = 1; i < widths.length; i++) jump += Math.abs(widths[i] - widths[i - 1]);
+      const avgJump = widths.length > 1 ? jump / (widths.length - 1) : 0;
+      // 平滑后逐列跳变应该是「个位数像素」，远小于 size=10 的整笔宽度
+      pass(avgJump < 4, "高频压力噪声被压住，轮廓逐列跳变 " + avgJump.toFixed(2) + "px（< 4）");
+      pass(widths.length > 300, "整条笔迹连续不断（列数 " + widths.length + "）");
+    }
+
+    // 4) 导出/嵌入共用：paintStroke 与 drawStroke 画到两块画布逐像素一致
+    {
+      const pts: Pt[] = [];
+      for (let i = 0; i < 40; i++) pts.push([30 + i * 8, 120 + Math.sin(i / 4) * 20, 0.6]);
+      const s = mk(pts, 6);
+      const a = document.createElement("canvas"); a.width = 400; a.height = 300;
+      const b = document.createElement("canvas"); b.width = 400; b.height = 300;
+      drawStroke(a.getContext("2d")!, s);
+      paintStroke(b.getContext("2d")!, s);
+      const da = a.getContext("2d")!.getImageData(0, 0, 400, 300).data;
+      const db = b.getContext("2d")!.getImageData(0, 0, 400, 300).data;
+      let diff = 0;
+      for (let i = 0; i < da.length; i += 4) if (da[i + 3] !== db[i + 3]) diff++;
+      pass(diff === 0, "导出位图路径与屏幕路径共用同一份轮廓（像素差 " + diff + "）");
+    }
+
+    // 5) 性能红线：200 点笔迹构建 100 次不得超过 200ms（闭合曲线比旧写法多点算术）
+    {
+      const pts: Pt[] = [];
+      for (let i = 0; i < 200; i++) pts.push([20 + i * 1.6, 150 + Math.sin(i / 9) * 30, 0.65]);
+      const s = mk(pts, 8);
+      const t0 = performance.now();
+      // 每次强制失效缓存，测的是真实构建耗时而不是 WeakMap 命中
+      for (let k = 0; k < 100; k++) {
+        invalidateStroke(s);
+        strokePath(s);
+      }
+      const ms = performance.now() - t0;
+      pass(ms < 200, "200 点笔迹 ×100 次 path 构建 " + ms.toFixed(1) + "ms（< 200ms）");
+    }
   }
 
   await sleep(60);

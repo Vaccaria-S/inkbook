@@ -61,23 +61,84 @@ function smoothPressures(points: Pt[]): number[][] {
   return out;
 }
 
+/**
+ * 渲染用的压力再稳一道，专治手写笔高频采样下的「细密波浪」。
+ *
+ * 120Hz+ 采样时相邻点的压力差其实只是设备噪声，5 点三角窗（smoothPressures）
+ * 还会把它原样留在线宽上，轮廓两侧于是呈锯齿状。这里按**局部弧长**决定
+ * 平滑窗：点挨得近（慢笔、采样密）就多 averaging 几帧；点拉得开（快笔、
+ * 真在变方向）就少动，别把速度/压感带来的粗细变化抹平。
+ *
+ * 注意：只给 buildInkPath 用，effectivePressures 的对外语义保持不变
+ * （feel 套件测的是那条曲线）。
+ */
+function steadyPressures(pts: number[][]): number[][] {
+  const n = pts.length;
+  if (n < 3) return pts;
+  const out: number[][] = [];
+  for (let i = 0; i < n; i++) {
+    const prev = pts[Math.max(0, i - 1)];
+    const next = pts[Math.min(n - 1, i + 1)];
+    const span = Math.hypot(next[0] - prev[0], next[1] - prev[1]);
+    // 采样密（span 小）→ 窗宽 3；拉开到 6px 以上 → 退回 1，几乎不平滑
+    const k = span < 2 ? 3 : span < 6 ? 2 : 1;
+    let sum = 0;
+    let weight = 0;
+    for (let d = -k; d <= k; d++) {
+      const j = Math.min(n - 1, Math.max(0, i + d));
+      const w = k + 1 - Math.abs(d);
+      sum += pts[j][2] * w;
+      weight += w;
+    }
+    out.push([pts[i][0], pts[i][1], sum / weight]);
+  }
+  return out;
+}
+
+/**
+ * perfect-freehand 给的是一圈**闭合**的轮廓点。
+ *
+ * 旧写法从首点直线起、末尾直接 lineTo 再 closePath：首点与末点之间
+ * 没有曲线过渡，起收笔处会留一个硬折角（高倍缩放下就是「边缘发毛」里
+ * 最扎眼的那种尖刺）。
+ *
+ * 这里用**经过每个轮廓点**的闭合 Catmull-Rom 三次样条：曲线首尾连续，
+ * 且不像「中点二次样条」那样把轮廓往内缩 1/4 点距（细笔画会因此变窄）。
+ * 张力取 1/6（标准 Catmull-Rom）：不过冲，转折不会被抹成圆球。
+ */
 function outlineToPath(outline: number[][]): Path2D {
   const path = new Path2D();
-  if (outline.length < 2) return path;
-  path.moveTo(outline[0][0], outline[0][1]);
-  for (let i = 1; i < outline.length - 1; i++) {
-    const [x0, y0] = outline[i];
-    const [x1, y1] = outline[i + 1];
-    path.quadraticCurveTo(x0, y0, (x0 + x1) / 2, (y0 + y1) / 2);
+  const n = outline.length;
+  if (n < 2) return path;
+  // 点数太少时（极短笔迹）平滑没有意义，直连保面积
+  if (n < 8) {
+    path.moveTo(outline[0][0], outline[0][1]);
+    for (let i = 1; i < n; i++) path.lineTo(outline[i][0], outline[i][1]);
+    path.closePath();
+    return path;
   }
-  const last = outline[outline.length - 1];
-  path.lineTo(last[0], last[1]);
+  const at = (i: number) => outline[((i % n) + n) % n];
+  path.moveTo(outline[0][0], outline[0][1]);
+  for (let i = 0; i < n; i++) {
+    const p0 = at(i - 1);
+    const p1 = at(i);
+    const p2 = at(i + 1);
+    const p3 = at(i + 2);
+    path.bezierCurveTo(
+      p1[0] + (p2[0] - p0[0]) / 6,
+      p1[1] + (p2[1] - p0[1]) / 6,
+      p2[0] - (p3[0] - p1[0]) / 6,
+      p2[1] - (p3[1] - p1[1]) / 6,
+      p2[0],
+      p2[1]
+    );
+  }
   path.closePath();
   return path;
 }
 
 function buildInkPath(stroke: Stroke): Path2D {
-  const smooth = smoothPressures(envelopePressures(stroke.points, stroke.size));
+  const smooth = steadyPressures(smoothPressures(envelopePressures(stroke.points, stroke.size)));
   const isBallpoint = stroke.tool === "ballpoint";
   const outline = getStroke(smooth, {
     size: stroke.size,

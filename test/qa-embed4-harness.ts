@@ -243,8 +243,15 @@ function darkIn(canvas: HTMLCanvasElement, x: number, y: number, w: number, h: n
   }
   return n;
 }
-/** 笔迹落在页面坐标 40–600 × 100–360（第 1/2 页都画在这一带） */
+/**
+ * 笔迹落在页面坐标 40–600 × 100–360（第 1/2 页都画在这一带）。
+ *
+ * 极窄档（|25）整张位图才 25×35，把取样框按比例缩到 18×9 之后
+ * 只剩亚像素，取整差 1px 就会把笔迹全切出框——实测 ink 在 0 与 1 之间
+ * 随 CDP 实例摆动，是断言本身不稳，不是渲染退化。窄档直接量整张画布。
+ */
 function inkOf(canvas: HTMLCanvasElement): number {
+  if (canvas.width <= 64) return darkIn(canvas, 0, 0, canvas.width, canvas.height);
   const k = canvas.width / 794;
   return darkIn(canvas, 40 * k, 100 * k, 570 * k, 270 * k);
 }
