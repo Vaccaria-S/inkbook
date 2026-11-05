@@ -30,7 +30,7 @@ const PAGES = [
   ["view.html", 28],
   ["tablet.html", 26],
   ["zoom.html", 21],
-  ["dist.html", 26],
+  ["dist.html", 29],
   ["plugin.html", 22],
   ["jumptest.html", 11],
   ["feel.html", 29],

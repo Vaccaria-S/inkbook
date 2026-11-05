@@ -319,6 +319,10 @@ async function main() {
         paper: "white",
         activeLayerId: "l1",
         layers: [{ id: "l1", name: "笔迹层", visible: true, opacity: 1, strokes: [] }],
+        // 产物级导出冒烟要用：有 user 批注才会走「内联中文字体」那条路
+        texts: [
+          { id: "t1", source: "user", x: 60, y: 300, size: 16, color: "#1A1A1A", text: "产物导出冒烟" },
+        ],
       },
     ],
   });
@@ -465,6 +469,34 @@ async function main() {
         "产物：页间距测量精确（" + gap.toFixed(3) + "px）"
       );
     }
+  }
+
+  /*
+   * 产物级导出的冒烟（HANDOFF §3.5 记的测试缺口）。
+   *
+   * 源码侧的 export / pdftext 套件跑的是**源码 bundle**；用户真正装的是
+   * dist/main.js。`.ttf` 的 dataurl 内联、pdf-lib 打包、fontkit 注册——
+   * 任何一环在构建配置里掉了，源码测试都是全绿，只有装到 Obsidian 里才发现导不出字。
+   */
+  {
+    const before = new Set(files.keys());
+    await (view as any).runExport("pdf");
+    const added = [...files.keys()].filter((k) => !before.has(k));
+    const pdfKey = added.find((k) => k.endsWith("-手写本.pdf"));
+    pass(!!pdfKey, "产物导出：写出了 PDF（" + (added.join(", ") || "无新文件") + "）");
+
+    const raw = pdfKey ? (files.get(pdfKey) as unknown as ArrayBuffer) : null;
+    const bytes = raw ? new Uint8Array(raw) : new Uint8Array(0);
+    const head = String.fromCharCode(...bytes.slice(0, 5));
+    pass(bytes.length > 0 && head === "%PDF-", "产物导出：是合法 PDF（" + bytes.length + " B，头 " + head + "）");
+    /*
+     * 有批注时字体会整份内联，导出件必然 > 1MB；如果 .ttf loader 在构建里掉了，
+     * 导出会静默退回「批注烤进位图」，文件只有几 KB —— 这条断言就是拦它的。
+     */
+    pass(
+      bytes.length > 100_000,
+      "产物导出：中文字体确实内联进产物（" + Math.round(bytes.length / 1024) + "KB > 100KB）"
+    );
   }
 
   await view.onUnloadFile();
