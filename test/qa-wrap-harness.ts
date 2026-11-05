@@ -371,6 +371,106 @@ async function main() {
     pass((store.data.pages[0].texts || []).length === 1, "Esc 退出编辑，原文仍在");
   }
 
+  /* ---------- F2. 新建输入框：占位符「请输入」+ 侧栏样式实时预览 ---------- */
+  {
+    /*
+     * 本段会把编辑器的「默认样式」改到 30 号 / 红色 / 楷体来测实时预览。
+     * 这些值是编辑器级状态，不还原的话后面 K4「页底新建」会用 30 号落库
+     * （行高变大，末行行盒下沿超出纸面 1.3px），把无关断言带红。
+     */
+    const prevSize = ed.textSize;
+    const prevColor = ed.textColor;
+    const prevFont = ed.textFont;
+    // F 段结束后 note1 可能还处于选中态；先取消，否则 setTextSize 会改到它身上
+    ed.selectText(null);
+    ed.setTextSize(16);
+    ed.setTextColor("#1A1A1A");
+    ed.setTextFont("sans");
+    ed.beginTextEdit(rec, 200, 700);
+    await sleep(60);
+    const ta = pageEl().querySelector(".mb-text-edit") as HTMLTextAreaElement;
+    pass(!!ta, "新建：出现输入框");
+    pass(ta?.placeholder === "请输入", "新建：空框显示「请输入」");
+    pass(ta?.value === "", "占位符不进 value（提交时不会多出三个字）");
+
+    const z = zoom();
+    ed.setTextSize(30);
+    await sleep(30);
+    pass(
+      Math.abs(parseFloat(ta.style.fontSize) - 30 * z) < 0.6,
+      `改字号 30：输入框字号实时预览（${ta.style.fontSize}）`
+    );
+    pass((ed as any).textEdit?.size === 30, "改字号：待提交的字号也更新了");
+
+    ed.setTextColor("#C0392B");
+    await sleep(20);
+    pass(ta.style.color === "rgb(192, 57, 43)", `改颜色：输入框颜色实时预览（${ta.style.color}）`);
+    pass((ed as any).textEdit?.color === "#C0392B", "改颜色：待提交的颜色也更新了");
+
+    ed.setTextFont("kai");
+    await sleep(20);
+    pass(/kai/i.test(ta.style.fontFamily), `改字体：输入框字体实时预览（${ta.style.fontFamily}）`);
+
+    /*
+     * 点侧栏样式控件会把焦点从 textarea 抢走。blur 不能把空框提交掉，
+     * 否则用户"先选样式再输入"的流程直接断掉（这正是用户报的场景）。
+     * 判定必须走 pointerdown 标记（iPad 上 relatedTarget 经常是 null）。
+     */
+    const side = document.createElement("div");
+    side.className = "mb-side";
+    const styleBtn = document.createElement("button");
+    styleBtn.dataset.mbTextStyle = "1"; // 与真实字号/颜色/字体控件同一标记
+    const plainBtn = document.createElement("button"); // 导出/撤销这类普通动作
+    side.append(styleBtn, plainBtn);
+    document.body.appendChild(side);
+
+    styleBtn.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerId: 91 }));
+    styleBtn.focus();
+    await sleep(60);
+    pass(!!pageEl().querySelector(".mb-text-edit"), "点样式控件后输入框还在（没被 blur 提交掉）");
+    pass((ed as any).textEdit !== null, "点样式控件后编辑状态仍保留");
+
+    // 输入并提交：用预览时选的样式落库
+    ta.value = "样式预览";
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
+    ta.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await sleep(60);
+    const created = (store.data.pages[0].texts || []).find((t) => t.text === "样式预览");
+    pass(
+      !!created && created.size === 30 && created.color === "#C0392B" && created.font === "kai",
+      "提交后用的是预览时选的样式（" +
+        (created ? `${created.size} / ${created.color} / ${created.font}` : "没写入") +
+        "）"
+    );
+
+    /*
+     * 反向用例：点普通按钮（导出/撤销）必须把编辑框内容提交掉，
+     * 否则导出会少一段字（reviewer 抓到的 High-1）。
+     */
+    ed.beginTextEdit(rec, 400, 900);
+    await sleep(60);
+    const ta2 = pageEl().querySelector(".mb-text-edit") as HTMLTextAreaElement;
+    ta2.value = "导出前要落库";
+    ta2.dispatchEvent(new Event("input", { bubbles: true }));
+    plainBtn.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerId: 92 }));
+    plainBtn.focus();
+    await sleep(80);
+    pass(
+      (store.data.pages[0].texts || []).some((t) => t.text === "导出前要落库"),
+      "点普通按钮（导出/撤销）前会把编辑框内容落库"
+    );
+    pass(!pageEl().querySelector(".mb-text-edit"), "普通按钮触发 blur 后输入框正常关闭");
+    side.remove();
+
+    // 还原，后面的用例仍按「只有 note1」和编辑器原有默认样式计算
+    store.data.pages[0].texts = [note1];
+    ed.renderTextLayer(rec);
+    ed.setTextSize(prevSize);
+    ed.setTextColor(prevColor);
+    ed.setTextFont(prevFont);
+    await sleep(20);
+  }
+
   /* ---------- G. 性能：200 字批注的命中判定 ---------- */
   {
     const longT: PageText = { id: "long", source: "user", x: 50, y: 300, size: 16, text: CN54.repeat(3).slice(0, 200), color: "#111" };

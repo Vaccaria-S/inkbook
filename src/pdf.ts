@@ -57,8 +57,21 @@ export async function openPdf(
   const task = pdfjs.getDocument({
     url,
     range: pdfjs.PDFDataRangeTransport,
-    disableAutoFetch: false,
-    disableStream: false,
+    /*
+     * 大 PDF 不要自动预取。
+     *
+     * 用户那本 857 页的本子引用的是一份 **69.5MB** 的 PDF。开着自动预取时，
+     * 只要底层流支持 Range，pdf.js 就会在打开后持续把整份文件按块拉完，
+     * 平板上和首屏渲染抢 IO，表现就是「打开半天」；关掉后只按需拉
+     * 「交叉引用表 + 当前页」那几段。
+     *
+     * 说明：pdf.js 4.10 只在协议能提供 Range 时才走这条路。测试环境是
+     * http（server.mjs 支持 Range），收益确定；Obsidian 的 app:// 在部分平台
+     * 也支持 Range，不支持时行为与以前一致（整份缓冲），不会变差。
+     * 代价是连续翻页会多发几次 Range 请求（本地文件，可忽略）。
+     */
+    disableAutoFetch: true,
+    disableStream: true,
   });
   if (onProgress) {
     task.onProgress = (p: any) => {

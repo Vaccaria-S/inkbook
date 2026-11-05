@@ -154,6 +154,14 @@ export class InkbookView extends FileView {
   private paperChips = new Map<PaperId, HTMLElement>();
   private layerSig = "";
   private pageCountSig = -1;
+  /**
+   * 当前高亮的缩略图条目。
+   *
+   * 只切换「旧的 / 新的」两个元素，不要每次状态变化都
+   * querySelectorAll(".mb-thumb") 扫全列表——857 页的本子每次抬笔
+   * 都要扫一遍，打开时也会连着扫好几次。
+   */
+  private activeThumbEl: HTMLElement | null = null;
   private templatePaperSig = "";
 
   /** 平板模式：底部浮动工具条 + 大按钮 */
@@ -453,6 +461,9 @@ export class InkbookView extends FileView {
        * 用户以为那页是空的。
        */
       onThumbNeedsRedraw: (i: number) => {
+        // 侧栏收起/仅阅读时不要画：隐藏状态的 rect 是 0，会走 60×84 的回退尺寸，
+        // 白白把 PDF 页排进光栅化队列（展开时会统一补画）
+        if (!this.thumbVisible()) return;
         const cv = this.thumbCanvases[i];
         if (cv && cv.isConnected) this.editor?.renderThumbnail(cv, i);
       },
@@ -514,7 +525,11 @@ export class InkbookView extends FileView {
     this.templateGrid = null;
     this.paperRow = null;
     this.statsEl = null;
+    // 侧栏收起时列表可能还没建，观察器只在 renderPageList 里断会漏
+    this.thumbObserver?.disconnect();
+    this.thumbObserver = null;
     this.thumbCanvases = [];
+    this.activeThumbEl = null;
     this.templateCards.clear();
     this.paperChips.clear();
     this.layerSig = "";
@@ -568,7 +583,19 @@ export class InkbookView extends FileView {
 
   /** 侧栏显隐：仅阅读时一律收起来，把屏幕让给纸 */
   private applySideVisibility(): void {
-    this.sideEl?.toggleClass("is-hidden", this.reading || !this.sideShown);
+    const visible = !this.reading && this.sideShown;
+    this.sideEl?.toggleClass("is-hidden", !visible);
+    /*
+     * 展开侧栏（或退出仅阅读）时补建/补画缩略图。
+     * 收起状态下不建页列表、不渲染缩略图：857 页的本子光建 DOM 就要几十毫秒，
+     * 更贵的是会立刻用 pdf.js 渲 5 页缩略图，和首屏抢同一份 PDF。
+     */
+    if (visible) this.refreshThumbs();
+  }
+
+  /** 缩略图/页列表现在有必要维护吗（侧栏收起或仅阅读时都不必要） */
+  private thumbVisible(): boolean {
+    return !this.reading && this.sideShown;
   }
 
   private buildUI(): void {
@@ -1352,6 +1379,8 @@ export class InkbookView extends FileView {
         const b = seg.createEl("button", {
           cls: "mb-seg-btn" + (s.textSize === n ? " is-active" : ""),
           text: String(n),
+          // 标记为「文字样式控件」：编辑框开着时点它不能把框提交掉
+          attr: { "data-mb-text-style": "1" },
         });
         b.onclick = () => {
           this.editor?.setTextSize(n);
@@ -1360,7 +1389,10 @@ export class InkbookView extends FileView {
       }
 
       // 字体
-      const fontSel = this.dynEl.createEl("select", { cls: "mb-font-sel" });
+      const fontSel = this.dynEl.createEl("select", {
+        cls: "mb-font-sel",
+        attr: { "data-mb-text-style": "1" },
+      });
       fontSel.title = "字体";
       for (const f of TEXT_FONTS) {
         const opt = fontSel.createEl("option", { text: f.label, value: f.id });
@@ -1378,6 +1410,7 @@ export class InkbookView extends FileView {
           cls:
             "mb-tcolor" +
             (s.textColor.toLowerCase() === c.toLowerCase() ? " is-active" : ""),
+          attr: { "data-mb-text-style": "1" },
         });
         dot.style.background = c;
         dot.title = c;
@@ -1569,6 +1602,8 @@ export class InkbookView extends FileView {
 
   private async runExport(kind: "png" | "pdf"): Promise<void> {
     if (!this.editor || !this.file) return;
+    // 编辑框里没提交的文字先落库，否则导出的文件会少这一段
+    this.editor.commitTextEditNow();
     try {
       const scale = 2;
       if (kind === "png") await exportPagePng(this.app.vault, this.editor, this.file, scale);
@@ -1816,7 +1851,8 @@ export class InkbookView extends FileView {
     const addPage = pageHead.createEl("button", { cls: "mb-link", text: "+ 加一页" });
     addPage.onclick = () => this.editor?.addPage();
     this.pageListEl = pageSec.createDiv("mb-pages");
-    this.renderPageList();
+    // 侧栏收起时先不建：857 页 × (缩略图 + 画布) 没必要在打开文件时付
+    if (this.thumbVisible()) this.renderPageList();
 
     this.statsEl = body.createDiv("mb-stats");
 
@@ -1966,11 +2002,30 @@ export class InkbookView extends FileView {
     add.createDiv({ cls: "mb-thumb-add-label", text: "加一页" });
     add.onclick = () => this.editor?.addPage();
     this.pageCountSig = count;
+    this.activeThumbEl = (this.thumbCanvases[current]?.parentElement as HTMLElement) ?? null;
 
     // 只在缩略图进入可视区时才绘制
     this.observeThumbs();
-    // 当前页和相邻几页先画出来，其余等滚动
-    this.drawThumbRange(current, 2);
+    /*
+     * 先只画当前页；相邻页延到空闲时再画。
+     * 857 页的本子打开时，5 张缩略图会同时排进 pdf.js 的渲染队列，
+     * 和首屏那一页抢 IO/CPU，用户感觉就是「打开半天」。
+     */
+    this.drawThumbRange(current, 0);
+    const idle = (window as any).requestIdleCallback as
+      | ((cb: () => void, opts?: { timeout: number }) => number)
+      | undefined;
+    if (typeof idle === "function") idle(() => this.drawThumbRange(current, 2), { timeout: 1200 });
+    else window.setTimeout(() => this.drawThumbRange(current, 2), 300);
+  }
+
+  /** 只切换新旧两个缩略图的选中态（不扫全列表） */
+  private setActiveThumb(index: number): void {
+    const next = (this.thumbCanvases[index]?.parentElement as HTMLElement) ?? null;
+    if (next === this.activeThumbEl) return;
+    this.activeThumbEl?.classList.remove("is-active");
+    next?.classList.add("is-active");
+    this.activeThumbEl = next;
   }
 
   /** 监听缩略图可见性，进入视口才渲染 */
@@ -2013,18 +2068,21 @@ export class InkbookView extends FileView {
 
   private refreshThumbs(): void {
     if (!this.editor || !this.store) return;
+    this.renderStats();
+    /*
+     * 侧栏收起 / 仅阅读：页列表和缩略图都看不见，什么活都不用干。
+     * 这条也覆盖了「写字时 markDirty → thumbDebounce → refreshThumbs」——
+     * 侧栏没开时不会在每次停顿后去重画 5 张缩略图（PDF 页很贵）。
+     */
+    if (!this.thumbVisible()) return;
     if (this.pageCountSig !== this.store.pageCount) {
       this.renderPageList();
       return;
     }
     // 只重画当前页附近的缩略图——其余等滚进视口时再画
-    this.drawThumbRange(this.store.data.activePage, 2);
     const current = this.store.data.activePage;
-    this.pageListEl?.querySelectorAll(".mb-thumb").forEach((el) => {
-      if (!(el as HTMLElement).dataset.page) return;
-      el.toggleClass("is-active", Number((el as HTMLElement).dataset.page) === current);
-    });
-    this.renderStats();
+    this.drawThumbRange(current, 2);
+    this.setActiveThumb(current);
   }
 
   private renderStats(): void {
@@ -2079,15 +2137,10 @@ export class InkbookView extends FileView {
     this.renderDynamicTools();
 
     if (this.layerSig !== this.layerSignature()) this.renderLayers();
-    if (this.pageCountSig !== s.pageCount) this.renderPageList();
+    // 侧栏收起时不建页列表（首次展开由 applySideVisibility → refreshThumbs 补建）
+    if (this.thumbVisible() && this.pageCountSig !== s.pageCount) this.renderPageList();
 
-    if (this.pageListEl) {
-      this.pageListEl.querySelectorAll(".mb-thumb").forEach((el) => {
-        const page = (el as HTMLElement).dataset.page;
-        if (!page) return;
-        el.toggleClass("is-active", Number(page) === s.pageIndex);
-      });
-    }
+    if (this.thumbVisible()) this.setActiveThumb(s.pageIndex);
 
     if (this.store) {
       if (this.templatePaperSig !== this.store.page.paper) this.renderTemplates();

@@ -105,6 +105,50 @@ async function main() {
   pass(!!stroke && stroke.points.length > 20, "点数 " + (stroke?.points.length || 0));
   pass(!!stroke && stroke.points.some((p) => p[2] !== 0.5), "记录了非恒定压力");
 
+  /*
+   * 单击（按下即抬起、不移动）也必须留下一个点。
+   * 用户报「用钢笔点了一个点，它就是不显示」——先钉住数据层：
+   * 如果这里就没有笔迹，问题在落笔/提交路径；如果这里有，问题在渲染。
+   */
+  {
+    const n0 = store.strokeCount;
+    await draw([[300, 500]], 11);
+    pass(store.strokeCount === n0 + 1, "单击不移动也写入 1 条笔迹（" + n0 + " → " + store.strokeCount + "）");
+    const dot = store.page.layers[0].strokes[store.page.layers[0].strokes.length - 1];
+    pass(!!dot && dot.points.length === 1, "单击笔迹只有 1 个点（" + (dot?.points.length ?? 0) + "）");
+    /*
+     * 渲染层：低缩放下单点必须有**看得见**的面积。
+     * 修复前这里只有 2 个深色像素（几何半径 0.86 设备像素），
+     * 用户看到的就是「点了一下没画上」。修复后要求至少 4 个。
+     */
+    await sleep(60);
+    const cv = document.querySelector(".mb-canvas") as HTMLCanvasElement;
+    const ctx2 = cv.getContext("2d")!;
+    const z = editor.getState().zoom;
+    const k2 = cv.width / 794;
+    const cx = Math.round(300 * k2);
+    const cy = Math.round(500 * k2);
+    const pad = Math.max(4, Math.round(6 * k2));
+    const img = ctx2.getImageData(
+      Math.max(0, cx - pad),
+      Math.max(0, cy - pad),
+      pad * 2,
+      pad * 2
+    ).data;
+    let dark = 0;
+    for (let i = 0; i < img.length; i += 4) {
+      if ((img[i] + img[i + 1] + img[i + 2]) / 3 < 160) dark++;
+    }
+    pass(
+      dark >= 4,
+      "单击点在低缩放下也看得见（" + dark + " 个深色像素，zoom " + z.toFixed(2) + "，修复前 2 个）"
+    );
+    // 收尾：把这个点撤掉，后面的断言仍按原来的笔迹条数算
+    editor.undo();
+    await sleep(40);
+    pass(store.strokeCount === n0, "单击测试收尾：撤销后回到 " + n0 + " 条");
+  }
+
   /* 撤销 / 重做 */
   editor.undo();
   pass(store.strokeCount === 0, "撤销后 0 条");

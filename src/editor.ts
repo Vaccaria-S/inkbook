@@ -309,6 +309,16 @@ export class BookEditor {
     color: string;
     font: string;
   } | null = null;
+  /**
+   * 本次 pointerdown 是否落在「文字样式控件」上（带 data-mb-text-style）。
+   *
+   * 为什么不用 blur 的 relatedTarget 判断：iPad WKWebView 上点 button/select
+   * 经常不转移焦点，relatedTarget 是 null，空框会被当成"点到别处"提交掉，
+   * 「先选样式再输入」在平板（主场景）直接失效。
+   * pointerdown 在 blur 之前到达，用捕获阶段的标记判断，跨平台稳定。
+   */
+  private textEditStylePress = false;
+  private textEditPointerHandler: ((e: PointerEvent) => void) | null = null;
   /** 正在补抽文字的页（防止重复触发） */
   private textExtracting = new Set<number>();
   /** 新建文字用的字号（页面坐标）；已有文字编辑时保持它自己的字号 */
@@ -787,12 +797,70 @@ export class BookEditor {
 
   setTextSize(size: number): void {
     const v = clamp(Math.round(size), 8, 96);
-    if (v === this.textSizeValue) return;
+    const changed = v !== this.textSizeValue;
     this.textSizeValue = v;
-    /* 选中的那段文字跟着改——"选中它再改字号"是最自然的手势 */
+    /*
+     * 编辑框开着时优先照顾框里的预览（新建或改已有文字都一样）。
+     * 改已有文字时同时写回 store，保持"选中它再改字号"的既有语义；
+     * 不能走 else 分支的早退——旧实现里 v === 默认值 时直接 return，
+     * 编辑 30 号文字时点「18」会毫无反应。
+     */
+    const ed = this.textEdit;
+    if (ed) {
+      if (ed.id && this.selectedText) this.updateSelectedText({ size: v });
+      this.applyTextEditStyle({ size: v });
+      this.emitState();
+      return;
+    }
     const sel = this.selectedText;
     if (sel) this.updateSelectedText({ size: v });
-    else this.emitState();
+    else if (changed) this.emitState();
+  }
+
+  /**
+   * 把样式改动实时喂给正在打开的输入框。
+   *
+   * 只改**预览**（textarea 的样式与待提交的 size/color/font），
+   * 不碰 store、不记历史；提交时 commitTextEdit 会用更新后的值写入。
+   */
+  private applyTextEditStyle(patch: { size?: number; color?: string; font?: string }): void {
+    const ed = this.textEdit;
+    if (!ed) return;
+    if (typeof patch.size === "number") {
+      ed.size = patch.size;
+      /*
+       * 字号变了要重新过一遍排版夹取：否则在页底放大字号，
+       * 框会伸到纸外，提交后 layout 又把它拉回纸内——用户看到的是「跳一下」。
+       * 已有文字保留了手动框宽，预览也要用同一个宽度，断行才和提交后一致。
+       */
+      const src = ed.id
+        ? this.store.data.pages[ed.rec.index]?.texts?.find((t) => t.id === ed.id)
+        : null;
+      const l = this.textLayout({
+        x: ed.x,
+        y: ed.y,
+        size: ed.size,
+        text: ed.el.value,
+        font: ed.font,
+        width: src?.width,
+      });
+      ed.y = l.y;
+    }
+    if (patch.color) ed.color = patch.color;
+    if (patch.font) ed.font = patch.font;
+    const ta = ed.el;
+    ta.style.fontSize = `${ed.size * this.zoom}px`;
+    ta.style.fontFamily = textFontStack(ed.font);
+    ta.style.color = ed.color;
+    // 基线固定在 y，字号变了顶边要跟着重算（0.82 个字高是基线上方的距离）
+    ta.style.top = `${(ed.y - ed.size * 0.82) * this.zoom}px`;
+    ta.style.height = "auto";
+    ta.style.height = `${ta.scrollHeight}px`;
+    /*
+     * 点侧栏按钮会把焦点抢走，这里夺回来，用户改完样式可以直接接着打。
+     * <select> 的下拉此时已经关闭（change 才触发），不会被打断。
+     */
+    ta.focus();
   }
 
   get textFont(): string {
@@ -801,10 +869,18 @@ export class BookEditor {
 
   setTextFont(id: string): void {
     if (!TEXT_FONTS.some((f) => f.id === id)) return;
+    const changed = id !== this.textFontValue;
     this.textFontValue = id;
+    const ed = this.textEdit;
+    if (ed) {
+      if (ed.id && this.selectedText) this.updateSelectedText({ font: id });
+      this.applyTextEditStyle({ font: id });
+      this.emitState();
+      return;
+    }
     const sel = this.selectedText;
     if (sel) this.updateSelectedText({ font: id });
-    else this.emitState();
+    else if (changed) this.emitState();
   }
 
   get textColor(): string {
@@ -813,10 +889,18 @@ export class BookEditor {
 
   setTextColor(color: string): void {
     if (!color) return;
+    const changed = color !== this.textColorValue;
     this.textColorValue = color;
+    const ed = this.textEdit;
+    if (ed) {
+      if (ed.id && this.selectedText) this.updateSelectedText({ color });
+      this.applyTextEditStyle({ color });
+      this.emitState();
+      return;
+    }
     const sel = this.selectedText;
     if (sel) this.updateSelectedText({ color });
-    else this.emitState();
+    else if (changed) this.emitState();
   }
 
   /* --------------------------- 选中文字对象 --------------------------- */
@@ -950,6 +1034,9 @@ export class BookEditor {
     sizeLbl.className = "mb-tb-size";
     sizeLbl.textContent = String(Math.round(sel.size));
     const inc = mkBtn("+", "放大字号", () => this.updateSelectedText({ size: plusSize }));
+    // 编辑框开着时点它不能把框提交掉（与侧栏样式控件同一套标记）
+    dec.dataset.mbTextStyle = "1";
+    inc.dataset.mbTextStyle = "1";
     bar.append(dec, sizeLbl, inc);
     bar.appendChild(this.textBarSep());
 
@@ -966,6 +1053,7 @@ export class BookEditor {
     const fontSel = document.createElement("select");
     fontSel.className = "mb-tb-font";
     fontSel.title = "字体";
+    fontSel.dataset.mbTextStyle = "1";
     for (const f of TEXT_FONTS) {
       const opt = document.createElement("option");
       opt.value = f.id;
@@ -985,6 +1073,7 @@ export class BookEditor {
       dot.className = "mb-tb-dot" + ((sel.color || "").toLowerCase() === c.toLowerCase() ? " is-active" : "");
       dot.style.background = c;
       dot.title = "改成这个颜色";
+      dot.dataset.mbTextStyle = "1";
       dot.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -2706,6 +2795,12 @@ export class BookEditor {
     const ta = document.createElement("textarea");
     ta.className = "mb-text-edit";
     ta.spellcheck = false;
+    /*
+     * 空框提示「请输入」：用原生 placeholder，输入第一个字就自动消失，
+     * 而且永远不会混进 value（提交时不需要额外过滤）。
+     * 它的字号/颜色继承 textarea 的当前样式，正好用来预览。
+     */
+    ta.placeholder = "请输入";
     ta.value = hit?.text ?? "";
     ta.style.fontFamily = textFontStack(font);
     ta.style.fontSize = `${size * this.zoom}px`;
@@ -2756,7 +2851,30 @@ export class BookEditor {
         finish(true);
       }
     });
-    ta.addEventListener("blur", () => finish(true));
+    /*
+     * 点字号/字体/颜色这些「文字样式控件」时**不能提交**：
+     * 用户是在「先选样式、再输入」，空框一提交就等于把框关掉。
+     *
+     * 判定用 pointerdown 捕获阶段的标记，**不用 blur 的 relatedTarget**：
+     * iPad WKWebView 上点 button/select 常常不转移焦点（relatedTarget=null），
+     * 用 relatedTarget 会在平板主场景失效。pointerdown 一定先于 blur 到达。
+     * 点其它任何地方（画布、导出、撤销、窗口外）标记为 false，照常提交。
+     */
+    this.textEditStylePress = false;
+    const markStylePress = (ev: PointerEvent) => {
+      const el = ev.target as HTMLElement | null;
+      this.textEditStylePress = !!el?.closest?.("[data-mb-text-style]");
+    };
+    document.addEventListener("pointerdown", markStylePress, true);
+    this.textEditPointerHandler = markStylePress;
+
+    ta.addEventListener("blur", () => {
+      if (this.textEditStylePress) {
+        this.textEditStylePress = false;
+        return;
+      }
+      finish(true);
+    });
     // 高度跟着内容长，别让两行字挤在一行的高度里
     ta.addEventListener("input", () => {
       ta.style.height = "auto";
@@ -2770,11 +2888,30 @@ export class BookEditor {
     });
   }
 
+  /** 拆掉编辑框期间挂的 document 级 pointerdown 监听 */
+  private detachTextEditStyleWatcher(): void {
+    if (this.textEditPointerHandler) {
+      document.removeEventListener("pointerdown", this.textEditPointerHandler, true);
+      this.textEditPointerHandler = null;
+    }
+    this.textEditStylePress = false;
+  }
+
+  /**
+   * 外部动作（导出 / 撤销 / 翻页）前，把编辑框里还没提交的文字落库。
+   *
+   * 移动端点按钮不一定触发 blur，光靠 blur 提交会漏字（导出少一段）。
+   */
+  commitTextEditNow(): void {
+    this.commitTextEdit(true);
+  }
+
   /** 收掉编辑框。save=false 用于 Esc / 页面被卸载时丢弃 */
   private commitTextEdit(save = true): void {
     const ed = this.textEdit;
     if (!ed) return;
     this.textEdit = null;
+    this.detachTextEditStyleWatcher();
     const value = ed.el.value.replace(/\s+$/g, "");
     ed.el.remove();
     if (!save) return;
@@ -3793,6 +3930,8 @@ export class BookEditor {
   }
 
   goToPage(index: number, smooth = true): void {
+    // 翻页前先落库：编辑框里没提交的文字不能跟着页面一起被晾着
+    this.commitTextEdit();
     this.scrollToPage(index, smooth);
   }
 
@@ -3860,6 +3999,8 @@ export class BookEditor {
 
   undo(): void {
     if (this.readOnly) return;
+    // 还在编辑框里的文字先落库（移动端点按钮不一定触发 blur），否则会漏字
+    this.commitTextEdit();
     if (!this.store.undo()) return;
     if (this.recs.length !== this.store.pageCount) {
       this.current = this.store.data.activePage;
@@ -3884,6 +4025,7 @@ export class BookEditor {
 
   redo(): void {
     if (this.readOnly) return;
+    this.commitTextEdit();
     if (!this.store.redo()) return;
     if (this.recs.length !== this.store.pageCount) {
       this.current = this.store.data.activePage;

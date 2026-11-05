@@ -279,6 +279,24 @@ export function strokePath(stroke: Stroke): Path2D {
   return path;
 }
 
+/**
+ * 当前画布变换的缩放倍数（页面坐标 → 设备像素）。
+ *
+ * 只有单击点用它：单点的几何半径是「笔画宽度的一半」，在 fit 缩放（0.6 倍）
+ * 下只有 1 个设备像素，看起来就像「点了一下没画上」。给半径加一个屏幕空间
+ * 下限，任何缩放下都留得下一个看得见的点。导出/嵌入/缩略图各自带自己的变换，
+ * 会被同一套下限正确覆盖（导出 scale=2 时下限比几何半径还小，不影响）。
+ */
+function deviceScaleOf(ctx: CanvasRenderingContext2D): number {
+  try {
+    const m = ctx.getTransform?.();
+    const k = m ? Math.hypot(m.a, m.b) : 1;
+    return Number.isFinite(k) && k > 0.0001 ? k : 1;
+  } catch (_) {
+    return 1;
+  }
+}
+
 export function drawStroke(ctx: CanvasRenderingContext2D, stroke: Stroke, alpha = 1): void {
   const pts = stroke.points;
   if (!pts.length) return;
@@ -293,8 +311,10 @@ export function drawStroke(ctx: CanvasRenderingContext2D, stroke: Stroke, alpha 
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     if (pts.length === 1) {
+      // 同钢笔单点：屏幕空间下限，别让一个点缩没了
+      const r = Math.max(stroke.size / 2, 1.2 / deviceScaleOf(ctx));
       ctx.beginPath();
-      ctx.arc(pts[0][0], pts[0][1], stroke.size / 2, 0, Math.PI * 2);
+      ctx.arc(pts[0][0], pts[0][1], r, 0, Math.PI * 2);
       ctx.fill();
     } else {
       ctx.stroke(strokePath(stroke));
@@ -315,8 +335,14 @@ export function drawStroke(ctx: CanvasRenderingContext2D, stroke: Stroke, alpha 
 
   ctx.fillStyle = stroke.color;
   if (pts.length === 1) {
+    /*
+     * 单击点：几何半径 = 字号×0.46，但缩放 0.6 倍时直径只剩 1 个屏幕像素，
+     * 用户看到的是「用钢笔点了一个点，它就是不显示」。加一个屏幕空间下限
+     * （直径 ≥ 2.4 设备像素），任何缩放下都看得见。
+     */
+    const r = Math.max(0.45, stroke.size * 0.46, 1.2 / deviceScaleOf(ctx));
     ctx.beginPath();
-    ctx.arc(pts[0][0], pts[0][1], Math.max(0.45, stroke.size * 0.46), 0, Math.PI * 2);
+    ctx.arc(pts[0][0], pts[0][1], r, 0, Math.PI * 2);
     ctx.fill();
   } else {
     ctx.fill(strokePath(stroke));

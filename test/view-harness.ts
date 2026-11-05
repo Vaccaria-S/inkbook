@@ -131,6 +131,55 @@ async function main() {
   pass(view.sideEl.querySelectorAll(".mb-thumb").length === 3, "2 页 + 加页按钮");
   pass(view.sideEl.querySelectorAll(".mb-layer").length === 1, "1 个图层");
 
+  /*
+   * 侧栏收起时不能预渲染缩略图（大本子打开提速）。
+   * 用户那本 857 页的本子，打开时侧栏是收起的：以前照样建 857 个条目、
+   * 还立刻用 pdf.js 渲 5 页缩略图，和首屏抢同一份 PDF。
+   */
+  {
+    const v = view as any;
+    const orig = view.editor!.renderThumbnail.bind(view.editor!);
+    let calls = 0;
+    view.editor!.renderThumbnail = ((cv: HTMLCanvasElement, i: number) => {
+      calls += 1;
+      return orig(cv, i);
+    }) as any;
+
+    v.sideShown = false;
+    v.applySideVisibility();
+    calls = 0;
+    v.refreshThumbs();
+    pass(calls === 0, "侧栏收起：refreshThumbs 不渲染任何缩略图（实际 " + calls + " 次）");
+
+    v.sideShown = true;
+    v.applySideVisibility();
+    pass(calls > 0, "展开侧栏：自动补画当前页附近的缩略图（" + calls + " 次）");
+
+    /*
+     * 「从未建过列表」的路径：收起状态打开文件时列表根本不建。
+     * 展开必须能补建出完整列表，不能是空白。
+     */
+    v.sideShown = false;
+    v.applySideVisibility();
+    v.pageListEl.empty();
+    v.thumbCanvases = [];
+    v.pageCountSig = -1;
+    calls = 0;
+    v.refreshThumbs();
+    pass(
+      view.sideEl.querySelectorAll(".mb-thumb").length === 0,
+      "侧栏收起且列表未建：打开时不创建缩略图条目（" + view.sideEl.querySelectorAll(".mb-thumb").length + " 个）"
+    );
+    v.sideShown = true;
+    v.applySideVisibility();
+    pass(
+      view.sideEl.querySelectorAll(".mb-thumb").length === 3,
+      "首次展开：补建完整页列表（2 页 + 加页，实际 " + view.sideEl.querySelectorAll(".mb-thumb").length + " 个）"
+    );
+
+    view.editor!.renderThumbnail = orig;
+  }
+
   /* 真实指针落笔 */
   const pageEl = view.contentEl.querySelector(".mb-page") as HTMLElement;
   const r = pageEl.getBoundingClientRect();
