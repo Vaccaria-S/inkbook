@@ -165,7 +165,7 @@ export class InkbookSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("生成文字索引（全局搜索能搜到手写本里的字）")
       .setDesc(
-        "开启后，每次保存会在本子同目录的「本子名.墨本索引/」里，为**有文字的页**各写一个「第 N 页.md」（文字来自 PDF 原文与手动添加的文字，手写笔迹不在其中）。Obsidian 全局搜索命中它就能定位到第几页，点开直接跳回那一页。索引是派生文件，删掉不影响本子，下次保存会重建。"
+        "开启后，每次保存会在本子同目录的「本子名.墨本索引/」里，为**有文字的页**各写一个「本子名 · 第 N 页.md」（文字来自 PDF 原文与手动添加的文字，手写笔迹不在其中）。搜索结果直接显示是哪本本子的第几页，点开就跳回那一页。索引是派生文件，删掉不影响本子，下次保存会重建。"
       )
       .addToggle((t) =>
         t.setValue(this.plugin.settings.searchIndex !== false).onChange(async (v) => {

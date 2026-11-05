@@ -1,5 +1,8 @@
-import { OneEuroFilter, shapePressure, speedWidthFactor } from "../src/filter";
+import { OneEuroFilter, shapePressure, speedWidthFactor, zoomNormalization } from "../src/filter";
 import { predictTail, effectivePressures, strokePath, drawStroke, paintStroke, invalidateStroke } from "../src/ink";
+import { BookEditor } from "../src/editor";
+import { BookStore } from "../src/store";
+import { createBook } from "../src/types";
 import type { Pt, Stroke } from "../src/types";
 
 const lines: string[] = [];
@@ -15,7 +18,210 @@ const pass = (ok: boolean, label: string) => {
 };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/* ============================================================================
+ * 跨缩放手感一致性（双 zoom A/B）
+ *
+ * 用户报「放大之后再写，笔迹识别得比较粗糙」。根因：输入管线把**屏幕尺度**
+ * 的手速/位移当成了**页面单位**——同一手速在 2.8 倍时换算到页面坐标只剩
+ * 1/3.5，于是滤波过度平滑（滞后 9.5px vs 3.1px）、采样阈值变大
+ * （1.54px vs 0.44px）、快笔收窄失效（压力 0.97 vs 0.80）。
+ *
+ * 修复（src/filter.ts 的 zoomNormalization + editor.ts 三处接入）之后，
+ * **同一条屏幕轨迹**在 0.8 倍与 2.8 倍下应该得到同一条**屏幕上的**笔迹：
+ * 路径一致、压力一致。
+ *
+ * 这段是**真指针事件**的 A/B：真的派发 pointerdown/pointermove/pointerup，
+ * 走完整的 editor 输入管线（1€ 滤波 → 采样阈值 → 压力整形 → 速度收窄），
+ * 而不是直接调纯函数——纯函数测试锁不住「有没有漏接一处归一化」。
+ *
+ * 时间轴用 Object.defineProperty 覆盖 event.timeStamp 写死，
+ * 这样两次 A/B 拿到**完全相同**的时间戳，差异只可能来自缩放本身。
+ * （PointerEvent 的 timeStamp 是可覆盖的自有属性，实测生效。）
+ * ========================================================================== */
+
+/** 一条屏幕轨迹：相对页面左上角的 CSS px 位移 + 时间戳 */
+interface TrackPoint {
+  /** 相对页面左上角的屏幕位移（CSS px） */
+  sx: number;
+  sy: number;
+  /** 事件时间戳（ms） */
+  t: number;
+}
+
+/**
+ * 屏幕轨迹：微移动 + 一个小转折。
+ *
+ * 微移动每步 0.5 屏幕 px——这是关键：旧实现里 2.8 倍的采样阈值是
+ * 1.54 **屏幕** px（0.55 页面单位），所以这些微移会被整段丢掉；
+ * 新实现里阈值是 0.44 屏幕 px（0.55/3.5 页面单位），两个缩放都采得到。
+ * 后面的快笔段（每步 12 屏幕 px）把速度拉起来，让压力差显现出来。
+ */
+function buildScreenTrack(): TrackPoint[] {
+  const raw: Array<[number, number]> = [];
+  let x = 0;
+  let y = 0;
+  raw.push([x, y]); // 落笔
+  for (let i = 0; i < 20; i++) {
+    x += 0.5; // 细密微移动 0.5px/步
+    raw.push([x, y]);
+  }
+  for (let i = 0; i < 8; i++) {
+    x += 12; // 快笔 12px/步
+    raw.push([x, y]);
+  }
+  for (let i = 0; i < 8; i++) {
+    y += 12; // 小转折
+    raw.push([x, y]);
+  }
+  // 时间轴写死：两次 A/B 完全一致，差异只可能来自缩放
+  return raw.map((p, i) => ({ sx: p[0], sy: p[1], t: 1000 + i * 16 }));
+}
+
+/** 一次 A/B 的结果：页面坐标路径 + 压力序列 */
+interface AbRun {
+  /** 页面坐标路径（未经缩放换算） */
+  points: Pt[];
+}
+
+/**
+ * 造一个跟真实 Obsidian 一致的编辑器宿主。
+ *
+ * 尺寸必须够大：2.8 倍时页面是 794×2.8 = 2223px 宽，
+ * 容器放不下就画不到纸上，轨迹会被裁掉。
+ */
+function makeAbHost(): { host: HTMLElement; editor: BookEditor; store: BookStore } {
+  const root = document.createElement("div");
+  root.className = "mb-root";
+  root.style.cssText =
+    "position:absolute;left:0;top:0;width:2600px;height:3400px;overflow:auto;display:flex;flex-direction:column";
+  const host = document.createElement("div");
+  host.className = "mb-host";
+  root.appendChild(host);
+  document.body.appendChild(root);
+  const book = createBook("缩放一致性", "blank", "white");
+  const store = new BookStore(book);
+  const editor = new BookEditor(host, store, {
+    penOnly: false,
+    pressure: 1,
+    onState: () => {},
+    onChange: () => {},
+    onPageChange: () => {},
+  });
+  return { host, editor, store };
+}
+
+/**
+ * 把整条屏幕轨迹派发成真指针事件，返回这次落笔写出的笔迹。
+ */
+async function drawTrack(
+  editor: BookEditor,
+  store: BookStore,
+  zoom: number,
+  track: TrackPoint[],
+  pointerId: number
+): Promise<AbRun> {
+  editor.setZoom(zoom);
+  await sleep(200); // 等布局与页宽稳定
+
+  const rec = (editor as any).recs[0];
+  const pageEl = rec.pageEl as HTMLElement;
+  const rect = pageEl.getBoundingClientRect();
+  const before = store.strokeCount;
+
+  /*
+   * 派发真指针事件。
+   *
+   * timeStamp 用 defineProperty 写死（PointerEvent 的 timeStamp 是可覆盖的
+   * 自有属性），让两次 A/B 的时间轴逐点相同。
+   * clientX/clientY 用构造器给小数——PointerEvent 保留亚像素，实测 100.5
+   * 原样传到 handler，微移动的 0.5px 步长才不会被抹平。
+   */
+  const fire = (type: string, p: TrackPoint, buttons: number) => {
+    const e = new PointerEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      pointerId,
+      pointerType: "pen",
+      isPrimary: true,
+      button: 0,
+      buttons,
+      clientX: rect.left + p.sx,
+      clientY: rect.top + p.sy,
+      pressure: type === "pointerup" ? 0 : 0.5,
+    });
+    Object.defineProperty(e, "timeStamp", { value: p.t, configurable: true });
+    pageEl.dispatchEvent(e);
+  };
+
+  fire("pointerdown", track[0], 1);
+  for (let i = 1; i < track.length; i++) fire("pointermove", track[i], 1);
+  const last = track[track.length - 1];
+  fire("pointerup", last, 0);
+  await sleep(120);
+
+  const strokes = store.page.layers[0].strokes;
+  const stroke = strokes[strokes.length - 1];
+  if (strokes.length !== before + 1 || !stroke) return { points: [] };
+  return { points: stroke.points };
+}
+
+/**
+ * 按弧长重采样一条路径。
+ *
+ * 为什么不能直接逐点比：两个缩放下采样点**数量**可能不同
+ * （旧实现 34 vs 22 点），逐点比就变成了「拿第 5 点比第 5 点」，
+ * 后面整段都错位。按弧长重采样是形状层面的比较，公平且稳定。
+ */
+function resampleByArcLength(pts: Pt[], n: number): Pt[] {
+  if (!pts.length) return [];
+  if (pts.length === 1) return Array.from({ length: n }, () => pts[0]);
+  const cum: number[] = [0];
+  for (let i = 1; i < pts.length; i++) {
+    cum.push(cum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
+  }
+  const total = cum[cum.length - 1];
+  const out: Pt[] = [];
+  let j = 0;
+  for (let k = 0; k < n; k++) {
+    const target = (k / (n - 1)) * total;
+    while (j < cum.length - 2 && cum[j + 1] < target) j++;
+    const seg = cum[j + 1] - cum[j];
+    const t = seg > 1e-9 ? (target - cum[j]) / seg : 0;
+    const a = pts[j];
+    const b = pts[j + 1];
+    out.push([
+      a[0] + (b[0] - a[0]) * t,
+      a[1] + (b[1] - a[1]) * t,
+      a[2] + (b[2] - a[2]) * t,
+    ]);
+  }
+  return out;
+}
+
+/** 页面坐标 → 屏幕坐标：页面 1 单位 = zoom 个 CSS px */
+function toScreen(pts: Pt[], zoom: number): Pt[] {
+  return pts.map((p) => [p[0] * zoom, p[1] * zoom, p[2]] as Pt);
+}
+
+/** 两条路径逐点最大距离 */
+function maxDev(a: Pt[], b: Pt[]): number {
+  let m = 0;
+  for (let i = 0; i < a.length; i++) m = Math.max(m, Math.hypot(a[i][0] - b[i][0], a[i][1] - b[i][1]));
+  return m;
+}
+
 async function main() {
+  /* -------------------- 缩放手感归一化 -------------------- */
+  {
+    pass(zoomNormalization(0.8) === 1, "缩放归一化：0.8 倍是基准（1.0）");
+    pass(
+      Math.abs(zoomNormalization(2.8) - 3.5) < 1e-9,
+      "缩放归一化：2.8 倍 = 3.5（速度/采样阈值换回屏幕尺度）"
+    );
+    pass(zoomNormalization(0.5) === 1, "缩放归一化：低倍不放大（下限 1）");
+    pass(zoomNormalization(NaN) === 1, "缩放归一化：非法 zoom 回落 1");
+  }
+
   /* -------------------- 1€ 滤波：去抖 -------------------- */
   {
     const f = new OneEuroFilter(1.0, 0.02, 1.0);
@@ -273,6 +479,82 @@ async function main() {
       pass(ms < 200, "200 点笔迹 ×100 次 path 构建 " + ms.toFixed(1) + "ms（< 200ms）");
     }
   }
+
+
+  /* -------------------- 跨缩放手感一致性（双 zoom A/B） -------------------- */
+  {
+    const { editor, store } = makeAbHost();
+    await sleep(500); // 等页面挂载
+
+    const track = buildScreenTrack();
+    const Z_LOW = 0.8;
+    const Z_HIGH = 2.8;
+
+    const low = await drawTrack(editor, store, Z_LOW, track, 61);
+    const high = await drawTrack(editor, store, Z_HIGH, track, 62);
+
+    pass(
+      low.points.length >= 20 && high.points.length >= 20,
+      "双 zoom A/B：两个缩放都写出了足量点（0.8 倍 " +
+        low.points.length +
+        " 点 / 2.8 倍 " +
+        high.points.length +
+        " 点）"
+    );
+
+    /*
+     * ① 路径一致：把两次的页面坐标换算回屏幕尺度再比。
+     *
+     * 旧实现这里差 100+ 屏幕 px（采样阈值在 2.8 倍下变成 1.54px，
+     * 微移整段被丢掉，路径形状都不一样了）。
+     */
+    const lowScreen = toScreen(low.points, Z_LOW);
+    const highScreen = toScreen(high.points, Z_HIGH);
+    const lowShape = resampleByArcLength(lowScreen, 120);
+    const highShape = resampleByArcLength(highScreen, 120);
+    const pathDev = maxDev(lowShape, highShape);
+    pass(
+      pathDev < 0.5,
+      "跨缩放路径一致：同一屏幕轨迹在 0.8/2.8 倍下换算回屏幕尺度后偏差 " +
+        pathDev.toFixed(4) +
+        "px（< 0.5，旧实现约 100px）"
+    );
+
+    /*
+     * ② 压力一致：同一屏幕手速在两个缩放下给出的压力必须一样。
+     *
+     * 旧实现：0.8 倍压力约 0.80、2.8 倍约 0.97，差 0.17。
+     * 新实现：两者完全一致（速度按屏幕尺度算），差 ~0。
+     */
+    const lowP = lowShape.map((p) => p[2]);
+    const highP = highShape.map((p) => p[2]);
+    let pressureDiff = 0;
+    for (let i = 0; i < lowP.length; i++) {
+      pressureDiff = Math.max(pressureDiff, Math.abs(lowP[i] - highP[i]));
+    }
+    pass(
+      pressureDiff < 0.05,
+      "跨缩放压力一致：同一屏幕手速在 0.8/2.8 倍下压力最大差 " +
+        pressureDiff.toFixed(4) +
+        "（< 0.05，旧实现约 0.17）"
+    );
+
+    // 附带的诊断信息：两次的实际压力水平，便于人肉核对
+    log(
+      "  [诊断] 0.8 倍压力 " +
+        lowP[0].toFixed(3) +
+        "→" +
+        lowP[lowP.length - 1].toFixed(3) +
+        "，2.8 倍压力 " +
+        highP[0].toFixed(3) +
+        "→" +
+        highP[highP.length - 1].toFixed(3)
+    );
+
+    editor.destroy();
+    document.querySelectorAll(".mb-root").forEach((el) => el.remove());
+  }
+
 
   await sleep(60);
   log(failures === 0 ? "ALL PASS" : failures + " FAILED");

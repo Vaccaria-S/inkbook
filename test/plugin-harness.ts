@@ -24,7 +24,10 @@ const wsProto: any = {
 };
 const workspace: any = Object.create(wsProto);
 Object.assign(workspace, {
-  on: () => ({}),
+  on: (evt: string, cb: any) => {
+    if (evt === "file-open") fileOpenCb = cb;
+    return {};
+  },
   onLayoutReady: (cb: () => void) => setTimeout(cb, 0),
   getLeaf: () => ({ openFile: async () => {}, setViewState: async () => {} }),
   getActiveFile: () => activeFile,
@@ -53,6 +56,11 @@ const app: any = {
 };
 
 const manifest = { id: "inkbook", name: "墨本 Inkbook", version: "0.1.0", dir: ".obsidian/plugins/inkbook" };
+
+/** file-open 事件的回调（插件注册在 workspace.on("file-open") 上） */
+let fileOpenCb: ((f: any) => void) | null = null;
+/** openBookAt 打开时记下的路径 + 页码 */
+const openedAt: Array<{ path: string; page: number }> = [];
 
 async function main() {
   try {
@@ -150,6 +158,61 @@ async function main() {
     );
     inkbookLeaves = leafWith(true);
     log((fire() === 1 ? "PASS" : "FAIL") + " 卸载后不再拦截：1 次");
+
+    /* ---- 搜索结果点开 → 直接落到本子那一页 ---- */
+    /*
+     * 用户原话：「在笔记文件里搜索打的字时……我想要的是直接显示出是这个文件」。
+     *
+     * 索引页的文件名带本子名（全局搜索结果显示的就是文件名），
+     * 点开之后靠 parseIndexPath 反查出「哪本 + 第几页」，
+     * 然后换成本子并滚到那一页——不停在 md 里。
+     */
+    {
+      const bookFile = { path: "笔记/数学.inkbook", extension: "inkbook" };
+      (app.vault as any).getAbstractFileByPath = (p: string) =>
+        p === bookFile.path ? bookFile : null;
+      const origOpen = (plugin as any).openBookAt.bind(plugin);
+      (plugin as any).openBookAt = async (path: string, page: number) => {
+        openedAt.push({ path, page });
+      };
+
+      // 新命名：数学 · 第 12 页.md
+      fileOpenCb?.({ path: "笔记/数学.墨本索引/数学 · 第 12 页.md" });
+      await new Promise((r) => setTimeout(r, 120));
+      log(
+        (openedAt.length === 1 &&
+          openedAt[0].path === "笔记/数学.inkbook" &&
+          openedAt[0].page === 12
+          ? "PASS"
+          : "FAIL") +
+          " 点开新命名的索引页 → 跳到「笔记/数学.inkbook」第 12 页：" +
+          JSON.stringify(openedAt[0] || null)
+      );
+
+      // 旧命名（迁移期残留）：第 12 页.md —— 点开也得能跳回去
+      openedAt.length = 0;
+      fileOpenCb?.({ path: "笔记/数学.墨本索引/第 12 页.md" });
+      await new Promise((r) => setTimeout(r, 120));
+      log(
+        (openedAt.length === 1 &&
+          openedAt[0].path === "笔记/数学.inkbook" &&
+          openedAt[0].page === 12
+          ? "PASS"
+          : "FAIL") +
+          " 点开旧命名的索引页 → 同样跳到第 12 页：" +
+          JSON.stringify(openedAt[0] || null)
+      );
+
+      // 普通 md 不能被当成索引页
+      openedAt.length = 0;
+      fileOpenCb?.({ path: "笔记/普通笔记.md" });
+      await new Promise((r) => setTimeout(r, 120));
+      log(
+        (openedAt.length === 0 ? "PASS" : "FAIL") + " 普通 md 不会被当成索引页"
+      );
+
+      (plugin as any).openBookAt = origOpen;
+    }
   } catch (e: any) {
     log("FAIL " + (e && e.stack ? e.stack : e));
   }

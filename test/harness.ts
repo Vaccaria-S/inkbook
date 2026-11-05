@@ -7,10 +7,13 @@ import { availableTextWidth, layoutUserText, wrapText } from "../src/textwrap";
 import {
   buildPageIndex,
   indexDirFor,
+  indexFileName,
   indexPagePath,
+  isLegacyIndexPageName,
   parseIndexPath,
   writeTextIndex,
 } from "../src/indexer";
+import { importPdf } from "../src/importer";
 
 const lines: string[] = [];
 const out = document.getElementById("out")!;
@@ -147,6 +150,52 @@ async function main() {
     editor.undo();
     await sleep(40);
     pass(store.strokeCount === n0, "单击测试收尾：撤销后回到 " + n0 + " 条");
+  }
+
+  /*
+   * 放大后细写：同样的屏幕小步移动，在 2.8 倍下必须仍然被采样。
+   * 旧实现的采样阈值固定 0.55 页面单位（2.8 倍时 = 1.54 CSS px），
+   * 细小的转折会被整段丢掉，用户感觉「放大再写识别得比较粗糙」。
+   */
+  {
+    const zPrev = editor.getState().zoom;
+    editor.setZoom(2.8);
+    await sleep(220);
+    const r2 = pageEl().getBoundingClientRect();
+    const n0 = store.strokeCount;
+    const pid = 12;
+    const at = (type: string, dx: number, dy: number, buttons: number) =>
+      pageEl().dispatchEvent(
+        new PointerEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          pointerId: pid,
+          pointerType: "pen",
+          isPrimary: true,
+          button: 0,
+          buttons,
+          clientX: r2.left + dx,
+          clientY: r2.top + dy,
+          pressure: 0.5,
+        })
+      );
+    at("pointerdown", 300, 300, 1);
+    for (let i = 1; i <= 80; i += 1) {
+      at("pointermove", 300 + i * 0.5, 300 + Math.sin(i / 6) * 2, 1);
+      if (i % 8 === 0) await sleep(8);
+    }
+    at("pointerup", 340, 300, 0);
+    await sleep(80);
+    const fine = store.page.layers[0].strokes[store.page.layers[0].strokes.length - 1];
+    pass(store.strokeCount === n0 + 1, "2.8 倍细写：写入了 1 条笔迹");
+    pass(
+      !!fine && fine.points.length >= 50,
+      "2.8 倍细写：微小位移仍被采样（" + (fine?.points.length ?? 0) + " 点，旧阈值会只剩约 1/3）"
+    );
+    editor.undo();
+    await sleep(40);
+    editor.setZoom(zPrev);
+    await sleep(220);
   }
 
   /* 撤销 / 重做 */
@@ -552,14 +601,55 @@ async function main() {
       "索引目录与本子同目录、同名前缀：" + indexDirFor(mockFile)
     );
     pass(
-      indexPagePath(mockFile, 12) === "笔记/数学.墨本索引/第 12 页.md",
-      "索引页文件名带页码：" + indexPagePath(mockFile, 12)
+      indexPagePath(mockFile, 12) === "笔记/数学.墨本索引/数学 · 第 12 页.md",
+      "索引页文件名带本子名与页码：" + indexPagePath(mockFile, 12)
+    );
+    pass(
+      indexFileName(mockFile, 12) === "数学 · 第 12 页.md",
+      "索引页文件名（不含目录）带本子名：" + indexFileName(mockFile, 12)
+    );
+    pass(
+      indexFileName(mockFile, 12).includes("数学"),
+      "全局搜索结果显示的是文件名——文件名里必须能看到是哪本本子"
     );
 
-    const parsed = parseIndexPath("笔记/数学.墨本索引/第 12 页.md");
+    /*
+     * 本子名超长时要截断：Windows 的文件名上限 255 字符，
+     * 本子名占满 240 时再加「 · 第 12 页.md」就超了，文件根本建不出来。
+     * 截断只影响文件名，目录名不变，反查照样对得上。
+     */
+    {
+      const longName = "长".repeat(200);
+      const longFile = {
+        path: "笔记/长名字.inkbook",
+        basename: longName,
+        parent: { path: "笔记" },
+      } as any;
+      const nm = indexFileName(longFile, 12);
+      pass(
+        Array.from(nm).length <= 255,
+        "超长本子名：索引文件名被截断到 255 字符内（实际 " + Array.from(nm).length + "）"
+      );
+      pass(
+        indexDirFor(longFile) === "笔记/" + longName + ".墨本索引",
+        "超长本子名：索引目录名不截断（反查靠它）"
+      );
+    }
+
+    const parsed = parseIndexPath("笔记/数学.墨本索引/数学 · 第 12 页.md");
     pass(
       parsed?.bookPath === "笔记/数学.inkbook" && parsed?.page === 12,
-      "索引页路径能反查出本子与页码"
+      "新命名索引页路径能反查出本子与页码"
+    );
+    const parsedOld = parseIndexPath("笔记/数学.墨本索引/第 12 页.md");
+    pass(
+      parsedOld?.bookPath === "笔记/数学.inkbook" && parsedOld?.page === 12,
+      "旧命名索引页仍能反查（迁移期间搜索结果里的旧链接不失效）"
+    );
+    const parsedDot = parseIndexPath("笔记/高数 · 下册.墨本索引/高数 · 下册 · 第 3 页.md");
+    pass(
+      parsedDot?.bookPath === "笔记/高数 · 下册.inkbook" && parsedDot?.page === 3,
+      "本子名里本身带「·」也能正确反查"
     );
     pass(parseIndexPath("笔记/数学.md") === null, "普通 md 不会被当成索引页");
     pass(parseIndexPath("笔记/数学.墨本索引/说明.md") === null, "索引目录里的非页文件不误判");
@@ -590,16 +680,44 @@ async function main() {
 
     // 旧方案的一本一个大 md：迁移时要被删掉
     fsMap.set("笔记/数学.墨本文字.md", "旧索引");
+    // 旧命名的一页一个 md：同一页会以新名字重建，旧的必须清掉
+    fsMap.set("笔记/数学.墨本索引/第 1 页.md", "旧命名第 1 页");
+    fsMap.set("笔记/数学.墨本索引/第 7 页.md", "旧命名第 7 页（这一页已经不存在）");
 
     await writeTextIndex(mockApp, mockFile, bk);
-    const f1 = fsMap.get("笔记/数学.墨本索引/第 1 页.md") || "";
+    const f1 = fsMap.get("笔记/数学.墨本索引/数学 · 第 1 页.md") || "";
     pass(
       dirs.has("笔记/数学.墨本索引") && f1.includes("傅里叶变换的定义"),
-      "writeTextIndex 建好索引目录并写出第 1 页"
+      "writeTextIndex 建好索引目录并写出第 1 页（文件名带本子名）"
     );
-    pass(fsMap.has("笔记/数学.墨本索引/第 2 页.md"), "有文字的第 2 页也生成了索引页");
-    pass(!fsMap.has("笔记/数学.墨本索引/第 3 页.md"), "没有文字的页不生成文件");
+    pass(
+      fsMap.has("笔记/数学.墨本索引/数学 · 第 2 页.md"),
+      "有文字的第 2 页也生成了索引页"
+    );
+    pass(
+      !fsMap.has("笔记/数学.墨本索引/数学 · 第 3 页.md"),
+      "没有文字的页不生成文件"
+    );
     pass(!fsMap.has("笔记/数学.墨本文字.md"), "旧版单文件索引被清理掉");
+    pass(
+      !fsMap.has("笔记/数学.墨本索引/第 1 页.md") &&
+        !fsMap.has("笔记/数学.墨本索引/第 7 页.md"),
+      "旧命名的索引页被清理掉（不会和新命名重复出现在搜索里）"
+    );
+
+    /*
+     * 旧命名的识别口径必须和清理口径是同一把尺子。
+     * 认得出、却删不掉 —— 或者认错了、删掉了别的东西 —— 都是 bug。
+     */
+    pass(isLegacyIndexPageName("第 12 页.md"), "旧命名识别：第 12 页.md 是旧索引页");
+    pass(
+      !isLegacyIndexPageName("数学 · 第 12 页.md"),
+      "旧命名识别：新命名不算旧索引页（不能被误删）"
+    );
+    pass(
+      !isLegacyIndexPageName("说明.md") && !isLegacyIndexPageName("数学.md"),
+      "旧命名识别：普通 md 不算旧索引页"
+    );
 
     const w1 = writes;
     await writeTextIndex(mockApp, mockFile, bk);
@@ -607,7 +725,127 @@ async function main() {
 
     bk.pages[1].texts = [];
     await writeTextIndex(mockApp, mockFile, bk);
-    pass(!fsMap.has("笔记/数学.墨本索引/第 2 页.md"), "某页文字清空后删掉对应索引页");
+    pass(
+      !fsMap.has("笔记/数学.墨本索引/数学 · 第 2 页.md"),
+      "某页文字清空后删掉对应索引页"
+    );
+
+    /*
+     * 导入 PDF 的端到端索引：
+     *   真实 sample.pdf（第 1 页）→ importPdf 抽文字 → 组装成书 → writeTextIndex
+     * 断言抽出来的每一条 PDF 原文都进入了索引 md，且文件名带本子名。
+     */
+    {
+      const pdfFile = { path: "/test/sample.pdf", name: "sample.pdf", basename: "sample" } as any;
+      const imported = await importPdf(mockApp, pdfFile, mockFile.path, 1);
+      pass(imported.pages.length === 1, "导入 PDF：只取第 1 页（pageLimit=1）");
+      const pdfTexts = (imported.pages[0].texts || []).filter(
+        (t) => t.source === "pdf" && (t.text || "").trim()
+      );
+      pass(
+        pdfTexts.length > 0,
+        "导入 PDF：第 1 页抽出 " + pdfTexts.length + " 条 PDF 文字"
+      );
+
+      const importedBook = createBook("数学", "grid", "white");
+      importedBook.pages = imported.pages;
+      importedBook.source = imported.source;
+      await writeTextIndex(mockApp, mockFile, importedBook);
+      const idxPath = "笔记/数学.墨本索引/数学 · 第 1 页.md";
+      const idx = fsMap.get(idxPath) || "";
+      const hit = pdfTexts.filter((t) => idx.includes(t.text)).length;
+      pass(
+        hit === pdfTexts.length,
+        "导入 PDF 后，索引内容含全部 " + hit + "/" + pdfTexts.length + " 条 PDF 原文"
+      );
+      pass(idx.includes("# 数学 · 第 1 页"), "导入后索引标题仍是「本子名 · 第 N 页」");
+      pass(
+        idxPath.split("/").pop() === "数学 · 第 1 页.md",
+        "导入后索引文件名带本子名（全局搜索直接显示「数学 · 第 1 页」）"
+      );
+      const back = parseIndexPath(idxPath);
+      pass(
+        back?.bookPath === "笔记/数学.inkbook" && back?.page === 1,
+        "导入后的索引页路径能反查回本子第 1 页"
+      );
+      pass(
+        pdfTexts.every((t) => (t.text || "").trim().length > 0),
+        "导入 PDF：抽出的 " + pdfTexts.length + " 条文字都不是空串（空串进不了索引）"
+      );
+    }
+
+    /*
+     * 导入 PDF → 索引 → **进 vault 文件表** 的端到端。
+     *
+     * 前面的用例只验了「内容写对了」，没验「Obsidian 认得这个文件」。
+     * 而「全局搜索搜不到」的真因正是：文件在磁盘上，却不在 Obsidian 的
+     * 文件表里。这里把导入结果真的写进一个带文件表的 vault，
+     * 断言索引页进了文件表、且文件里的内容含全部 PDF 原文。
+     */
+    {
+      const disk = new Map<string, string>();
+      const folders = new Set<string>();
+      const registry = new Map<string, { path: string }>();
+      const vault = {
+        adapter: {
+          exists: async (p: string) => disk.has(p) || folders.has(p),
+          read: async (p: string) => disk.get(p) || "",
+          write: async (p: string, d: string) => disk.set(p, d),
+          remove: async (p: string) => {
+            disk.delete(p);
+            registry.delete(p);
+          },
+          mkdir: async (p: string) => folders.add(p),
+          list: async (p: string) => ({
+            files: [...disk.keys()].filter((k) => k.startsWith(p + "/")),
+            folders: [],
+          }),
+        },
+        getAbstractFileByPath: (p: string) => registry.get(p) ?? null,
+        createFolder: async (p: string) => {
+          folders.add(p);
+          registry.set(p, { path: p });
+        },
+        create: async (p: string, d: string) => {
+          const parent = p.split("/").slice(0, -1).join("/");
+          if (parent && !registry.has(parent)) throw new Error("Parent folder does not exist.");
+          disk.set(p, d);
+          registry.set(p, { path: p });
+        },
+        modify: async (f: { path: string }, d: string) => disk.set(f.path, d),
+        delete: async (f: { path: string }) => {
+          disk.delete(f.path);
+          registry.delete(f.path);
+        },
+      };
+      const e2eApp = { vault } as any;
+
+      const pdfFile = { path: "/test/sample.pdf", name: "sample.pdf", basename: "sample" } as any;
+      const imported = await importPdf(e2eApp, pdfFile, mockFile.path, 1);
+      const pdfTexts = (imported.pages[0].texts || []).filter(
+        (t) => t.source === "pdf" && (t.text || "").trim()
+      );
+      const e2eBook = createBook("数学", "grid", "white");
+      e2eBook.pages = imported.pages;
+      await writeTextIndex(e2eApp, mockFile, e2eBook);
+
+      const e2ePath = "笔记/数学.墨本索引/数学 · 第 1 页.md";
+      pass(
+        registry.has(e2ePath),
+        "✓ 导入 PDF 后索引页进了 vault 文件表（全局搜索才搜得到）"
+      );
+      const e2eContent = disk.get(e2ePath) || "";
+      const e2eHit = pdfTexts.filter((t) => e2eContent.includes(t.text)).length;
+      pass(
+        e2eHit === pdfTexts.length && pdfTexts.length > 0,
+        "✓ 导入 PDF 后索引文件里有全部 " + e2eHit + "/" + pdfTexts.length + " 条 PDF 原文"
+      );
+      pass(
+        registry.has(e2ePath) &&
+          parseIndexPath(e2ePath)?.bookPath === "笔记/数学.inkbook",
+        "✓ 导入后的索引页既在文件表里、又能反查回本子"
+      );
+    }
 
     /*
      * 文件表路径：有 vault 一等 API 时必须走 create / modify。
@@ -653,7 +891,8 @@ async function main() {
         },
         create: async (p: string, d: string) => {
           calls.push("create");
-          if (registry.has(p)) throw new Error("File already exists.");
+          // 真机上"磁盘上有、文件表没有"的遗留文件也会让 create 抛已存在
+          if (registry.has(p) || disk.has(p)) throw new Error("File already exists.");
           const parent = p.split("/").slice(0, -1).join("/");
           // 模拟 Obsidian：父目录不在文件表里就建不了文件
           if (parent && !registry.has(parent)) throw new Error("Parent folder does not exist.");
@@ -663,6 +902,11 @@ async function main() {
         modify: async (f: { path: string }, d: string) => {
           calls.push("modify");
           disk.set(f.path, d);
+        },
+        delete: async (f: { path: string }) => {
+          calls.push("delete");
+          disk.delete(f.path);
+          registry.delete(f.path);
         },
       };
       const vApp = { vault } as any;
@@ -679,7 +923,8 @@ async function main() {
         "✓ 索引页走 vault.create，不是裸写 adapter（否则文件表里没有、全局搜索搜不到）"
       );
       pass(
-        registry.has("笔记/数学.墨本索引") && registry.has("笔记/数学.墨本索引/第 1 页.md"),
+        registry.has("笔记/数学.墨本索引") &&
+          registry.has("笔记/数学.墨本索引/数学 · 第 1 页.md"),
         "✓ 目录与索引页都进了 vault 文件表"
       );
 
@@ -696,7 +941,7 @@ async function main() {
        * create 会因"已存在"失败 —— 必须先删再建，否则这个文件永远进不了检索。
        */
       calls.length = 0;
-      const ghost = "笔记/数学.墨本索引/第 2 页.md";
+      const ghost = "笔记/数学.墨本索引/数学 · 第 2 页.md";
       disk.set(ghost, "旧内容");
       bk2.pages.push(createPage("lined", "white"));
       bk2.pages[1].texts = [
@@ -707,6 +952,64 @@ async function main() {
         registry.has(ghost) && disk.get(ghost)?.includes("第二页新文字"),
         "✓ 磁盘上已有但未登记的索引页会被重建成登记态（旧版遗留能救回来）"
       );
+
+      /*
+       * 删除也必须走文件表。
+       *
+       * `adapter.remove` 是绕过 Obsidian 的裸删：文件在磁盘上没了，
+       * 但 Obsidian 的文件表里还留着那条记录 —— 全局搜索里依然能搜到
+       * 这份「已经不存在」的索引内容，点进去就是「文件不存在」。
+       * 旧命名的索引页清理时最容易踩到：同一页出现两条搜索结果，
+       * 其中一条点不开。
+       */
+      calls.length = 0;
+      bk2.pages[1].texts = [];
+      await writeTextIndex(vApp, mockFile, bk2);
+      pass(
+        calls.includes("delete") && !calls.includes("adapter.remove"),
+        "✓ 删索引页走 vault.delete，不是裸删 adapter（否则搜索里还留着已删内容）"
+      );
+      pass(
+        !registry.has("笔记/数学.墨本索引/数学 · 第 2 页.md"),
+        "✓ 删掉的索引页也从 vault 文件表里消失了"
+      );
+
+      /*
+       * 索引写失败**不能**把保存报成失败。
+       *
+       * 索引是派生物：它坏了，最多让用户搜不到，
+       * 绝不能反过来把「本子已保存」变成「保存失败」。
+       */
+      {
+        const brokenVault = {
+          adapter: {
+            exists: async () => true,
+            read: async () => {
+              throw new Error("磁盘读不出来");
+            },
+            write: async () => {
+              throw new Error("磁盘写不进去");
+            },
+            remove: async () => {},
+            mkdir: async () => {},
+            list: async () => {
+              throw new Error("列目录失败");
+            },
+          },
+          getAbstractFileByPath: () => null,
+          create: async () => {
+            throw new Error("创建失败");
+          },
+        };
+        const brokenApp = { vault: brokenVault } as any;
+        let threw = false;
+        try {
+          await writeTextIndex(brokenApp, mockFile, bk2);
+        } catch (_) {
+          threw = true;
+        }
+        pass(!threw, "✓ 索引写失败被兜底住，不会把保存/导入报成失败");
+      }
     }
   }
 

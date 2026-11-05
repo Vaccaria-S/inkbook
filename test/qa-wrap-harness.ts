@@ -347,6 +347,7 @@ async function main() {
     await sleep(60);
     const ta = pageEl().querySelector(".mb-text-edit") as HTMLTextAreaElement;
     pass(!!ta, "进入编辑：出现 textarea");
+    pass(!pageEl().querySelector(".mb-texteditbar"), "改已有文字：不重复出现新建样式条");
     const z = zoom();
     const cs = getComputedStyle(ta);
     const chrome = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight) + parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth);
@@ -394,6 +395,34 @@ async function main() {
     pass(ta?.value === "", "占位符不进 value（提交时不会多出三个字）");
 
     const z = zoom();
+
+    /* ---- 就近样式条：新建时浮在输入框正上方，先选样式再打字 ---- */
+    const editBar = pageEl().querySelector(".mb-texteditbar") as HTMLElement | null;
+    pass(!!editBar, "新建：输入框上方出现就近样式条");
+    const taTop0 = ta.getBoundingClientRect().top;
+    const barBox = editBar?.getBoundingClientRect();
+    pass(
+      !!barBox && barBox.top < taTop0 && Math.abs(taTop0 - barBox.bottom - 8) <= 1,
+      `新建：样式条在输入框上方 8px（条底 ${barBox ? barBox.bottom.toFixed(1) : "-"} / 框顶 ${taTop0.toFixed(1)}）`
+    );
+
+    const size24 = Array.from(editBar?.querySelectorAll(".mb-tb-btn") ?? []).find(
+      (b) => (b.textContent || "").trim() === "24"
+    ) as HTMLElement | undefined;
+    size24?.click();
+    await sleep(30);
+    pass(
+      Math.abs(parseFloat(ta.style.fontSize) - 24 * z) < 0.6,
+      `点样式条「24」：输入框字号实时预览（${ta.style.fontSize}）`
+    );
+    pass(!!pageEl().querySelector(".mb-text-edit"), "点样式条字号后输入框还在（没被提交）");
+
+    const redDot = editBar?.querySelector('[data-mb-color="#D64545"]') as HTMLElement | null;
+    redDot?.click();
+    await sleep(20);
+    pass(ta.style.color === "rgb(214, 69, 69)", `点样式条红色：输入框颜色实时预览（${ta.style.color}）`);
+    pass(!!pageEl().querySelector(".mb-text-edit"), "点样式条颜色后输入框还在（没被提交）");
+
     ed.setTextSize(30);
     await sleep(30);
     pass(
@@ -442,6 +471,7 @@ async function main() {
         (created ? `${created.size} / ${created.color} / ${created.font}` : "没写入") +
         "）"
     );
+    pass(!pageEl().querySelector(".mb-texteditbar"), "提交后样式条跟着输入框一起移除");
 
     /*
      * 反向用例：点普通按钮（导出/撤销）必须把编辑框内容提交掉，
@@ -461,6 +491,15 @@ async function main() {
     );
     pass(!pageEl().querySelector(".mb-text-edit"), "普通按钮触发 blur 后输入框正常关闭");
     side.remove();
+
+    // Esc 关闭也要收掉样式条，不能残留在纸上
+    ed.beginTextEdit(rec, 500, 950);
+    await sleep(60);
+    const ta3 = pageEl().querySelector(".mb-text-edit") as HTMLTextAreaElement;
+    pass(!!pageEl().querySelector(".mb-texteditbar"), "Esc 前：新建的样式条在");
+    ta3.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await sleep(60);
+    pass(!pageEl().querySelector(".mb-texteditbar"), "Esc 关闭后样式条被移除");
 
     // 还原，后面的用例仍按「只有 note1」和编辑器原有默认样式计算
     store.data.pages[0].texts = [note1];

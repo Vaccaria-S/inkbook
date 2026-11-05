@@ -77,12 +77,25 @@ const book = createBook("测试手写本", "grid", "white");
 book.pages.push(createPage("lined", "cream"));
 const file = mkFile("测试手写本.inkbook", JSON.stringify(book));
 
+/** 导入 PDF 之后的页数（导入会加页，后面「重新打开后页数还在」按它算） */
+let pagesAfterImport = 0;
+
 const adapter = {
   exists: async (p: string) => files.has(p),
   read: async (p: string) => files.get(p),
   write: async (p: string, d: string) => void files.set(p, d),
   writeBinary: async (p: string, d: any) => void files.set(p, d),
   mkdir: async () => {},
+  remove: async (p: string) => {
+    files.delete(p);
+    index.delete(p);
+  },
+  list: async (p: string) => ({
+    files: [...files.keys()].filter((k) => k.startsWith(p + "/")),
+    folders: [],
+  }),
+  // PDF 底图 / 文字层要能真的加载：指向测试服务上的样例 PDF
+  getResourcePath: (p: string) => (p.endsWith(".pdf") ? "/test/sample.pdf" : p),
 };
 const vault = {
   adapter,
@@ -91,6 +104,13 @@ const vault = {
     return { path: p };
   },
   create: async (p: string, text: string) => mkFile(p, text),
+  modify: async (f: any, text: string) => {
+    files.set(f.path, text);
+  },
+  delete: async (f: any) => {
+    files.delete(f.path);
+    index.delete(f.path);
+  },
   getAbstractFileByPath: (p: string) => index.get(p) || null,
   getFiles: () => [...index.values()].filter((f) => f.extension),
 };
@@ -257,6 +277,174 @@ async function main() {
   const pdf = [...files.keys()].find((p) => p.endsWith(".pdf"));
   pass(!!pdf, "导出 PDF 文件：" + pdf);
 
+  /*
+   * 导入 PDF → 索引 的端到端（视图层）。
+   *
+   * 用户原话：「我导入了一个 PDF 文件之后……这个笔记文件里导入的 PDF
+   * 文件的文字，仍然可以被直接搜索到。」
+   *
+   * 这里走的是**真正的导入路径**（view.runImport → importPdf → 落盘 →
+   * 写索引），不是直接调 writeTextIndex：只有走完整条链，才能验到
+   * 「导入完立刻就能搜到」这个要求——以前就是索引定时器还没到点就被
+   * 销毁，PDF 原文根本进不了索引。
+   */
+  {
+    const idxDir = "测试手写本.墨本索引";
+    const before = new Set(files.keys());
+
+    // 造一个「库里的 PDF」：importPdf 只会读它的路径 + 抽文字
+    const pdfFile = mkFile("样例.pdf", "%PDF-1.4");
+    pdfFile.path = "/test/sample.pdf";
+    pdfFile.name = "sample.pdf";
+    pdfFile.basename = "sample";
+    files.delete("样例.pdf");
+    index.delete("样例.pdf");
+
+    await (view as any).runImport("pdf", pdfFile);
+    await sleep(400);
+
+    const newIdx = [...files.keys()].filter((p) => !before.has(p) && p.endsWith(".md"));
+    pass(
+      newIdx.length > 0,
+      "导入 PDF 后当场写出了索引页（" + newIdx.length + " 个：" + newIdx.join(", ") + "）"
+    );
+    pass(
+      newIdx.some((p) => p.includes("测试手写本 · 第")),
+      "导入后的索引文件名带本子名（全局搜索直接显示「测试手写本 · 第 N 页」）"
+    );
+    const idxContent = newIdx.map((p) => files.get(p) || "").join("\n");
+    const pdfTexts = (view.store!.data.pages || [])
+      .flatMap((p: any) => p.texts || [])
+      .filter((t: any) => t.source === "pdf" && (t.text || "").trim());
+    pass(
+      pdfTexts.length > 0,
+      "导入 PDF 抽出了 " + pdfTexts.length + " 条原文（进了本子数据）"
+    );
+    const inIdx = pdfTexts.filter((t: any) => idxContent.includes(t.text)).length;
+    pass(
+      pdfTexts.length > 0 && inIdx === pdfTexts.length,
+      "导入 PDF 后索引正文含全部 " + inIdx + "/" + pdfTexts.length + " 条 PDF 原文"
+    );
+    pass(
+      idxContent.includes("PDF Page 1"),
+      "导入 PDF 后索引正文里有样例 PDF 的真实文字（PDF Page 1）"
+    );
+    pass(
+      !!files.get("测试手写本.inkbook"),
+      "导入后本子本体也落盘了"
+    );
+    // 导入往本子里加了页，后面的「重新打开后页数还在」要按加完之后的数算
+    pagesAfterImport = view.store!.pageCount;
+  }
+
+  /*
+   * 导入完**马上切走**，PDF 原文还得在索引里。
+   *
+   * 这是用户报的第二个症状：「我导入了一个 PDF 文件之后，
+   * 这个笔记文件里导入的 PDF 文件的文字，仍然可以被直接搜索到」。
+   *
+   * 以前这条路是断的：导入只置了 dirty，等 0.85s 防抖才保存，
+   * 保存完才排一个 1s 的索引定时器——用户在这 2 秒内切走/关标签页，
+   * destroyEditor 把定时器清掉，PDF 原文就永远进不了索引。
+   *
+   * 用**一本全新的本子**做：不能复用上一段那本，否则它早就写过索引了，
+   * 断言会假通过。
+   */
+  {
+    const freshBook = createBook("切走测试", "grid", "white");
+    const freshFile = mkFile("切走测试.inkbook", JSON.stringify(freshBook));
+    const otherBook = createBook("另一本", "grid", "white");
+    const otherFile = mkFile("另一本.inkbook", JSON.stringify(otherBook));
+
+    await view.onUnloadFile();
+    await view.onLoadFile(freshFile);
+    await sleep(300);
+
+    // 导入（这次不等它自己写完索引就走）
+    const pdfFile2 = mkFile("样例2.pdf", "%PDF-1.4");
+    pdfFile2.path = "/test/sample.pdf";
+    pdfFile2.name = "sample.pdf";
+    pdfFile2.basename = "sample";
+    files.delete("样例2.pdf");
+    index.delete("样例2.pdf");
+
+    await (view as any).runImport("pdf", pdfFile2);
+    // 导入完的页数：切走再切回来必须是这个数（说明导入的内容真的落盘了）
+    const pagesAfterImport2 = view.store!.pageCount;
+    // 不 sleep：立刻切走（索引定时器还在去抖窗口里）
+    await view.onUnloadFile();
+    await view.onLoadFile(otherFile);
+    await sleep(300);
+
+    const idxAfter = [...files.keys()].filter((p) =>
+      p.startsWith("切走测试.墨本索引/") && p.endsWith(".md")
+    );
+    const contentAfter = idxAfter.map((p) => files.get(p) || "").join("\n");
+    pass(
+      idxAfter.length > 0 && contentAfter.includes("PDF Page 1"),
+      "导入后立刻切走：PDF 原文仍然进了索引（" + idxAfter.length + " 个索引页）"
+    );
+    pass(
+      idxAfter.some((p) => p.includes("切走测试 · 第")),
+      "导入后立刻切走：索引文件名也带本子名（" + (idxAfter[0] || "-") + "）"
+    );
+
+    // 切回原来那本，确认内容还在
+    await view.onUnloadFile();
+    await view.onLoadFile(file);
+    await sleep(400);
+    pass(
+      view.store!.pageCount === pagesAfterImport,
+      "切回来后页数没丢（" + view.store!.pageCount + " 页，导入后是 " + pagesAfterImport + " 页）"
+    );
+    pagesAfterImport = view.store!.pageCount;
+  }
+
+  /*
+   * 索引定时器被销毁了，但内容还没进索引 → flushSave 必须补写一次。
+   *
+   * 这是「切文件/关标签页」那条路的最后一道保险：
+   * `destroyEditor()` 会 `clearTimeout(this.indexTimer)`，
+   * 1 秒去抖窗口内的改动就此丢掉。以前判据是「定时器非零」，
+   * 定时器一被清掉就看不出「还有东西没写」——PDF 原文因此永远进不了索引。
+   *
+   * 这里直接模拟那个瞬间：让定时器被清掉、待写标志还在，
+   * 再调 flushSave，断言索引照样被写出来。
+   */
+  {
+    const tBook = createBook("定时器测试", "grid", "white");
+    tBook.pages[0].texts = [
+      { id: "tt1", source: "pdf", x: 90, y: 100, size: 12, text: "定时器被销毁也要写进索引" },
+    ];
+    const tFile = mkFile("定时器测试.inkbook", JSON.stringify(tBook));
+    await view.onUnloadFile();
+    await view.onLoadFile(tFile);
+    await sleep(300);
+
+    // 让内容变脏 → 触发一次保存（saveNow 内部会 scheduleTextIndex）
+    (view.store!.data.pages[0].texts as any)[0].text = "定时器被销毁也要写进索引（改过）";
+    (view as any).markDirty();
+    await view.saveNow();
+    await sleep(50);
+
+    // 模拟 destroyEditor 把定时器清掉：待写的内容还在，但定时器没了
+    (view as any).indexTimer = 0;
+
+    await view.flushSave();
+    await sleep(100);
+
+    const idxPath = "定时器测试.墨本索引/定时器测试 · 第 1 页.md";
+    const content = files.get(idxPath) || "";
+    pass(
+      content.includes("定时器被销毁也要写进索引"),
+      "索引定时器被销毁后 flushSave 仍补写了索引（" + (content ? "有内容" : "空") + "）"
+    );
+    pass(
+      index.has(idxPath),
+      "补写的索引页进了 vault 文件表（全局搜索搜得到）"
+    );
+  }
+
   /* 新建弹窗 */
   let created: any = null;
   const modal = new NewBookModal(app, plugin, (f) => (created = f));
@@ -273,7 +461,10 @@ async function main() {
   await view.onLoadFile(file);
   await sleep(500);
   pass(view.store!.strokeCount === 1, "重新打开后笔迹还在");
-  pass(view.store!.pageCount === 3, "重新打开后页数还在");
+  pass(
+    view.store!.pageCount === pagesAfterImport,
+    "重新打开后页数还在（" + view.store!.pageCount + " 页，导入时加了页）"
+  );
 
   /* 展示本：丰富笔迹，用于截图 */
   const show = createBook("墨本 · 手感展示", "grid", "white");

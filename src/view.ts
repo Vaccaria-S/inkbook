@@ -125,6 +125,19 @@ export class InkbookView extends FileView {
   private pendingPage: number | null = null;
   /** 文字索引的去抖定时器（保存后 1s 写一次，避免连续保存反复重写） */
   private indexTimer = 0;
+  /**
+   * 还没进索引的内容（文件 + 那时的书内容）。
+   *
+   * 为什么要单独记一份：以前「立刻写索引」是靠 `indexTimer` 非零来判断
+   * 「有东西要写」。但定时器会被 `destroyEditor()` 清掉（切文件 / 关标签页），
+   * 一旦清完，`indexTimer` 归零，看起来就像「没有待写的内容」——
+   * 正好把「刚导入的 PDF 原文」这一批内容漏掉，用户看到的就是
+   * 「PDF 导进来了，可一个字都搜不到」。
+   *
+   * 存下**文件与内容快照**还有一个好处：切文件以后再冲，也不会把
+   * 新本子的内容写进旧本子的索引（或反过来）。
+   */
+  private indexPending: { file: TFile; book: InkBook } | null = null;
   /** 侧边可拖动滑条（替代系统滚动条，手指也抓得住） */
   private sbEl: HTMLElement | null = null;
   private sbTrack: HTMLElement | null = null;
@@ -501,6 +514,11 @@ export class InkbookView extends FileView {
     window.clearTimeout(this.zoomHintTimer);
     window.clearTimeout(this.indexTimer);
     this.indexTimer = 0;
+    /*
+     * `indexPending` **不清**：定时器被销毁不代表内容已经进索引了。
+     * 紧接着的 flushSave 会看这个标志，决定要不要补写一次——
+     * 这正是「导入 PDF 后马上切走，PDF 原文搜不到」的修法。
+     */
     this.floatEl?.remove();
     // 滑条挂在 paperHost 上，跟着编辑器一起拆；监听器走 AbortController 一并断掉
     this.sbAbort?.abort();
@@ -1554,7 +1572,26 @@ export class InkbookView extends FileView {
       this.editor?.goToPage(at);
       this.updateUI();
       this.refreshThumbs();
+      /*
+       * 导入是显式动作：当场落盘、当场写索引，不等自动保存的 0.85s 防抖。
+       *
+       * 否则「导入 PDF → 马上去全局搜索（或马上切走）」时，索引定时器
+       * 还没到点就被销毁，PDF 出来的原文根本进不了索引——用户看到的就是
+       * 「PDF 导进来了，但一个字都搜不到」。
+       *
+       * 顺序很重要：先 saveNow（把本子落盘），再 scheduleTextIndex + flushTextIndex
+       * （把索引写掉）。索引失败绝不能把「导入成功」报成失败——writeTextIndex 自己兜底。
+       *
+       * 为什么这里要再 schedule 一次：saveNow 在「已经有一次保存正在进行」时会
+       * 直接返回（排队 saveAgain），那次保存还没走到 scheduleTextIndex，
+       * 这时 indexPending 可能还是空的——不补这一次 schedule，
+       * 紧接着的 flushTextIndex 就没有东西可写。
+       */
       this.markDirty();
+      this.saveDebounce.cancel();
+      await this.saveNow();
+      this.scheduleTextIndex();
+      await this.flushTextIndex();
       notice.setMessage(`已导入 ${result.pages.length} 页`);
       setTimeout(() => notice.hide(), 2500);
     } catch (e: any) {
@@ -2260,11 +2297,40 @@ export class InkbookView extends FileView {
     if (this.plugin.settings.searchIndex === false) return;
     const file = this.file;
     const book = this.store.data;
+    // 有东西等着进索引——哪怕定时器随后被销毁，这条事实也还在
+    this.indexPending = { file, book };
     window.clearTimeout(this.indexTimer);
     this.indexTimer = window.setTimeout(() => {
       this.indexTimer = 0;
       void writeTextIndex(this.app, file, book);
     }, 1000);
+  }
+
+  /**
+   * 把还在去抖里的索引立刻写掉。
+   *
+   * 平时 1 秒的去抖没问题，但 `flushSave()`（切文件 / 关标签页）之后
+   * `destroyEditor()` 会直接 `clearTimeout(this.indexTimer)`——最后 1 秒内
+   * 的改动就永远进不了索引。以前「导入 PDF 后马上切走，结果 PDF 原文搜不到」
+   * 走的就是这条路。所以在 flushSave 末尾主动冲一次。
+   *
+   * 判据是 `indexPending` 而不是「定时器非零」：定时器可能已经被销毁了，
+   * 但内容确实还没进索引——这种情况同样要写。
+   */
+  private async flushTextIndex(): Promise<void> {
+    if (!this.indexPending) return;
+    if (this.plugin.settings.searchIndex === false) return;
+    const pending = this.indexPending;
+    window.clearTimeout(this.indexTimer);
+    this.indexTimer = 0;
+    // 先取走：writeTextIndex 失败也不该让「待写」永远挂着，
+    // 否则每次保存都要重试一次写失败的索引。
+    this.indexPending = null;
+    try {
+      await writeTextIndex(this.app, pending.file, pending.book);
+    } catch (_) {
+      // writeTextIndex 自己已经兜底；索引是派生物，绝不能影响保存/导入的结果
+    }
   }
 
   /**
@@ -2464,6 +2530,16 @@ export class InkbookView extends FileView {
   async flushSave(): Promise<void> {
     this.saveDebounce.cancel();
     if (this.dirty || this.metaDirty) await this.saveNow();
+    /*
+     * saveNow 成功时只负责「排一个 1 秒后的索引定时器」，而随后 destroyEditor()
+     * 会把它取消。这里等索引真正写完，搜索里才不会缺最后一次保存的内容。
+     *
+     * 补一次 schedule：saveNow 在「已经有一次保存正在进行」时会直接返回
+     * （排队 saveAgain），那次保存还没走到 scheduleTextIndex，
+     * 这时 indexPending 可能还是空的——不补这一次，就没东西可冲。
+     */
+    if (this.dirty || this.metaDirty) this.scheduleTextIndex();
+    await this.flushTextIndex();
   }
 
   /* ------------------------------- 快捷键 ------------------------------- */

@@ -14,7 +14,7 @@ import {
 } from "./types";
 import { BookStore, type HistoryEntry } from "./store";
 import { drawStroke, invalidateStroke, predictTail } from "./ink";
-import { OneEuroFilter, shapePressure, speedWidthFactor } from "./filter";
+import { OneEuroFilter, shapePressure, speedWidthFactor, zoomNormalization } from "./filter";
 import { TouchArbiter, type PinchInfo, type PointerInfo, type TouchRole } from "./touch";
 import { drawPaper, paperBackground } from "./paper";
 import { BitmapCache } from "./cache";
@@ -350,6 +350,14 @@ export class BookEditor {
   private lastTextTap: { id: string; t: number } | null = null;
   /** 选中文字后浮在纸上方的属性条 */
   private textBarEl: HTMLElement | null = null;
+  /**
+   * **新建**输入框正上方的就近样式条（字号 / 颜色）。
+   *
+   * 与 textBarEl 分开：那条是"选中已有文字"的属性条，这条只在空键新写时出现，
+   * 让用户先定字号颜色再打字（打完再回头调是用户明确抱怨的流程）。
+   * 只挂一份，编辑框关闭时随 commitTextEdit 一起移除。
+   */
+  private textEditBarEl: HTMLElement | null = null;
   private pointerId: number | null = null;
   private draft: Stroke | null = null;
   private draftRec: PageRec | null = null;
@@ -856,6 +864,8 @@ export class BookEditor {
     ta.style.top = `${(ed.y - ed.size * 0.82) * this.zoom}px`;
     ta.style.height = "auto";
     ta.style.height = `${ta.scrollHeight}px`;
+    // 字号变了输入框顶边会跟着动，样式条的高亮和位置都要跟上
+    this.updateTextEditBar();
     /*
      * 点侧栏按钮会把焦点抢走，这里夺回来，用户改完样式可以直接接着打。
      * <select> 的下拉此时已经关闭（change 才触发），不会被打断。
@@ -1131,6 +1141,117 @@ export class BookEditor {
     bar.style.top = `${top}px`;
   }
 
+  /* --------------------- 新建输入框上方的就近样式条 --------------------- */
+
+  /**
+   * 为空输入框建一条字号 / 颜色样式条，挂在页面坐标容器上。
+   *
+   * 只在 `beginTextEdit` 的**新键**分支调用；改已有文字时用的是选中属性条
+   * （syncTextBar），两条不能同时出现。
+   */
+  private syncTextEditBar(): void {
+    this.textEditBarEl?.remove();
+    this.textEditBarEl = null;
+    const ed = this.textEdit;
+    // 只给"新建"用：改已有文字的框自带 .mb-textbar，不重复
+    if (!ed || ed.id || !ed.rec.mounted) return;
+
+    const bar = document.createElement("div");
+    // 复用属性条的布局规则（flex-wrap / max-width / 圆角阴影），再加尺寸修饰类
+    bar.className = "mb-textbar mb-texteditbar";
+    // 手势一律不传到画布，否则点一下字号会顺手画一笔
+    const eat = (e: Event) => e.stopPropagation();
+    for (const evName of ["pointerdown", "mousedown", "touchstart"]) {
+      bar.addEventListener(evName, eat, { passive: true });
+    }
+
+    // 字号：4 档常用大小，当前值高亮。数字按钮比 −/＋ 少一半点击次数
+    for (const v of [14, 18, 24, 32]) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "mb-tb-btn" + (Math.round(ed.size) === v ? " is-active" : "");
+      b.textContent = String(v);
+      b.title = `字号 ${v}`;
+      b.dataset.mbSize = String(v);
+      // 没有这个标记，pointerdown 后 blur 会把空框提交掉（"先选样式再打字"直接断）
+      b.dataset.mbTextStyle = "1";
+      b.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        // setTextSize → applyTextEditStyle：实时改预览并 focus 回 textarea
+        this.setTextSize(v);
+      });
+      bar.appendChild(b);
+    }
+
+    bar.appendChild(this.textBarSep());
+
+    // 颜色：与属性条同一组 6 个色点
+    for (const c of PEN_COLORS.slice(0, 6)) {
+      const dot = document.createElement("button");
+      dot.type = "button";
+      dot.className =
+        "mb-tb-dot" + ((ed.color || "").toLowerCase() === c.toLowerCase() ? " is-active" : "");
+      dot.style.background = c;
+      dot.title = "文字颜色";
+      dot.dataset.mbColor = c;
+      dot.dataset.mbTextStyle = "1";
+      dot.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.setTextColor(c);
+      });
+      bar.appendChild(dot);
+    }
+
+    ed.rec.pageEl.appendChild(bar);
+    this.textEditBarEl = bar;
+    this.positionTextEditBar();
+  }
+
+  /** 样式值变了以后同步高亮与位置（不重建 DOM，避免点按钮时把它自己换掉） */
+  private updateTextEditBar(): void {
+    const bar = this.textEditBarEl;
+    const ed = this.textEdit;
+    if (!bar || !ed) return;
+    for (const b of Array.from(bar.querySelectorAll<HTMLElement>(".mb-tb-btn[data-mb-size]"))) {
+      b.classList.toggle("is-active", Number(b.dataset.mbSize) === Math.round(ed.size));
+    }
+    for (const d of Array.from(bar.querySelectorAll<HTMLElement>(".mb-tb-dot[data-mb-color]"))) {
+      d.classList.toggle(
+        "is-active",
+        (d.dataset.mbColor || "").toLowerCase() === (ed.color || "").toLowerCase()
+      );
+    }
+    this.positionTextEditBar();
+  }
+
+  /**
+   * 样式条跟着输入框走：默认在框顶上方 8px。
+   *
+   * 像素换算与 beginTextEdit 写 textarea 的 top 完全一致（页面坐标 × zoom），
+   * 缩放时由 applyLayout 重算。框贴着页顶导致上方放不下时翻到框下方——
+   * 宁可换边，也不能让样式条半截悬在纸外。
+   */
+  private positionTextEditBar(): void {
+    const bar = this.textEditBarEl;
+    const ed = this.textEdit;
+    if (!bar || !ed) return;
+    const z = this.zoom;
+    const pageW = this.store.data.width * z;
+    const pageH = this.store.data.height * z;
+    const w = bar.offsetWidth || 320;
+    const h = bar.offsetHeight || 40;
+    const taTop = (ed.y - ed.size * 0.82) * z;
+    const taLeft = ed.x * z;
+    const left = Math.max(4, Math.min(taLeft, pageW - w - 4));
+    const above = taTop - h - 8;
+    const below = taTop + (ed.el.offsetHeight || 0) + 8;
+    const top = above >= 4 ? above : Math.max(4, Math.min(below, pageH - h - 4));
+    bar.style.left = `${left}px`;
+    bar.style.top = `${top}px`;
+  }
+
   setPenColor(color: string): void {
     this.penColor = color;
     this.emitState();
@@ -1319,6 +1440,8 @@ export class BookEditor {
     this.docEl.style.setProperty("--mb-zoom", String(this.zoom));
     // 属性条是按像素定位的，缩放后得重算一次
     this.positionTextBar();
+    // 新建输入框上方的样式条同理（页面坐标 × zoom）
+    this.positionTextEditBar();
     // 只重建已挂载页的 canvas（数量很少，通常 1-3 个）
     for (const rec of this.recs) {
       if (rec.mounted) this.resizeRec(rec);
@@ -2831,6 +2954,11 @@ export class BookEditor {
     rec.pageEl.appendChild(ta);
 
     this.textEdit = { rec, el: ta, id: hit?.id ?? null, x, y, size, color, font };
+    /*
+     * 新键才给就近样式条：用户要先定字号/颜色再打字。
+     * 改已有文字走的是选中属性条（.mb-textbar），这里不再叠一条。
+     */
+    if (!hit) this.syncTextEditBar();
 
     let done = false;
     const finish = (save: boolean) => {
@@ -2908,6 +3036,9 @@ export class BookEditor {
 
   /** 收掉编辑框。save=false 用于 Esc / 页面被卸载时丢弃 */
   private commitTextEdit(save = true): void {
+    // 样式条与输入框同生共死：提交、Esc、翻页重建都不能留下孤儿节点
+    this.textEditBarEl?.remove();
+    this.textEditBarEl = null;
     const ed = this.textEdit;
     if (!ed) return;
     this.textEdit = null;
@@ -3023,15 +3154,26 @@ export class BookEditor {
     if (smooth <= 0.02) return raw;
     // 平滑强度映射到 1€ 滤波器的 minCutoff：越强越稳
     const minCutoff = 0.6 + (1 - smooth) * 3.4;
-    this.smoother.configure(minCutoff, 0.012 + smooth * 0.05, 1.0);
+    /*
+     * beta 乘 zoom 归一化因子：beta 的单位是「每单位速度」，
+     * 而速度是页面坐标/秒。放大 2.8 倍时同一手速的页面速度只剩 1/3.5，
+     * cutoff 跟着变低、滤波滞后从约 3px 涨到 9.5px（拐角被抹圆）。
+     * 乘上因子等价于用屏幕速度调参，各缩放档手感一致。
+     * 仍然只 configure 单实例，不 new。
+     */
+    this.smoother.configure(minCutoff, (0.012 + smooth * 0.05) * zoomNormalization(this.zoom), 1.0);
     const out = this.smoother.filter(raw[0], raw[1], e.timeStamp || performance.now());
     return [out.x, out.y, 0.5];
   }
 
   private pressureFor(e: PointerEvent, dist: number, dt: number): number {
     if (this.tool === "ballpoint") return 0.62;
-    // 速度：页面单位 / 毫秒
-    const speed = dist / Math.max(1, dt);
+    /*
+     * 速度：页面单位 / 毫秒，再乘 zoom 归一化因子换成屏幕尺度。
+     * 不归一化的话，同一手速在 2.8 倍下算出来的速度只有 0.8 倍的 1/3.5：
+     * 快笔收窄失效（笔画偏粗约 21%）、鼠标虚拟压力也失真。
+     */
+    const speed = (dist / Math.max(1, dt)) * zoomNormalization(this.zoom);
     this.lastSpeed = speed;
 
     let raw: number;
@@ -3634,7 +3776,14 @@ export class BookEditor {
 
     const last = this.draft.points[this.draft.points.length - 1];
     const dist = last ? Math.hypot(p[0] - last[0], p[1] - last[1]) : 0;
-    if (dist < 0.55) return;
+    /*
+     * 采样阈值按 zoom 归一化：0.55 页面单位在 0.8 倍时约 0.44 CSS px，
+     * 到 2.8 倍就是 1.54 CSS px——放大后点变稀，转角/曲率被切掉，
+     * 用户感觉「放大再写识别得比较粗糙」。除以因子后各缩放档的
+     * 屏幕采样密度一致（只影响慢速移动，正常书写点数基本不变）。
+     */
+    const minStep = 0.55 / zoomNormalization(this.zoom);
+    if (dist < minStep) return;
     const dt = this.lastPoint ? now - this.lastPoint.t : 16;
     // 撤销记录由 commitDraft → addStroke 自动记增量，
     // 这里不用再拍全页快照（大页面上那一下要几毫秒）。
@@ -4382,6 +4531,7 @@ export class BookEditor {
     this.moveText = null;
     this.resizeText = null;
     this.textBarEl = null;
+    this.textEditBarEl = null;
     this.selectedTextId = null;
     this.host.innerHTML = "";
   }

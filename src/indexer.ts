@@ -23,8 +23,29 @@ export const INDEX_DIR_SUFFIX = ".墨本索引";
 /** 旧方案（一本一个 md）的文件名后缀，遇到就删掉 */
 export const LEGACY_INDEX_SUFFIX = ".墨本文字.md";
 
-/** 索引页文件名：`第 12 页.md` */
-const PAGE_FILE_RE = /^第 (\d+) 页\.md$/;
+/**
+ * 索引页文件名：`<本子名> · 第 12 页.md`。
+ *
+ * 为什么文件名里要带本子名：Obsidian 的全局搜索结果显示的是**文件名**，
+ * 旧命名只有「第 12 页」，搜出来一排结果根本分不清是哪本本子的。
+ * 加上本子名之后，搜索结果本身就是「数学 · 第 12 页」，一眼能认出来。
+ *
+ * 本子名本身可以带任意字符（含「·」）：文件名里最后一个「 · 」才是分隔符。
+ */
+const PAGE_FILE_RE = /^.+ · 第 (\d+) 页\.md$/;
+
+/** 旧命名 `第 12 页.md`：写入新索引时顺手清掉（搜索结果里不再出现两份） */
+const LEGACY_PAGE_FILE_RE = /^第 (\d+) 页\.md$/;
+
+/**
+ * 这个文件名是不是旧命名的索引页。
+ *
+ * 导出来给测试用：迁移逻辑（清理旧文件）必须和识别逻辑用同一把尺子，
+ * 否则会出现「认得出、却删不掉」或者「删错了别的文件」。
+ */
+export function isLegacyIndexPageName(name: string): boolean {
+  return LEGACY_PAGE_FILE_RE.test(name);
+}
 
 /** 单页最多索引这么多字符（约 200 行中文），超出截断 */
 const MAX_PAGE_CHARS = 12000;
@@ -42,9 +63,32 @@ export function indexDirFor(file: TFile): string {
   return `${dirOf(file)}${baseOf(file)}${INDEX_DIR_SUFFIX}`;
 }
 
-/** 某一页的索引文件路径 */
+/** 某一页的索引文件路径（文件名带本子名，全局搜索结果里才分得清） */
 export function indexPagePath(file: TFile, pageNo: number): string {
-  return `${indexDirFor(file)}/第 ${pageNo} 页.md`;
+  return `${indexDirFor(file)}/${indexFileName(file, pageNo)}`;
+}
+
+/** 某一页的索引**文件名**（不含目录） */
+export function indexFileName(file: TFile, pageNo: number): string {
+  return `${indexFileBase(file)} · 第 ${pageNo} 页.md`;
+}
+
+/**
+ * 索引文件名里用的本子名。
+ *
+ * 为什么要截断：Windows 的文件名上限是 255 字符，本子名本身可能已经占了
+ * 240 个，再加「 · 第 12 页.md」就超了——超限的文件根本创建不出来。
+ * 截断只影响**文件名**，不影响目录名，所以反查（parseIndexPath 靠目录名
+ * 找本子）照样对得上。
+ */
+const MAX_INDEX_FILE_BASE = 120;
+
+function indexFileBase(file: TFile): string {
+  const base = baseOf(file);
+  const chars = Array.from(base);
+  return chars.length > MAX_INDEX_FILE_BASE
+    ? chars.slice(0, MAX_INDEX_FILE_BASE).join("")
+    : base;
 }
 
 /** 旧方案的单文件路径（用于清理） */
@@ -59,7 +103,15 @@ export function legacyIndexPath(file: TFile): string {
  * 不是索引页就返回 null。
  */
 export function parseIndexPath(path: string): { bookPath: string; page: number } | null {
-  const m = path.match(/^(.*)\.墨本索引\/第 (\d+) 页\.md$/);
+  /*
+   * 两种名字都要认：
+   *   · 新：`<本子名> · 第 N 页.md`
+   *   · 旧：`第 N 页.md`
+   * 旧文件要等下一次保存才会被清掉；在那之前，搜索结果里残留的旧链接
+   * 点开也应该能跳回本子，而不是停在一页过期的索引上。
+   * 文件名前缀（本子名）允许为空，兼容历史数据。
+   */
+  const m = path.match(/^(.*)\.墨本索引\/(?:.+ · )?第 (\d+) 页\.md$/);
   if (!m) return null;
   const page = Number(m[2]);
   if (!Number.isFinite(page) || page < 1) return null;
@@ -129,6 +181,10 @@ interface VaultLike {
   createFolder?: (path: string) => Promise<unknown>;
   create?: (path: string, data: string) => Promise<unknown>;
   modify?: (file: unknown, data: string) => Promise<void>;
+  /** 彻底删除（文件或文件夹）——必须走它，adapter.remove 绕过了文件表 */
+  delete?: (file: unknown, force?: boolean) => Promise<void>;
+  /** 移到回收站 */
+  trash?: (file: unknown, system?: boolean) => Promise<void>;
   adapter: AdapterLike;
 }
 
@@ -244,6 +300,52 @@ async function writeIndexFile(
 }
 
 /**
+ * 删掉一个索引文件。
+ *
+ * 与写入对称：**优先走 vault.delete / vault.trash**。
+ *
+ * 为什么删除也必须走文件表：`adapter.remove` 是绕过 Obsidian 的裸删——
+ * 文件在磁盘上没了，但 Obsidian 的文件表里还留着那条记录，
+ * 于是全局搜索里依然能搜到这份「已经不存在」的索引内容，
+ * 点进去就是「文件不存在」。旧命名的索引页（`第 12 页.md`）清理时
+ * 最容易踩到：用户会看到同一页出现两条搜索结果，其中一条点不开。
+ *
+ * 拿不到文件对象时（测试桩、文件本来就没登记）退回 adapter.remove。
+ */
+async function removeIndexFile(
+  vault: VaultLike,
+  adapter: AdapterLike,
+  path: string
+): Promise<void> {
+  if (hasFileTable(vault)) {
+    const abs = vault.getAbstractFileByPath(path);
+    if (abs) {
+      /*
+       * 优先彻底删除而不是扔进回收站：索引是派生文件，
+       * 一次「重建索引」可能删掉几百个，扔进回收站只是把垃圾换个地方堆。
+       */
+      if (typeof vault.delete === "function") {
+        try {
+          await vault.delete(abs, true);
+          return;
+        } catch (_) {
+          /* 某些环境不让硬删，退回回收站 */
+        }
+      }
+      if (typeof vault.trash === "function") {
+        try {
+          await vault.trash(abs, false);
+          return;
+        } catch (_) {
+          /* 落到 adapter */
+        }
+      }
+    }
+  }
+  if (typeof adapter.remove === "function") await adapter.remove(path);
+}
+
+/**
  * 写索引：有文字的页各写一个文件，清掉多余的旧页与旧版单文件。
  *
  * 失败只记日志——索引是附属品，不能因为它坏了就把「保存成功」报成失败。
@@ -267,20 +369,29 @@ export async function writeTextIndex(app: App, file: TFile, book: InkBook): Prom
       await writeIndexFile(vault, adapter, path, content);
     }
 
-    // 页数变少 / 某页文字被清空：删掉对应的索引页
-    if (typeof adapter.list === "function" && typeof adapter.remove === "function") {
+    // 页数变少 / 某页文字被清空：删掉对应的索引页；旧命名统一迁移掉
+    if (typeof adapter.list === "function") {
       const listed = await adapter.list(dir);
       for (const p of listed?.files || []) {
         const name = p.split("/").pop() || "";
+        /*
+         * 旧命名 `第 N 页.md`：不参与 wanted 的比对，一律删掉。
+         * 新命名的索引页已经在上面写好了，留着旧的只会让搜索结果里
+         * 同一页出现两份（一份叫「第 12 页」，一份叫「数学 · 第 12 页」）。
+         */
+        if (LEGACY_PAGE_FILE_RE.test(name)) {
+          await removeIndexFile(vault, adapter, p);
+          continue;
+        }
         if (!PAGE_FILE_RE.test(name)) continue;
-        if (!wanted.has(p)) await adapter.remove(p);
+        if (!wanted.has(p)) await removeIndexFile(vault, adapter, p);
       }
     }
 
     // 旧方案留下的一本一个大 md：迁移时删掉，免得搜索结果里出现两份
     const legacy = legacyIndexPath(file);
-    if (typeof adapter.remove === "function" && (await adapter.exists(legacy))) {
-      await adapter.remove(legacy);
+    if (await adapter.exists(legacy)) {
+      await removeIndexFile(vault, adapter, legacy);
     }
   } catch (e) {
     console.warn("[inkbook] 写文字索引失败（不影响本子保存）", e);
@@ -289,17 +400,18 @@ export async function writeTextIndex(app: App, file: TFile, book: InkBook): Prom
 
 /** 删掉整份索引（本子被删/改名时用；失败也无所谓，它只是派生数据） */
 export async function removeTextIndex(app: App, file: TFile): Promise<void> {
-  const adapter = app.vault.adapter as unknown as AdapterLike;
+  const vault = app.vault as unknown as VaultLike;
+  const adapter = (vault.adapter || (app.vault.adapter as unknown as AdapterLike));
   try {
     const legacy = legacyIndexPath(file);
-    if (typeof adapter.remove === "function" && (await adapter.exists(legacy))) {
-      await adapter.remove(legacy);
+    if (await adapter.exists(legacy)) {
+      await removeIndexFile(vault, adapter, legacy);
     }
     const dir = indexDirFor(file);
-    if (typeof adapter.list !== "function" || typeof adapter.remove !== "function") return;
+    if (typeof adapter.list !== "function") return;
     if (!(await adapter.exists(dir))) return;
     const listed = await adapter.list(dir);
-    for (const p of listed?.files || []) await adapter.remove(p);
+    for (const p of listed?.files || []) await removeIndexFile(vault, adapter, p);
   } catch (_) {
     /* 派生数据，删不掉不算错 */
   }

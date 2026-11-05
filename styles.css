@@ -996,6 +996,44 @@
   height: 22px;
 }
 
+/* ---------------- 新建输入框上方的就近样式条 ----------------
+ *
+ * 只在新键（空输入框）时出现：先定字号 / 颜色，再开始打字。
+ * 复用 .mb-textbar 的 flex-wrap / max-width，不会横向顶出纸面；
+ * 触控优先，按钮和色点都做到 ≥30px，比选中文字的属性条更好按。
+ */
+.mb-texteditbar {
+  z-index: 9;
+  gap: 6px;
+  padding: 5px 8px;
+}
+
+.mb-texteditbar .mb-tb-btn {
+  min-width: 32px;
+  height: 32px;
+  font-size: 13px;
+}
+
+.mb-texteditbar .mb-tb-btn.is-active {
+  background: var(--interactive-accent, #6c5ce7);
+  color: var(--text-on-accent, #fff);
+}
+
+.mb-texteditbar .mb-tb-dot {
+  width: 30px;
+  height: 30px;
+}
+
+.mb-tablet .mb-texteditbar .mb-tb-btn {
+  min-width: 34px;
+  height: 34px;
+}
+
+.mb-tablet .mb-texteditbar .mb-tb-dot {
+  width: 32px;
+  height: 32px;
+}
+
 .mb-canvas,
 .mb-overlay {
   position: absolute;
