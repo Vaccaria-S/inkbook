@@ -16,6 +16,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { killEdgeTree, installEdgeCleanup } from "./edge-cleanup.mjs";
 
 const URL_ = process.argv[2] || "http://127.0.0.1:8901/swipe.html";
 const PORT = 9351;
@@ -24,7 +25,13 @@ const profile = path.resolve(".edge-swipe");
 
 fs.mkdirSync(profile, { recursive: true });
 
-const child = spawn(
+/** Edge 主进程；先声明好，退出清理要用 */
+let child = null;
+
+// 退出时收干净整棵 Edge 进程树（只 child.kill() 会漏掉 gpu/renderer 子进程）
+installEdgeCleanup(() => child?.pid, () => profile);
+
+child = spawn(
   EDGE,
   [
     "--headless=new",
@@ -156,8 +163,9 @@ try {
 } catch (e) {
   console.error("运行出错:", e);
 } finally {
+  // 收干净整棵 Edge 进程树（只 child.kill() 会漏掉 gpu/renderer 子进程）
   try {
-    child.kill();
+    killEdgeTree(child?.pid, profile);
   } catch (_) {
     /* ignore */
   }

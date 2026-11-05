@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
+import { killEdgeTree, installEdgeCleanup } from './edge-cleanup.mjs';
 
 const url = process.argv[2] || 'http://127.0.0.1:8901/test.html';
 const timeout = Number(process.argv[3] || 45000);
@@ -24,7 +25,21 @@ fs.mkdirSync(profile, { recursive: true });
  * 默认不改任何行为——别的套件拿到的浏览器跟以前完全一样。
  */
 const extraArgs = (process.env.CHROME_ARGS || '').split(' ').filter(Boolean);
-const child = spawn(EDGE, [
+
+/** Edge 主进程（后面 spawn 出来的）；先声明好，退出清理要用 */
+let child = null;
+
+/*
+ * 退出时收干净整棵 Edge 进程树。
+ *
+ * `child.kill()` 只杀主进程，gpu-process / renderer / utility 这些子进程会
+ * 变成孤儿继续跑（跑完全量实测攒到 52 个，把用户电脑拖卡）。
+ * 详见 test/edge-cleanup.mjs 的说明。
+ */
+const cleanup = () => killEdgeTree(child?.pid, profile);
+installEdgeCleanup(() => child?.pid, () => profile);
+
+child = spawn(EDGE, [
   '--headless=new', '--disable-gpu', '--no-first-run', '--no-proxy-server',
   `--remote-debugging-port=${CDP_PORT}`, `--user-data-dir=${profile}`, ...extraArgs, url,
 ], { stdio: 'ignore' });
@@ -40,7 +55,7 @@ for (let i = 0; i < 60; i++) {
   } catch (_) {}
   await sleep(300);
 }
-if (!page) { console.error('CDP 连不上'); process.exit(1); }
+if (!page) { console.error('CDP 连不上'); cleanup(); process.exit(1); }
 const ws = new WebSocket(page.webSocketDebuggerUrl);
 let id = 0;
 const pending = new Map();
@@ -85,4 +100,8 @@ console.log('--- output ---');
 console.log(text || '(empty)');
 if (logs.length) { console.log('--- console ---'); console.log(logs.slice(0, 30).join('\n')); }
 console.log('--- title:', title || '(timeout)', '---');
-ws.close(); child.kill(); process.exit(0);
+ws.close();
+// 收干净整棵 Edge 进程树（只 child.kill() 会漏掉 gpu/renderer 等子进程，
+// 跑完全量能攒到几十个孤儿 Edge，把用户电脑拖卡）
+cleanup();
+process.exit(0);

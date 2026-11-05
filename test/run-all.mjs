@@ -102,4 +102,19 @@ for (let i = 0; i < PAGES.length; i++) {
 }
 
 console.log(`\n合计 PASS=${totalPass} FAIL=${totalFail} 异常页面=${badPages}`);
+
+/*
+ * 兜底清一遍所有 `.edge-*` 的无头 Edge。
+ *
+ * 每个 runner 自己会收干净（见 test/edge-cleanup.mjs），但万一某个 runner
+ * 崩了/被强杀，它那棵 Edge 进程树就会留下来。跑完全量 26 个套件，
+ * 漏一个就是十几个孤儿进程，用户那边表现为「电脑特别卡」。
+ */
+try {
+  const { killEdgeTree } = await import("./edge-cleanup.mjs");
+  killEdgeTree(null, ".edge-");
+} catch (_) {
+  /* 收不到就算了，不影响测试结论 */
+}
+
 process.exit(badPages === 0 && totalFail === 0 ? 0 : 1);
