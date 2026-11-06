@@ -37,7 +37,7 @@ const PAGES = [
   ["perf.html", 21],
   ["perf-open.html", 60],
   ["qa-open.html", 49],
-  ["dock.html", 199],
+  ["dock.html", 202],
   ["thumb.html", 12],
   ["pdf.html", 40],
   ["bigpdf.html", 13],

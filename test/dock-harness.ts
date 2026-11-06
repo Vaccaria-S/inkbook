@@ -1098,6 +1098,55 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
         "，期望 2）"
     );
 
+    /* ---- ④b 拖完那一下的 click 守卫只挡「被拖的那一页」（2026-11-07 修） ---- */
+    /*
+     * 旧实现用**一个全局布尔**当守卫：拖完设 true，任何缩略图的 click
+     * 都先消费它。触屏 pointerup 的落点可能偏到相邻条目，于是「点了别的
+     * 条目」也会被吞掉一次（用户点了没反应，还白吃掉标志）。
+     * 现在按页 id 命中：只有被拖那一页的 click 被挡，别的照常翻页。
+     */
+    {
+      const v3 = view as any;
+      const pages = view.store!.data.pages;
+      // 假装刚拖完第 1 页（id = pages[0].id）
+      v3.thumbDragClickGuard = true;
+      v3.thumbDragClickGuardId = pages[0].id;
+      const beforeClick = view.editor.getState().pageIndex;
+      // 点**另一页**（下标 1 的条目）—— 应该正常翻页，不被吞
+      const other = thumbAt(1);
+      if (other) {
+        other.click();
+        await sleep(300);
+      }
+      pass(
+        view.editor.getState().pageIndex === 1,
+        "2.7 拖完后点「别的页」照常翻页（守卫按页 id 命中，不误吞；" +
+          beforeClick +
+          " → " +
+          view.editor.getState().pageIndex +
+          "）"
+      );
+      pass(
+        !v3.thumbDragClickGuard,
+        "2.7 点别的页后守卫被清掉（不会一直挂着挡住后续点击）"
+      );
+      // 再验：被拖的那一页的 click 仍然被挡
+      v3.thumbDragClickGuard = true;
+      v3.thumbDragClickGuardId = pages[0].id;
+      const selfBefore = view.editor.getState().pageIndex;
+      thumbAt(0)?.click();
+      await sleep(200);
+      pass(
+        view.editor.getState().pageIndex === selfBefore,
+        "2.7 拖完那一下点「被拖的那一页」仍被挡住（不顺手翻页）"
+      );
+      // 复位，别影响后面
+      v3.thumbDragClickGuard = false;
+      v3.thumbDragClickGuardId = "";
+      view.editor.goToPage(2, false);
+      await sleep(200);
+    }
+
     /* ---- ⑤ 长按期间（未到 450ms）移动超 8px → 当滚动，不重排 ---- */
     const orderBeforeScroll = order();
     const pageBeforeScroll = view.editor.getState().pageIndex;

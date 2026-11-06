@@ -346,8 +346,15 @@ export class InkbookView extends FileView {
   private thumbDragTargetIndex = -1;
   /** movePage 要的「最终下标」（0 起），算出后松手才调用 */
   private thumbDragInsertPos = -1;
-  /** 松手自带的 click 屏蔽位：拖完再点这格不能顺手翻页 */
+  /**
+   * 松手自带的 click 屏蔽位：拖完那一下不能顺手翻页。
+   *
+   * 必须**按页 id 命中**（`thumbDragClickGuardId`），不能只用一个全局布尔：
+   * 触屏 pointerup 的落点可能偏到相邻条目，全局布尔会把别的条目的正常
+   * 点击也吞掉一次。空 id = 没有待挡的点击。
+   */
   private thumbDragClickGuard = false;
+  private thumbDragClickGuardId = "";
   private thumbDragGhost: HTMLElement | null = null;
   /** 落点指示（紫色竖条） */
   private thumbDragIndicator: HTMLElement | null = null;
@@ -3508,10 +3515,20 @@ export class InkbookView extends FileView {
       if (this.thumbMenuEl) e.preventDefault();
     });
     item.onclick = () => {
-      if (this.thumbDragClickGuard) {
-        // 刚拖完的抬手 click 不能顺手翻页；下次按下再解除
+      /*
+       * 只挡「刚被拖的那一页」的抬手 click，别的条目照常翻页。
+       * 按页 id 命中：条目会在回收池里进出、页序刚变过，闭包里的 index
+       * 可能已经过期，只有 id 是稳的。
+       */
+      if (this.thumbDragClickGuard && item.dataset.pageId === this.thumbDragClickGuardId) {
         this.thumbDragClickGuard = false;
+        this.thumbDragClickGuardId = "";
         return;
+      }
+      // 不是被拖的那一条：把过期的守卫清掉，别留着挡住下一次正常点击
+      if (this.thumbDragClickGuard) {
+        this.thumbDragClickGuard = false;
+        this.thumbDragClickGuardId = "";
       }
       const at = Number(item.dataset.longPressAt || 0);
       if (at && Date.now() - at < 1200) {
@@ -3539,6 +3556,7 @@ export class InkbookView extends FileView {
     if ((e.target as Element | null)?.closest?.(".mb-thumb-act")) return;
     // 解除上一次拖拽留下的 click 屏蔽
     this.thumbDragClickGuard = false;
+    this.thumbDragClickGuardId = "";
     this.cancelThumbPress();
     this.armThumbTouchGuard();
     this.thumbPressItem = item;
@@ -4056,6 +4074,14 @@ export class InkbookView extends FileView {
     this.updateThumbDragTarget(x, y);
     const from = this.thumbDragFromIndex;
     const to = this.thumbDragInsertPos;
+    /*
+     * 记下「被拖的那一页的 id」再清理——清理会把 fromIndex 复位成 -1。
+     * 守卫要按 id 命中，不能用一个全局布尔：拖完的抬手 click 理论上落在
+     * 被拖条目上，但触屏 pointerup 的落点可能偏到相邻条目（手指抖动），
+     * 那种情况下全局布尔会把**别的**条目的正常点击也吞掉一次
+     * （用户点了没反应，还白吃掉标志）。
+     */
+    const draggedId = this.store?.data.pages[from]?.id ?? "";
     this.cleanupThumbDrag();
     if (from < 0 || to < 0) return;
     /*
@@ -4064,8 +4090,9 @@ export class InkbookView extends FileView {
      * 否则 is-dragging / ghost / 指示线会残留在即将被空的旧文档里。
      */
     this.editor?.movePage(from, to);
-    // 拖完自带的抬手 click：不能顺手翻到这一页
+    // 拖完自带的抬手 click：只挡「被拖的那一页」，别的条目的点击照常翻页
     this.thumbDragClickGuard = true;
+    this.thumbDragClickGuardId = draggedId;
   }
 
   private cancelThumbDrag(): void {
