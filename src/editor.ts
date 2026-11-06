@@ -213,6 +213,33 @@ const MAX_CANVAS_PIXELS = 16_000_000;
 const MAX_EXPORT_PX = 4096;
 
 /**
+ * 缩略图快照缓存（LRU）的两条上限。
+ *
+ * 侧栏窗口化后，滚出视口的条目连 canvas 一起回收；滚回来时条目重建，
+ * 以前会把「纸面线 + 笔迹 + PDF 底图」整张再画一遍。现在把画好的小图
+ * 按页 id 存一份，窗口重建后直接 drawImage。
+ *
+ * 每条只是缩略图尺寸（60×84 CSS @dpr2 ≈ 120×168×4 ≈ 80KB），
+ * 但侧栏宽度会变、dpr 会变，不同尺寸各存一份，所以既按字节也按条数封顶。
+ * 8MB 约等于 100 张 60×84@2x；实际按条数先到 80 张，对平板内存可忽略，
+ * 也远小于 PDF 位图的 32MB thumbBitmaps。
+ */
+const THUMB_SHOT_BUDGET = 8 * 1024 * 1024;
+const THUMB_SHOT_MAX = 80;
+
+/** 缩略图快照的 key：页 id + 目标像素尺寸（尺寸变了要重画一份） */
+function thumbShotKey(pageId: string, w: number, h: number): string {
+  return `${pageId}@${w}x${h}`;
+}
+
+/** 一张画好的缩略图快照（不在 DOM 里，平板内存按 w×h×4 记账） */
+interface ThumbShot {
+  canvas: HTMLCanvasElement;
+  bytes: number;
+  touched: number;
+}
+
+/**
  * 同时挂载的所有画布总字节预算（不含 PDF 位图缓存）。
  *
  * 这是**软目标**，不是硬上界：实际挂载量会被 MIN_MOUNTED 抬到 2 页
@@ -305,6 +332,13 @@ export class BookEditor {
   private recs: PageRec[] = [];
   private observer: IntersectionObserver | null = null;
   private current = 0;
+  /**
+   * 上次 renderPages 时的页顺序版本（store.pageOrderRev）。
+   *
+   * 撤销/重做原来只比页数：页数不变但顺序变了（上移/下移）就不重建 DOM，
+   * 主视图会「第 3 页的位置显示第 1 页的内容」。靠这个版本号捕捉换序。
+   */
+  private pageOrderRev = -1;
   private gesture: Gesture = "none";
   /** 正在编辑的文字框（同一时刻只有一个） */
   private textEdit: {
@@ -480,6 +514,26 @@ export class BookEditor {
    *   分开之后：缩略图浏览再狠也只吃自己那 32MB。
    */
   private thumbBitmaps = new BitmapCache({ budget: 32 * 1024 * 1024 });
+  /**
+   * 已经**画完的缩略图快照**（HTMLCanvasElement 小图）LRU。
+   *
+   * 与 thumbBitmaps 的区别：
+   *   · thumbBitmaps 存的是 PDF 页的**原始位图**，只有导入的 PDF 页用得上；
+   *   · 这里存的是整张缩略图的**最终像素**（纸面线 + 笔迹 + PDF/图片底图），
+   *     滚出窗口再滚回来时直接 drawImage，连纸面线和笔迹都不用重画。
+   *
+   * key 是「页 id + 目标像素尺寸」，不是页号：
+   *   · 上移/下移、插入、删除页后页号会变，页 id 跟着内容走；
+   *   · 侧栏宽度 / dpr 变了会得到新尺寸，按新尺寸另画一份，不会拿小图硬拉。
+   * 上限见 THUMB_SHOT_BUDGET / THUMB_SHOT_MAX；内容改变时按页失效（见 changed）。
+   */
+  private thumbShots = new Map<string, ThumbShot>();
+  private thumbShotBytes = 0;
+  private thumbShotClock = 0;
+  /** 真正画过几眼缩略图（命中缓存不算）——诊断 / 测试用 */
+  private thumbRasterized = 0;
+  /** 缩略图缓存命中次数——诊断 / 测试用 */
+  private thumbHits = 0;
   /**
    * 缩略图渲染队列。
    *
@@ -856,6 +910,21 @@ export class BookEditor {
   }
 
   private changed(): void {
+    /*
+     * 内容变了 → 当前页的缩略图快照作废。
+     *
+     * 缩略图不能显示旧笔迹。所有内容改动都会在改完后走到这里，而且改的
+     * 就是 current 页：落笔 / 擦除在 onDown 里先把 current 对齐到按下的页，
+     * 模板 / 纸张 / 图层 / 撤销重做也都作用在当前页（撤销会把 activePage
+     * 设到被改的那页）。整本范围的改动（全部换模板、整本快照撤销）另外
+     * 在调用点 clearThumbShots()。
+     *
+     * 这里只按页 id 删，不会误伤其他页滚回来时还能用的快照；
+     * 文字改动其实不进缩略图（renderThumbnail 不画 texts），多失效一次
+     * 只是下次刷新重画一张小图，不追求零成本。
+     */
+    const page = this.store.page;
+    if (page) this.invalidateThumb(page.id);
     if (this.opts.onChange) this.opts.onChange();
   }
 
@@ -1376,6 +1445,8 @@ export class BookEditor {
     const wrap = document.createElement("div");
     wrap.className = "mb-page-wrap";
     wrap.dataset.page = String(index);
+    // 页 id 才是身份：重排后下标全变，测试/排查靠它确认 DOM 顺序与数据一致
+    wrap.dataset.pageId = page.id;
     if (page.background) wrap.classList.add("has-bg");
     const pageEl = document.createElement("div");
     pageEl.className = "mb-page";
@@ -1491,6 +1562,8 @@ export class BookEditor {
     this.bindDelegatedEvents();
 
     this.current = clamp(this.store.data.activePage, 0, this.store.pageCount - 1);
+    // 记下这次渲染对应的页顺序版本（undo/redo 靠它判断要不要重建）
+    this.pageOrderRev = this.store.pageOrderRev;
     this.applyLayout();
     this.applyTouchAction();
     this.observePages();
@@ -4103,7 +4176,11 @@ export class BookEditor {
   }
 
   deletePage(index = this.current): void {
+    // 页 id 是缓存的身份：删掉的页立刻把它的快照释放掉
+    // （撤销恢复的是同一页对象、同一 id，即便留着也不会错，但没必要占内存）
+    const gone = this.store.data.pages[index];
     if (!this.store.deletePage(index)) return;
+    if (gone) this.invalidateThumb(gone.id);
     this.current = clamp(index, 0, this.store.pageCount - 1);
     this.renderPages();
     requestAnimationFrame(() => this.goToPage(this.current, false));
@@ -4116,9 +4193,26 @@ export class BookEditor {
     requestAnimationFrame(() => this.goToPage(at, false));
   }
 
+  /**
+   * 调整页顺序（侧栏上移/下移）。
+   *
+   * 页数没变，主视图必须整页重建：页 DOM 是按数组顺序建的，
+   * 只重画 canvas 的话位置和内容会错位。当前页由 store 按 id 跟随。
+   */
+  movePage(from: number, to: number): boolean {
+    // store.movePage 已 touch（→ view.markDirty），这里只负责重建主视图
+    if (!this.store.movePage(from, to)) return false;
+    this.current = clamp(this.store.data.activePage, 0, this.store.pageCount - 1);
+    this.renderPages();
+    return true;
+  }
+
   setTemplate(template: TemplateId, all = false): void {
-    if (all) this.store.setAllTemplates(template);
-    else this.store.setTemplate(this.current, template);
+    if (all) {
+      this.store.setAllTemplates(template);
+      // 整本都换了纸面线，所有页的缩略图快照一起作废
+      this.clearThumbShots();
+    } else this.store.setTemplate(this.current, template);
     for (const rec of this.recs) {
       const page = this.store.data.pages[rec.index];
       if (page) rec.pageEl.style.background = paperBackground(page.paper);
@@ -4277,7 +4371,16 @@ export class BookEditor {
     // 还在编辑框里的文字先落库（移动端点按钮不一定触发 blur），否则会漏字
     this.commitTextEdit();
     if (!this.store.undo()) return;
-    if (this.recs.length !== this.store.pageCount) {
+    /*
+     * 撤销可能恢复整本快照（加/删页、全部换模板），被改的不一定只有当前页；
+     * 缩略图快照又便宜（最多 8MB），直接全丢，别去猜哪几页受影响。
+     */
+    this.clearThumbShots();
+    /*
+     * 页数不变但顺序可能变了（撤销一次上移/下移）：
+     * 页 DOM 是按数组顺序建的，不重建就会「第 3 页的位置还是第 1 页的内容」。
+     */
+    if (this.recs.length !== this.store.pageCount || this.pageOrderRev !== this.store.pageOrderRev) {
       this.current = this.store.data.activePage;
       this.renderPages();
     } else {
@@ -4302,7 +4405,10 @@ export class BookEditor {
     if (this.readOnly) return;
     this.commitTextEdit();
     if (!this.store.redo()) return;
-    if (this.recs.length !== this.store.pageCount) {
+    // 同 undo：整本快照可能被恢复，缩略图快照全丢（见上）
+    this.clearThumbShots();
+    // 同 undo：顺序变化也要重建（见上）
+    if (this.recs.length !== this.store.pageCount || this.pageOrderRev !== this.store.pageOrderRev) {
       this.current = this.store.data.activePage;
       this.renderPages();
     } else {
@@ -4337,7 +4443,8 @@ export class BookEditor {
    *     一屏最多 5–8 张，不会一次点爆；
    *   · PDF 位图走独立的小缓存 `thumbBitmaps`（32MB），只要 160px 宽；
    *   · 主视图已经渲染过同一页就借它的位图，省一次光栅化；
-   *   · 位图没就绪先画一层浅灰占位，渲染完由 onThumbNeedsRedraw 补画。
+   *   · 位图没就绪先画一层浅灰占位，渲染完由 onThumbNeedsRedraw 补画；
+   *   · 画完的整张缩略图进 thumbShots 小 LRU（8MB / 80 张），滚回来直接 blit。
    */
   renderThumbnail(canvas: HTMLCanvasElement, index: number): void {
     const page = this.store.data.pages[index];
@@ -4346,12 +4453,77 @@ export class BookEditor {
     const rect = canvas.getBoundingClientRect();
     const cssW = rect.width || 60;
     const cssH = rect.height || 84;
-    canvas.width = Math.max(1, Math.round(cssW * dpr));
-    canvas.height = Math.max(1, Math.round(cssH * dpr));
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    const kx = (cssW * dpr) / this.store.data.width;
-    const ky = (cssH * dpr) / this.store.data.height;
+    const w = Math.max(1, Math.round(cssW * dpr));
+    const h = Math.max(1, Math.round(cssH * dpr));
+
+    /*
+     * 缓存命中：窗口重建换了一块新 canvas，但这一页内容没变——
+     * 直接把上次画好的小图 blit 过去。纸面线、笔迹、PDF 底图都不用再画，
+     * 滚回看过的页就是一次 drawImage。
+     *
+     * key 里带页 id 而不是页号：上移/下移、插入、删除页后页号会漂，
+     * 但页 id 跟着内容走；尺寸也进 key，侧栏变宽 / dpr 变了按新尺寸重画。
+     */
+    const key = thumbShotKey(page.id, w, h);
+    const hit = this.thumbShots.get(key);
+    if (hit) {
+      hit.touched = ++this.thumbShotClock;
+      this.thumbHits += 1;
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext("2d")?.drawImage(hit.canvas, 0, 0);
+      return;
+    }
+
+    /*
+     * 先画到一块**离屏小画布**，画完再 blit 到目标：
+     * 同一份像素既给当前窗口用，也进 LRU 给下次滚回来用。
+     * 直接画目标 canvas 的话还得再复制一份才能缓存，白画一遍。
+     */
+    const shot = document.createElement("canvas");
+    shot.width = w;
+    shot.height = h;
+    const sctx = shot.getContext("2d");
+    if (!sctx) {
+      // 极端环境拿不到离屏 ctx：退回直接画目标，不缓存（正确性优先）
+      canvas.width = w;
+      canvas.height = h;
+      const direct = canvas.getContext("2d");
+      if (!direct) return;
+      this.paintThumb(direct, page, cssW, dpr, w, h);
+      this.thumbRasterized += 1;
+      return;
+    }
+
+    const bgReady = this.paintThumb(sctx, page, cssW, dpr, w, h);
+    this.thumbRasterized += 1;
+    /*
+     * 底图没就绪（PDF 位图还在渲染 / 图片还没加载完）时**不缓存**：
+     * 存下来的会是灰占位 / 空底图，底图好了回调重画时会命中这张假图，
+     * 用户就永远看不到内容。等就绪后的那一遍再进缓存。
+     */
+    if (bgReady) this.putThumbShot(key, shot, w, h);
+
+    canvas.width = w;
+    canvas.height = h;
+    canvas.getContext("2d")?.drawImage(shot, 0, 0);
+  }
+
+  /**
+   * 把一页画进给定 ctx（缩略图尺寸）。
+   *
+   * @returns 底图是否已就绪。false = 画的是占位/空底图，这一张不能进缓存。
+   */
+  private paintThumb(
+    ctx: CanvasRenderingContext2D,
+    page: Page,
+    cssW: number,
+    dpr: number,
+    w: number,
+    h: number
+  ): boolean {
+    const kx = w / this.store.data.width;
+    const ky = h / this.store.data.height;
     ctx.scale(kx, ky);
     drawPaper(
       ctx,
@@ -4363,16 +4535,24 @@ export class BookEditor {
     );
     /*
      * 底图：PDF 走缩略图专用的小尺寸渲染；图片（Word 导入）照旧。
-     * 这里**不能**调 drawBackground —— 它对 PDF 会按主视图缩放去请求
-     * 2000px 级别的高清位图，侧栏滚一遍等于把整个 PDF 重新光栅化一遍。
+     * 这里**不能**调 drawBackground 的 PDF 分支——它对 PDF 会按主视图缩放
+     * 去请求 2000px 级别的高清位图，侧栏滚一遍等于把整个 PDF 重新光栅化一遍。
      */
     const bg = page.background;
-    if (bg?.pdf) this.drawPdfThumb(ctx, bg, cssW);
-    else if (bg?.src) this.drawBackground(ctx, page);
+    let bgReady = true;
+    if (bg?.pdf) {
+      bgReady = this.drawPdfThumb(ctx, bg, cssW);
+    } else if (bg?.src) {
+      // 图片底图是异步加载的，没加载完时 drawBackground 什么都不画
+      const img = this.bgImages.get(bg.src);
+      bgReady = !!img && img.complete && img.naturalWidth > 0;
+      this.drawBackground(ctx, page);
+    }
     for (const layer of page.layers) {
       if (!layer.visible) continue;
       for (const s of layer.strokes) drawStroke(ctx, s, layer.opacity);
     }
+    return bgReady;
   }
 
   /**
@@ -4380,14 +4560,16 @@ export class BookEditor {
    *
    * ctx 已经按「页面坐标 → 缩略图设备像素」缩放过，所以 bg.x/y/width/height
    * 可以直接用，和主视图是同一套坐标。
+   *
+   * @returns 是否画上了真实位图（false = 只画了灰占位，调用方不要缓存这一张）
    */
   private drawPdfThumb(
     ctx: CanvasRenderingContext2D,
     bg: PageBackground,
     cssW: number
-  ): void {
+  ): boolean {
     const pdf = bg.pdf;
-    if (!pdf) return;
+    if (!pdf) return true;
     const key = `${pdf.path}#${pdf.page}`;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     // 1.4 倍余量：缩略图在 hover / 窄侧栏里会有几像素的尺寸浮动
@@ -4399,7 +4581,7 @@ export class BookEditor {
       ctx.save();
       ctx.drawImage(bmp, bg.x, bg.y, bg.width, bg.height);
       ctx.restore();
-      return;
+      return true;
     }
 
     /*
@@ -4414,6 +4596,78 @@ export class BookEditor {
     ctx.restore();
 
     this.requestPdfThumb(pdf.path, pdf.page, key, want);
+    return false;
+  }
+
+  /* --------------------- 缩略图快照 LRU（诊断 / 测试可见） --------------------- */
+
+  /** 缩略图快照缓存统计；只读，不参与渲染决策 */
+  get thumbCacheStats(): {
+    count: number;
+    bytes: number;
+    budget: number;
+    max: number;
+    rasterized: number;
+    hits: number;
+  } {
+    return {
+      count: this.thumbShots.size,
+      bytes: this.thumbShotBytes,
+      budget: THUMB_SHOT_BUDGET,
+      max: THUMB_SHOT_MAX,
+      rasterized: this.thumbRasterized,
+      hits: this.thumbHits,
+    };
+  }
+
+  /** 放进 LRU；超预算 / 超条数就淘汰最久没用的 */
+  private putThumbShot(key: string, canvas: HTMLCanvasElement, w: number, h: number): void {
+    this.dropThumbShot(key);
+    const bytes = w * h * 4;
+    // 单张就超预算：不缓存（正常缩略图远到不了，防尺寸异常时吃光内存）
+    if (bytes > THUMB_SHOT_BUDGET) return;
+    this.thumbShots.set(key, { canvas, bytes, touched: ++this.thumbShotClock });
+    this.thumbShotBytes += bytes;
+    while (this.thumbShotBytes > THUMB_SHOT_BUDGET || this.thumbShots.size > THUMB_SHOT_MAX) {
+      let oldestKey: string | null = null;
+      let oldest = Infinity;
+      for (const [k, e] of this.thumbShots) {
+        if (e.touched < oldest) {
+          oldest = e.touched;
+          oldestKey = k;
+        }
+      }
+      if (!oldestKey) break;
+      this.dropThumbShot(oldestKey);
+    }
+  }
+
+  private dropThumbShot(key: string): void {
+    const e = this.thumbShots.get(key);
+    if (!e) return;
+    this.thumbShots.delete(key);
+    this.thumbShotBytes -= e.bytes;
+    /*
+     * 把 backing store 缩到 0，别等 GC。
+     * 平板上一次滚动可能淘汰几十张，等 GC 的话峰值内存会多顶一会儿。
+     */
+    e.canvas.width = 0;
+    e.canvas.height = 0;
+  }
+
+  /** 某页内容变了：丢掉它所有尺寸的快照 */
+  private invalidateThumb(pageId?: string): void {
+    if (!pageId) return;
+    const prefix = pageId + "@";
+    for (const key of Array.from(this.thumbShots.keys())) {
+      if (key.startsWith(prefix)) this.dropThumbShot(key);
+    }
+  }
+
+  /** 整本范围改动（全部换模板 / 撤销整本快照）：全部丢掉 */
+  private clearThumbShots(): void {
+    for (const key of Array.from(this.thumbShots.keys())) this.dropThumbShot(key);
+    this.thumbShotBytes = 0;
   }
 
   /**
@@ -4646,6 +4900,7 @@ export class BookEditor {
     // 释放位图显存和 PDF 文档句柄
     this.bgBitmaps.clear();
     this.thumbBitmaps.clear();
+    this.clearThumbShots();
     this.thumbRendering.clear();
     this.thumbQueue.length = 0;
     this.thumbQueued.clear();

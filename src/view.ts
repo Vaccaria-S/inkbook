@@ -231,6 +231,21 @@ export class InkbookView extends FileView {
   private layerSig = "";
   private pageCountSig = -1;
   /**
+   * 上次建页列表时的页顺序版本（store.pageOrderRev）。
+   * 上移/下移不改页数，只比 pageCount 会让侧栏停留在旧顺序上。
+   */
+  private pageOrderRev = -1;
+  /** 页序长按菜单（同一时刻只允许一个） */
+  private thumbMenuEl: HTMLElement | null = null;
+  private thumbMenuOwner: HTMLElement | null = null;
+  private thumbMenuAbort: AbortController | null = null;
+  /** 长按计时器：450ms 内没抬手/没滚动才弹菜单 */
+  private thumbPressTimer = 0;
+  private thumbPressItem: HTMLElement | null = null;
+  private thumbPressId = -1;
+  private thumbPressX = 0;
+  private thumbPressY = 0;
+  /**
    * 侧栏页列表窗口化（`.mb-pages` 网格）。
    *
    * 侧栏展开时不再给 857 页各建一个条目，只建「可视行 ± overscan」，
@@ -704,6 +719,9 @@ export class InkbookView extends FileView {
     this.paperChips.clear();
     this.layerSig = "";
     this.pageCountSig = -1;
+    this.pageOrderRev = -1;
+    this.cancelThumbPress();
+    this.closeThumbMenu();
     this.templatePaperSig = "";
   }
 
@@ -2404,6 +2422,9 @@ export class InkbookView extends FileView {
      */
     this.thumbObserver?.disconnect();
     this.thumbObserver = null;
+    // 长按菜单和计时器都挂在旧节点上，重建前先收掉（否则引用悬空）
+    this.cancelThumbPress();
+    this.closeThumbMenu();
     list.empty();
     this.thumbCanvases.clear();
     this.activeThumbEl = null;
@@ -2430,6 +2451,7 @@ export class InkbookView extends FileView {
     }
 
     this.pageCountSig = count;
+    this.pageOrderRev = this.store?.pageOrderRev ?? 0;
     this.pageWinRowLo = rowLo;
     this.pageWinRowHi = rowHi;
     this.pageWinCols = cols;
@@ -2455,6 +2477,12 @@ export class InkbookView extends FileView {
   private createThumbItem(list: HTMLElement, index: number, active: boolean): void {
     const item = list.createDiv("mb-thumb" + (active ? " is-active" : ""));
     item.dataset.page = String(index);
+    /*
+     * 页 id 一起写进 dataset：窗口化后条目会随滚动重建，
+     * 长按菜单的动作必须按 id 回查当前下标，闭包里的 index 会过期。
+     */
+    item.dataset.pageId = this.store?.data.pages[index]?.id ?? "";
+    item.title = "长按可上移 / 下移";
     const cv = document.createElement("canvas");
     cv.className = "mb-thumb-canvas";
     item.appendChild(cv);
@@ -2476,8 +2504,144 @@ export class InkbookView extends FileView {
         this.editor?.deletePage(index);
       };
     }
-    item.onclick = () => this.editor?.goToPage(index);
+    // 长按（触屏/鼠标都可以）弹「上移 / 下移」，不做拖拽——拖拽会和侧栏滚动打架
+    item.addEventListener("pointerdown", (e) => this.onThumbPointerDown(e, item));
+    item.addEventListener("pointermove", (e) => this.onThumbPointerMove(e));
+    item.addEventListener("pointerup", () => this.cancelThumbPress());
+    item.addEventListener("pointercancel", () => this.cancelThumbPress());
+    item.addEventListener("pointerleave", () => this.cancelThumbPress());
+    // 触屏长按会触发系统菜单，盖掉；桌面右键保持原样
+    item.addEventListener("contextmenu", (e) => {
+      if (this.thumbMenuEl) e.preventDefault();
+    });
+    item.onclick = () => {
+      const at = Number(item.dataset.longPressAt || 0);
+      if (at && Date.now() - at < 1200) {
+        // 这次 click 是长按抬手带出来的，不能当成"翻到这一页"
+        delete item.dataset.longPressAt;
+        return;
+      }
+      if (this.thumbMenuEl) {
+        this.closeThumbMenu();
+        return;
+      }
+      this.editor?.goToPage(index);
+    };
     this.thumbCanvases.set(index, cv);
+  }
+
+  /* --------------------------- 页序长按菜单 --------------------------- */
+
+  private onThumbPointerDown(e: PointerEvent, item: HTMLElement): void {
+    if (e.button !== 0) return;
+    // 点在复制/删除按钮上不参与长按
+    if ((e.target as Element | null)?.closest?.(".mb-thumb-act")) return;
+    this.cancelThumbPress();
+    this.thumbPressItem = item;
+    this.thumbPressId = e.pointerId;
+    this.thumbPressX = e.clientX;
+    this.thumbPressY = e.clientY;
+    this.thumbPressTimer = window.setTimeout(() => {
+      this.thumbPressTimer = 0;
+      const it = this.thumbPressItem;
+      this.thumbPressItem = null;
+      // 条目可能已经被滚动重建掉；菜单已开时也不再叠加
+      if (!it || !it.isConnected || this.thumbMenuEl) return;
+      it.dataset.longPressAt = String(Date.now());
+      this.openThumbMenu(it);
+    }, 450);
+  }
+
+  /** 手指/鼠标在长按期间移动超过 8px 视为滚动，取消 */
+  private onThumbPointerMove(e: PointerEvent): void {
+    if (!this.thumbPressTimer || e.pointerId !== this.thumbPressId) return;
+    if (
+      Math.abs(e.clientX - this.thumbPressX) > 8 ||
+      Math.abs(e.clientY - this.thumbPressY) > 8
+    ) {
+      this.cancelThumbPress();
+    }
+  }
+
+  private cancelThumbPress(): void {
+    if (this.thumbPressTimer) {
+      window.clearTimeout(this.thumbPressTimer);
+      this.thumbPressTimer = 0;
+    }
+    this.thumbPressItem = null;
+  }
+
+  private openThumbMenu(item: HTMLElement): void {
+    this.closeThumbMenu();
+    const at = this.pageIndexOfThumb(item);
+    const n = this.store?.pageCount ?? 0;
+    if (at < 0 || n <= 0) return;
+    const menu = item.createDiv("mb-thumb-menu");
+    const up = menu.createEl("button", { cls: "mb-thumb-menu-btn", text: "上移" });
+    up.disabled = at <= 0;
+    up.onclick = (e) => {
+      e.stopPropagation();
+      this.movePageBy(item, -1);
+    };
+    const down = menu.createEl("button", { cls: "mb-thumb-menu-btn", text: "下移" });
+    down.disabled = at >= n - 1;
+    down.onclick = (e) => {
+      e.stopPropagation();
+      this.movePageBy(item, 1);
+    };
+    this.thumbMenuEl = menu;
+    this.thumbMenuOwner = item;
+    item.classList.add("is-menu");
+    // 点菜单外面关掉（捕获阶段，先于任何翻页/按钮逻辑）
+    const ac = new AbortController();
+    this.thumbMenuAbort = ac;
+    document.addEventListener(
+      "pointerdown",
+      (e) => {
+        if (!item.contains(e.target as Node)) this.closeThumbMenu();
+      },
+      { capture: true, signal: ac.signal }
+    );
+  }
+
+  private closeThumbMenu(): void {
+    this.thumbMenuAbort?.abort();
+    this.thumbMenuAbort = null;
+    this.thumbMenuOwner?.classList.remove("is-menu");
+    this.thumbMenuOwner = null;
+    this.thumbMenuEl?.remove();
+    this.thumbMenuEl = null;
+  }
+
+  /**
+   * 条目 → **当前**页下标。
+   *
+   * 以 dataset.pageId 回查为准（重排/重建后下标会变），dataset.page 只做兜底。
+   * 绝不能用创建闭包时捕获的旧 index——审查时明确指出的坑。
+   */
+  private pageIndexOfThumb(item: HTMLElement): number {
+    if (!this.store) return -1;
+    const id = item.dataset.pageId;
+    if (id) {
+      const at = this.store.data.pages.findIndex((p) => p.id === id);
+      if (at >= 0) return at;
+    }
+    const at = Number(item.dataset.page);
+    return Number.isFinite(at) && at >= 0 && at < this.store.pageCount ? at : -1;
+  }
+
+  private movePageBy(item: HTMLElement, delta: number): void {
+    const at = this.pageIndexOfThumb(item);
+    const n = this.store?.pageCount ?? 0;
+    const to = at + delta;
+    this.closeThumbMenu();
+    if (at < 0 || to < 0 || to >= n) return;
+    /*
+     * editor.movePage 里 renderPages → emitState → updateUI 会检测到
+     * pageOrderRev 变化并同步重建侧栏，这里不用再调 renderPageList
+     * （否则同一帧建两遍窗口、缩略图白画一次）。
+     */
+    this.editor?.movePage(at, to);
   }
 
   private createAddThumb(list: HTMLElement): void {
@@ -2617,7 +2781,11 @@ export class InkbookView extends FileView {
      * 侧栏没开时不会在每次停顿后去重画 5 张缩略图（PDF 页很贵）。
      */
     if (!this.thumbVisible()) return;
-    if (this.pageCountSig !== this.store.pageCount) {
+    // 页数变了要建新条目；页数没变但换序了（上移/下移、撤销换序）也要重建
+    if (
+      this.pageCountSig !== this.store.pageCount ||
+      this.pageOrderRev !== this.store.pageOrderRev
+    ) {
       this.renderPageList();
       return;
     }
@@ -2680,7 +2848,13 @@ export class InkbookView extends FileView {
 
     if (this.layerSig !== this.layerSignature()) this.renderLayers();
     // 侧栏收起时不建页列表（首次展开由 applySideVisibility → refreshThumbs 补建）
-    if (this.thumbVisible() && this.pageCountSig !== s.pageCount) this.renderPageList();
+    if (
+      this.thumbVisible() &&
+      this.store &&
+      (this.pageCountSig !== s.pageCount || this.pageOrderRev !== this.store.pageOrderRev)
+    ) {
+      this.renderPageList();
+    }
 
     if (this.thumbVisible()) this.setActiveThumb(s.pageIndex);
 

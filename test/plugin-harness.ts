@@ -1,4 +1,5 @@
 import InkbookPlugin from "../src/main";
+import { TFile } from "obsidian";
 
 const lines: string[] = [];
 const out = document.getElementById("out")!;
@@ -15,6 +16,12 @@ const swipeCalls: any[] = [];
 let inkbookLeaves: any[] = [];
 /** getActiveFile 的返回值 */
 let activeFile: any = null;
+/** revealLeaf 的调用记录（多标签防呆用） */
+const revealed: any[] = [];
+/** getLeaf(mode) 的调用记录 */
+const leafRequests: string[] = [];
+/** getAbstractFileByPath 的返回值（默认 null = 找不到文件） */
+let abstractFile: any = null;
 
 /** 原型上带 trigger：插件只该改这个原型，不该落到 Object.prototype */
 const wsProto: any = {
@@ -29,7 +36,13 @@ Object.assign(workspace, {
     return {};
   },
   onLayoutReady: (cb: () => void) => setTimeout(cb, 0),
-  getLeaf: () => ({ openFile: async () => {}, setViewState: async () => {} }),
+  getLeaf: (mode?: any) => {
+    leafRequests.push(String(mode));
+    return { openFile: async () => {}, setViewState: async () => {} };
+  },
+  revealLeaf: (leaf: any) => {
+    revealed.push(leaf);
+  },
   getActiveFile: () => activeFile,
   getActiveViewOfType: () => null,
   getLeavesOfType: () => inkbookLeaves,
@@ -50,7 +63,7 @@ const app: any = {
   vault: {
     adapter: { exists: async () => false, read: async () => "", write: async () => {}, mkdir: async () => {}, writeBinary: async () => {}, readBinary: async () => new ArrayBuffer(0), getFullPath: (p: string) => p },
     getFiles: () => [],
-    getAbstractFileByPath: () => null,
+    getAbstractFileByPath: () => abstractFile,
   },
   workspace,
 };
@@ -162,6 +175,48 @@ async function main() {
       (fireCmd("command-palette:open") === 1 ? "PASS" : "FAIL") + " 开关关掉后放行：1 次"
     );
     plugin.settings.blockCommandPalette = true;
+
+    /* ---- 同一本已开在别的标签：默认切过去，不新开第二份 store ---- */
+    {
+      const bookFile: any = new TFile();
+      bookFile.path = "笔记/代数.inkbook";
+      bookFile.extension = "inkbook";
+      abstractFile = bookFile;
+      activeFile = null;
+      const jumped: number[] = [];
+      const leaf: any = {
+        view: { file: bookFile, gotoPageFromLink: (p: number) => jumped.push(p) },
+      };
+      inkbookLeaves = [leaf];
+      revealed.length = 0;
+      leafRequests.length = 0;
+
+      await (plugin as any).openBookAt(bookFile.path, 12);
+      log(
+        (revealed.length === 1 &&
+        revealed[0] === leaf &&
+        jumped.join(",") === "12" &&
+        leafRequests.length === 0
+          ? "PASS"
+          : "FAIL") +
+          " 同一本已在别的标签 → reveal 原叶并翻页，不新建 leaf（reveal " +
+          revealed.length +
+          " / 新建 " +
+          leafRequests.length +
+          "）"
+      );
+
+      await (plugin as any).openBookAt(bookFile.path, 5, { newTab: true });
+      log(
+        (revealed.length === 1 && leafRequests[0] === "tab" ? "PASS" : "FAIL") +
+          " 明确 newTab → 照开新标签，不抢原标签（新建 " +
+          leafRequests.length +
+          "）"
+      );
+
+      abstractFile = null;
+      inkbookLeaves = [];
+    }
 
     plugin.onunload();
     log(

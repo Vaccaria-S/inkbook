@@ -1548,6 +1548,52 @@
   right: 2px;
 }
 
+/*
+ * 长按页序菜单：盖在缩略图上（.mb-thumb 是 overflow:hidden，菜单就在内部）。
+ * 触屏没有 hover，长按是唯一不打架（不和侧栏滚动抢手势）的入口。
+ */
+.mb-thumb {
+  -webkit-touch-callout: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.mb-thumb-menu {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  background: rgba(20, 20, 20, 0.62);
+  cursor: default;
+}
+
+.mb-thumb-menu-btn {
+  width: calc(100% - 10px);
+  min-width: 0;
+  padding: 1px 0;
+  border: none;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.94);
+  color: #222;
+  font-size: 10px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.mb-thumb-menu-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.mb-root.is-tablet .mb-thumb-menu-btn {
+  padding: 3px 0;
+  font-size: 12px;
+}
+
 .mb-thumb:hover .mb-thumb-act {
   display: inline-flex;
   align-items: center;

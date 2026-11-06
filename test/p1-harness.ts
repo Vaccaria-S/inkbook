@@ -960,6 +960,153 @@ async function I() {
   v.containerEl.remove();
 }
 
+/**
+ * J：页序重排（侧栏「长按 → 上移/下移」的完整路径）。
+ *
+ * 用户场景：补页/导入后想把某页挪到中间，撤销后顺序必须回去。
+ * 页 id 是身份、下标只是位置——这里同时盯 store 顺序和主视图/侧栏 DOM，
+ * 因为「页数没变但顺序变了」最容易漏掉 DOM 重建（第 3 页还显示第 1 页的内容）。
+ */
+async function J() {
+  const p = "J.inkbook";
+  seed(p, JSON.stringify(mkBook("J本", 4, 2)));
+  const v = await openView();
+  await v.onLoadFile(tf(p));
+  await sleep(400);
+
+  const ids = (): string[] => v.store.data.pages.map((pg: any) => pg.id);
+  const strokesById = (): Map<string, number> => {
+    const m = new Map<string, number>();
+    for (const pg of v.store.data.pages) {
+      let n = 0;
+      for (const l of pg.layers) n += l.strokes.length;
+      m.set(pg.id, n);
+    }
+    return m;
+  };
+  const mainDomIds = (): string[] =>
+    [...v.contentEl.querySelectorAll(".mb-page-wrap")].map((el: any) => el.dataset.pageId);
+  const sideDomIds = (): string[] =>
+    [...v.contentEl.querySelectorAll(".mb-thumb:not(.mb-thumb-add)")].map(
+      (el: any) => el.dataset.pageId
+    );
+
+  /** 真实 UI：长按某条目 → 点菜单项 */
+  async function longPress(pageIndex: number, label: "上移" | "下移"): Promise<boolean> {
+    const item = v.contentEl.querySelector(
+      `.mb-thumb[data-page="${pageIndex}"]`
+    ) as HTMLElement | null;
+    if (!item) return false;
+    item.dispatchEvent(
+      new PointerEvent("pointerdown", {
+        bubbles: true,
+        cancelable: true,
+        button: 0,
+        pointerId: 41,
+        pointerType: "touch",
+        clientX: 20,
+        clientY: 20,
+      } as any)
+    );
+    await sleep(700);
+    const menu = item.querySelector(".mb-thumb-menu") as HTMLElement | null;
+    const btn = [...(menu?.querySelectorAll("button") || [])].find(
+      (b) => (b.textContent || "") === label
+    ) as HTMLElement | undefined;
+    if (!menu || !btn) {
+      item.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, pointerId: 41 } as any));
+      return false;
+    }
+    btn.click();
+    await sleep(150);
+    return true;
+  }
+
+  const before = ids();
+  const beforeStrokes = strokesById();
+  pass(
+    before.length === 4 && new Set(before).size === 4,
+    "J1 前置：4 页且页 id 唯一（" + before.length + " 页）"
+  );
+
+  // ① 第 3 页长按上移 → 与第 2 页换位
+  const movedOk = await longPress(2, "上移");
+  const moved = ids();
+  pass(
+    movedOk && moved[1] === before[2] && moved[2] === before[1] && moved.length === 4,
+    "J2 长按「上移」后 store 顺序：" + moved.map((x) => before.indexOf(x)).join(",") +
+      "（期望 0,2,1,3；页 id 身份不变）"
+  );
+  pass(
+    mainDomIds().join(",") === moved.join(","),
+    "J2 主视图页 DOM 跟着换序（" + mainDomIds().map((x) => before.indexOf(x)).join(",") + "）"
+  );
+  pass(
+    sideDomIds().join(",") === moved.join(","),
+    "J2 侧栏条目跟着换序（" + sideDomIds().map((x) => before.indexOf(x)).join(",") + "）"
+  );
+
+  // ② 撤销：顺序恢复（页数没变，必须靠页顺序版本触发 DOM 重建）
+  v.editor.undo();
+  await sleep(200);
+  pass(
+    ids().join(",") === before.join(","),
+    "J3 撤销后 store 顺序恢复（" + ids().map((x) => before.indexOf(x)).join(",") + "）"
+  );
+  pass(
+    mainDomIds().join(",") === before.join(",") && sideDomIds().join(",") === before.join(","),
+    "J3 撤销后主视图 + 侧栏 DOM 也恢复（主=" + mainDomIds().map((x) => before.indexOf(x)).join(",") +
+      "；侧=" + sideDomIds().map((x) => before.indexOf(x)).join(",") + "）"
+  );
+
+  // ③ 重做：再次前移
+  v.editor.redo();
+  await sleep(200);
+  pass(
+    ids().join(",") === moved.join(","),
+    "J4 重做后再次前移（" + ids().map((x) => before.indexOf(x)).join(",") + "）"
+  );
+  pass(
+    mainDomIds().join(",") === moved.join(","),
+    "J4 重做后主视图 DOM 再次换序（" + mainDomIds().map((x) => before.indexOf(x)).join(",") + "）"
+  );
+
+  // ④ 笔迹跟着页 id 走：移动/撤销/重做一条都不能丢、不能串页
+  const nowStrokes = strokesById();
+  let strokesOk = nowStrokes.size === beforeStrokes.size;
+  for (const [id, n] of beforeStrokes) if (nowStrokes.get(id) !== n) strokesOk = false;
+  pass(
+    strokesOk,
+    "J5 移动/撤销/重做不影响每页笔迹（" +
+      [...nowStrokes].map(([id, n]) => "p" + before.indexOf(id) + "=" + n).join(" ") + "）"
+  );
+
+  // 反方向也走一遍真实 UI：第 1 页「下移」
+  const downOk = await longPress(0, "下移");
+  const down = ids();
+  pass(
+    downOk && down[1] === moved[0] && down[0] === moved[1],
+    "J6 长按「下移」也能换位（" + down.map((x) => before.indexOf(x)).join(",") + "，期望 2,0,1,3）"
+  );
+  v.editor.undo();
+  await sleep(200);
+  pass(
+    ids().join(",") === moved.join(","),
+    "J6 下移后撤销恢复（" + ids().map((x) => before.indexOf(x)).join(",") + "）"
+  );
+
+  // 越界/原地移动不记历史
+  const rev = v.store.pageOrderRev;
+  pass(
+    v.store.movePage(0, -1) === false && v.store.movePage(0, 0) === false &&
+      v.store.movePage(0, 99) === false && v.store.pageOrderRev === rev,
+    "J7 越界/原地移动返回 false 且不产生历史（rev 不变 " + rev + "）"
+  );
+
+  await v.onClose();
+  v.containerEl.remove();
+}
+
 const CASES: Array<[string, () => Promise<void>]> = [
   ["A1+A2", A12],
   ["A3", A3],
@@ -976,6 +1123,7 @@ const CASES: Array<[string, () => Promise<void>]> = [
   ["G bak 限频", G],
   ["H 只读态侧栏改动", H],
   ["I recovered 副本覆盖", I],
+  ["J 页序重排", J],
   ["F14", F14],
 ];
 

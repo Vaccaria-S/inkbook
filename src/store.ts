@@ -51,7 +51,19 @@ export type HistoryEntry =
       strokes: Stroke[];
       /** 每条笔迹在层内的位置（-1 = 追加到末尾） */
       positions?: number[];
-    };
+    }
+  /**
+   * 页顺序（重排）。
+   *
+   * 只存页 id 的排列，**不存整本快照**：重排只动数组顺序，每页的
+   * 笔迹/图层对象原样不动，按 id 还原即可。整本快照会把几十 MB
+   * 复制两遍，而且撤销后页对象变成新副本，后面记录在「旧页对象 id」上的
+   * 笔迹增量历史就对不上了。
+   *
+   * apply 时把 data.pages 按 order 重排；order 里没出现的页（理论上不会
+   * 有，防御性兜底）保持原有相对顺序补在末尾。
+   */
+  | { kind: "order"; order: string[] };
 
 /** 撤销栈最多保留多少条 */
 const MAX_HISTORY = 60;
@@ -59,6 +71,13 @@ const MAX_HISTORY = 60;
 export class BookStore {
   data: InkBook;
   onChange: () => void = () => {};
+  /**
+   * 页顺序版本号：每次页顺序真的变化（movePage / 应用 order 历史）就 +1。
+   *
+   * 页数不变但顺序变了时，编辑器/侧栏靠它判断「必须重建 DOM」——
+   * 只比 pageCount 会漏掉重排，导致主视图第 3 页还显示第 1 页的内容。
+   */
+  pageOrderRev = 0;
   /** 撤销栈：每项是一次操作的前后状态 */
   private undoStack: Array<{ before: HistoryEntry; after: HistoryEntry }> = [];
   private redoStack: Array<{ before: HistoryEntry; after: HistoryEntry }> = [];
@@ -120,9 +139,10 @@ export class BookStore {
    * 所以先记下 before，等下一次 touch() 时再补 after。
    * 这样调用方不用关心顺序：先 snapshot 再改，改完 touch 即可。
    */
-  private pendingBefore: HistoryEntry | null = null;
+  /** 挂起快照只可能是页/整本（层与页顺序都是即改即记，不挂起） */
+  private pendingBefore: Extract<HistoryEntry, { kind: "page" } | { kind: "book" }> | null = null;
 
-  private captureBefore(entry: HistoryEntry): void {
+  private captureBefore(entry: Extract<HistoryEntry, { kind: "page" } | { kind: "book" }>): void {
     this.pendingBefore = entry;
   }
 
@@ -200,8 +220,10 @@ export class BookStore {
     };
   }
 
-  /** 找出条目对应的页下标 */
-  private pageIndexOf(entry: Exclude<HistoryEntry, { kind: "book" }>): number {
+  /** 找出条目对应的页下标（只看有 pageId 的条目） */
+  private pageIndexOf(
+    entry: Exclude<HistoryEntry, { kind: "book" } | { kind: "order" }>
+  ): number {
     const found = this.data.pages.findIndex((p) => p.id === entry.pageId);
     return found >= 0 ? found : Math.min(entry.pageIndex, this.data.pages.length - 1);
   }
@@ -238,6 +260,32 @@ export class BookStore {
       const obj = JSON.parse(entry.data) as { pages: Page[]; activePage: number };
       this.data.pages = obj.pages;
       this.data.activePage = Math.min(obj.activePage, this.data.pages.length - 1);
+      // 整本快照也可能带来不同的页顺序（页数相同的情况），一并让 DOM 重建
+      this.pageOrderRev += 1;
+    } else if (entry.kind === "order") {
+      /*
+       * 按 id 重排。用 Map 而不是对每个 id 做 findIndex：
+       * 857 页时 findIndex 是 O(n²)，撤销一次要扫几十万次。
+       * 找不到的页（如历史与当前页集合不一致）保持原相对顺序补在末尾。
+       */
+      const byId = new Map(this.data.pages.map((p) => [p.id, p] as const));
+      const activeId = this.data.pages[this.data.activePage]?.id;
+      const next: Page[] = [];
+      for (const id of entry.order) {
+        const page = byId.get(id);
+        if (!page) continue;
+        next.push(page);
+        byId.delete(id);
+      }
+      for (const page of this.data.pages) {
+        if (byId.has(page.id)) next.push(page);
+      }
+      this.data.pages = next;
+      // 当前页跟着自己的 id 走：撤销换序后用户视野里的还是同一页
+      const at = activeId ? next.findIndex((p) => p.id === activeId) : -1;
+      this.data.activePage =
+        at >= 0 ? at : Math.min(this.data.activePage, Math.max(0, next.length - 1));
+      this.pageOrderRev += 1;
     } else if (entry.kind === "layer") {
       // 整层替换：把该层的笔迹列表换成记录里的那些
       const at = this.pageIndexOf(entry);
@@ -327,6 +375,34 @@ export class BookStore {
     this.data.activePage = index + 1;
     this.touch();
     return index + 1;
+  }
+
+  /**
+   * 调整页顺序：把 from 页挪到 to（目标下标 = 移动完成后的最终位置）。
+   *
+   * 只重排 pages 数组，并记一条「页顺序」历史（存页 id 顺序，不复制页内容）。
+   * 页 id 才是身份，下标在重排后全变了，所以历史和当前页都用 id 还原。
+   *
+   * @returns 是否真的移动了（越界或原地不动返回 false，不记历史）
+   */
+  movePage(from: number, to: number): boolean {
+    const n = this.data.pages.length;
+    if (!Number.isInteger(from) || !Number.isInteger(to)) return false;
+    if (from < 0 || from >= n || to < 0 || to >= n || from === to) return false;
+    const activeId = this.data.pages[this.data.activePage]?.id;
+    const before = this.data.pages.map((p) => p.id);
+    const [page] = this.data.pages.splice(from, 1);
+    this.data.pages.splice(to, 0, page);
+    // 当前页跟着自己的 id 走：挪的不是当前页时，用户视野不跳
+    const at = activeId ? this.data.pages.findIndex((p) => p.id === activeId) : -1;
+    this.data.activePage = at >= 0 ? at : Math.min(this.data.activePage, n - 1);
+    this.pageOrderRev += 1;
+    this.pushHistory(
+      { kind: "order", order: before },
+      { kind: "order", order: this.data.pages.map((p) => p.id) }
+    );
+    this.touch();
+    return true;
   }
 
   setTemplate(index: number, template: TemplateId): void {

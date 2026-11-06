@@ -277,6 +277,35 @@ export default class InkbookPlugin extends Plugin {
         }
       }
     }
+    /*
+     * 同一本已经在**别的叶子**开着：切过去，别再开第二份 store。
+     *
+     * 两个 view 各持一份 store、各自保存，正常的保存会变成一对
+     * `-disk-` / `-mine-` 冲突副本——内容不丢，但用户会困惑。
+     *
+     * 用 reveal 而不是禁止：既延续「已在这本就只翻页」的既有语义，
+     * 也保住了 newTab「两页对照」的用法（那种情况是用户明确要的，
+     * 只提示一句，不改变行为）。
+     *
+     * 边界：文件浏览器里手动「在新标签页打开」仍会双开——那是用户明确操作，不拦。
+     */
+    const sameBook = (
+      this.app.workspace.getLeavesOfType?.(VIEW_TYPE) || []
+    ).find((leaf: any) => {
+      const v: any = leaf?.view;
+      return v && v.file && v.file.path === file.path && typeof v.gotoPageFromLink === "function";
+    });
+    if (sameBook) {
+      if (!newTab) {
+        void this.app.workspace.revealLeaf?.(sameBook);
+        (sameBook.view as InkbookView).gotoPageFromLink(page);
+        return;
+      }
+      new Notice(
+        "这本已在另一个标签页打开：两个标签同时编辑会各存各的，可能产生冲突副本。",
+        8000
+      );
+    }
     const leaf = newTab
       ? this.app.workspace.getLeaf("tab")
       : this.app.workspace.getLeaf(false);
