@@ -521,6 +521,15 @@
   .mb-ib {
     transition-duration: 0.01ms !important;
   }
+  /*
+   * 落点提示只做透明度淡出；关掉动画后保留一段静态描边，
+   * 仍然是「轻微、不打断」的，只是不闪。
+   */
+  .mb-page-wrap.is-located::after,
+  .mb-page-wrap.is-located .mb-page-num,
+  .mb-locate-hint {
+    animation: none !important;
+  }
   .mb-top-tool:active,
   .mb-toprow .mb-topbtn:active {
     transform: none;
@@ -1098,6 +1107,78 @@
   pointer-events: none;
   z-index: 3;
   font-variant-numeric: tabular-nums;
+}
+
+/* ---------------------------- 跳转落点提示 ----------------------------
+ *
+ * 从全局搜索的索引页 / 内部链接 / 嵌入跳到某一页后，让目标页轻轻亮一下：
+ *   · 页外围一圈柔和的主色描边 + 外发光，淡入后 1.8 秒内淡出；
+ *   · 页顶浮出「已跳到第 N 页」，给一个明确的落点确认；
+ *   · 右上角页码同时变成实心小胶囊，远看也能认出这一页。
+ *
+ * 为什么只做页面级提示：全局搜索只给插件文件路径，命中行号与搜索词都拿不到，
+ * 高亮具体文字没有可靠输入（读 ephemeralState / 搜索面板 DOM 属跨版本易断，
+ * 已评估为不做）。所以这里帮的是"确认落点、把视线拉回来"，不是"指出哪个词"。
+ *
+ * 全部是 DOM / CSS：不写进页面数据（文件格式不变），导出 PDF 走矢量重绘、
+ * 从不读页面 DOM，所以导出的 PDF 里不会出现这圈高亮。
+ * class 由 editor.locatePage() 加上，约 1.8 秒后由 clearLocateHint() 摘掉。
+ * 所有标记都 pointer-events:none —— 平板落笔不会被它吃掉。
+ */
+.mb-page-wrap.is-located::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: 5px;
+  pointer-events: none;
+  z-index: 5;
+  box-shadow:
+    0 0 0 2px var(--interactive-accent, #4c8bf5),
+    0 0 18px rgba(76, 139, 245, 0.3);
+  animation: mb-locate-fade 1.75s ease-out both;
+}
+
+.mb-page-wrap.is-located .mb-page-num {
+  color: #fff;
+  background: var(--interactive-accent, #4c8bf5);
+  border-radius: 8px;
+  padding: 0 5px;
+  animation: mb-locate-fade 1.75s ease-out both;
+}
+
+.mb-locate-hint {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 6;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--interactive-accent, #4c8bf5);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  animation: mb-locate-fade 1.75s ease-out both;
+}
+
+@keyframes mb-locate-fade {
+  0% {
+    opacity: 0;
+  }
+  12% {
+    opacity: 1;
+  }
+  70% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
 }
 
 .mb-add-page {

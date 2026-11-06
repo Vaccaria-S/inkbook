@@ -1343,6 +1343,62 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
     pass(!!root.querySelector(".mb-range"), "形状面板仍有粗细滑杆");
   }
 
+  /* ============ 13. 搜索 / 链接跳转后的落点提示 ============ */
+  /*
+   * 全局搜索只给插件文件路径，拿不到命中行号和搜索词，无法高亮具体文字。
+   * 这里验证换的思路：从索引页跳进某一页后，目标页本身要有可观察的
+   * 落点标记（页面级高亮 + 「已跳到第 N 页」），而且：
+   *   · 只是视觉提示：跳转语义不变、页面数据不变、不拦指针；
+   *   · 约 2 秒自动消失，不在页面上留垃圾节点；
+   *   · 设置里可以关掉。
+   * 调用链与「全局搜索点索引页」一致：
+   *   file-open → openBookAt → view.gotoPageFromLink(页码)
+   */
+  {
+    const pagesBefore = JSON.stringify(view.store!.data.pages);
+
+    view.gotoPageFromLink(2);
+    await sleep(80);
+    const located = Array.from(
+      root.querySelectorAll(".mb-page-wrap.is-located")
+    ) as HTMLElement[];
+    const hint = located[0]?.querySelector(".mb-locate-hint") as HTMLElement | null;
+    pass(
+      located.length === 1 && located[0]?.dataset.page === "1",
+      "跳到第 2 页后只有目标页带落点高亮（" + located.length + " 页）"
+    );
+    pass(
+      hint?.textContent?.includes("第 2 页") === true,
+      "目标页浮出「已跳到第 2 页」定位标记：" + (hint?.textContent || "无")
+    );
+    pass(
+      hint ? getComputedStyle(hint).pointerEvents === "none" : false,
+      "落点标记不拦指针（pointer-events:none，平板可继续落笔）"
+    );
+    pass(
+      view.editor!.getState().pageIndex === 1 &&
+        JSON.stringify(view.store!.data.pages) === pagesBefore,
+      "落点提示不改变跳转语义与页面数据（仍落在第 2 页，book 不变）"
+    );
+
+    await sleep(2000);
+    pass(
+      root.querySelectorAll(".mb-page-wrap.is-located").length === 0 &&
+        !root.querySelector(".mb-locate-hint"),
+      "约 2 秒后落点提示自动消失（class 与标记都摘干净）"
+    );
+
+    (view as any).plugin.settings.jumpHint = false;
+    view.gotoPageFromLink(3);
+    await sleep(80);
+    pass(
+      root.querySelectorAll(".mb-page-wrap.is-located").length === 0 &&
+        !root.querySelector(".mb-locate-hint"),
+      "设置关掉「跳转后轻提示落点」后，跳转不再出现任何标记"
+    );
+    (view as any).plugin.settings.jumpHint = true;
+  }
+
   log("");
   const fails = lines.filter((l) => l.startsWith("FAIL")).length;
   log(fails === 0 ? "ALL PASS" : fails + " FAILED");

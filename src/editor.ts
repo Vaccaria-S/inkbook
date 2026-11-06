@@ -25,6 +25,7 @@ import {
   straightenPoints,
   strokeBounds,
   strokeHit,
+  type Bounds,
 } from "./geometry";
 import {
   availableTextWidth,
@@ -332,6 +333,10 @@ export class BookEditor {
   private recs: PageRec[] = [];
   private observer: IntersectionObserver | null = null;
   private current = 0;
+  /** 落点提示（locatePage）的自动清理定时器；0 = 当前没有提示 */
+  private locateTimer = 0;
+  /** 当前打着落点提示的页：同一时刻只保留一个，新提示先收掉旧的 */
+  private locateRec: PageRec | null = null;
   /**
    * 上次 renderPages 时的页顺序版本（store.pageOrderRev）。
    *
@@ -837,15 +842,8 @@ export class BookEditor {
       this.gesture = "none";
       this.pointerId = null;
       this.eraserPos = null;
-      // 与 onUp 的 erase 分支保持一致：整条擦除手势合成一条历史
-      if (this.eraseBefore && this.eraseAfter) {
-        this.store.recordLayerChange(this.eraseBefore, this.eraseAfter);
-      }
-      this.eraseBefore = null;
-      this.eraseAfter = null;
-      this.undoPushed = false;
-      const rec = this.recs[this.current];
-      if (rec) this.renderOverlay(rec);
+      // 与 onUp 的 erase 分支保持一致：整条擦除手势合成一条历史，并补一次整页重画
+      this.finishEraseGesture(this.recs[this.current] ?? null);
       this.emitState();
       if (this.opts.onInkGestureEnd) this.opts.onInkGestureEnd();
       return true;
@@ -1540,6 +1538,8 @@ export class BookEditor {
   renderPages(): void {
     // 编辑框挂在页面 DOM 上，重建前先落盘，否则输入的内容跟着 DOM 一起消失
     this.commitTextEdit();
+    // 页面 DOM 马上全部重建，旧的落点提示引用要一起清掉（含定时器）
+    this.clearLocateHint();
     // 页面全部重建，旧的锚点索引失效
     this.lockedAnchor = null;
     this.draft = null;
@@ -2610,6 +2610,89 @@ export class BookEditor {
       if (!layer.visible) continue;
       for (const stroke of layer.strokes) drawStroke(ctx, stroke, layer.opacity);
     }
+  }
+
+  /**
+   * 橡皮手势期间的局部重绘：只把**受影响的矩形**按 renderRec 的顺序重画一遍。
+   *
+   * 旧实现每个 pointermove 都走 renderRec——清整页 + 重画全部笔迹，
+   * 1000 笔的页面上要 10~30ms/帧，平板上擦字明显发滞。
+   * 局部重绘的工作量只和「擦除点附近的笔迹数」有关，与整页笔迹总数无关
+   * （全页笔迹数仍要扫一遍包围盒，但那是缓存过的 WeakMap 查询，不是逐点绘制）。
+   *
+   * 为什么不用 overlay 做预览补丁：
+   *   · overlay 下面还压着文字层（DOM），铺一块不透明的纸色补丁会把
+   *     附近的文字批注在擦除过程中遮住，抬手才重新出现；
+   *   · 荧光笔用 multiply 合成，画在透明 overlay 上再 source-over 贴回主画布，
+   *     结果和直接乘在纸面上不一致；
+   *   · 主画布反正要更新，直接在原地做 dirty-rect 重绘没有合成接缝。
+   *
+   * 裁剪区先切到设备像素（transform 置 1:1）再切回页面坐标：
+   * 否则切边落在半像素上，半透明笔迹会在边界处二次混合出一条细线。
+   */
+  private repaintEraseRegion(rec: PageRec, b: Bounds): void {
+    const ctx = rec.ctx;
+    const page = this.store.data.pages[rec.index];
+    if (!ctx || !page) return;
+    const w = this.store.data.width;
+    const h = this.store.data.height;
+    // 画布变换是 resizeRec 设的等比缩放；拿实际值，别用可能已经变过的 this.zoom
+    let k = this.zoom * this.renderDpr();
+    try {
+      const m = ctx.getTransform?.();
+      const km = m ? Math.hypot(m.a, m.b) : 0;
+      if (Number.isFinite(km) && km > 0.0001) k = km;
+    } catch (_) {}
+    if (!(k > 0.0001)) return;
+
+    const x0 = Math.max(0, Math.floor(Math.max(0, b.minX) * k));
+    const y0 = Math.max(0, Math.floor(Math.max(0, b.minY) * k));
+    const x1 = Math.min(Math.ceil(w * k), Math.ceil(Math.min(w, b.maxX) * k));
+    const y1 = Math.min(Math.ceil(h * k), Math.ceil(Math.min(h, b.maxY) * k));
+    if (x1 <= x0 || y1 <= y0) return;
+
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.beginPath();
+    ctx.rect(x0, y0, x1 - x0, y1 - y0);
+    ctx.clip();
+    ctx.setTransform(k, 0, 0, k, 0, 0);
+    // 顺序必须和 renderRec 一致：纸面 → 底图 → 各层笔迹
+    drawPaper(ctx, page.template, page.paper, w, h, 1);
+    this.drawBackground(ctx, page);
+    for (const layer of page.layers) {
+      if (!layer.visible) continue;
+      for (const stroke of layer.strokes) {
+        if (!this.strokeTouchesRegion(stroke, b)) continue;
+        drawStroke(ctx, stroke, layer.opacity);
+      }
+    }
+    ctx.restore();
+  }
+
+  /**
+   * 笔迹轮廓可能超出 strokeBounds 的额外余量。
+   *
+   * strokeBounds 只按点集算、并留了 size/2+5；但完美自由手在拐弯处会略微过冲，
+   * 而箭头的头部是从端点**往回**画 max(10, size*4)——短箭头的头会伸到
+   * 点集包围盒外面。局部重绘漏掉这一点，整笔擦除后会残留半截箭头。
+   */
+  private strokeExtraPad(s: Stroke): number {
+    let pad = s.size / 2 + 2;
+    if (s.tool === "shape") pad = Math.max(pad, Math.max(10, s.size * 4) + 2);
+    return pad;
+  }
+
+  /** 笔迹包围盒（含外扩余量）是否与重绘区相交 */
+  private strokeTouchesRegion(stroke: Stroke, b: Bounds): boolean {
+    const sb = strokeBounds(stroke);
+    const pad = this.strokeExtraPad(stroke);
+    return (
+      sb.maxX + pad >= b.minX &&
+      sb.minX - pad <= b.maxX &&
+      sb.maxY + pad >= b.minY &&
+      sb.minY - pad <= b.maxY
+    );
   }
 
   /** 实时预览用的笔迹：真实点 + 预测尾巴 */
@@ -4055,14 +4138,8 @@ export class BookEditor {
       this.commitDraft(rec);
     } else if (gesture === "erase") {
       this.eraserPos = null;
-      // 擦除手势结束，这时才把整条历史入栈
-      if (this.eraseBefore && this.eraseAfter) {
-        this.store.recordLayerChange(this.eraseBefore, this.eraseAfter);
-      }
-      this.eraseBefore = null;
-      this.eraseAfter = null;
-      this.undoPushed = false;
-      this.renderOverlay(rec);
+      // 擦除手势结束：这时才结算整条历史，并整页重画一次
+      this.finishEraseGesture(rec);
     }
     this.emitState();
     // 抬手了：自动保存可以从「避让」恢复排程（橡皮尤其需要，
@@ -4126,9 +4203,24 @@ export class BookEditor {
     let changed = false;
     const remove = new Set<string>();
     const replacements: Array<{ oldId: string; pieces: Stroke[] }> = [];
+    /*
+     * 这次 pointermove 实际会改到哪些像素：被删 / 被替换笔迹的包围盒并集。
+     * 手势期间只重绘这一块（见 repaintEraseRegion），不再整页重画。
+     * 新切出的碎片都在老笔迹的包围盒内，所以不用再算一遍碎片的范围。
+     */
+    const dirty: Bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+    const unionBounds = (s: Stroke) => {
+      const b = strokeBounds(s);
+      const pad = this.strokeExtraPad(s);
+      if (b.minX - pad < dirty.minX) dirty.minX = b.minX - pad;
+      if (b.minY - pad < dirty.minY) dirty.minY = b.minY - pad;
+      if (b.maxX + pad > dirty.maxX) dirty.maxX = b.maxX + pad;
+      if (b.maxY + pad > dirty.maxY) dirty.maxY = b.maxY + pad;
+    };
 
     for (const s of layer.strokes) {
       if (!strokeHit(s, x, y, radius)) continue;
+      unionBounds(s);
       if (this.eraserMode === "whole" || s.tool === "shape") {
         remove.add(s.id);
         changed = true;
@@ -4158,7 +4250,8 @@ export class BookEditor {
      * 看起来就是"擦不掉"。
      *
      * 所以用 undoPushed 标记：手势期间只记第一次的前态，
-     * 每次擦完都更新"后态"，手势结束才真正入栈。
+     * 手势结束才把前后态一起入栈（后态由 finishEraseGesture 统一抓，
+     * 手势期间不再每个 move 都做一次 O(笔迹数) 的数组拷贝）。
      */
     const store = this.store;
     if (!this.undoPushed) {
@@ -4167,14 +4260,43 @@ export class BookEditor {
     }
     if (remove.size) store.removeStrokes(remove, rec.index, true);
     for (const r of replacements) store.replaceStroke(r.oldId, r.pieces, rec.index, true);
-    const after = store.captureLayerState(rec.index, layer.id);
-    if (this.eraseBefore && after) {
-      // 只更新后态，不入栈——手势结束才 push
-      this.eraseAfter = after;
-    }
+    // 只重画改动区域；抬手时 finishEraseGesture 再整页重画一次兜底
+    this.repaintEraseRegion(rec, dirty);
     store.touch();
-    this.renderRec(rec);
     this.changed();
+  }
+
+  /**
+   * 擦除手势收尾（抬手 / 切后台共用）。
+   *
+   * 三件事：
+   *   1. 现在才抓「后态」并和「前态」合成**一条**撤销记录——
+   *      手势期间每次 move 都抓的话，1000 笔的页面上每帧要白拷贝一次
+   *      O(笔迹数) 的数组，而历史本来就只在抬手入栈；
+   *   2. 丢掉中间状态；
+   *   3. 主画布整页重画一次。手势期间只做了局部重绘，这一步保证
+   *      最终画面和落盘数据完全一致（局部重绘边界、底图异步加载等
+   *      任何意外都被这一下抹平）。
+   */
+  private finishEraseGesture(rec: PageRec | null): void {
+    const before = this.eraseBefore;
+    // eraseBefore 非空 ⇔ 这次手势真的擦到过东西
+    const edited = !!before;
+    if (before && before.kind === "layer") {
+      const after = this.store.captureLayerState(before.pageIndex, before.layerId);
+      if (after) this.eraseAfter = after;
+    }
+    if (this.eraseBefore && this.eraseAfter) {
+      this.store.recordLayerChange(this.eraseBefore, this.eraseAfter);
+    }
+    this.eraseBefore = null;
+    this.eraseAfter = null;
+    this.undoPushed = false;
+    if (rec) {
+      // 没擦到东西的点击（比如空页上点一下）不值得整页重画，只清 overlay
+      if (edited) this.renderRec(rec);
+      this.renderOverlay(rec);
+    }
   }
 
   /* ------------------------------- 页面操作 ------------------------------- */
@@ -4313,6 +4435,60 @@ export class BookEditor {
     // 翻页前先落库：编辑框里没提交的文字不能跟着页面一起被晾着
     this.commitTextEdit();
     this.scrollToPage(index, smooth);
+  }
+
+  /**
+   * 轻轻标一下「刚跳到这一页」。
+   *
+   * 为什么只做页面级提示（而不是高亮搜索到的文字）：
+   * Obsidian 的全局搜索打开索引 md 时只给插件一个文件路径，命中行号没有、
+   * 搜索词也没有——读 ephemeralState / 搜索面板 DOM 都属于跨版本易断的
+   * 内部实现，已评估为不做。所以能做且值得做的是让目标页自己"亮一下"：
+   *   · 页面四周一圈柔和的主色描边，淡入后 1.8 秒内淡出；
+   *   · 页顶浮出「已跳到第 N 页」，给一个明确的落点确认；
+   *   · 右上角的页码同时变成实心小胶囊，远看也能找到这一页。
+   *
+   * 全部是 DOM class + 定时器：
+   *   · 不碰 store / 页面数据，所以文件格式不变；
+   *   · 导出 PDF 走的是矢量重绘，从不读页面 DOM，页面上这圈高亮不会被导出；
+   *   · 标记 pointer-events:none，写字、翻页、缩放都不受影响；
+   *   · 页面重建 / 编辑器销毁时由 clearLocateHint 收干净。
+   *
+   * @param index 0 起的页下标；非法或越界时静默忽略
+   * @param ms 提示存活时间（毫秒）
+   */
+  locatePage(index: number, ms = 1800): void {
+    this.clearLocateHint();
+    if (!Number.isFinite(index) || !this.recs.length) return;
+    const rec = this.recs[clamp(Math.round(index), 0, this.recs.length - 1)];
+    if (!rec) return;
+
+    rec.wrap.classList.add("is-located");
+    let badge = rec.wrap.querySelector(".mb-locate-hint") as HTMLElement | null;
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "mb-locate-hint";
+      // 纯视觉提示，不进无障碍朗读队列（否则每次跳页都念一句）
+      badge.setAttribute("aria-hidden", "true");
+      rec.wrap.appendChild(badge);
+    }
+    badge.textContent = `已跳到第 ${rec.index + 1} 页`;
+    this.locateRec = rec;
+    this.locateTimer = window.setTimeout(
+      () => this.clearLocateHint(),
+      Math.max(300, ms)
+    );
+  }
+
+  /** 收掉落点提示：撤 class、摘标记、清定时器（可重复调用） */
+  private clearLocateHint(): void {
+    if (this.locateTimer) window.clearTimeout(this.locateTimer);
+    this.locateTimer = 0;
+    const rec = this.locateRec;
+    this.locateRec = null;
+    if (!rec) return;
+    rec.wrap.classList.remove("is-located");
+    rec.wrap.querySelector(".mb-locate-hint")?.remove();
   }
 
   /**
@@ -4922,6 +5098,7 @@ export class BookEditor {
     this.pdfDocs.clear();
     window.clearTimeout(this.pinchReleaseTimer);
     this.pinchReleaseTimer = 0;
+    this.clearLocateHint();
     this.moveText = null;
     this.resizeText = null;
     this.textBarEl = null;

@@ -177,6 +177,8 @@ export class InkbookView extends FileView {
    * mountEditor 之后再滚过去。
    */
   private pendingPage: number | null = null;
+  /** pendingPage 落到的那一页要不要带落点提示（跟随 jumpHint 设置） */
+  private pendingPageHint = false;
   /** 文字索引的去抖定时器（保存后 1s 写一次，避免连续保存反复重写） */
   private indexTimer = 0;
   /**
@@ -678,8 +680,14 @@ export class InkbookView extends FileView {
     // 从索引链接跳进来：布局完成后再滚，否则拿到的页偏移是 0
     if (this.pendingPage != null) {
       const p = this.pendingPage;
+      const hint = this.pendingPageHint;
       this.pendingPage = null;
-      requestAnimationFrame(() => this.editor?.goToPage(p, false));
+      this.pendingPageHint = false;
+      requestAnimationFrame(() => {
+        this.editor?.goToPage(p, false);
+        // 滚到位之后再标，否则提示会跟着滚动一起飞走
+        if (hint) this.editor?.locatePage(p);
+      });
     }
   }
 
@@ -3289,14 +3297,21 @@ export class InkbookView extends FileView {
    * 从索引里的链接跳进来：打开到指定页（1 起）。
    *
    * 编辑器可能还没建好（文件刚打开），那时先记下，mountEditor 后消费。
+   *
+   * `opts.hint` 是落点提示（页面轻亮一下 + 「已跳到第 N 页」）的开关：
+   * 缺省跟随设置 `jumpHint`。这里只增加视觉提示，跳转语义不变。
    */
-  gotoPageFromLink(page1: number): void {
+  gotoPageFromLink(page1: number, opts?: { hint?: boolean }): void {
     const idx = Math.max(0, Math.round(Number(page1) || 1) - 1);
+    const hint = opts?.hint !== false && this.plugin.settings?.jumpHint !== false;
     if (this.editor) {
       this.editor.goToPage(idx, false);
       this.pendingPage = null;
+      this.pendingPageHint = false;
+      if (hint) this.editor.locatePage(idx);
     } else {
       this.pendingPage = idx;
+      this.pendingPageHint = hint;
     }
   }
 

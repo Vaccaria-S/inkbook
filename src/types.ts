@@ -191,6 +191,15 @@ export interface InkbookSettings {
    * 属于派生数据：删掉不影响本子，下次保存会重建。
    */
   searchIndex: boolean;
+  /**
+   * 从搜索结果 / 内部链接跳到某一页后，给目标页一个轻微的落点提示。
+   *
+   * 全局搜索只把「文件路径」交给插件，既拿不到命中行号、也拿不到搜索词，
+   * 没法高亮具体那几个字。这句提示只负责「确认落在哪一页、把视线拉回来」，
+   * 约 1.8 秒后自动消失，不拦指针、不写进本子文件，也不影响导出的 PDF。
+   * 关掉后跳转行为完全不变，只是不再闪这一下。
+   */
+  jumpHint: boolean;
   /** 浮层工具盘的位置与方向（缺省 = 左侧居中竖排） */
   toolPanel?: { left: number; top: number; vertical: boolean };
 }
@@ -219,6 +228,7 @@ export const DEFAULT_SETTINGS: InkbookSettings = {
   blockCommandPalette: true,
   straightLine: false,
   searchIndex: true,
+  jumpHint: true,
 };
 
 export const PEN_COLORS = [

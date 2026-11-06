@@ -233,6 +233,97 @@ async function main() {
   editor.undo();
   pass(store.strokeCount === 2, "局部擦可撤销");
 
+  /*
+   * 擦除性能：手势期间不允许整页重画。
+   *
+   * 旧实现每个 pointermove 都 renderRec：清整页 + 重画全部笔迹，
+   * 1000 笔的页面上平板上要 10~30ms/帧，擦字明显发滞。
+   * 现在只局部重绘受影响的矩形，抬手才整页重画一次兜底。
+   */
+  {
+    editor.setTool("eraser");
+    editor.setEraserMode("part");
+    // 比默认稍大：擦出的缺口要明显宽于荧光笔两端的圆帽，
+    // 否则采样点会压到切口的半圆笔帽上，纸色断言不稳
+    editor.eraserSize = 40;
+    await sleep(40);
+    const n0 = store.strokeCount;
+    const cv = document.querySelector(".mb-canvas") as HTMLCanvasElement;
+    const mctx = cv.getContext("2d")!;
+    const sx = cv.width / store.data.width;
+    const sy = cv.height / store.data.height;
+    // 9×9 平均色：避开单像素抗锯齿的抖动
+    const avg = (x: number, y: number) => {
+      const r = 4;
+      const d = mctx.getImageData(
+        Math.max(0, Math.round(x * sx) - r),
+        Math.max(0, Math.round(y * sy) - r),
+        r * 2 + 1,
+        r * 2 + 1
+      ).data;
+      let R = 0,
+        G = 0,
+        B = 0;
+      const n = d.length / 4;
+      for (let i = 0; i < d.length; i += 4) {
+        R += d[i];
+        G += d[i + 1];
+        B += d[i + 2];
+      }
+      return { r: R / n, g: G / n, b: B / n };
+    };
+    const inkedBefore = avg(300, 332);
+    pass(
+      inkedBefore.b < 220,
+      "擦除前 (300,332) 是荧光笔墨色（b=" + inkedBefore.b.toFixed(0) + "）"
+    );
+
+    // renderRec 是唯一的整页重画入口，挂探针数次数
+    const realRenderRec = editor.renderRec.bind(editor);
+    let fullRenders = 0;
+    (editor as any).renderRec = (r: any) => {
+      fullRenders++;
+      realRenderRec(r);
+    };
+
+    const pid = 31;
+    pageEl().dispatchEvent(ev("pointerdown", 300, 332, 1, pid));
+    for (const x of [312, 324, 336]) {
+      pageEl().dispatchEvent(ev("pointermove", x, 332, 1, pid));
+      await sleep(4);
+    }
+    await sleep(30);
+    pass(fullRenders === 0, "擦除过程中没有整页重画（renderRec 0 次）");
+    const during = avg(300, 332);
+    pass(
+      during.b > 235,
+      "擦除过程中被擦处已是纸色（局部重绘生效，b=" + during.b.toFixed(0) + "）"
+    );
+    pass(
+      avg(150, 330).b < 230,
+      "擦除过程中未擦到的部分仍在（局部重绘没有多擦）"
+    );
+
+    pageEl().dispatchEvent(ev("pointerup", 336, 332, 0, pid));
+    await sleep(40);
+    pass(fullRenders === 1, "抬手后整页重画恰好 1 次（" + fullRenders + "）");
+    pass(
+      store.strokeCount > n0,
+      "抬手后被擦的荧光笔已切分（" + n0 + " → " + store.strokeCount + "）"
+    );
+    pass(avg(300, 332).b > 235, "抬手后被擦处保持纸色");
+    // 撤掉探针，恢复原型上的 renderRec
+    delete (editor as any).renderRec;
+
+    editor.undo();
+    await sleep(60);
+    pass(
+      store.strokeCount === n0,
+      "一条擦除手势只记一条撤销（撤销后回到 " + n0 + " 条）"
+    );
+    pass(avg(300, 332).b < 230, "撤销后荧光笔墨迹像素恢复");
+  }
+
   /* 文字：添加、编辑、删除、撤销、导出 */
   {
     editor.setTool("text");

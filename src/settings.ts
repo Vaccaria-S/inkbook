@@ -177,6 +177,19 @@ export class InkbookSettingTab extends PluginSettingTab {
         })
       );
 
+    new Setting(containerEl)
+      .setName("跳转后轻提示落点")
+      .setDesc(
+        "从搜索结果、内部链接或嵌入跳到某一页后，目标页边缘轻轻亮一下、页顶浮出「已跳到第 N 页」，约 2 秒自动消失。全局搜索不提供命中行号和搜索词，插件无法高亮具体文字，这个提示负责帮你确认落在哪一页。不拦触控、不影响导出的 PDF；关掉后跳转行为不变。"
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.jumpHint !== false).onChange(async (v) => {
+          this.plugin.settings.jumpHint = v;
+          await this.plugin.saveSettings();
+          this.plugin.refreshViews();
+        })
+      );
+
     /*
      * 手动补建按钮。
      *
