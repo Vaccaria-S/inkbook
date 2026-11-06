@@ -429,6 +429,74 @@ async function main() {
       `新建：样式条在输入框上方 8px（条底 ${barBox ? barBox.bottom.toFixed(1) : "-"} / 框顶 ${taTop0.toFixed(1)}）`
     );
 
+    /* ---- 样式条必须是扁平单行：不折行、控件全在同一行、条高只有一行 ---- */
+    if (editBar) {
+      const ctrls = Array.from(
+        editBar.querySelectorAll<HTMLElement>(".mb-tb-btn, .mb-tb-dot")
+      );
+      // 控件高度不同（26/22/14），align-items:center 下 top 天然不同，比垂直中心才准
+      const centers = ctrls.map((c) => {
+        const r = c.getBoundingClientRect();
+        return r.top + r.height / 2;
+      });
+      const spread = centers.length ? Math.max(...centers) - Math.min(...centers) : 999;
+      const ctrlH = Math.max(...ctrls.map((c) => c.getBoundingClientRect().height), 0);
+      const hBox = editBar.getBoundingClientRect();
+      pass(getComputedStyle(editBar).flexWrap === "nowrap", "样式条不折行（flex-wrap: nowrap）");
+      pass(
+        ctrls.length === 10 && spread <= 1,
+        `样式条 ${ctrls.length} 个控件排在同一行（中心差 ${spread.toFixed(2)}px）`
+      );
+      pass(
+        hBox.height <= ctrlH + 12,
+        `样式条只有一行高（条高 ${hBox.height.toFixed(1)}px，控件高 ${ctrlH.toFixed(1)}px）`
+      );
+      pass(
+        ctrls.every((c) => c.dataset.mbTextStyle === "1"),
+        "样式条控件仍带 data-mb-text-style（点它们不会提交输入框）"
+      );
+    }
+
+    /* ---- 窄纸：最窄缩放（侧栏 fit 到 0.3×，纸只有 ~238px）也不能越纸缘 ---- */
+    if (editBar) {
+      const prevZoom = ed.zoom;
+      const wasFit = ed.fitMode;
+      // 直接写 zoom 再 applyLayout：走 setZoom 会顺带刷新 current，干扰后面的用例
+      ed.fitMode = false;
+      ed.zoom = 0.3;
+      ed.applyLayout();
+      await sleep(40);
+      const pageBox = pageEl().getBoundingClientRect();
+      const narrowBox = editBar.getBoundingClientRect();
+      pass(
+        narrowBox.left >= pageBox.left + 3.5 &&
+          narrowBox.right <= pageBox.right - 3.5 &&
+          narrowBox.width <= pageBox.width - 7,
+        `窄纸（0.3×）：样式条不越纸缘（条宽 ${narrowBox.width.toFixed(1)} / 纸宽 ${pageBox.width.toFixed(
+          1
+        )}，左右余量 ${(narrowBox.left - pageBox.left).toFixed(1)}/${(pageBox.right - narrowBox.right).toFixed(1)}）`
+      );
+      const narrowCenters = Array.from(
+        editBar.querySelectorAll<HTMLElement>(".mb-tb-btn, .mb-tb-dot")
+      ).map((c) => {
+        const r = c.getBoundingClientRect();
+        return r.top + r.height / 2;
+      });
+      const narrowSpread = narrowCenters.length
+        ? Math.max(...narrowCenters) - Math.min(...narrowCenters)
+        : 999;
+      pass(
+        narrowCenters.length === 10 && narrowSpread <= 1,
+        `窄纸（0.3×）：等比缩小后仍是单行（${narrowCenters.length} 个控件，中心差 ${narrowSpread.toFixed(2)}px）`
+      );
+      // 还原：先写回 zoom 再 applyLayout（fitMode 仍为 false，不会按视口重算），
+      // 最后才恢复 fitMode，避免基准漂移
+      ed.zoom = prevZoom;
+      ed.applyLayout();
+      ed.fitMode = wasFit;
+      await sleep(40);
+    }
+
     const size24 = Array.from(editBar?.querySelectorAll(".mb-tb-btn") ?? []).find(
       (b) => (b.textContent || "").trim() === "24"
     ) as HTMLElement | undefined;

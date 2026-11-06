@@ -1015,19 +1015,36 @@
 /* ---------------- 新建输入框上方的就近样式条 ----------------
  *
  * 只在新键（空输入框）时出现：先定字号 / 颜色，再开始打字。
- * 复用 .mb-textbar 的 flex-wrap / max-width，不会横向顶出纸面；
- * 触控优先，按钮和色点都做到 ≥30px，比选中文字的属性条更好按。
+ *
+ * 用户报「在侧边栏上下占的面积太大」：原来 4 个 32px 字号按钮 + 6 个 30px
+ * 色点放不下一行，继承 .mb-textbar 的 flex-wrap:wrap 后折成两行。
+ * 现在改成**单行细带**：nowrap + 较小控件，任何时候都不折行；
+ * 纸太窄（侧栏 fit 到 0.3 倍时纸只有 ~238px）时由 positionTextEditBar
+ * 整条等比缩小，保证左右都不被 .mb-page 的 overflow:hidden 裁掉。
+ *
+ * 注意 max-width:none 是必须的：否则继承来的 max-width 会把条压窄，
+ * nowrap 的内容反而会从条的背景里溢出去。
  */
 .mb-texteditbar {
   z-index: 9;
-  gap: 6px;
-  padding: 5px 8px;
+  flex-wrap: nowrap;
+  /* 按内容取宽，offsetWidth 量到的就是"一行自然宽度"，与 left 无关 */
+  width: max-content;
+  max-width: none;
+  gap: 3px;
+  padding: 2px 4px;
+  border-radius: 6px;
+  box-shadow: 0 2px 8px -5px rgba(0, 0, 0, 0.45);
+  transform-origin: 0 0;
 }
 
 .mb-texteditbar .mb-tb-btn {
-  min-width: 32px;
-  height: 32px;
-  font-size: 13px;
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  min-width: 26px;
+  height: 26px;
+  padding: 0 3px;
+  font-size: 12px;
 }
 
 .mb-texteditbar .mb-tb-btn.is-active {
@@ -1036,18 +1053,30 @@
 }
 
 .mb-texteditbar .mb-tb-dot {
-  width: 30px;
-  height: 30px;
+  /* border-box：22/24 就是最终可点尺寸，不随宿主全局 box-sizing 变化 */
+  box-sizing: border-box;
+  width: 22px;
+  height: 22px;
+}
+
+.mb-texteditbar .mb-tb-sep {
+  height: 14px;
+}
+
+/* 平板：手指也要点得准，按钮/色点放大到 28/24，但仍保持单行 */
+.mb-tablet .mb-texteditbar {
+  gap: 4px;
+  padding: 3px 5px;
 }
 
 .mb-tablet .mb-texteditbar .mb-tb-btn {
-  min-width: 34px;
-  height: 34px;
+  min-width: 28px;
+  height: 28px;
 }
 
 .mb-tablet .mb-texteditbar .mb-tb-dot {
-  width: 32px;
-  height: 32px;
+  width: 24px;
+  height: 24px;
 }
 
 .mb-canvas,

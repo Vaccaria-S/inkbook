@@ -1,5 +1,12 @@
 import { InkbookView, debounce } from "../src/view";
-import { createBook, createPage, DEFAULT_SETTINGS, type Pt } from "../src/types";
+import {
+  createBook,
+  createPage,
+  DEFAULT_SETTINGS,
+  HIGHLIGHTER_SIZES,
+  PEN_SIZES,
+  type Pt,
+} from "../src/types";
 import { NewBookModal } from "../src/modals";
 
 const lines: string[] = [];
@@ -168,6 +175,44 @@ async function main() {
   pass(view.sideEl.querySelectorAll(".mb-paper-chip").length === 3, "3 种纸色");
   pass(view.sideEl.querySelectorAll(".mb-thumb").length === 3, "2 页 + 加页按钮");
   pass(view.sideEl.querySelectorAll(".mb-layer").length === 1, "1 个图层");
+
+  /*
+   * 点「文字」工具 → 侧栏自动展开。
+   *
+   * 字号 / 字体 / 颜色面板住在侧栏的「当前工具」区（.mb-sec-dyn），
+   * 而平板上侧栏默认收起：以前点文字只是 setTool("text")，用户找不到
+   * 调参入口（真机反馈：「点击输入的按钮后，侧边栏不会弹出来」）。
+   */
+  {
+    const v = view as any;
+    const sideEl = view.sideEl;
+    v.sideShown = false;
+    v.applySideVisibility();
+    v.updateUI();
+    pass(
+      sideEl.classList.contains("is-hidden"),
+      "updateUI 不会自己弹出侧栏（用户手动收起后保持收起）"
+    );
+
+    const textBtn = [...view.containerEl.querySelectorAll(".mb-top-tool")].find(
+      (b) => (b as HTMLElement).title.startsWith("文字")
+    ) as HTMLElement;
+    textBtn.click();
+    pass(
+      !sideEl.classList.contains("is-hidden"),
+      "点顶栏「文字」工具后侧栏自动展开"
+    );
+    pass(
+      !!sideEl.querySelector(".mb-font-sel") &&
+        sideEl.querySelectorAll(".mb-tcolor").length >= 6,
+      "展开后侧栏里有字号 / 字体 / 颜色控件（字体下拉 + " +
+        sideEl.querySelectorAll(".mb-tcolor").length +
+        " 个色点）"
+    );
+
+    // 收尾：切回钢笔，后面还有真实落笔用例
+    view.editor!.setTool("pen");
+  }
 
   /*
    * 侧栏收起时不能预渲染缩略图（大本子打开提速）。
@@ -429,6 +474,36 @@ async function main() {
   await sleep(60);
   pass(view.store!.page.paper === "cream", "点纸色切到米黄");
 
+  /*
+   * 笔粗细持久化：侧栏选「粗」要写回 settings，而不是只改内存里的 editor。
+   * 重启时 mountEditor 读的是 settings.defaultPenSize / defaultHighlighterSize。
+   */
+  {
+    const penRow = view.sideEl.querySelectorAll(".mb-size-row")[0] as HTMLElement;
+    const penThick = [...penRow.querySelectorAll(".mb-size-btn")].find(
+      (b) => (b as HTMLElement).textContent === "粗"
+    ) as HTMLElement;
+    penThick.click();
+    await sleep(20);
+    pass(
+      plugin.settings.defaultPenSize === PEN_SIZES[2],
+      "选钢笔「粗」后 settings.defaultPenSize 写回（" + plugin.settings.defaultPenSize + "）"
+    );
+
+    const hlRow = view.sideEl.querySelectorAll(".mb-size-row")[1] as HTMLElement;
+    const hlThick = [...hlRow.querySelectorAll(".mb-size-btn")].find(
+      (b) => (b as HTMLElement).textContent === "粗"
+    ) as HTMLElement;
+    hlThick.click();
+    await sleep(20);
+    pass(
+      plugin.settings.defaultHighlighterSize === HIGHLIGHTER_SIZES[2],
+      "选荧光笔「粗」后 settings.defaultHighlighterSize 写回（" +
+        plugin.settings.defaultHighlighterSize +
+        "）"
+    );
+  }
+
   /* 图层 */
   const addLayer = [...view.sideEl.querySelectorAll(".mb-link")].find((el) =>
     (el.textContent || "").includes("新图层")
@@ -651,6 +726,28 @@ async function main() {
     view.store!.pageCount === pagesAfterImport,
     "重新打开后页数还在（" + view.store!.pageCount + " 页，导入时加了页）"
   );
+
+  /*
+   * 模拟重启：重新 new 一个 view，mountEditor 必须从 settings 恢复
+   * 上次在侧栏里选的钢笔 / 荧光笔粗细（真机诉求：
+   * 「退出 Obsidian 后再进来，之前选过的钢笔粗细依旧是之前选的」）。
+   */
+  {
+    const restarted = new InkbookView(leaf, plugin);
+    await restarted.onOpen();
+    await restarted.onLoadFile(file);
+    await sleep(300);
+    pass(
+      Math.abs(restarted.editor!.penSize - PEN_SIZES[2]) < 1e-9,
+      "重新 new 一个 view 后钢笔粗细仍是上次选的（" + restarted.editor!.penSize + "）"
+    );
+    pass(
+      Math.abs(restarted.editor!.highlighterSize - HIGHLIGHTER_SIZES[2]) < 1e-9,
+      "重新 new 一个 view 后荧光笔粗细仍是上次选的（" + restarted.editor!.highlighterSize + "）"
+    );
+    await restarted.onClose();
+    restarted.containerEl.remove();
+  }
 
   /* 展示本：丰富笔迹，用于截图 */
   const show = createBook("墨本 · 手感展示", "grid", "white");

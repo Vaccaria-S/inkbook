@@ -1314,7 +1314,7 @@ export class BookEditor {
     if (!ed || ed.id || !ed.rec.mounted) return;
 
     const bar = document.createElement("div");
-    // 复用属性条的布局规则（flex-wrap / max-width / 圆角阴影），再加尺寸修饰类
+    // 复用属性条的基础外观，再加扁平单行的尺寸修饰类（见 .mb-texteditbar）
     bar.className = "mb-textbar mb-texteditbar";
     // 手势一律不传到画布，否则点一下字号会顺手画一笔
     const eat = (e: Event) => e.stopPropagation();
@@ -1389,6 +1389,12 @@ export class BookEditor {
    * 像素换算与 beginTextEdit 写 textarea 的 top 完全一致（页面坐标 × zoom），
    * 缩放时由 applyLayout 重算。框贴着页顶导致上方放不下时翻到框下方——
    * 宁可换边，也不能让样式条半截悬在纸外。
+   *
+   * 样式条是**单行不折行**的（见 styles.css .mb-texteditbar）。纸窄到
+   * 放不下整条时（侧栏 fit 到 0.3 倍，纸只有 ~238px），这里把整条等比
+   * 缩小到纸宽以内：.mb-page 是 overflow:hidden，超出纸缘的内容会被
+   * 直接裁掉（用户看到的「被挤到一边 / 字号按钮点不到」就是它）。
+   * 纸足够宽时 fit=1，控件保持设计尺寸。
    */
   private positionTextEditBar(): void {
     const bar = this.textEditBarEl;
@@ -1397,14 +1403,19 @@ export class BookEditor {
     const z = this.zoom;
     const pageW = this.store.data.width * z;
     const pageH = this.store.data.height * z;
-    const w = bar.offsetWidth || 320;
-    const h = bar.offsetHeight || 40;
+    const w = bar.offsetWidth || 277;
+    const h = bar.offsetHeight || 32;
+    // 左右各留 4px，超出纸面就按比例缩（transform 不影响 offsetWidth）
+    const fit = pageW > 8 ? Math.min(1, (pageW - 8) / Math.max(1, w)) : 1;
+    const shownW = w * fit;
+    const shownH = h * fit;
+    bar.style.transform = fit < 1 ? `scale(${fit})` : "";
     const taTop = (ed.y - ed.size * 0.82) * z;
     const taLeft = ed.x * z;
-    const left = Math.max(4, Math.min(taLeft, pageW - w - 4));
-    const above = taTop - h - 8;
+    const left = Math.max(4, Math.min(taLeft, pageW - shownW - 4));
+    const above = taTop - shownH - 8;
     const below = taTop + (ed.el.offsetHeight || 0) + 8;
-    const top = above >= 4 ? above : Math.max(4, Math.min(below, pageH - h - 4));
+    const top = above >= 4 ? above : Math.max(4, Math.min(below, pageH - shownH - 4));
     bar.style.left = `${left}px`;
     bar.style.top = `${top}px`;
   }

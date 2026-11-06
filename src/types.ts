@@ -161,6 +161,8 @@ export interface InkbookSettings {
   autosave: boolean;
   sidebarOpen: boolean;
   defaultPenSize: number;
+  /** 荧光笔粗细默认值（侧栏「荧光 细/中/粗」选的会写回这里） */
+  defaultHighlighterSize: number;
   lastPenColor: string;
   lastHighlighterColor: string;
   /**
@@ -206,6 +208,11 @@ export const DEFAULT_SETTINGS: InkbookSettings = {
   autosave: true,
   sidebarOpen: true,
   defaultPenSize: 2.8,
+  /**
+   * 荧光笔粗细默认值（侧栏「荧光 细/中/粗」选的会写回这里）。
+   * 取 HIGHLIGHTER_SIZES 的中间档（16/24/34），与老设置回落值一致。
+   */
+  defaultHighlighterSize: 24,
   lastPenColor: "#1A1A1A",
   lastHighlighterColor: "#F6E05E",
   blockEdgeSwipe: true,

@@ -613,6 +613,78 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       "初始窗口里没有第 400 页（没有一次性建满）"
     );
 
+    /*
+     * 2.6.1 滚动跨行**不重建**窗口内条目的 DOM。
+     *
+     * 用户真机反馈「侧栏缩略图滑动时一闪一闪」：旧实现每次跨行
+     * list.empty() + 整屏新建，窗口里的旧 canvas 被摘下、新 canvas
+     * 还没画完，中间必然空一帧。这里直接比对对象身份：
+     *   · 跨行后仍留在窗口里的页 → canvas 和条目必须是同一个对象；
+     *   · 滚回原位置时，刚被回收的页 → 从复用池取回同一个 canvas（像素还在）。
+     */
+    {
+      // 先把页列表滚进视口，让窗口是「完整一屏 + overscan」，才有足够的重叠行
+      const bodyRect = sideBody.getBoundingClientRect();
+      const listOffset = listEl.getBoundingClientRect().top - bodyRect.top + sideBody.scrollTop;
+      sideBody.scrollTop = listOffset;
+      sideBody.dispatchEvent(new Event("scroll"));
+      await sleep(300);
+
+      const beforeLo = (view as any).pageWinRowLo as number;
+      const beforeCv = new Map<number, HTMLCanvasElement>();
+      for (const [i, cv] of (view as any).thumbCanvases as Map<number, HTMLCanvasElement>) {
+        beforeCv.set(i, cv);
+      }
+      const rowH = ((view as any).pageWinRowH as number) || 90;
+
+      // 往下滚 3 行：overscan 是 2 行，窗口会真正下移一行
+      sideBody.scrollTop = sideBody.scrollTop + rowH * 3 + 2;
+      sideBody.dispatchEvent(new Event("scroll"));
+      await sleep(300);
+
+      const afterLo = (view as any).pageWinRowLo as number;
+      const afterCv = (view as any).thumbCanvases as Map<number, HTMLCanvasElement>;
+      pass(
+        afterLo > beforeLo,
+        "滚动跨行后窗口确实下移（rowLo " + beforeLo + " → " + afterLo + "）"
+      );
+
+      const stayed: number[] = [];
+      let sameCanvas = true;
+      let sameItem = true;
+      for (const [i, cv] of beforeCv) {
+        const now = afterCv.get(i);
+        if (!now) continue;
+        stayed.push(i);
+        if (now !== cv) sameCanvas = false;
+        if (now.parentElement !== cv.parentElement) sameItem = false;
+      }
+      pass(
+        stayed.length >= 4,
+        "跨行后仍有 " + stayed.length + " 页留在窗口里（可验证不重建）"
+      );
+      pass(
+        stayed.length > 0 && sameCanvas && sameItem,
+        "跨行后窗口内的缩略图仍是同一个 canvas/条目对象（没有整屏重建）"
+      );
+
+      // 滚回原来的位置：刚回收的条目应从复用池原样取回，canvas 不被清空
+      const leaving = Array.from(beforeCv.keys()).filter((i) => !afterCv.has(i));
+      sideBody.scrollTop = listOffset;
+      sideBody.dispatchEvent(new Event("scroll"));
+      await sleep(300);
+      const backCv = (view as any).thumbCanvases as Map<number, HTMLCanvasElement>;
+      const reused = leaving.filter((i) => backCv.get(i) === beforeCv.get(i));
+      pass(
+        leaving.length > 0 && reused.length === leaving.length,
+        "滚回原位置时回收条目按页号复用（" +
+          reused.length +
+          "/" +
+          leaving.length +
+          " 个 canvas 是同一对象）"
+      );
+    }
+
     // 滚到页列表底部：可视区换了，窗口应该按需补建到最后一页
     sideBody.scrollTop = sideBody.scrollHeight;
     sideBody.dispatchEvent(new Event("scroll"));
