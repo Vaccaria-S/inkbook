@@ -3925,7 +3925,7 @@ export class InkbookView extends FileView {
   }
 
   /**
-   * 落点：当前**可见窗口**条目里，横向覆盖指针、纵向最近一条（跳过被拖的自己）。
+   * 落点：当前**可见窗口**条目里，纵向最近一条（跳过被拖的自己）。
    *
    * 用「相对其他条目的上/下半」算插入位置，**不按 clientY/行高硬算**——
    * 窗口化后行高会变、上下还垫了 spacer，硬算必错。
@@ -3935,23 +3935,54 @@ export class InkbookView extends FileView {
    *   插到目标 t 之后：(t<from ? t+1 : t)
    *   验证：第 1 页(from=0)拖到第 2 页(t=1)之后 → to=1；
    *   movePage(0,1) = splice(0,1)+splice(1,0) ⇔ [第二页, 第一页]，正好对上。
+   *
+   * **横向不做「必须落在条目内」的硬判定**（2026-11-07 修）：
+   * 原来的 `if (x < r.left || x > r.right) continue` 会在两个地方丢命中：
+   *   · 拖到**列缝**里（4 列网格列间距 7px）—— 缝隙不属于任何条目；
+   *   · 拖到列表**最左/最右的外侧**—— 越出所有条目。
+   * 表现为竖条突然消失、松手不重排（用户会觉得「拖到一半没反应」）。
+   * 现在改成**按列吸附**：先看指针横向离哪一列最近（列区间按条目实际
+   * 左右边 + 半缝外扩），再在该列里找纵向最近的一条。
+   * 这样拖到缝里会吸到相邻列、拖到外侧会吸到最近的一列，落点不会丢。
    */
   private findThumbDropTarget(x: number, y: number): { index: number; rect: DOMRect } | null {
     const want = this.thumbDragFromIndex;
     if (want < 0) return null;
-    let best: { index: number; rect: DOMRect } | null = null;
-    let bestDist = Infinity;
+    /*
+     * 分两步：先定「行」，再在该行内定「列」。
+     *
+     * 为什么不合成一个加权和：行距（~90px）与列距（~7px）差一个量级，
+     * 加权和的权重怎么取都会在某个边界上判错。分两步语义清楚：
+     *   1. 找纵向中心最近的那一行（dy 最小）；
+     *   2. 该行内（dy 落在最小值的容差内）选横向最近的一条。
+     * 容差用半行高：同一行的条目 cy 完全相同，dy 也完全相同，容差只是
+     * 为了吸收亚像素取整，不会把相邻行吞进来。
+     */
+    const cands: Array<{ index: number; rect: DOMRect; dy: number; dx: number }> = [];
     for (const [idx, item] of this.thumbItems) {
       if (idx === want) continue; // 跳过被拖的自己
       const r = item.getBoundingClientRect();
       if (r.width <= 0 || r.height <= 0) continue;
-      // 横向必须落到条目所在列范围，否则多列网格会选错列
-      if (x < r.left || x > r.right) continue;
       const cy = (r.top + r.bottom) / 2;
-      const d = Math.abs(y - cy);
-      if (d < bestDist) {
-        bestDist = d;
-        best = { index: idx, rect: r };
+      const dy = Math.abs(y - cy);
+      // 横向距离：落在条目内为 0，落在左右外侧（列缝/列表边缘）为实际距离
+      const dx = x < r.left ? r.left - x : x > r.right ? x - r.right : 0;
+      cands.push({ index: idx, rect: r, dy, dx });
+    }
+    if (!cands.length) return null;
+
+    // ① 纵向最近的一行
+    const minDy = Math.min(...cands.map((c) => c.dy));
+    const rowH = Math.max(...cands.map((c) => c.rect.height));
+    const tol = Math.max(1, rowH / 2);
+    // ② 该行内横向最近的一条（列缝里会吸到相邻列，列表外侧会吸到最近列）
+    let best: { index: number; rect: DOMRect } | null = null;
+    let bestDx = Infinity;
+    for (const c of cands) {
+      if (c.dy > minDy + tol) continue;
+      if (c.dx < bestDx) {
+        bestDx = c.dx;
+        best = { index: c.index, rect: c.rect };
       }
     }
     return best;

@@ -254,6 +254,41 @@ export function inkRenderDpr(deviceDpr: number): number {
   return raw < 1.5 ? 1.25 : raw;
 }
 
+/**
+ * 超采样只在「日常书写倍率」生效，高倍时退回设备原生 dpr。
+ *
+ * 为什么要这一层（2026-11-07 补）：`inkRenderDpr` 无条件补到 1.25，
+ * 在桌面**最大缩放 2.8 倍**时会把单页画布推到 83MB（两块 167MB），
+ * 超过 `MOUNT_BUDGET_BYTES`(160MB) —— 而 `MIN_MOUNTED=2` 是硬下限
+ * （绝不能卸邻页，卸了滚过去是永久空白），所以预算被突破。
+ * 原来的 dpr=1 在那一档只用 107MB，抬到 1.25 反而把安全余量吃掉了。
+ *
+ * 收益上也不值得：2.8 倍时笔画在屏幕上已经很粗（一笔约 8 个设备像素），
+ * 边缘的亚像素过渡本来就明显，超采样带来的相对改善远不如 0.8~1.25 倍。
+ * 而 0.8~1.25 是用户**真正在写**的倍率，那里内存余量充足（38MB）。
+ *
+ * 所以：**zoom ≤ SUPERSAMPLE_MAX_ZOOM 才超采样**，超过就用原生 dpr。
+ * 阈值取 1.25（= 最大超采样倍率本身）：fit（0.3~1.25）全部在内 ——
+ * 那是用户**真正在写**的区间；1.3 倍以上算「放大看细节」，清晰度交给
+ * 画布自身分辨率。实测这个阈值下最坏占用 139MB（1.6 倍那档），
+ * 仍留 21MB 余量；取 1.5 会多出一档 1.3 倍的 144MB，余量只剩 16MB。
+ */
+export const SUPERSAMPLE_MAX_ZOOM = 1.25;
+
+/**
+ * 按缩放档决定最终渲染 dpr。
+ *
+ * @param deviceDpr 设备 devicePixelRatio
+ * @param zoom      当前缩放
+ */
+export function inkRenderDprForZoom(deviceDpr: number, zoom: number): number {
+  const raw = Math.min(deviceDpr || 1, 2);
+  // 平板（dpr≥2）与高倍缩放都保持原生：不动没问题的场景，也不吃内存余量
+  if (raw >= 1.5) return raw;
+  if (!(zoom > 0) || zoom > SUPERSAMPLE_MAX_ZOOM) return raw;
+  return inkRenderDpr(raw);
+}
+
 /** 导出的底图位图宽度上限（设备像素） */
 const MAX_EXPORT_PX = 4096;
 
@@ -378,16 +413,28 @@ const SIZE_STEP_REPEAT_MS = 100;
  */
 export function bindHoldStepBtn(btn: HTMLElement, onStep: () => void): void {
   let timer: number | null = null;
+  /** 是否正处在一轮按住（防止重复 pointerdown 叠加多套监听与多个 timer） */
+  let holding = false;
 
   function stop(): void {
     if (timer !== null) {
       clearTimeout(timer);
       timer = null;
     }
+    /*
+     * 四个监听都要摘掉，**包括按钮自己的 pointerleave**。
+     *
+     * 侧栏每次 setTextSize 都会重建工具区（按钮 DOM 换新），旧闭包随之作废；
+     * 但在**不重建**的路径上（输入框样式条只在编辑期间存在），同一个按钮
+     * 会被反复按下，只加不摘会累积监听。累积本身不致命（stop 幂等），
+     * 但属于该收没收拾干净。
+     */
     document.removeEventListener("pointerup", onUp);
     document.removeEventListener("pointercancel", onCancel);
     window.removeEventListener("blur", onWinBlur);
+    btn.removeEventListener("pointerleave", stop);
     btn.classList.remove("is-held");
+    holding = false;
   }
 
   const repeat = (): void => {
@@ -412,6 +459,9 @@ export function bindHoldStepBtn(btn: HTMLElement, onStep: () => void): void {
     e.stopPropagation();
     /* 只认主指针：鼠标右键留给浏览器菜单 */
     if (e.pointerType === "mouse" && e.button !== 0) return;
+    // 上一轮还没收尾（例如 pointerup 丢在窗口外）：先收干净再重新开始
+    if (holding) stop();
+    holding = true;
     onStep();
     btn.classList.add("is-held");
     timer = window.setTimeout(repeat, SIZE_STEP_WAIT_MS);
@@ -2645,7 +2695,8 @@ export class BookEditor {
    */
   private renderDpr(): number {
     const raw = Math.min(window.devicePixelRatio || 1, 2);
-    const want = inkRenderDpr(raw);
+    // 超采样只在小倍率生效（高倍时内存会超 MOUNT_BUDGET_BYTES，见该函数注释）
+    const want = inkRenderDprForZoom(raw, this.zoom);
     const perZoom = this.store.data.width * this.store.data.height * this.zoom * this.zoom;
     if (perZoom <= 0) return want;
     const maxDpr = Math.sqrt(MAX_CANVAS_PIXELS / perZoom);

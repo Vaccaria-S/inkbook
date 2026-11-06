@@ -1155,6 +1155,84 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       "2.7 取消拖拽不改变页序"
     );
 
+    /* ---- ⑦ 拖到「列缝」/列表外侧也不能丢落点（2026-11-07 修） ---- */
+    /*
+     * 旧实现要求指针横向**必须落在条目 left~right 之间**才算命中，
+     * 于是拖到 4 列网格的列缝里、或拖到列表最左/最右外侧时，
+     * 落点直接变 null → 竖条消失、松手不重排。
+     * 用户手感上就是「拖到一半突然没反应」。
+     *
+     * 现在按「先定行、再定该行内横向最近的一条」来吸附。
+     * 这里验三处：列缝、列表左外侧、列表右外侧 —— 都必须仍有落点。
+     */
+    {
+      const listEl2 = sideEl.querySelector(".mb-pages") as HTMLElement;
+      const items = [...listEl2.querySelectorAll(".mb-thumb:not(.mb-thumb-add)")] as HTMLElement[];
+      // 取第一行两个相邻条目之间的缝
+      const r0 = items[0].getBoundingClientRect();
+      const r1 = items[1] ? items[1].getBoundingClientRect() : null;
+      const listRect = listEl2.getBoundingClientRect();
+      const sameRow = r1 ? Math.abs(r0.top - r1.top) < 2 : false;
+      const seamX = r1 && sameRow ? (r0.right + r1.left) / 2 : r0.right + 3;
+      const rowY = r0.top + r0.height / 2;
+
+      /*
+       * findThumbDropTarget 在 fromIndex < 0 时直接返回 null（不在拖拽态）。
+       * 这里只想验「吸附算法」本身，所以临时把 fromIndex 设成 0
+       * （= 假装正在拖第 1 页），验完还原。
+       */
+      const v2 = view as any;
+      const savedFrom = v2.thumbDragFromIndex;
+      v2.thumbDragFromIndex = 0;
+      const probe = (x: number, y: number) =>
+        v2.findThumbDropTarget(x, y) as { index: number; rect: DOMRect } | null;
+      const atSeam = probe(seamX, rowY);
+      pass(
+        !!atSeam,
+        "2.7 拖到列缝里仍有落点（缝 x=" +
+          seamX.toFixed(0) +
+          "，命中 " +
+          (atSeam ? "#" + atSeam.index : "无") +
+          "）"
+      );
+      const atLeft = probe(listRect.left - 40, rowY);
+      pass(
+        !!atLeft,
+        "2.7 拖到列表左外侧仍有落点（x=" +
+          (listRect.left - 40).toFixed(0) +
+          "，命中 " +
+          (atLeft ? "#" + atLeft.index : "无") +
+          "）"
+      );
+      const atRight = probe(listRect.right + 40, rowY);
+      pass(
+        !!atRight,
+        "2.7 拖到列表右外侧仍有落点（x=" +
+          (listRect.right + 40).toFixed(0) +
+          "，命中 " +
+          (atRight ? "#" + atRight.index : "无") +
+          "）"
+      );
+      /*
+       * 吸附必须**落在同一行**：列缝探测到的条目，其纵向中心应与指针
+       * 所在行接近（否则「先定行」这步就没生效，会吸到别的行去）。
+       */
+      pass(
+        !!atSeam && Math.abs((atSeam.rect.top + atSeam.rect.bottom) / 2 - rowY) < 4,
+        "2.7 列缝吸附落在同一行（纵向偏差 " +
+          (atSeam ? Math.abs((atSeam.rect.top + atSeam.rect.bottom) / 2 - rowY).toFixed(1) : "-") +
+          "px）"
+      );
+      // 而且不能吸到「被拖的自己」（fromIndex=0 时不该返回 #0）
+      pass(
+        !!atSeam && atSeam.index !== 0,
+        "2.7 吸附不会落到被拖的那一条上（命中 " +
+          (atSeam ? "#" + atSeam.index : "无") +
+          "）"
+      );
+      v2.thumbDragFromIndex = savedFrom;
+    }
+
     /*
      * 收尾：把本段留下的历史痕迹清干净。
      *

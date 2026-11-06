@@ -703,6 +703,30 @@ async function main() {
       pass(!!pageEl().querySelector(".mb-text-edit"), "点步进按钮后输入框还在（没被提交掉）");
       releaseStep(302);
       releaseStep(303);
+      /*
+       * 重复按下不叠加（2026-11-07 修）：
+       * bindHoldStepBtn 每次 pointerdown 都会挂 4 个监听，其中 pointerleave
+       * 原来只加不摘。在不重建按钮的路径上（输入框样式条）反复按下会累积，
+       * 累积后同一个 pointerleave 会触发多次 stop（虽然幂等），
+       * 但更麻烦的是「上一轮的 timer 没被清掉就被新一轮覆盖」→ 连调速度翻倍。
+       * 这里连按 3 次同一个按钮，验字号只按「一次一下」走。
+       */
+      {
+        csizeIn.value = "30";
+        csizeIn.dispatchEvent(new Event("input", { bubbles: true }));
+        await sleep(30);
+        const before3 = ed.textSize;
+        for (let i = 0; i < 3; i += 1) {
+          holdStep(plusBtn!, 310 + i);
+          releaseStep(310 + i);
+          await sleep(40);
+        }
+        await sleep(200);
+        pass(
+          ed.textSize === before3 + 3,
+          "连按「＋」3 次：字号正好 +3（" + before3 + " → " + ed.textSize + "，没有叠加速度）"
+        );
+      }
       // 输入框带着 data-mb-text-style：编辑框开着时点它不能把框提交掉
       csizeIn.dispatchEvent(
         new PointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerId: 93 })

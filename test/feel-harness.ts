@@ -1,6 +1,11 @@
 import { OneEuroFilter, shapePressure, speedWidthFactor, zoomNormalization } from "../src/filter";
 import { predictTail, effectivePressures, strokePath, drawStroke, paintStroke, invalidateStroke } from "../src/ink";
-import { BookEditor, inkRenderDpr } from "../src/editor";
+import {
+  BookEditor,
+  inkRenderDpr,
+  inkRenderDprForZoom,
+  SUPERSAMPLE_MAX_ZOOM,
+} from "../src/editor";
 import { BookStore } from "../src/store";
 import { createBook } from "../src/types";
 import type { Pt, Stroke } from "../src/types";
@@ -259,12 +264,67 @@ async function main() {
       "超采样：dpr=1.5 保持 1.5、非法值按 1 处理"
     );
 
+    /*
+     * 超采样只在小倍率生效（2026-11-07 补）：
+     * 桌面 dpr=1.25 在最大缩放 2.8 倍时单页 83MB、两块 167MB，
+     * 超过 MOUNT_BUDGET_BYTES(160MB)，而 MIN_MOUNTED=2 是硬下限卸不掉。
+     * 所以高倍时退回原生 dpr —— 那一档笔画本身已经很粗，超采样收益小。
+     */
+    pass(
+      inkRenderDprForZoom(1, 0.8) === 1.25 &&
+        inkRenderDprForZoom(1, SUPERSAMPLE_MAX_ZOOM) === 1.25,
+      "超采样：日常书写倍率（0.8 / " +
+        SUPERSAMPLE_MAX_ZOOM +
+        " 倍）仍然超采样到 1.25"
+    );
+    pass(
+      inkRenderDprForZoom(1, 2.8) === 1 && inkRenderDprForZoom(1, 1.6) === 1,
+      "超采样：高倍缩放（1.6 / 2.8 倍）退回原生 dpr=1（内存不超预算）"
+    );
+    pass(
+      inkRenderDprForZoom(2, 0.8) === 2 && inkRenderDprForZoom(2, 2.8) === 2,
+      "超采样：平板（dpr=2）在任何倍率都不动"
+    );
+    pass(
+      inkRenderDprForZoom(1, 0) === 1 && inkRenderDprForZoom(1, -1) === 1,
+      "超采样：非法 zoom（0 / 负数）退回原生 dpr，不会误超采样"
+    );
+    /*
+     * 内存红线：按「挂载上限 × 单页」扫全档缩放，任何一档都不许超
+     * MOUNT_BUDGET_BYTES(160MB)。这条锁住上面那个阈值不被随手改大。
+     */
+    {
+      const BUDGET = 160 * 1024 * 1024;
+      const MIN_MOUNTED = 2;
+      const MAX_MOUNTED = 8;
+      let worst = 0;
+      let worstZoom = 0;
+      for (const z of [0.3, 0.5, 0.67, 0.8, 1, 1.25, 1.3, 1.6, 2, 2.8]) {
+        const d = inkRenderDprForZoom(1, z);
+        const perPage = 794 * z * d * 1123 * z * d * 4 * 2; // 两块画布
+        const limit = Math.max(MIN_MOUNTED, Math.min(MAX_MOUNTED, Math.floor(BUDGET / perPage)));
+        const used = limit * perPage;
+        if (used > worst) {
+          worst = used;
+          worstZoom = z;
+        }
+      }
+      pass(
+        worst <= BUDGET,
+        "超采样：全档缩放最坏占用 " +
+          (worst / 1048576).toFixed(0) +
+          "MB（zoom=" +
+          worstZoom +
+          "）≤ MOUNT_BUDGET_BYTES 160MB"
+      );
+    }
+
     /* ② 集成层：编辑器实际画出来的 backing */
     const { editor, store } = makeAbHost();
     await sleep(500); // 等页面挂载
 
     const rawDpr = Math.min(window.devicePixelRatio || 1, 2);
-    const wantDpr = inkRenderDpr(rawDpr);
+    const wantDpr = inkRenderDprForZoom(rawDpr, 0.8);
 
     editor.setZoom(0.8);
     await sleep(400);
