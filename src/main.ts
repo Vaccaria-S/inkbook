@@ -159,10 +159,14 @@ export default class InkbookPlugin extends Plugin {
     for (const f of files) {
       try {
         const book = await readBook(this.app.vault.adapter, f.path, f.basename);
-        await writeTextIndex(this.app, f, book);
+        const indexResult = await writeTextIndex(this.app, f, book);
+        if (!indexResult.ok) {
+          // 索引失败原因已由 writeTextIndex 弹过 Notice，这里只计数
+          failed += 1;
+          continue;
+        }
         books += 1;
-        pages += book.pages.filter((p) => (p.texts ?? []).some((t) => (t.text || "").trim()))
-          .length;
+        pages += indexResult.pages;
       } catch (e) {
         failed += 1;
         console.warn("[inkbook] 重建索引时读不出这一本，已跳过：" + f.path, e);
@@ -171,9 +175,9 @@ export default class InkbookPlugin extends Plugin {
     const msg =
       files.length === 0
         ? "墨本：库里还没有 .inkbook 手写本。"
-        : `墨本：${books} 本 / ${pages} 页有文字，已重建索引` +
-          (failed ? `（${failed} 本读取失败，已跳过）` : "") +
-          "。全局搜索现在能搜到这些页，点结果直接落在纸上。";
+        : failed
+        ? `墨本：${books} 本 / ${pages} 页已重建索引；${failed} 本生成失败（原因见上方提示，本子本身不受影响）。`
+        : `墨本：${books} 本 / ${pages} 页有文字，已重建索引。全局搜索现在能搜到这些页，点结果直接落在纸上。`;
     new Notice(msg, 10000);
     return { books, pages, failed };
   }

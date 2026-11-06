@@ -1095,6 +1095,80 @@
   outline-offset: 1px;
 }
 
+/* ---------------- 侧栏「文字」工具参数：两行扁平布局 ----------------
+ *
+ * 电脑端侧栏 258px，减去左右 padding 后内容区只有 234px。
+ * 旧 DOM 把提示 / 字号 / 字体 / 色点四组直接放进 .mb-dyn
+ * （display:flex 且默认 nowrap）：
+ *   · 提示文字 white-space:nowrap，最小宽度 ~220px；
+ *   · 字号组 ~106px；
+ *   · 字体下拉 width:100%，flex 基准 234px；
+ *   · 色点行 flex-wrap:wrap，最小宽度 18px。
+ * 最小内容宽 400px+，但容器只有 234px → 字体下拉被推到侧栏右缘之外
+ * （用户：「选择字体的那个框已经到页面外了」），色点行被压成
+ * 18px 宽、8 个点竖着排，整区被撑到约 200px 高（用户：「上下占的面积太大」）。
+ *
+ * 现在显式拆成两行：
+ *   第一行：字号组（定宽）+ 字体下拉（flex:1，最小 0，可以缩）
+ *   第二行：8 个 16px 色点，nowrap，总宽 8×16+7×6 = 170px
+ * 两行合计 ~48px。
+ *
+ * 平板（.mb-root.is-tablet）色点放大到 22px，触摸目标够大；
+ * 侧栏在平板上最窄也有 ~292px 内容宽，8×22+7×6 = 218px 仍放得下。
+ */
+.mb-text-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  min-width: 0;
+}
+
+.mb-text-tools-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mb-text-tools-row .mb-seg {
+  flex: 0 0 auto;
+}
+
+/* 字体下拉不再独占一行：和字号并排，吃掉剩余宽度 */
+.mb-text-tools .mb-font-sel {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+  height: 24px;
+  margin: 0;
+  font-size: 11.5px;
+}
+
+/* 色点强制一行：侧栏再窄也不许折成两行（折行会把整区撑高） */
+.mb-text-tools .mb-tcolor-row {
+  flex-wrap: nowrap;
+  gap: 6px;
+  margin: 0;
+}
+
+/* border-box：16px 就是最终可点尺寸，不随宿主 box-sizing 变化 */
+.mb-text-tools .mb-tcolor {
+  box-sizing: border-box;
+  width: 16px;
+  height: 16px;
+}
+
+.mb-root.is-tablet .mb-text-tools .mb-tcolor {
+  width: 22px;
+  height: 22px;
+}
+
+.mb-root.is-tablet .mb-text-tools .mb-font-sel {
+  height: 30px;
+  font-size: 12.5px;
+}
+
 /* 平板：属性条得用手指点得准，按钮放大到 30px */
 .mb-tablet .mb-textbar {
   gap: 7px;

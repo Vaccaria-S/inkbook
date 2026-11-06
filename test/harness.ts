@@ -1159,13 +1159,166 @@ async function main() {
         };
         const brokenApp = { vault: brokenVault } as any;
         let threw = false;
+        let brokenResult: Awaited<ReturnType<typeof writeTextIndex>> | null = null;
         try {
-          await writeTextIndex(brokenApp, mockFile, bk2);
+          brokenResult = await writeTextIndex(brokenApp, mockFile, bk2);
         } catch (_) {
           threw = true;
         }
         pass(!threw, "✓ 索引写失败被兜底住，不会把保存/导入报成失败");
+        pass(
+          brokenResult?.ok === false && !!brokenResult?.error,
+          "✓ 索引失败时返回可展示的原因，不再静默成功：" + (brokenResult?.error || "")
+        );
       }
+    }
+
+    /*
+     * 真机故障回归（2026-11-06）：索引目录**已经在磁盘上、但不在
+     * Obsidian 的文件表里**（旧版裸建 / 同步工具外部建目录 / watcher 漏事件）。
+     *
+     * 旧实现：
+     *   createFolder 因「Folder already exists.」抛错 → catch 吞掉；
+     *   adapter.exists(dir) 为真 → 跳过 adapter.mkdir；
+     *   目录永远不登记 → vault.create 写出的 md 挂不进 vault 文件表那棵树
+     *   → 全局搜索 0 结果，而且 writeTextIndex 一声不吭。
+     *
+     * 这里用「磁盘层」和「文件表层」分开的桩复现：磁盘上预置目录 + 旧命名
+     * 文件，文件表里什么都没有。断言它会 rmdir 旧目录、重建登记目录，
+     * 并真的生成可反查的新索引页。
+     */
+    {
+      const disk = new Map<string, string>();
+      const diskFolders = new Set<string>();
+      const table = new Map<string, { path: string; kind: "file" | "folder" }>();
+      const calls3: string[] = [];
+      const adapter3 = {
+        exists: async (p: string) => disk.has(p) || diskFolders.has(p),
+        read: async (p: string) => disk.get(p) || "",
+        write: async (p: string, d: string) => {
+          calls3.push("adapter.write");
+          disk.set(p, d);
+        },
+        remove: async (p: string) => {
+          calls3.push("adapter.remove");
+          disk.delete(p);
+        },
+        mkdir: async (p: string) => {
+          calls3.push("adapter.mkdir");
+          diskFolders.add(p);
+        },
+        rmdir: async (p: string, recursive?: boolean) => {
+          calls3.push("adapter.rmdir");
+          diskFolders.delete(p);
+          if (recursive) {
+            for (const k of [...disk.keys()]) if (k.startsWith(p + "/")) disk.delete(k);
+          }
+          table.delete(p);
+          for (const k of [...table.keys()]) if (k.startsWith(p + "/")) table.delete(k);
+        },
+        list: async (p: string) => ({
+          files: [...disk.keys()].filter((k) => k.startsWith(p + "/")),
+          folders: [],
+        }),
+      };
+      const vault3 = {
+        adapter: adapter3,
+        getAbstractFileByPath: (p: string) => table.get(p) ?? null,
+        createFolder: async (p: string) => {
+          calls3.push("createFolder");
+          // 真机：磁盘上已有目录 → 直接抛，而且**不会**补登记
+          if (diskFolders.has(p)) throw new Error("Folder already exists.");
+          diskFolders.add(p);
+          table.set(p, { path: p, kind: "folder" });
+        },
+        create: async (p: string, d: string) => {
+          calls3.push("create");
+          if (table.has(p)) throw new Error("File already exists.");
+          const parent = p.split("/").slice(0, -1).join("/");
+          // 真机：父目录不在文件表里 → 创建失败（不能靠它自愈）
+          if (parent && !table.has(parent)) throw new Error("Parent folder does not exist.");
+          disk.set(p, d);
+          table.set(p, { path: p, kind: "file" });
+        },
+        modify: async (f: { path: string }, d: string) => disk.set(f.path, d),
+        delete: async (f: { path: string }) => {
+          disk.delete(f.path);
+          table.delete(f.path);
+        },
+      };
+
+      // 故障态：目录在磁盘上 + 旧命名文件还在；文件表里连目录都没有
+      diskFolders.add("笔记/数学.墨本索引");
+      disk.set("笔记/数学.墨本索引/第 1 页.md", "旧命名索引");
+      const bk3 = createBook("数学", "grid", "white");
+      bk3.pages[0].texts = [
+        { id: "r1", source: "pdf", x: 10, y: 10, size: 12, text: "自愈后要能搜到的原文" },
+      ];
+      const r3 = await writeTextIndex({ vault: vault3 } as any, mockFile, bk3);
+      const idx3 = "笔记/数学.墨本索引/数学 · 第 1 页.md";
+
+      pass(r3.ok === true, "✓ 已存在但未登记的索引目录能自愈（不再静默失败）");
+      pass(
+        calls3.includes("adapter.rmdir") && calls3.includes("createFolder"),
+        "✓ 自愈方式：删掉未登记旧目录，再用 vault.createFolder 重建登记"
+      );
+      pass(
+        !!vault3.getAbstractFileByPath("笔记/数学.墨本索引") &&
+          !!vault3.getAbstractFileByPath(idx3),
+        "✓ 自愈后目录与索引页都在 vault 文件表里（全局搜索才看得到）"
+      );
+      pass(
+        (disk.get(idx3) || "").includes("自愈后要能搜到的原文"),
+        "✓ 自愈后索引 md 内容正确：" + (disk.get(idx3) || "").slice(0, 28)
+      );
+      pass(
+        !disk.has("笔记/数学.墨本索引/第 1 页.md"),
+        "✓ 自愈时旧命名文件一并清掉（搜索里不会出现两份）"
+      );
+      pass(
+        parseIndexPath(idx3)?.bookPath === "笔记/数学.inkbook" &&
+          parseIndexPath(idx3)?.page === 1,
+        "✓ 端到端：本子数据 → 索引 md 真的生成，且能反查回第 1 页"
+      );
+    }
+
+    /*
+     * 如果宿主就是不让文件进文件表（权限 / 目录被占用 / 私有实现变化），
+     * 必须返回 ok=false 并带上可展示的原因，供上层弹 Notice。
+     */
+    {
+      const disk4 = new Map<string, string>();
+      const orphanVault = {
+        adapter: {
+          exists: async (p: string) => disk4.has(p),
+          read: async (p: string) => disk4.get(p) || "",
+          write: async (p: string, d: string) => void disk4.set(p, d),
+          remove: async (p: string) => void disk4.delete(p),
+          mkdir: async () => {},
+          list: async (p: string) => ({
+            files: [...disk4.keys()].filter((k) => k.startsWith(p + "/")),
+            folders: [],
+          }),
+        },
+        getAbstractFileByPath: () => null, // 永远不登记
+        createFolder: async () => {},
+        create: async (p: string, d: string) => void disk4.set(p, d), // 落盘但不入表
+        modify: async () => {},
+        delete: async () => {},
+      };
+      const bk4 = createBook("数学", "grid", "white");
+      bk4.pages[0].texts = [
+        { id: "x1", source: "pdf", x: 1, y: 1, size: 12, text: "落盘但进不了表" },
+      ];
+      const r4 = await writeTextIndex({ vault: orphanVault } as any, mockFile, bk4);
+      pass(
+        r4.ok === false && /文件表/.test(r4.error || ""),
+        "✓ 索引进不了文件表时返回失败原因（交给可见 Notice）：" + (r4.error || "")
+      );
+      pass(
+        (disk4.get("笔记/数学.墨本索引/数学 · 第 1 页.md") || "").includes("落盘但进不了表"),
+        "✓ 即使文件已落盘，也要如实报告「搜索不可用」，而不是假装成功"
+      );
     }
   }
 

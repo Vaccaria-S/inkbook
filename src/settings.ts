@@ -262,7 +262,7 @@ export class InkbookSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("重建文字索引")
       .setDesc(
-        "把库里每一本手写本重新写一遍索引。以前生成过索引、但全局搜索搜不到时点这里——旧版是绕过 Obsidian 的文件表直接落盘的，可能一直没被检索收录。"
+        "把库里每一本手写本重新写一遍索引。生成过索引、但全局搜索搜不到时点这里——旧版裸写、同步工具从外部建目录等情况会让索引目录没被 Obsidian 收录，这里会自动修复目录登记并重写。"
       )
       .addButton((b) => {
         b.setButtonText("立即重建").onClick(async () => {
@@ -274,7 +274,13 @@ export class InkbookSettingTab extends PluginSettingTab {
           b.setDisabled(true);
           try {
             const r = await this.plugin.rebuildTextIndex();
-            b.setButtonText(r.pages > 0 ? `完成 · ${r.pages} 页` : "完成 · 无文字");
+            b.setButtonText(
+              r.failed
+                ? `完成 · ${r.pages} 页，${r.failed} 本失败`
+                : r.pages > 0
+                ? `完成 · ${r.pages} 页`
+                : "完成 · 无文字"
+            );
           } catch (_) {
             b.setButtonText("失败，看控制台");
           } finally {

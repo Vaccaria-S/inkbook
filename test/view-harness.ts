@@ -1190,6 +1190,37 @@ async function main() {
     );
   }
 
+  /*
+   * 打开本子时索引自动补建（真机：857 页本子有 21605 条文字，但索引目录是空的，
+   * 全局搜索 0 结果）。scheduleTextIndex 只在保存成功后触发，光打开不会重建，
+   * 所以 mountEditor 末尾要主动检查一次。
+   */
+  {
+    const ib = createBook("索引自愈", "grid", "white");
+    ib.pages[0].texts = [
+      { id: "it1", source: "pdf", x: 10, y: 10, size: 12, text: "打开就该能搜到" },
+    ];
+    const ibFile = mkFile("索引自愈.inkbook", JSON.stringify(ib));
+    const dir = "索引自愈.墨本索引";
+    // 故障态：目录里只有旧命名残留，没有新命名索引页
+    files.set(dir + "/第 1 页.md", "旧命名残留");
+    index.set(dir + "/第 1 页.md", {
+      path: dir + "/第 1 页.md",
+      extension: "md",
+    });
+    const opened = new InkbookView(leaf, plugin);
+    await opened.onOpen();
+    await opened.onLoadFile(ibFile);
+    await sleep(350);
+    const idxPath = dir + "/索引自愈 · 第 1 页.md";
+    pass(
+      (files.get(idxPath) || "").includes("打开就该能搜到"),
+      "打开本子（不保存）时索引自动补建，文字进了索引"
+    );
+    pass(index.has(idxPath), "自动补建的索引页进了 vault 文件表（全局搜索搜得到）");
+    pass(!files.has(dir + "/第 1 页.md"), "自动补建时旧命名索引一并清掉");
+  }
+
   /* 展示本：丰富笔迹，用于截图 */
   const show = createBook("墨本 · 手感展示", "grid", "white");
   show.pages[0].layers[0].strokes.push(...sampleStrokes());

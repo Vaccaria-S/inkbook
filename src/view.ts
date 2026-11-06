@@ -1,7 +1,7 @@
 import { FileView, Menu, Notice, type TFile } from "obsidian";
 import { setIcon } from "./icons";
 import { BookEditor, TEXT_FONTS } from "./editor";
-import { writeTextIndex } from "./indexer";
+import { indexDirFor, writeTextIndex } from "./indexer";
 import { BookStore } from "./store";
 import {
   bookStats,
@@ -730,6 +730,45 @@ export class InkbookView extends FileView {
         if (hint) this.editor?.locatePage(p);
       });
     }
+
+    this.ensureTextIndexIfMissing();
+  }
+
+  /**
+   * 打开本子时若发现「本子有文字、但索引目录里没有新命名的索引页」，异步补建一次。
+   *
+   * 为什么需要它：`scheduleTextIndex()` 只在**保存成功后**触发，用户光打开一本
+   * 老本子（不改动、不保存）时不会重建索引。而真机上确实出现过索引目录建了、
+   * 却因为「目录在磁盘上、没进 Obsidian 文件表」导致一个 md 都写不出来（全局搜索
+   * 0 结果）。`writeTextIndex` 现在会自愈这种目录，但得有人调用它。
+   *
+   * 只做一次轻量检查 + 异步写，不阻塞打开；失败由 writeTextIndex 自己弹可见提示。
+   */
+  private ensureTextIndexIfMissing(): void {
+    if (!this.file || !this.store || this.plugin.settings.searchIndex === false) return;
+    const book = this.store.data;
+    const hasText = book.pages.some((p) =>
+      (p?.texts ?? []).some((t) => (t.text || "").trim())
+    );
+    if (!hasText) return;
+    const adapter = this.app.vault.adapter as any;
+    if (typeof adapter?.list !== "function") return;
+    const dir = indexDirFor(this.file);
+    void (async () => {
+      try {
+        const listed = await adapter.list(dir);
+        const files: string[] = listed?.files || [];
+        // 有新命名的索引页就算健康；只有旧命名 / 空目录才需要重建
+        const hasNew = files.some((p) => {
+          const name = String(p).split("/").pop() || "";
+          return /^.+ · 第 \d+ 页\.md$/.test(name);
+        });
+        if (hasNew) return;
+        await writeTextIndex(this.app, this.file!, book);
+      } catch (_) {
+        /* 索引是派生物，打不开就算了，writeTextIndex 自己会兜底 */
+      }
+    })();
   }
 
   private destroyEditor(): void {
@@ -1845,18 +1884,28 @@ export class InkbookView extends FileView {
     }
 
     if (s.tool === "text") {
-      this.dynEl.createSpan({
-        cls: "mb-hint",
-        text: "点页面输入；点已有文字选中，再点一次编辑",
-      });
-
       /*
-       * 这三组控制「新建文字」的默认样式；
-       * 如果此刻已选中某段文字，改这里会直接改那段（editor 的 setter 会转发）。
+       * 文字工具参数压成**两行**（电脑端侧栏内容区只有 234px 宽）：
+       *   第一行：[字号 14 18 24 32] [字体下拉，占剩余宽度]
+       *   第二行：[8 个色点，强制一行不折]
+       *
+       * 旧实现把提示 / 字号 / 字体 / 色点四组直接塞进 .mb-dyn
+       * （nowrap 单行）：提示文字的最小宽度就 ~220px，整行最小内容宽
+       * 400px+，字体下拉被推到侧栏右缘之外（用户：「选择字体的那个框
+       * 已经到页面外了」）；色点行被挤到 18px 宽，8 个点竖着排，
+       * 整区被撑到约 200px 高（用户：「上下占的面积太大」）。
+       *
+       * 提示文字不再常驻占一行，收进容器的 title（悬停可见）。
+       * 三组控件都带 data-mb-text-style：编辑框开着时点它们不提交。
        */
+      const tools = this.dynEl.createDiv("mb-text-tools");
+      tools.title = "点页面输入文字；点已有文字选中，再点一次编辑";
+
+      // 第一行：字号 + 字体（并排，字号定宽、字体吃掉剩余宽度）
+      const row = tools.createDiv("mb-text-tools-row");
 
       // 字号
-      const seg = this.dynEl.createDiv("mb-seg");
+      const seg = row.createDiv("mb-seg");
       for (const n of [14, 18, 24, 32]) {
         const b = seg.createEl("button", {
           cls: "mb-seg-btn" + (s.textSize === n ? " is-active" : ""),
@@ -1870,8 +1919,8 @@ export class InkbookView extends FileView {
         };
       }
 
-      // 字体
-      const fontSel = this.dynEl.createEl("select", {
+      // 字体（不再 width:100% 独占一行，见 .mb-text-tools .mb-font-sel）
+      const fontSel = row.createEl("select", {
         cls: "mb-font-sel",
         attr: { "data-mb-text-style": "1" },
       });
@@ -1885,8 +1934,8 @@ export class InkbookView extends FileView {
         this.renderDynamicTools();
       };
 
-      // 颜色
-      const crow = this.dynEl.createDiv("mb-tcolor-row");
+      // 颜色（第二行；.mb-text-tools .mb-tcolor-row 强制 nowrap）
+      const crow = tools.createDiv("mb-tcolor-row");
       for (const c of PEN_COLORS) {
         const dot = crow.createEl("button", {
           cls:

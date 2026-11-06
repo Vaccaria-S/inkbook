@@ -1331,6 +1331,128 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       "侧栏文字面板有颜色点（" + root.querySelectorAll(".mb-tcolor").length + " 个）"
     );
 
+    /*
+     * 文字工具区扁平化（用户真机：「输入文字的字体在侧边栏上下占的
+     * 面积太大」「电脑端选择字体的那个框已经到页面外了」）。
+     *
+     * 旧布局四组控件直接塞在 .mb-dyn（nowrap 单行）里：
+     * 提示文字 ~220px + 字号组 ~106px + 字体下拉 234px + 色点行，
+     * 最小内容宽 400px+，而侧栏内容区只有 234px：
+     *   · 字体下拉被推到侧栏右缘之外（横向看不见）；
+     *   · 色点行被压成 18px 宽，8 个点竖排 → 整区被撑到约 200px 高。
+     * 现在两行：字号+字体一行、8 个色点一行（nowrap）。
+     */
+    {
+      const v = view as any;
+      v.sideShown = true;
+      v.applySideVisibility();
+      const sideBody = view.sideEl.querySelector(".mb-side-body") as HTMLElement;
+      sideBody.scrollTop = 0;
+      await sleep(30);
+
+      const dyn = view.sideEl.querySelector(".mb-sec-dyn") as HTMLElement;
+      const tools = dyn?.querySelector(".mb-text-tools") as HTMLElement | null;
+      const seg = dyn?.querySelector(".mb-seg") as HTMLElement;
+      const fsel = dyn?.querySelector(".mb-font-sel") as HTMLSelectElement;
+      const dots = [...(dyn?.querySelectorAll(".mb-tcolor") ?? [])] as HTMLElement[];
+      pass(!!tools, "文字工具区有独立的两行容器 .mb-text-tools");
+      pass(!dyn?.querySelector(".mb-hint"), "文字工具区不再常驻一行提示（信息收进 title）");
+      pass(dots.length === 8, "8 个文字色点齐全（" + dots.length + " 个）");
+
+      const dynRect = dyn.getBoundingClientRect();
+      const segRect = seg.getBoundingClientRect();
+      const fontRect = fsel.getBoundingClientRect();
+      const bodyRect = sideBody.getBoundingClientRect();
+      const bodyCS = getComputedStyle(sideBody);
+      // 滚动容器**可视内容区**的四条边（clientWidth/Height 已扣掉滚动条）
+      const contentLeft =
+        bodyRect.left + sideBody.clientLeft + parseFloat(bodyCS.paddingLeft);
+      const contentRight =
+        bodyRect.left + sideBody.clientLeft + sideBody.clientWidth - parseFloat(bodyCS.paddingRight);
+      const contentTop =
+        bodyRect.top + sideBody.clientTop + parseFloat(bodyCS.paddingTop);
+      const contentBottom =
+        bodyRect.top + sideBody.clientTop + sideBody.clientHeight - parseFloat(bodyCS.paddingBottom);
+
+      // 高度：旧布局约 200px（色点被挤成竖排），两行方案 ~50px
+      pass(
+        dynRect.height <= 64,
+        "文字工具区高度 ≤64px（实测 " + dynRect.height.toFixed(1) + "px，改前约 200px）"
+      );
+      // 字号与字体同一行（纵向区间重叠）
+      pass(
+        fontRect.top < segRect.bottom && segRect.top < fontRect.bottom,
+        "字号组与字体下拉在同一行（seg " +
+          segRect.top.toFixed(1) +
+          "~" +
+          segRect.bottom.toFixed(1) +
+          " / font " +
+          fontRect.top.toFixed(1) +
+          "~" +
+          fontRect.bottom.toFixed(1) +
+          "）"
+      );
+      // 字体下拉真的可用，不是被挤成一条缝
+      pass(
+        fontRect.width >= 80,
+        "字体下拉宽度 ≥80px（实测 " + fontRect.width.toFixed(1) + "px）"
+      );
+      // 纵向在侧栏可视区内（不靠滚动也看得到）
+      pass(
+        fontRect.top >= contentTop - 1 && fontRect.bottom <= contentBottom + 1,
+        "字体下拉在侧栏可视区纵向范围内（font bottom " +
+          fontRect.bottom.toFixed(1) +
+          " ≤ 可视区 bottom " +
+          contentBottom.toFixed(1) +
+          "）"
+      );
+      // 横向在侧栏内容区内（旧布局正是在这里溢出到页面外）
+      pass(
+        fontRect.left >= contentLeft - 1 && fontRect.right <= contentRight + 1,
+        "字体下拉在侧栏内容区内（font right " +
+          fontRect.right.toFixed(1) +
+          " ≤ " +
+          contentRight.toFixed(1) +
+          "）"
+      );
+      pass(
+        dyn.scrollWidth <= dyn.clientWidth + 1,
+        "文字工具区不横向溢出（scrollWidth " +
+          dyn.scrollWidth +
+          " / clientWidth " +
+          dyn.clientWidth +
+          "）"
+      );
+      // 8 个色点必须在同一行，且排在字号/字体行的下面
+      const tops = [...new Set(dots.map((d) => Math.round(d.getBoundingClientRect().top)))];
+      pass(tops.length === 1, "8 个色点在同一行（top: " + tops.join(",") + "）");
+      pass(
+        Math.round(dots[0].getBoundingClientRect().top) >= Math.round(segRect.bottom) - 1,
+        "色点行排在字号/字体行下方（两行布局）"
+      );
+      pass(
+        dots[0].getBoundingClientRect().width >= 16,
+        "电脑端色点 ≥16px 可点（" + dots[0].getBoundingClientRect().width + "px）"
+      );
+      pass(
+        !!seg.querySelector('[data-mb-text-style="1"]') &&
+          fsel.getAttribute("data-mb-text-style") === "1" &&
+          dots.every((d) => d.getAttribute("data-mb-text-style") === "1"),
+        "字号 / 字体 / 色点都带 data-mb-text-style（编辑框开着时点它们不提交）"
+      );
+
+      // 平板：色点放大到 ≥22px 触摸目标（CSS 用 .mb-root.is-tablet 区分）
+      root.classList.add("is-tablet");
+      await sleep(30);
+      const tabletDot = dyn.querySelector(".mb-tcolor") as HTMLElement;
+      pass(
+        tabletDot.getBoundingClientRect().width >= 22,
+        "平板色点 ≥22px 可点（" + tabletDot.getBoundingClientRect().width + "px）"
+      );
+      root.classList.remove("is-tablet");
+      await sleep(30);
+    }
+
     // Esc：先取消选中，不该顺手切到仅阅读
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     await sleep(80);

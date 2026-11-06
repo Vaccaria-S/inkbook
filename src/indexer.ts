@@ -1,4 +1,4 @@
-import type { App, TFile } from "obsidian";
+import { Notice, type App, type TFile } from "obsidian";
 import type { InkBook, Page } from "./types";
 
 /**
@@ -166,6 +166,7 @@ interface AdapterLike {
   read: (path: string) => Promise<string>;
   write: (path: string, data: string) => Promise<void>;
   mkdir?: (path: string) => Promise<void>;
+  rmdir?: (path: string, recursive?: boolean) => Promise<void>;
   remove?: (path: string) => Promise<void>;
   list?: (path: string) => Promise<{ files: string[]; folders: string[] }>;
 }
@@ -199,26 +200,64 @@ function hasFileTable(vault: VaultLike | undefined): vault is VaultLike {
 }
 
 /**
- * 确保索引目录存在。
+ * 确保索引目录存在，**并且**已经进入 Obsidian 的文件表。
  *
- * 优先 `vault.createFolder`：它会把文件夹登记进 Obsidian 的文件表。
+ * 优先 `vault.createFolder`：它会把文件夹登记进文件表。
  * 直接用 `adapter.mkdir` 建出来的目录，在 Obsidian 眼里可能"不存在"，
  * 里面的文件也就跟着进不了全局搜索。
+ *
+ * ### 为什么还要处理"磁盘上有、文件表里没有"
+ *
+ * `vault.createFolder` 在目录已存在于磁盘时只会抛「Folder already exists.」，
+ * **不会**补登记。旧版裸建、同步工具在 Obsidian 运行时从外部建目录、
+ * watcher 漏事件，都会留下这种状态。此时 `vault.create` 能把 md 写到磁盘，
+ * 但 Obsidian 的 `Vault.addChild` 找不到父目录，文件不会挂进 `vault.getFiles()`
+ * 那棵树——全局搜索永远 0 结果，而且不报任何错。
+ *
+ * 索引全是派生数据，所以这里直接删掉未登记的旧目录，再用 `createFolder`
+ * 建一个会被登记的。删不掉才退回裸建（最终校验会把它报出来）。
  */
 async function ensureDir(vault: VaultLike, adapter: AdapterLike, dir: string): Promise<void> {
-  if (hasFileTable(vault) && vault.getAbstractFileByPath(dir)) return;
-  if (hasFileTable(vault) && typeof vault.createFolder === "function") {
-    try {
-      await vault.createFolder(dir);
+  if (hasFileTable(vault)) {
+    if (vault.getAbstractFileByPath(dir)) return;
+
+    if (typeof vault.createFolder === "function") {
+      try {
+        await vault.createFolder(dir);
+      } catch (_) {
+        /* 磁盘上已经有了（旧版裸建 / 同步工具建的）→ 抛「已存在」 */
+      }
       if (vault.getAbstractFileByPath(dir)) return;
-    } catch (_) {
-      // 磁盘上已经有了（旧版用 adapter.mkdir 建的）→ createFolder 抛"已存在"。
-      // 这时候 Obsidian 只是没登记它，落盘照旧能写，这里不当作失败。
+      // 有的宿主把 create 事件异步派发，让一轮宏任务再确认一次
+      await new Promise((r) => setTimeout(r, 0));
+      if (vault.getAbstractFileByPath(dir)) return;
+
+      /*
+       * 走到这里：目录在磁盘上，文件表里却没有。createFolder 对已存在目录
+       * 只会失败、不会补登记，必须把旧目录删掉重建。
+       */
+      if (
+        typeof adapter.rmdir === "function" &&
+        dir.length > INDEX_DIR_SUFFIX.length &&
+        dir.endsWith(INDEX_DIR_SUFFIX)
+      ) {
+        try {
+          if (await adapter.exists(dir)) {
+            await adapter.rmdir(dir, true);
+            await vault.createFolder(dir);
+            await new Promise((r) => setTimeout(r, 0));
+            if (vault.getAbstractFileByPath(dir)) return;
+          }
+        } catch (_) {
+          /* 修不好就退回下面的裸建；最终校验会把"进不了文件表"报给用户 */
+        }
+      }
     }
   }
-  if (typeof adapter.mkdir === "function" && !(await adapter.exists(dir))) {
+
+  if (typeof adapter.mkdir === "function") {
     try {
-      await adapter.mkdir(dir);
+      if (!(await adapter.exists(dir))) await adapter.mkdir(dir);
     } catch (_) {
       /* 并发建目录时可能撞上，忽略 */
     }
@@ -346,21 +385,94 @@ async function removeIndexFile(
 }
 
 /**
+ * 索引失败时给用户看的提示。
+ *
+ * 为什么不能只 console.warn：真机上没人看控制台，索引写不出来时用户
+ * 看到的只是「全局搜索永远搜不到本子里的文字」。
+ *
+ * 为什么不能报成「保存失败」：索引是派生物，本子已经正常落盘。
+ * 自动保存会反复触发索引失败，同一句原因 60 秒内只提示一次，避免刷屏。
+ */
+let lastFailureNoticeAt = 0;
+let lastFailureNoticeText = "";
+
+function notifyTextIndexFailure(reason: string): void {
+  const msg = `文字索引生成失败：${reason}；全局搜索可能搜不到本子里的文字（本子本身不受影响）。`;
+  const now = Date.now();
+  if (msg === lastFailureNoticeText && now - lastFailureNoticeAt < 60_000) return;
+  lastFailureNoticeAt = now;
+  lastFailureNoticeText = msg;
+  try {
+    new Notice(msg, 10000);
+  } catch (_) {
+    // 极少数测试桩没有 Notice：至少把原因留在控制台
+    console.warn("[inkbook] " + msg);
+  }
+}
+
+function describeError(e: unknown): string {
+  const text = e instanceof Error && e.message ? e.message : String(e ?? "");
+  return text.length > 160 ? `${text.slice(0, 160)}…` : text || "未知错误";
+}
+
+/**
+ * 写完后的硬校验：索引页必须**真的进了 Obsidian 的文件表**。
+ *
+ * 只看「磁盘上有文件」不够。真机故障正是「盘上有、文件表没有」：
+ * `vault.getFiles()` 与全局搜索都只认文件表，此时文件等于不存在。
+ * 校验失败必须让用户知道，否则他只会觉得搜索坏了。
+ */
+async function verifyIndexRegistered(
+  vault: VaultLike,
+  dir: string,
+  wanted: Set<string>
+): Promise<void> {
+  if (!hasFileTable(vault) || wanted.size === 0) return;
+  // 给异步派发的 create 事件一点时间
+  await new Promise((r) => setTimeout(r, 0));
+  if (!vault.getAbstractFileByPath(dir)) {
+    throw new Error("索引目录没有进入 Obsidian 文件表（全局搜索会搜不到）");
+  }
+  for (const p of wanted) {
+    if (!vault.getAbstractFileByPath(p)) {
+      throw new Error(`索引页没有进入 Obsidian 文件表：${p}`);
+    }
+  }
+}
+
+export interface TextIndexResult {
+  /** 索引是否真的可用（false 时原因在 error 里） */
+  ok: boolean;
+  /** 有文字、应当存在索引页的页数 */
+  pages: number;
+  /** ok=false 时的失败原因（可直接展示给用户） */
+  error?: string;
+}
+
+/**
  * 写索引：有文字的页各写一个文件，清掉多余的旧页与旧版单文件。
  *
- * 失败只记日志——索引是附属品，不能因为它坏了就把「保存成功」报成失败。
+ * **永不抛异常**：索引是附属品，不能因为它坏了就把「保存成功」报成失败。
+ * 失败时返回 `ok:false` 并弹一个用户可见的 Notice（同一原因会节流）。
  */
-export async function writeTextIndex(app: App, file: TFile, book: InkBook): Promise<void> {
+export async function writeTextIndex(
+  app: App,
+  file: TFile,
+  book: InkBook,
+  opts: { notify?: boolean } = {}
+): Promise<TextIndexResult> {
   const dir = indexDirFor(file);
   const vault = app.vault as unknown as VaultLike;
   const adapter = (vault.adapter || (app.vault.adapter as unknown as AdapterLike));
+  const wanted = new Set<string>();
+  let stage = "准备索引目录";
   try {
     await ensureDir(vault, adapter, dir);
 
-    const wanted = new Set<string>();
     for (let i = 0; i < book.pages.length; i += 1) {
       const pageNo = i + 1;
       const path = indexPagePath(file, pageNo);
+      stage = `写第 ${pageNo} 页`;
       const content = buildPageIndex(file, book, i);
       // 没有文字的页不生成文件，但仍标记为「不该存在」，下面会清掉旧文件
       const hasText = (book.pages[i]?.texts ?? []).some((t) => (t.text || "").trim());
@@ -369,6 +481,7 @@ export async function writeTextIndex(app: App, file: TFile, book: InkBook): Prom
       await writeIndexFile(vault, adapter, path, content);
     }
 
+    stage = "清理旧索引";
     // 页数变少 / 某页文字被清空：删掉对应的索引页；旧命名统一迁移掉
     if (typeof adapter.list === "function") {
       const listed = await adapter.list(dir);
@@ -393,8 +506,18 @@ export async function writeTextIndex(app: App, file: TFile, book: InkBook): Prom
     if (await adapter.exists(legacy)) {
       await removeIndexFile(vault, adapter, legacy);
     }
+
+    stage = "校验索引";
+    await verifyIndexRegistered(vault, dir, wanted);
+
+    return { ok: true, pages: wanted.size };
   } catch (e) {
+    const reason = `${stage}时失败：${describeError(e)}`;
     console.warn("[inkbook] 写文字索引失败（不影响本子保存）", e);
+    if (opts.notify !== false) {
+      notifyTextIndexFailure(`${file.basename || "未命名"}（${reason}）`);
+    }
+    return { ok: false, pages: wanted.size, error: reason };
   }
 }
 
