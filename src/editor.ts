@@ -357,6 +357,18 @@ export class BookEditor {
     font: string;
   } | null = null;
   /**
+   * 输入框是否正在 IME 组字（拼音 / 假名还没上屏）。
+   *
+   * 组字期间 `textarea.value` 里混着未上屏的拼音，直接读它提交会把
+   * 「半截拼音」写进本子。`commitTextEditNow` 在组字中默认推迟到
+   * compositionend；必须立刻离开（销毁 / 关页）时只提交组字前的内容。
+   */
+  private textEditComposing = false;
+  /** 最近一次组字开始前的 value（不含未上屏内容，强制离开时的兜底） */
+  private textEditValueBeforeComp = "";
+  /** 组字期间收到过提交请求：等 compositionend（词上屏）后再提交 */
+  private textEditCommitPending = false;
+  /**
    * 本次 pointerdown 是否落在「文字样式控件」上（带 data-mb-text-style）。
    *
    * 为什么不用 blur 的 relatedTarget 判断：iPad WKWebView 上点 button/select
@@ -450,18 +462,27 @@ export class BookEditor {
     if (rec) this.onUp(e, rec);
   };
   /**
-   * 切后台 / 窗口失焦：收尾墨水手势。
+   * 切后台 / 窗口失焦：提交文字框 + 收尾墨水手势。
    *
    * 平板上切 App 时 pointerup 可能永远不来，gesture 会卡在 "draw"，
    * 自动保存一避让就成了「永远不落盘」。这里主动结束手势：
    * 正在画的那一笔提交（而不是丢），橡皮则补好撤销记录。
    * 之后 view 的 flushSave 一定能把这部分写下去。
+   *
+   * 文字同理：打完字没按回车就切走，textarea 里那段字只在 DOM 里，
+   * 移动端切后台未必触发 blur，不主动提交就会整段丢。
+   * 组字中（拼音未上屏）先挂起，由 compositionend 补交。
    */
   private onWindowBlur = () => {
+    this.commitTextEditNow();
     this.finishInkGesture();
   };
   private onVisibilityHidden = () => {
-    if (document.visibilityState === "hidden") this.finishInkGesture();
+    if (document.visibilityState === "hidden") {
+      // hidden 之后可能被系统直接回收：不等 compositionend，强制提交已上屏部分
+      this.commitTextEditNow(true);
+      this.finishInkGesture();
+    }
   };
   private resizeObserver: ResizeObserver | null = null;
   private resizeRaf = 0;
@@ -3132,6 +3153,17 @@ export class BookEditor {
 
     if (!hit) {
       this.selectText(null);
+      /*
+       * 已经有一个输入框开着时，点纸面空白**只提交、不再新建**。
+       *
+       * 旧行为是「提交旧框 → 又在落点弹一个新框」，用户想结束输入就得
+       * 再点一次，越点框越多（真机反馈：文字工具在平板上「点不出去」）。
+       * 现在：第一次点空白新建，之后点空白就是「写完了，收起」。
+       */
+      if (this.textEdit) {
+        this.commitTextEdit(true);
+        return;
+      }
       this.beginTextEdit(rec, px, py);
       return;
     }
@@ -3211,6 +3243,28 @@ export class BookEditor {
     rec.pageEl.appendChild(ta);
 
     this.textEdit = { rec, el: ta, id: hit?.id ?? null, x, y, size, color, font };
+    // 组字状态跟着新输入框复位，上一框遗留的 pending 不能带到这一框
+    this.textEditComposing = false;
+    this.textEditValueBeforeComp = ta.value;
+    this.textEditCommitPending = false;
+    /*
+     * IME 组字跟踪：组字期间 value 里有还没上屏的拼音，提交它等于把
+     * 半个词写死。记下组字前的值，作为「等不到 compositionend 的强制
+     * 离开」（销毁 / pagehide）时的兜底；如果只是暂时失焦 / 切后台，
+     * 则挂起提交，等 compositionend 把词真正上屏后再补交。
+     */
+    ta.addEventListener("compositionstart", () => {
+      this.textEditComposing = true;
+      this.textEditValueBeforeComp = ta.value;
+    });
+    ta.addEventListener("compositionend", () => {
+      this.textEditComposing = false;
+      this.textEditValueBeforeComp = ta.value;
+      if (this.textEditCommitPending) {
+        this.textEditCommitPending = false;
+        this.commitTextEdit(true);
+      }
+    });
     /*
      * 新键才给就近样式条：用户要先定字号/颜色再打字。
      * 改已有文字走的是选中属性条（.mb-textbar），这里不再叠一条。
@@ -3266,7 +3320,11 @@ export class BookEditor {
         this.textEditStylePress = false;
         return;
       }
-      finish(true);
+      /*
+       * 走 commitTextEditNow：组字中（拼音还没上屏）先挂起，
+       * 等 compositionend 再提交，别把半截拼音写进本子。
+       */
+      this.commitTextEditNow();
     });
     // 高度跟着内容长，别让两行字挤在一行的高度里
     ta.addEventListener("input", () => {
@@ -3301,24 +3359,54 @@ export class BookEditor {
   }
 
   /**
-   * 外部动作（导出 / 撤销 / 翻页）前，把编辑框里还没提交的文字落库。
+   * 外部动作（导出 / 撤销 / 翻页 / 切后台 / 失焦 / 切文件 / 销毁）前，
+   * 把编辑框里还没提交的文字落库。
    *
    * 移动端点按钮不一定触发 blur，光靠 blur 提交会漏字（导出少一段）。
+   *
+   * @param force 组字中也立刻提交。未上屏的拼音会被丢弃，只写
+   *              compositionstart 之前已经上屏的内容——用于销毁 / pagehide
+   *              这类「等不到 compositionend 了」的最后时刻。
    */
-  commitTextEditNow(): void {
+  commitTextEditNow(force = false): void {
+    if (!this.textEdit) return;
+    if (this.textEditComposing) {
+      if (!force) {
+        // 词还没上屏：先挂起，compositionend 时由监听器补交
+        this.textEditCommitPending = true;
+        return;
+      }
+      /*
+       * 不能等 compositionend（销毁 / 关页）：交给 commitTextEdit
+       * 只取组字前的值，绝不把 textarea.value 里的半截拼音写进去。
+       */
+    }
     this.commitTextEdit(true);
   }
 
-  /** 收掉编辑框。save=false 用于 Esc / 页面被卸载时丢弃 */
+  /**
+   * 收掉编辑框。save=false 用于 Esc / 页面被卸载时丢弃。
+   *
+   * 组字中提交时只写组字开始前的内容：任何「收框」动作都无法让 IME
+   * 继续组字，写半截拼音比丢掉这次未上屏的输入更糟。
+   */
   private commitTextEdit(save = true): void {
     // 样式条与输入框同生共死：提交、Esc、翻页重建都不能留下孤儿节点
     this.textEditBarEl?.remove();
     this.textEditBarEl = null;
     const ed = this.textEdit;
     if (!ed) return;
+    /*
+     * 先取内容再清状态：组字中 value 里是未上屏的拼音，
+     * 只提交 compositionstart 之前已经上屏的部分。
+     */
+    const raw = this.textEditComposing ? this.textEditValueBeforeComp : ed.el.value;
     this.textEdit = null;
+    this.textEditComposing = false;
+    this.textEditValueBeforeComp = "";
+    this.textEditCommitPending = false;
     this.detachTextEditStyleWatcher();
-    const value = ed.el.value.replace(/\s+$/g, "");
+    const value = raw.replace(/\s+$/g, "");
     ed.el.remove();
     if (!save) return;
 
@@ -3699,8 +3787,12 @@ export class BookEditor {
       /*
        * 文字工具例外：平板上用手指点一下就该出输入框，
        * 不然"添加文字"在平板上等于不能用（手指只会滚动）。
+       *
+       * 但**已经有输入框开着**时就不这么干了：那一次触摸应该是
+       * 「写完了，收起」——顺手还能滚动页面。以前手指一点就又弹一个新框，
+       * 想滚也滚不动（真机反馈：文字工具在平板上「点不出去」）。
        */
-      if (this.tool === "text" && !this.readOnly) {
+      if (this.tool === "text" && !this.readOnly && !this.textEdit) {
         const p = this.pointFromEvent(e, rec);
         this.current = rec.index;
         this.store.setPage(rec.index);
@@ -3737,6 +3829,14 @@ export class BookEditor {
         this.touchDraw &&
         this.tool !== "hand";
       if (!fingerDraws) {
+        /*
+         * 已经有输入框开着时，这一指是「写完了、点掉输入框」。
+         * 先提交再放行滚动——提交完这次触摸继续拖就是正常翻页，
+         * 用户既收了尾又能顺手滚，不至于卡住。
+         */
+        if (this.textEdit && this.tool === "text") {
+          this.commitTextEdit(true);
+        }
         this.gesture = "pan";
         this.pointerId = e.pointerId;
         this.pan = {
@@ -5068,6 +5168,11 @@ export class BookEditor {
   }
 
   destroy(): void {
+    /*
+     * 销毁前兜底提交编辑框里的字：destroy 之后 DOM 清空，textarea 里的
+     * 内容再也读不到。force：等不到 compositionend，组字中只提交已上屏部分。
+     */
+    this.commitTextEditNow(true);
     this.stopFling();
     this.destroyed = true;
     this.uninstallEdgeSwipeGuard();

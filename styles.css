@@ -394,10 +394,22 @@
   opacity: 1;
 }
 
-.mb-float-nav {
+.mb-float-nav,
+.mb-float-edit {
   display: flex;
   align-items: center;
   gap: 1px;
+}
+
+/*
+ * 撤销组与翻页组之间留一道极细的分隔：
+ * 两组按钮紧挨着，只差 2px 容易误触——尤其平板上连点撤销时。
+ * 只加 7px 宽，浮标整体仍然很小。
+ */
+.mb-float-edit {
+  padding-right: 3px;
+  margin-right: 1px;
+  border-right: 1px solid var(--background-modifier-border);
 }
 
 .mb-float-btn {
@@ -421,6 +433,12 @@
 .mb-float-btn:hover {
   background: var(--background-modifier-hover);
   color: var(--text-normal);
+}
+
+/* 和侧栏 .mb-ib.is-disabled 一致：置灰且点不到 */
+.mb-float-btn.is-disabled {
+  opacity: 0.32;
+  pointer-events: none;
 }
 
 .mb-root .mb-float-btn .mb-ic {
@@ -2119,20 +2137,20 @@
   padding-bottom: 110px;
 }
 
-/* 浮标在平板上也大一点，手指点得准 */
+/* 浮标在平板上也大一点，手指点得准（撤销/重做也吃这一档，≥36px 触控目标） */
 .mb-root.is-tablet .mb-float-btn {
-  width: 34px;
-  height: 34px;
+  width: 36px;
+  height: 36px;
 }
 
 .mb-root.is-tablet .mb-float-btn .mb-ic {
-  width: 19px;
-  height: 19px;
+  width: 20px;
+  height: 20px;
 }
 
 .mb-root.is-tablet .mb-float-num {
   min-width: 58px;
-  height: 34px;
+  height: 36px;
   font-size: 13px;
 }
 
@@ -2417,4 +2435,20 @@
  */
 .mb-embed:hover .mb-embed-badge.is-clamped {
   opacity: 1;
+}
+
+/*
+ * 导出进度 Notice 上的「取消」按钮。
+ * Notice 默认是纯文字块，按钮要收得紧凑一点，别把整本导出提示挤成两行。
+ */
+.notice .mb-export-cancel {
+  margin-left: 10px;
+  padding: 1px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.notice .mb-export-cancel:disabled {
+  cursor: default;
+  opacity: 0.6;
 }

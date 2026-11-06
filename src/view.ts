@@ -30,7 +30,7 @@ import {
 import { paintPaperPreview } from "./paper";
 import { NewBookModal, JumpPageModal, PromptModal, ImportSourceModal, ImportRangeModal } from "./modals";
 import { importPdf, importWord } from "./importer";
-import { exportBookPdf, exportPagePng } from "./export";
+import { ExportCancelledError, exportBookPdf, exportPagePng } from "./export";
 
 export const VIEW_TYPE = "inkbook-view";
 
@@ -219,6 +219,9 @@ export class InkbookView extends FileView {
   private statusEl!: HTMLElement;
   private undoBtn!: HTMLButtonElement;
   private redoBtn!: HTMLButtonElement;
+  /** 右下浮标里的撤销 / 重做（常驻，不依赖侧栏是否展开） */
+  private floatUndoBtn: HTMLButtonElement | null = null;
+  private floatRedoBtn: HTMLButtonElement | null = null;
   private stylusBtn!: HTMLButtonElement;
   private toolButtons = new Map<ToolId, HTMLButtonElement>();
   private sideBtn!: HTMLElement;
@@ -375,6 +378,8 @@ export class InkbookView extends FileView {
   private recoveredCopyName: string | null = null;
   private saving = false;
   private saveAgain = false;
+  /** 导出进行中：重复点导出只提示，不并发跑第二份（大本会双倍吃内存） */
+  private exporting = false;
   private readOnly = false;
   private saveState: "saved" | "dirty" | "saving" = "saved";
   /** 打开中的占位（见 showLoading）；没有占位时是 null */
@@ -421,16 +426,23 @@ export class InkbookView extends FileView {
     this.registerDomEvent(document, "visibilitychange", () => {
       if (document.visibilityState === "hidden") {
         /*
-         * 先把正在画的一笔收尾（commitDraft 提交成正式笔迹），再强制落盘。
-         * 顺序不能反：flushSave 只写已提交内容，半笔还躺在 draft 里的话
-         * 这次切后台就直接把它丢了。editor 自己也监听 visibilitychange，
-         * 这里是提前、确定性的那一次（重复调用是安全的空操作）。
+         * 先把编辑框里的文字提交（打完字没按回车就切 App 的那一段），
+         * 再把正在画的一笔收尾（commitDraft 提交成正式笔迹），最后强制落盘。
+         * 顺序不能反：flushSave 只写已提交内容，文字还在 textarea 里、
+         * 半笔还躺在 draft 里的话，这次切后台就全丢了。
+         * force：可能直接进后台被系统回收，等不到 compositionend，
+         * 组字中只写已上屏部分（不写半截拼音）。
+         * editor 自己也监听 visibilitychange，这里是提前、确定性的那一次
+         * （重复调用是安全的空操作）。
          */
+        this.editor?.commitTextEditNow(true);
         this.editor?.finishInkGesture();
         void this.flushSave();
       }
     });
     this.registerDomEvent(window, "pagehide", () => {
+      // 页面即将卸载：输入框里的字必须在 DOM 被回收前提交出来
+      this.editor?.commitTextEditNow(true);
       this.editor?.finishInkGesture();
       void this.flushSave();
     });
@@ -1213,6 +1225,36 @@ export class InkbookView extends FileView {
     this.floatEl?.remove();
     const float = this.paperHost.createDiv("mb-float");
     this.floatEl = float;
+    this.floatUndoBtn = null;
+    this.floatRedoBtn = null;
+
+    /*
+     * 撤销组：常驻，与翻页组并列。
+     *
+     * 侧栏默认收起（平板上尤其如此），撤销/重做又只能进侧栏找——
+     * 写错一笔要「点侧栏 → 滚到顶部 → 点撤销」，没键盘就撤不了。
+     * 放在浮标里，落笔后手不用离开纸面右下角。
+     *
+     * 放在翻页组**左边**：浮标右对齐，翻页组仍在最右角，
+     * 原有肌肉记忆不变，新增的两键只向左延伸一点。
+     */
+    const edit = float.createDiv("mb-float-edit");
+    const undo = edit.createEl("button", {
+      cls: "mb-float-btn",
+      attr: { "aria-label": "撤销" },
+    });
+    setIcon(undo, "undo-2");
+    undo.title = "撤销 (Ctrl+Z)";
+    undo.onclick = () => this.editor?.undo();
+    this.floatUndoBtn = undo;
+    const redo = edit.createEl("button", {
+      cls: "mb-float-btn",
+      attr: { "aria-label": "重做" },
+    });
+    setIcon(redo, "redo-2");
+    redo.title = "重做 (Ctrl+Shift+Z)";
+    redo.onclick = () => this.editor?.redo();
+    this.floatRedoBtn = redo;
 
     /* 翻页组：常驻，很小 */
     const nav = float.createDiv("mb-float-nav");
@@ -1984,15 +2026,95 @@ export class InkbookView extends FileView {
     range?: { from: number; to: number }
   ): Promise<void> {
     if (!this.editor || !this.file) return;
-    // 编辑框里没提交的文字先落库，否则导出的文件会少这一段
-    this.editor.commitTextEditNow();
+    if (this.exporting) {
+      new Notice("正在导出中，请稍候…", 2500);
+      return;
+    }
+    /*
+     * 编辑框里没提交的文字先落库，否则导出的文件会少这一段。
+     * force：导出是显式动作，不能等 compositionend；组字中只写已上屏部分。
+     */
+    this.editor.commitTextEditNow(true);
+    this.exporting = true;
+    let progress: Notice | null = null;
     try {
       const scale = 2;
-      if (kind === "png") await exportPagePng(this.app.vault, this.editor, this.file, scale);
-      else await exportBookPdf(this.app.vault, this.editor, this.file, scale, range);
+      if (kind === "png") {
+        await exportPagePng(this.app.vault, this.editor, this.file, scale);
+        return;
+      }
+
+      /*
+       * 动线审查第 5 条：大本导出（用户有 857 页的 PDF 本子）必须看得见
+       * 进度、能取消。老实现只弹一个 3 秒的 Notice，之后全程静默像卡死。
+       *
+       * · 时长传 0 = 不自动消失（默认 3 秒）；
+       * · 每导完一页 exportBookPdf 回调一次，这里只更新文字节点；
+       * · 「取消」按钮挂在 Notice 上，点一下 abort，导出侧在页边界退出，
+       *   正式文件不写、已经写出的 .tmp 会被清掉。
+       */
+      const controller = new AbortController();
+      const notice = new Notice(
+        range ? `准备导出第 ${range.from}–${range.to} 页 PDF…` : "准备导出整本 PDF…",
+        0
+      );
+      progress = notice;
+      const setMessage = this.attachExportProgress(notice, controller);
+      await exportBookPdf(this.app.vault, this.editor, this.file, scale, range, {
+        signal: controller.signal,
+        onProgress: (done, total, phase) => {
+          if (phase === "saving") {
+            setMessage(`正在生成 PDF（${total} 页）…`);
+          } else {
+            setMessage(
+              done > 0 ? `正在导出第 ${done}/${total} 页…` : `准备导出 ${total} 页…`
+            );
+          }
+        },
+      });
+      notice.hide();
+      progress = null;
     } catch (e: any) {
-      new Notice("导出失败：" + (e && e.message ? e.message : e), 8000);
+      if (e instanceof ExportCancelledError) {
+        new Notice("已取消导出，没有写入文件。", 4000);
+      } else {
+        new Notice("导出失败：" + (e && e.message ? e.message : e || "未知错误"), 8000);
+        console.error("[inkbook] 导出失败", e);
+      }
+    } finally {
+      if (progress) progress.hide();
+      this.exporting = false;
     }
+  }
+
+  /**
+   * 给导出进度的 Notice 搭一条「文字 + 取消按钮」的内容，返回更新文字的函数。
+   *
+   * 为什么不直接用 notice.setMessage：Obsidian 的 setMessage 会整块替换
+   * noticeEl 的文本，挂上去的按钮会被一并清掉（第二次进度更新后就没法取消了）。
+   * 这里自己建 span/button，只改 span 的文字，按钮始终在。
+   *
+   * 测试桩的 Notice 没有 noticeEl，退回 setMessage——核心取消能力在
+   * exportBookPdf 的 signal 上，不依赖这个按钮。
+   */
+  private attachExportProgress(
+    notice: Notice,
+    controller: AbortController
+  ): (message: string) => void {
+    const el = (notice as any).noticeEl as HTMLElement | undefined;
+    if (!el || typeof el.createEl !== "function" || typeof el.empty !== "function") {
+      return (message: string) => notice.setMessage(message);
+    }
+    el.empty();
+    const text = el.createSpan({ cls: "mb-export-msg" });
+    const btn = el.createEl("button", { cls: "mb-export-cancel", text: "取消" });
+    btn.onclick = () => {
+      if (controller.signal.aborted) return;
+      controller.abort();
+      btn.disabled = true;
+      btn.setText("取消中…");
+    };
+    return (message: string) => text.setText(message);
   }
 
   /* ------------------------------- 侧栏 ------------------------------- */
@@ -3086,6 +3208,15 @@ export class InkbookView extends FileView {
     if (this.zoomLbl) this.zoomLbl.setText(Math.round(s.zoom * 100) + "%");
     if (this.undoBtn) this.undoBtn.toggleClass("is-disabled", !s.canUndo);
     if (this.redoBtn) this.redoBtn.toggleClass("is-disabled", !s.canRedo);
+    // 浮标里的两键与侧栏按钮同一套表达：不可用就置灰、不接收点击
+    if (this.floatUndoBtn) {
+      this.floatUndoBtn.toggleClass("is-disabled", !s.canUndo);
+      this.floatUndoBtn.setAttribute("aria-disabled", String(!s.canUndo));
+    }
+    if (this.floatRedoBtn) {
+      this.floatRedoBtn.toggleClass("is-disabled", !s.canRedo);
+      this.floatRedoBtn.setAttribute("aria-disabled", String(!s.canRedo));
+    }
     if (this.stylusBtn) this.stylusBtn.toggleClass("is-active", s.penOnly);
     if (this.touchBtn) this.touchBtn.toggleClass("is-active", !!this.editor?.touchDraw);
     if (this.sideBtn) this.sideBtn.toggleClass("is-active", this.sideShown);
@@ -3570,6 +3701,13 @@ export class InkbookView extends FileView {
   }
 
   async flushSave(): Promise<void> {
+    /*
+     * 编辑框里没按回车、也没失焦的文字先落库：切文件（onLoadFile /
+     * onUnloadFile）、关标签页（onClose）都从这条路过。移动端 textarea
+     * 自带的 blur 兜底不可靠（点别处 / 切后台未必触发），不在这里主动
+     * 提交就会整段丢字。force：等不到 compositionend，组字中只写已上屏部分。
+     */
+    this.editor?.commitTextEditNow(true);
     this.saveDebounce.cancel();
     /*
      * 显式落盘路径，**不避让书写**：切后台 / 关文件 / 切文件时，

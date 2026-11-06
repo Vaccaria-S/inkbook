@@ -792,6 +792,36 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   pass(!!zoomGrp, "浮标里有缩放组");
   pass(!!pageLbl, "浮标里有页码");
 
+  /*
+   * 撤销 / 重做也必须常驻在浮标里。
+   *
+   * 平板默认收起侧栏，写错一笔要「点侧栏 → 滚到顶部 → 点撤销」，
+   * 没键盘时等于撤不了。这两键和翻页组并列，不展开侧栏就能点。
+   */
+  const editGrp = root.querySelector(".mb-float-edit") as HTMLElement;
+  const floatUndo = editGrp?.querySelector(
+    'button[aria-label="撤销"]'
+  ) as HTMLButtonElement;
+  const floatRedo = editGrp?.querySelector(
+    'button[aria-label="重做"]'
+  ) as HTMLButtonElement;
+  pass(
+    !!editGrp && editGrp.querySelectorAll(".mb-float-btn").length === 2,
+    "浮标里有撤销/重做两键"
+  );
+  pass(
+    !!floatUndo?.querySelector("svg.mb-ic path") &&
+      !!floatRedo?.querySelector("svg.mb-ic path"),
+    "浮标撤销/重做的图标都画出来了（不是空框）"
+  );
+  pass(
+    !!floatUndo &&
+      !!floatRedo &&
+      floatUndo.classList.contains("is-disabled") &&
+      floatRedo.classList.contains("is-disabled"),
+    "还没有可撤销/可重做的内容时，两键都置灰"
+  );
+
   // 浮标在右下角
   const floatRect = float.getBoundingClientRect();
   const paperRect2 = paper.getBoundingClientRect();
@@ -983,6 +1013,32 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
     "退出后能正常落笔（" + beforeEdit + " → " + strokeCountAll() + "）"
   );
 
+  /* ============ 6.6 浮标上的撤销 / 重做能直接点 ============ */
+  {
+    pass(
+      floatUndo?.classList.contains("is-disabled") === false &&
+        floatRedo?.classList.contains("is-disabled") === true,
+      "刚落完一笔：浮标撤销可用、重做置灰"
+    );
+    const nUndo = strokeCountAll();
+    floatUndo?.click();
+    await sleep(250);
+    pass(
+      strokeCountAll() === nUndo - 1,
+      "点浮标上的撤销真能撤掉一笔（" + nUndo + " → " + strokeCountAll() + "）"
+    );
+    pass(
+      floatRedo?.classList.contains("is-disabled") === false,
+      "撤销后浮标重做键变可用"
+    );
+    floatRedo?.click();
+    await sleep(250);
+    pass(
+      strokeCountAll() === nUndo,
+      "点浮标上的重做能恢复那一笔（" + (nUndo - 1) + " → " + strokeCountAll() + "）"
+    );
+  }
+
   /* ============ 7. 浮标翻页可用 ============ */
   const cur = view.editor.getState().pageIndex;
   const nextBtn = float.querySelector(
@@ -1029,6 +1085,18 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   pass(
     tRect.height >= 32,
     "平板端按钮 ≥ 32px（实测 " + tRect.height.toFixed(0) + "px）"
+  );
+
+  // 浮标里的撤销/重做是手指直接点的，平板档必须 ≥ 36px
+  const fBtnEl = float.querySelector(".mb-float-edit .mb-float-btn") as HTMLElement;
+  const fBtnRect = fBtnEl.getBoundingClientRect();
+  pass(
+    fBtnRect.width >= 36 && fBtnRect.height >= 36,
+    "平板端浮标撤销/重做按钮 ≥ 36px（实测 " +
+      fBtnRect.width.toFixed(0) +
+      "×" +
+      fBtnRect.height.toFixed(0) +
+      "px）"
   );
 
   /*

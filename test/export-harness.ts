@@ -12,7 +12,11 @@
 import { BookEditor } from "../src/editor";
 import { BookStore } from "../src/store";
 import { createBook, createPage, type Stroke } from "../src/types";
-import { exportBookPdf, pageHasUserText } from "../src/export";
+import {
+  ExportCancelledError,
+  exportBookPdf,
+  pageHasUserText,
+} from "../src/export";
 import { chineseFontBytes } from "../src/fontasset";
 import {
   PDFArray,
@@ -166,6 +170,10 @@ async function main() {
   const written = new Map<string, Uint8Array>();
   const files = new Map<string, ArrayBuffer>();
   files.set(PDF_URL, srcBytes.buffer as ArrayBuffer);
+  const renamed: Array<[string, string]> = [];
+  const removed: string[] = [];
+  /** 写 .tmp 时的钩子：取消用例用它模拟「写到一半用户点取消」 */
+  let onTmpWrite: ((path: string) => void) | null = null;
   const adapter = {
     exists: async (p: string) => written.has(p),
     read: async () => "",
@@ -173,6 +181,18 @@ async function main() {
     write: async () => {},
     writeBinary: async (p: string, buf: ArrayBuffer) => {
       written.set(p, new Uint8Array(buf));
+      if (p.endsWith(".tmp") && onTmpWrite) onTmpWrite(p);
+    },
+    rename: async (from: string, to: string) => {
+      const data = written.get(from);
+      if (!data) throw new Error("rename 源文件不存在：" + from);
+      written.delete(from);
+      written.set(to, data);
+      renamed.push([from, to]);
+    },
+    remove: async (p: string) => {
+      written.delete(p);
+      removed.push(p);
     },
   };
   const app = { vault: { adapter } };
@@ -228,6 +248,98 @@ async function main() {
     const fdoc = await pdfjs.getDocument({ data: fb!.slice() }).promise;
     pass(fdoc.numPages === 4, "非法页范围：回落整本（" + fdoc.numPages + " 页）");
     await fdoc.destroy();
+  }
+
+  /* -------------------- 导出过程有进度（动线审查第 5 条） -------------------- */
+  {
+    const progress: Array<{ done: number; total: number; phase: string }> = [];
+    const progressPath = await exportBookPdf(vault, editor, file, 1, undefined, {
+      onProgress: (done, total, phase) => progress.push({ done, total, phase }),
+    });
+    pass(progress.length >= 2, "导出过程有进度回调（" + progress.length + " 次）");
+    const first = progress[0];
+    pass(
+      !!first && first.done === 0 && first.total === 4 && first.phase === "page",
+      "进度从 0/4 开始（" + (first ? `${first.phase} ${first.done}/${first.total}` : "无") + "）"
+    );
+    const pageSteps = progress.filter((p) => p.phase === "page" && p.done > 0).map((p) => p.done);
+    pass(
+      pageSteps.length === 4 && pageSteps.every((d, i) => d === i + 1),
+      "进度逐页递增到 4/4（" + pageSteps.join(",") + "）"
+    );
+    const last = progress[progress.length - 1];
+    pass(
+      !!last && last.phase === "saving" && last.done === 4,
+      "逐页完成后进入写文件阶段（" + (last ? `${last.phase} ${last.done}/${last.total}` : "无") + "）"
+    );
+    pass(written.has(progressPath), "带进度回调的导出正常落盘");
+    // 原子写：先写 .tmp 再 rename 顶掉目标，成功后不留临时文件
+    pass(
+      renamed.some(([from, to]) => from === progressPath + ".tmp" && to === progressPath),
+      "导出走 .tmp → rename 原子写"
+    );
+    pass(
+      !Array.from(written.keys()).some((k) => k.endsWith(".tmp")),
+      "导出成功后不留 .tmp"
+    );
+  }
+
+  /* -------------------- 中途取消：不写任何文件（动线审查第 5 条） -------------------- */
+  {
+    const controller = new AbortController();
+    const progress: number[] = [];
+    let err: any = null;
+    let cancelledPath: string | null = null;
+    const writtenBefore = written.size;
+    try {
+      cancelledPath = await exportBookPdf(vault, editor, file, 1, undefined, {
+        signal: controller.signal,
+        onProgress: (done, total, phase) => {
+          if (phase !== "page") return;
+          progress.push(done);
+          if (done === 1) controller.abort(); // 导完第 1 页，用户点取消
+        },
+      });
+    } catch (e) {
+      err = e;
+    }
+    pass(err instanceof ExportCancelledError, "第 1 页后取消：抛 ExportCancelledError");
+    pass(cancelledPath === null, "第 1 页后取消：没有返回文件名");
+    pass(written.size === writtenBefore, "第 1 页后取消：没有写出任何文件");
+    pass(
+      progress[progress.length - 1] === 1 && progress.indexOf(2) < 0,
+      "取消发生在第 1 页之后（进度停在 " + progress[progress.length - 1] + "/4）"
+    );
+  }
+
+  /* -------------------- 写 .tmp 时取消：清干净，不留半个 PDF -------------------- */
+  {
+    const controller = new AbortController();
+    let tmpSeen = "";
+    onTmpWrite = (p) => {
+      tmpSeen = p;
+      controller.abort(); // 模拟 .tmp 写到一半用户点取消
+    };
+    let err: any = null;
+    let cancelledPath: string | null = null;
+    try {
+      cancelledPath = await exportBookPdf(vault, editor, file, 1, undefined, {
+        signal: controller.signal,
+      });
+    } catch (e) {
+      err = e;
+    } finally {
+      onTmpWrite = null;
+    }
+    pass(err instanceof ExportCancelledError, "写 .tmp 时取消：抛 ExportCancelledError");
+    pass(cancelledPath === null, "写 .tmp 时取消：没有返回文件名");
+    pass(
+      !!tmpSeen && removed.includes(tmpSeen),
+      "写 .tmp 时取消：临时文件被删掉（" + (tmpSeen.split("/").pop() || "未写出") + "）"
+    );
+    pass(!!tmpSeen && !written.has(tmpSeen), "写 .tmp 时取消：.tmp 不残留");
+    const finalName = tmpSeen.replace(/\.tmp$/, "");
+    pass(!!finalName && !written.has(finalName), "写 .tmp 时取消：没有半个 .pdf 落盘");
   }
 
   const page1 = await doc.getPage(1);

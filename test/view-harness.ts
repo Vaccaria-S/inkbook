@@ -321,6 +321,139 @@ async function main() {
   }
 
   /*
+   * 打完字没按回车就切后台：那段字必须被提交进页面数据。
+   *
+   * 用户动线：在页面上打了一段批注，没按回车、也没点别处，直接切去
+   * 别的 App。以前只有 textarea 自带的 blur 兜底，移动端切后台未必
+   * 触发 blur——这段字就永远留在输入框里，被系统回收后直接消失。
+   */
+  {
+    const ed = view.editor!;
+    const rec = (ed as any).recs[(ed as any).current];
+    (ed as any).beginTextEdit(rec, 120, 150);
+    const ta = (ed as any).textEdit?.el as HTMLTextAreaElement | undefined;
+    pass(!!ta && ta.isConnected, "文字输入框已打开（模拟打完字没按回车）");
+    if (ta) {
+      ta.value = "切后台前没提交的字";
+      ta.dispatchEvent(new Event("input", { bubbles: true }));
+
+      const origVis = Object.getOwnPropertyDescriptor(document, "visibilityState");
+      try {
+        Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+        document.dispatchEvent(new Event("visibilitychange"));
+        await sleep(200);
+      } finally {
+        if (origVis) Object.defineProperty(document, "visibilityState", origVis);
+        else delete (document as any).visibilityState;
+      }
+
+      const texts = view.store!.data.pages[rec.index].texts || [];
+      pass(
+        texts.some((t: any) => t.text === "切后台前没提交的字"),
+        "切到后台：输入框里的字被提交进页面数据"
+      );
+      pass(!ta.isConnected, "切到后台：输入框已收起");
+      const onDisk =
+        JSON.parse(files.get("测试手写本.inkbook")).pages[rec.index].texts || [];
+      pass(
+        onDisk.some((t: any) => t.text === "切后台前没提交的字"),
+        "切到后台：那段字同时落到了磁盘"
+      );
+
+      // 收尾：撤销这条文字并落盘，后面的断言仍按「没有文字」计算
+      view.editor!.undo();
+      await view.flushSave();
+    }
+  }
+
+  /* 窗口失焦（window blur）同样要提交文字框 */
+  {
+    const ed = view.editor!;
+    const rec = (ed as any).recs[(ed as any).current];
+    (ed as any).beginTextEdit(rec, 130, 260);
+    const ta = (ed as any).textEdit?.el as HTMLTextAreaElement | undefined;
+    pass(!!ta, "窗口失焦用例：输入框已打开");
+    if (ta) {
+      ta.value = "失焦前没提交的字";
+      window.dispatchEvent(new Event("blur"));
+      await sleep(30);
+      const texts = view.store!.data.pages[rec.index].texts || [];
+      pass(
+        texts.some((t: any) => t.text === "失焦前没提交的字"),
+        "窗口失焦：输入框里的字也被提交进页面数据"
+      );
+      view.editor!.undo();
+      await view.flushSave();
+    }
+  }
+
+  /*
+   * IME 组字中离开：半截拼音不能写进本子。
+   * 失焦先挂起，等 compositionend（词真正上屏）再补交。
+   */
+  {
+    const ed = view.editor!;
+    const rec = (ed as any).recs[(ed as any).current];
+    (ed as any).beginTextEdit(rec, 140, 380);
+    const ta = (ed as any).textEdit?.el as HTMLTextAreaElement | undefined;
+    pass(!!ta, "IME 用例：输入框已打开");
+    if (ta) {
+      ta.value = "已经上屏";
+      ta.dispatchEvent(new CompositionEvent("compositionstart", { data: "", bubbles: true }));
+      // 组字中：value 里混着还没上屏的拼音
+      ta.value = "已经上屏pinyin";
+      ta.dispatchEvent(
+        new CompositionEvent("compositionupdate", { data: "pinyin", bubbles: true })
+      );
+      window.dispatchEvent(new Event("blur"));
+      await sleep(30);
+
+      const midTexts = view.store!.data.pages[rec.index].texts || [];
+      pass(
+        !!(ed as any).textEdit,
+        "组字中失焦：先挂起提交，输入框不关（等词上屏）"
+      );
+      pass(
+        !midTexts.some((t: any) => (t.text || "").includes("pinyin")),
+        "组字中失焦：半截拼音没有写进页面数据"
+      );
+
+      // 用户选词上屏 → compositionend → 补交完整文字
+      ta.value = "已经上屏拼音";
+      ta.dispatchEvent(new CompositionEvent("compositionend", { data: "拼音", bubbles: true }));
+      await sleep(30);
+      const texts = view.store!.data.pages[rec.index].texts || [];
+      pass(
+        texts.some((t: any) => t.text === "已经上屏拼音"),
+        "组字结束后补交：完整文字进页面数据"
+      );
+      view.editor!.undo();
+      await view.flushSave();
+    }
+  }
+
+  /* flushSave（切文件 / 关标签页的公共路径）也要提交文字框 */
+  {
+    const ed = view.editor!;
+    const rec = (ed as any).recs[(ed as any).current];
+    (ed as any).beginTextEdit(rec, 150, 500);
+    const ta = (ed as any).textEdit?.el as HTMLTextAreaElement | undefined;
+    pass(!!ta, "flushSave 用例：输入框已打开");
+    if (ta) {
+      ta.value = "切文件前没提交的字";
+      await view.flushSave();
+      const onDisk =
+        JSON.parse(files.get("测试手写本.inkbook")).pages[rec.index].texts || [];
+      pass(
+        onDisk.some((t: any) => t.text === "切文件前没提交的字"),
+        "flushSave（切文件 / 关标签页共用）把输入框里的字写进文件"
+      );
+      view.editor!.undo();
+      await view.flushSave();
+    }
+  }
+
+  /*
    * 保存不打断书写。
    *
    * 用户平板实测：70MB 的本子自动保存一次，主线程冻 1.5~2.5s，

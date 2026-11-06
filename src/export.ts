@@ -18,6 +18,98 @@ function canvasBytes(canvas: HTMLCanvasElement): Uint8Array {
   return out;
 }
 
+/** 导出被用户取消时抛出：调用方据此提示「已取消」，而不是当成「导出失败」。 */
+export class ExportCancelledError extends Error {
+  constructor(message = "导出已取消") {
+    super(message);
+    this.name = "ExportCancelledError";
+  }
+}
+
+/** 导出进度阶段：page = 逐页渲染；saving = 合并 / 写文件 */
+export type ExportPhase = "page" | "saving";
+
+/**
+ * 大本导出的可选控制：取消信号 + 进度回调。
+ *
+ * 不传时保持旧行为（纯导出、无界面）。界面层（view.ts 的 runExport）
+ * 传一个 AbortController 和一个常驻 Notice，就能做到「有进度、能取消」。
+ */
+export interface ExportBookOptions {
+  /**
+   * 协作式取消信号。每页开始 / 结束、写文件前后都会检查；
+   * 取消后不留下任何导出文件（已经写出的 `.tmp` 会被删掉）。
+   */
+  signal?: AbortSignal;
+  /**
+   * 进度回调。`done` 是**已完成**的页数（0 = 还没开始第一页），
+   * `total` 是本次导出的总页数（指定页范围时就是范围内的页数）。
+   */
+  onProgress?: (done: number, total: number, phase: ExportPhase) => void;
+}
+
+function throwIfCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new ExportCancelledError();
+}
+
+/** 尽力删掉临时文件；删不掉也不吭声（带着 .tmp 后缀，不会污染正式产物） */
+async function removeQuietly(adapter: Vault["adapter"], path: string): Promise<void> {
+  try {
+    if (typeof adapter.exists === "function" && !(await adapter.exists(path))) return;
+    await adapter.remove(path);
+  } catch (_) {
+    /* 清理失败无所谓：临时文件带 .tmp 后缀，不影响正式文件 */
+  }
+}
+
+/**
+ * 原子写导出文件：先写 `<目标>.tmp`，成功后再 rename 顶掉目标。
+ *
+ * 和 storage.ts 的 writeBook 不是一回事：那个是 .inkbook JSON 正文
+ * （备份 + integrity 自检），这里是二进制 PDF；但「半截文件不能顶上
+ * 正式文件」这条原则一样适用。rename 不可用的老适配器回落直接写。
+ *
+ * 取消发生在写 .tmp 期间时，删掉 .tmp 再抛 ExportCancelledError——
+ * 用户取消后目录里不会多出一个残缺的 .pdf 或 .tmp。
+ */
+async function writeExportFile(
+  vault: Vault,
+  path: string,
+  bytes: Uint8Array,
+  signal?: AbortSignal
+): Promise<void> {
+  throwIfCancelled(signal);
+  const adapter = vault.adapter;
+  const buffer = bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength
+  ) as ArrayBuffer;
+  if (typeof adapter.rename === "function") {
+    const tmp = path + ".tmp";
+    try {
+      await adapter.writeBinary(tmp, buffer);
+    } catch (e) {
+      await removeQuietly(adapter, tmp);
+      throw e;
+    }
+    // 写 .tmp 期间用户点了取消：正式文件一个字节都不写
+    if (signal?.aborted) {
+      await removeQuietly(adapter, tmp);
+      throw new ExportCancelledError();
+    }
+    try {
+      await adapter.rename(tmp, path);
+      return;
+    } catch (e) {
+      // rename 不是所有适配器都可靠；清掉临时文件、确认没被取消后退回直接写
+      await removeQuietly(adapter, tmp);
+      console.warn("[inkbook] 导出文件原子改名失败，改回直接写入", e);
+      throwIfCancelled(signal);
+    }
+  }
+  await adapter.writeBinary(path, buffer);
+}
+
 export async function exportPagePng(
   vault: Vault,
   editor: BookEditor,
@@ -154,16 +246,22 @@ function drawUserTextsPdf(page: PDFPage, src: Page, font: PDFFont, pageH: number
  * 导出整本或指定页范围。
  *
  * `range` 是 1 起的闭区间 `{ from, to }`；不传或非法一律回落整本。
- * 只夹「等哪些底图 / 循环哪些页 / 文件名」三处，
- * 批注矢量、原 PDF 保矢量、生僻字回退这些链路完全不动。
+ * 只夹「循环哪些页 / 文件名」两处，批注矢量、原 PDF 保矢量、
+ * 生僻字回退这些链路完全不动。
+ *
+ * `opts` 提供进度和取消（界面层用）：进度按页回调，取消时抛
+ * ExportCancelledError 且不留下正式文件或 `.tmp`。产物写出走
+ * 「.tmp → rename」原子写；改名不可用的适配器回落直接写。
  */
 export async function exportBookPdf(
   vault: Vault,
   editor: BookEditor,
   file: TFile,
   scale = 2,
-  range?: { from: number; to: number }
+  range?: { from: number; to: number },
+  opts: ExportBookOptions = {}
 ): Promise<string> {
+  const { signal, onProgress } = opts;
   const state = editor.getState();
   const total = state.pageCount;
   let from = 1;
@@ -178,14 +276,15 @@ export async function exportBookPdf(
   }
   const isPartial = from > 1 || to < total;
   const indices = Array.from({ length: to - from + 1 }, (_, k) => from - 1 + k);
-  new Notice(
-    isPartial
-      ? `正在导出第 ${from}–${to} 页 PDF…`
-      : `正在导出 ${total} 页 PDF…`,
-    3000
-  );
-  // 等底图加载完，否则导出的 PDF 会缺内容；只等真正要导出的那几页
-  await editor.waitBackgrounds(indices, scale);
+  const count = indices.length;
+  /*
+   * 动线审查第 5 条：老实现只弹一个 3 秒的 Notice，857 页的本子后面全程静默，
+   * 像卡死；逐页循环也没有进度和取消。现在：
+   *   · 每导完一页回调一次 onProgress（界面层负责续 Notice）；
+   *   · 每页开始 / 底图等待之后 / 写文件前后都检查取消信号。
+   */
+  throwIfCancelled(signal);
+  onProgress?.(0, count, "page");
 
   const doc = await PDFDocument.create();
   const pages = editor.store.data.pages;
@@ -265,6 +364,7 @@ export async function exportBookPdf(
   let fallbackPages = 0;
 
   for (let k = 0; k < indices.length; k++) {
+    throwIfCancelled(signal);
     const i = indices[k];
     const page = pages[i];
     const pdfRef = page?.background?.pdf;
@@ -336,6 +436,17 @@ export async function exportBookPdf(
     }
 
     if (!done) {
+      /*
+       * 只有「退回位图」的页才需要底图；PDF 矢量页（copyPages）用的只是
+       * 透明叠加层，根本不需要把原页再光栅化一遍。
+       *
+       * 老代码在开跑前 waitBackgrounds(indices) 一次性等**整本**每一页，
+       * 857 页的 PDF 本子会先把 857 张 2x 位图同时压进缓存（每张十几 MB），
+       * 进度条却一直停在 0 —— 既慢又像卡死。现在按页等，且只等真正要用
+       * 位图的页；矢量页直接跳过。
+       */
+      await editor.waitBackgrounds([i], scale);
+      throwIfCancelled(signal);
       const canvas = editor.exportPageCanvas(i, scale, canvasWithText);
       const png = await doc.embedPng(canvas.toDataURL("image/png"));
       const out = doc.addPage([A4_W, A4_H]);
@@ -345,9 +456,19 @@ export async function exportBookPdf(
         if (pageHasUserText(page)) textPages += 1;
       }
     }
+    onProgress?.(k + 1, count, "page");
   }
 
+  throwIfCancelled(signal);
+  onProgress?.(count, count, "saving");
+  /*
+   * doc.save() 是同步大活（几百页时能卡好几秒）。先让出一帧，把
+   * 「正在生成 PDF…」真正画到屏幕上，否则用户看到的是最后一个页码卡住。
+   */
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  throwIfCancelled(signal);
   const bytes = await doc.save();
+  throwIfCancelled(signal);
   const folder = file.parent && file.parent.path !== "/" ? file.parent.path + "/" : "";
   const base = safeName(file.basename);
   const suffix = isPartial ? `-第${from}-${to}页` : "";
@@ -356,10 +477,7 @@ export async function exportBookPdf(
   while (await vault.adapter.exists(folder + name)) {
     name = `${base}-手写本${suffix} ${++n}.pdf`;
   }
-  await vault.adapter.writeBinary(
-    folder + name,
-    bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
-  );
+  await writeExportFile(vault, folder + name, bytes, signal);
 
   const notes: string[] = [];
   if (vectorPages) notes.push(`${vectorPages} 页保留了 PDF 原文，可选中可搜索`);

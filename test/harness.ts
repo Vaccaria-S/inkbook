@@ -367,6 +367,40 @@ async function main() {
     pass(Math.abs((texts[0]?.x ?? 0) - 200) < 2, "横向位置落在点击处（" + (texts[0]?.x ?? 0).toFixed(0) + "）");
     pass(!pageEl().querySelector(".mb-text-edit"), "提交后输入框已移除");
 
+    /*
+     * 输入框开着时点纸面空白：**只提交，不新建**。
+     * 旧行为是「提交旧框 → 又在落点弹一个新框」，用户想结束输入要点好几下，
+     * 框越点越多（真机：文字工具在平板上「点不出去」）。
+     *
+     * 这里刻意**不输入文字**：空框提交是 no-op，不会动 texts 计数，
+     * 后面的断言仍按 1 条算。
+     */
+    {
+      const nTexts0 = (store.data.pages[0].texts || []).length;
+      editor.setTool("text");
+      // 点一处**没有文字**的空白（200,300 已有文字，点它会走「选中」而不是新建）
+      pageEl().dispatchEvent(ev("pointerdown", 500, 850, 1, 21));
+      pageEl().dispatchEvent(ev("pointerup", 500, 850, 0, 21));
+      await sleep(60);
+      const ta2 = pageEl().querySelector(".mb-text-edit") as HTMLTextAreaElement;
+      pass(!!ta2, "再点一处空白：新开一个输入框");
+      if (ta2) {
+        pageEl().dispatchEvent(ev("pointerdown", 500, 600, 1, 22));
+        pageEl().dispatchEvent(ev("pointerup", 500, 600, 0, 22));
+        await sleep(60);
+        pass(
+          !pageEl().querySelector(".mb-text-edit"),
+          "已有输入框时点纸面空白：只提交关闭，不再新建一个"
+        );
+        pass(
+          (store.data.pages[0].texts || []).length === nTexts0,
+          "点空白提交空框后文字条数不变（" +
+            (store.data.pages[0].texts || []).length +
+            " 条）"
+        );
+      }
+    }
+
     const spans = pageEl().querySelectorAll(".mb-text.is-user");
     pass(spans.length === 1 && spans[0].textContent === "第一行文字", "文字层渲染出可见文字");
 
