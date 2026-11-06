@@ -118,6 +118,20 @@ export interface Page {
   texts?: PageText[];
 }
 
+/**
+ * 本子里的一条目录：名字 + 它指向的页。
+ *
+ * 用户自己在侧栏加的条目（仿书签）：存的是**页面下标**（0 起），
+ * 点击目录项 = 跳到这一页。页序重排后它指向的是"当时的那一页"
+ * 在新顺序里的位置——这是下标语义的固有局限，与缩略图长按菜单一致。
+ */
+export interface Outline {
+  id: string;
+  title: string;
+  /** 指向的目标页（0 起下标） */
+  page: number;
+}
+
 export interface InkBook {
   /** 文件格式版本。当前是 2（v2 起页面可以带 texts），见 storage.ts 的 CURRENT_VERSION */
   version: number;
@@ -147,6 +161,16 @@ export interface InkBook {
   updated: number;
   activePage: number;
   pages: Page[];
+  /**
+   * 本子目录：`{ id, title, page }` 数组，page 是 0 起页面下标。
+   *
+   * 可选字段——老文件没有它，读出来是 undefined，UI 一律按空目录处理。
+   * 与 `Page.texts` 同为**不升版本**新增的字段（见 storage.ts 的
+   * CURRENT_VERSION 注释）：旧版插件读到未知字段直接忽略，不拒绝打开；
+   * 但 normalizeBook 的白名单必须同步重建它，否则第一次保存就会把它抹掉。
+   * 空目录不写回字段——保存时不会出现 `"outlines": []`。
+   */
+  outlines?: Outline[];
 }
 
 export interface InkbookSettings {

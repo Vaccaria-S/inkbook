@@ -1107,6 +1107,255 @@ async function J() {
   v.containerEl.remove();
 }
 
+/**
+ * K：本子目录（outline）。
+ *
+ * 覆盖四条主线：
+ *   ① 往返：加目录 → 保存 → 重开，目录还在（normalizeBook 白名单没把它抹掉）
+ *   ② 脏数据：normalizeBook 丢弃坏条目（title 空串 / page 负数或非整数 / id 缺失）
+ *   ③ 撤销/重做：撤销一次目录恢复，撤销两次回到原状，重做也能回去
+ *   ④ 规模：加 500 条目录不崩（DOM 不会一次建几千个）
+ */
+async function K() {
+  /* ---------- ① 往返：加目录 → 保存 → 重开还在 ---------- */
+  const p = "K.inkbook";
+  seed(p, JSON.stringify(mkBook("K本", 5, 1)));
+  const v = await openView();
+  await v.onLoadFile(tf(p));
+  await sleep(400);
+
+  const id1 = v.store.addOutline("第一章", 0);
+  const id2 = v.store.addOutline("第二章", 2);
+  pass(
+    !!id1 && !!id2 && v.store.outlines.length === 2,
+    "K1 加两条目录：条数=" + v.store.outlines.length + "（期望 2）；id 唯一=" +
+      (!!id1 && !!id2 && id1 !== id2)
+  );
+  pass(
+    v.store.outlines[0].page === 0 && v.store.outlines[1].page === 2,
+    "K1 页码存的是 0 起下标（" + v.store.outlines.map((o) => o.page).join(",") + "，期望 0,2）"
+  );
+
+  // 等自动保存落盘
+  await sleep(1300);
+  let saved: any = null;
+  try {
+    saved = JSON.parse(files.get(p));
+  } catch (e: any) {
+    log("K1 保存结果解析失败 " + e);
+  }
+  pass(
+    Array.isArray(saved?.outlines) && saved.outlines.length === 2 &&
+      saved.outlines[0].title === "第一章" && saved.outlines[1].page === 2,
+    "K1 保存到文件：outlines=" + JSON.stringify(saved?.outlines)
+  );
+
+  await v.onClose();
+  v.containerEl.remove();
+
+  // 重开：目录还在
+  const v2 = await openView();
+  await v2.onLoadFile(tf(p));
+  await sleep(400);
+  pass(
+    v2.store.outlines.length === 2 && v2.store.outlines[0].title === "第一章" &&
+      v2.store.outlines[1].page === 2,
+    "K2 重开后目录还在：条数=" + v2.store.outlines.length + "；内容=" +
+      JSON.stringify(v2.store.outlines)
+  );
+  await v2.onClose();
+  v2.containerEl.remove();
+
+  /* ---------- ② 脏数据：normalizeBook 丢弃坏条目 ---------- */
+  const dirty: any = mkBook("脏数据本", 3, 0);
+  dirty.outlines = [
+    { id: "ok1", title: "好的", page: 1 },                       // 合法
+    { id: "bad1", title: "", page: 1 },                        // title 空串 → 丢
+    { id: "bad2", title: "   ", page: 1 },                     // title 全空白 → 丢
+    { id: "bad3", title: "负页", page: -1 },                   // page 负数 → 丢
+    { id: "bad4", title: "小数", page: 1.5 },                  // page 非整数 → 丢
+    { id: "bad5", title: "非数字页", page: "abc" },            // page 不是数字 → 丢
+    { title: "没有id", page: 1 },                              // id 缺失 → 丢
+    { id: "bad7", title: "越界页", page: 9999 },               // page 超范围：留着，但点击要安全
+  ];
+  const dp = "K-dirty.inkbook";
+  seed(dp, JSON.stringify(dirty));
+  const v3 = await openView();
+  await v3.onLoadFile(tf(dp));
+  await sleep(400);
+  const kept = v3.store.outlines;
+  pass(
+    kept.length === 2 && kept[0].title === "好的" && kept[1].title === "越界页",
+    "K3 normalizeBook 丢弃脏目录：留下 " + kept.length + " 条（期望 2）=" +
+      JSON.stringify(kept.map((o) => ({ t: o.title, p: o.page })))
+  );
+  // 越界的那条：点击不能抛异常（要夹到有效范围）
+  let threw = "";
+  try {
+    const row = v3.contentEl.querySelector(".mb-outline") as HTMLElement | null;
+    if (row) row.click();
+  } catch (e: any) {
+    threw = String(e?.stack || e);
+  }
+  pass(
+    threw === "" && v3.editor.getState().pageIndex >= 0 &&
+      v3.editor.getState().pageIndex < v3.store.pageCount,
+    "K3 越界目录项点击不抛异常：threw=" + JSON.stringify(threw) + "；当前页=" +
+      v3.editor.getState().pageIndex + "（页数 " + v3.store.pageCount + "）"
+  );
+  await v3.onClose();
+  v3.containerEl.remove();
+
+  /* ---------- ③ 撤销 / 重做 ---------- */
+  const up = "K-undo.inkbook";
+  seed(up, JSON.stringify(mkBook("撤销本", 4, 0)));
+  const v4 = await openView();
+  await v4.onLoadFile(tf(up));
+  await sleep(400);
+  const noneBefore = v4.store.outlines.length === 0;
+  v4.store.addOutline("甲", 1);
+  v4.store.addOutline("乙", 2);
+  pass(
+    noneBefore && v4.store.outlines.length === 2,
+    "K4 前置：原来没有目录 → 加两条后有 " + v4.store.outlines.length + " 条"
+  );
+  // 撤销一次：回到 1 条
+  v4.editor.undo();
+  await sleep(200);
+  pass(
+    v4.store.outlines.length === 1 && v4.store.outlines[0].title === "甲",
+    "K4 撤销一次：剩 " + v4.store.outlines.length + " 条（期望 1，且是「甲」）"
+  );
+  // 撤销两次：回到原状（没有目录）
+  v4.editor.undo();
+  await sleep(200);
+  pass(
+    v4.store.outlines.length === 0 && v4.store.data.outlines === undefined,
+    "K4 撤销两次：回到原状（条数=" + v4.store.outlines.length +
+      "；字段=" +
+      (v4.store.data.outlines === undefined ? "undefined ✓" : JSON.stringify(v4.store.data.outlines)) +
+      "）"
+  );
+  // 重做两次：两条都回来
+  v4.editor.redo();
+  await sleep(200);
+  v4.editor.redo();
+  await sleep(200);
+  pass(
+    v4.store.outlines.length === 2 &&
+      v4.store.outlines[0].title === "甲" && v4.store.outlines[1].title === "乙",
+    "K4 重做两次：目录回来了（" + JSON.stringify(v4.store.outlines.map((o) => o.title)) + "）"
+  );
+  // 再撤销一次
+  v4.editor.undo();
+  await sleep(150);
+  pass(
+    v4.store.outlines.length === 1,
+    "K4 重做后再撤销：剩 " + v4.store.outlines.length + " 条（期望 1）"
+  );
+
+  /* ---------- ③a 编辑弹窗：名字 + 页码一次改完 = 一条撤销记录 ---------- */
+  const cur = v4.store.outlines[0];
+  v4.store.updateOutline(cur.id, "甲改名", 3);
+  await sleep(150);
+  pass(
+    v4.store.outlines[0].title === "甲改名" && v4.store.outlines[0].page === 3,
+    "K5 updateOutline 一次改完名字和页码：" + JSON.stringify(v4.store.outlines[0])
+  );
+  v4.editor.undo();
+  await sleep(150);
+  pass(
+    v4.store.outlines[0].title === "甲" && v4.store.outlines[0].page === 1,
+    "K5 撤销一次就整体回退（名字和页码一起回去）：" + JSON.stringify(v4.store.outlines[0])
+  );
+
+  /* ---------- ③b 删页 / 加页 → 目录的页码跟着挪（夹住，不删条目） ---------- */
+  const dp2 = "K-pages.inkbook";
+  seed(dp2, JSON.stringify(mkBook("页码本", 5, 0)));
+  const v5 = await openView();
+  await v5.onLoadFile(tf(dp2));
+  await sleep(400);
+  v5.store.addOutline("p0", 0);
+  v5.store.addOutline("p2", 2);
+  v5.store.addOutline("p4", 4);
+  v5.store.deletePage(2); // 删掉第 3 页
+  await sleep(200);
+  pass(
+    v5.store.outlines.length === 3 &&
+      v5.store.outlines[0].page === 0 &&
+      v5.store.outlines[1].page === 2 &&
+      v5.store.outlines[2].page === 3,
+    "K6 删掉第 3 页：目录三条都还在，页码=" +
+      JSON.stringify(v5.store.outlines.map((o) => o.page)) +
+      "（期望 [0,2,3]：指向被删页的夹到原下一页，后面的 -1）"
+  );
+  // 撤销删页：目录的页码要一起回去
+  v5.editor.undo();
+  await sleep(200);
+  pass(
+    v5.store.outlines.length === 3 &&
+      v5.store.outlines[0].page === 0 &&
+      v5.store.outlines[1].page === 2 &&
+      v5.store.outlines[2].page === 4,
+    "K6 撤销删页：目录页码一起还原=" +
+      JSON.stringify(v5.store.outlines.map((o) => o.page)) + "（期望 [0,2,4]）"
+  );
+  // 加页：后面的页码 +1
+  v5.store.addPage(0); // 在第 1 页后插入一页
+  await sleep(200);
+  pass(
+    v5.store.outlines[0].page === 0 && v5.store.outlines[1].page === 3 &&
+      v5.store.outlines[2].page === 5,
+    "K6 加一页：目录页码跟着挪=" +
+      JSON.stringify(v5.store.outlines.map((o) => o.page)) + "（期望 [0,3,5]）"
+  );
+  await v5.onClose();
+  v5.containerEl.remove();
+
+  /* ---------- ④ 规模：500 条不崩 ---------- */
+  let bigThrew = "";
+  const t0 = performance.now();
+  try {
+    for (let i = 0; i < 500; i++) v4.store.addOutline("目录 " + i, i % 4);
+  } catch (e: any) {
+    bigThrew = String(e?.stack || e);
+  }
+  const addMs = Math.round(performance.now() - t0);
+  v4.updateUI();
+  await sleep(300);
+  let uiThrew = "";
+  let domCount = -1;
+  try {
+    domCount = v4.contentEl.querySelectorAll(".mb-outline").length;
+  } catch (e: any) {
+    uiThrew = String(e?.stack || e);
+  }
+  pass(
+    bigThrew === "" && v4.store.outlines.length === 501,
+    "K5 加 500 条目录不崩：条数=" + v4.store.outlines.length + "（期望 501）；异常=" +
+      JSON.stringify(bigThrew.slice(0, 60)) + "；耗时=" + addMs + "ms"
+  );
+  pass(
+    uiThrew === "" && domCount > 0 && domCount < 501,
+    "K5 侧栏没一次建 501 个 DOM：实际建了 " + domCount + " 个条目（窗口化生效）"
+  );
+  // 逐条撤销不能炸（撤销栈有 60 层上限，撤 500 次会撤到底但不能抛异常）
+  let undoThrew = "";
+  let undoed = 0;
+  try {
+    for (let i = 0; i < 500; i++) if (v4.store.undo()) undoed++;
+  } catch (e: any) {
+    undoThrew = String(e?.stack || e);
+  }
+  pass(
+    undoThrew === "" && undoed > 0 && v4.store.outlines.length < 501,
+    "K5 连撤 500 次不炸：实际撤了 " + undoed + " 次，剩 " + v4.store.outlines.length +
+      " 条（撤销栈上限 60，撤到底就停）；异常=" + JSON.stringify(undoThrew.slice(0, 60))
+  );
+  await v4.onClose();
+  v4.containerEl.remove();
+}
+
 const CASES: Array<[string, () => Promise<void>]> = [
   ["A1+A2", A12],
   ["A3", A3],
@@ -1124,6 +1373,7 @@ const CASES: Array<[string, () => Promise<void>]> = [
   ["H 只读态侧栏改动", H],
   ["I recovered 副本覆盖", I],
   ["J 页序重排", J],
+  ["K 本子目录", K],
   ["F14", F14],
 ];
 

@@ -432,7 +432,7 @@ async function main() {
     /* ---- 样式条必须是扁平单行：不折行、控件全在同一行、条高只有一行 ---- */
     if (editBar) {
       const ctrls = Array.from(
-        editBar.querySelectorAll<HTMLElement>(".mb-tb-btn, .mb-tb-dot")
+        editBar.querySelectorAll<HTMLElement>(".mb-tb-btn, .mb-tb-dot, input.mb-tb-sizein")
       );
       // 控件高度不同（26/22/14），align-items:center 下 top 天然不同，比垂直中心才准
       const centers = ctrls.map((c) => {
@@ -444,7 +444,7 @@ async function main() {
       const hBox = editBar.getBoundingClientRect();
       pass(getComputedStyle(editBar).flexWrap === "nowrap", "样式条不折行（flex-wrap: nowrap）");
       pass(
-        ctrls.length === 10 && spread <= 1,
+        ctrls.length === 11 && spread <= 1,
         `样式条 ${ctrls.length} 个控件排在同一行（中心差 ${spread.toFixed(2)}px）`
       );
       pass(
@@ -477,7 +477,7 @@ async function main() {
         )}，左右余量 ${(narrowBox.left - pageBox.left).toFixed(1)}/${(pageBox.right - narrowBox.right).toFixed(1)}）`
       );
       const narrowCenters = Array.from(
-        editBar.querySelectorAll<HTMLElement>(".mb-tb-btn, .mb-tb-dot")
+        editBar.querySelectorAll<HTMLElement>(".mb-tb-btn, .mb-tb-dot, input.mb-tb-sizein")
       ).map((c) => {
         const r = c.getBoundingClientRect();
         return r.top + r.height / 2;
@@ -486,7 +486,7 @@ async function main() {
         ? Math.max(...narrowCenters) - Math.min(...narrowCenters)
         : 999;
       pass(
-        narrowCenters.length === 10 && narrowSpread <= 1,
+        narrowCenters.length === 11 && narrowSpread <= 1,
         `窄纸（0.3×）：等比缩小后仍是单行（${narrowCenters.length} 个控件，中心差 ${narrowSpread.toFixed(2)}px）`
       );
       // 还原：先写回 zoom 再 applyLayout（fitMode 仍为 false，不会按视口重算），
@@ -591,6 +591,58 @@ async function main() {
     ta3.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     await sleep(60);
     pass(!pageEl().querySelector(".mb-texteditbar"), "Esc 关闭后样式条被移除");
+
+    /* ---- 自定义字号入口（样式条上的紧凑输入框 + clamp 8~96） ---- */
+    ed.beginTextEdit(rec, 500, 950);
+    await sleep(60);
+    const cta = pageEl().querySelector(".mb-text-edit") as HTMLTextAreaElement;
+    const cbar = pageEl().querySelector(".mb-texteditbar") as HTMLElement | null;
+    const csizeIn = cbar?.querySelector("input.mb-tb-sizein") as HTMLInputElement | null;
+    pass(!!cbar && !!csizeIn, "新建样式条上有自定义字号输入框");
+    if (csizeIn && cbar) {
+      const cr = csizeIn.getBoundingClientRect();
+      pass(cr.width <= 44, `样式条自定义输入框宽度 ≤44px（实测 ${cr.width.toFixed(1)}px）`);
+      pass(
+        (csizeIn.title || "").includes("自定义"),
+        `样式条自定义输入框带提示（${csizeIn.title}）`
+      );
+      // 输入 21：实时预览 + 四档都不亮 + 入口显示当前数值
+      csizeIn.value = "21";
+      csizeIn.dispatchEvent(new Event("input", { bubbles: true }));
+      await sleep(30);
+      pass(ed.textSize === 21, "输入框输入 21：editor.textSize === 21");
+      pass(
+        Math.abs(parseFloat(cta.style.fontSize) - 21 * z) < 0.6,
+        `输入框输入 21：预览 fontSize 实时变（${cta.style.fontSize}）`
+      );
+      const activeBtns = Array.from(
+        cbar.querySelectorAll<HTMLElement>(".mb-tb-btn[data-mb-size]")
+      ).filter((b) => b.classList.contains("is-active"));
+      pass(activeBtns.length === 0, "自定义 21：四档字号按钮都不亮");
+      pass(csizeIn.value === "21", "自定义 21：自定义入口上显示当前数值 21");
+      // 非法值被 clamp：5 → 8，200 → 96
+      csizeIn.value = "5";
+      csizeIn.dispatchEvent(new Event("input", { bubbles: true }));
+      await sleep(30);
+      pass(ed.textSize === 8, "输入框输入 5：被 clamp 到 8（走 setTextSize 的 clamp）");
+      csizeIn.value = "200";
+      csizeIn.dispatchEvent(new Event("input", { bubbles: true }));
+      await sleep(30);
+      pass(ed.textSize === 96, "输入框输入 200：被 clamp 到 96");
+      pass(csizeIn.value === "96", `输入框输入 200：显示值整理成 clamp 后的实际值（${csizeIn.value}）`);
+      // 输入框带着 data-mb-text-style：编辑框开着时点它不能把框提交掉
+      csizeIn.dispatchEvent(
+        new PointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerId: 93 })
+      );
+      csizeIn.focus();
+      await sleep(60);
+      pass(!!pageEl().querySelector(".mb-text-edit"), "点自定义字号控件后输入框还在（没被提交掉）");
+      pass((ed as any).textEdit !== null, "点自定义字号控件后编辑状态仍保留");
+      // 关掉这个框，后面的用例按「只有 note1」继续
+      cta.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      await sleep(60);
+      pass(!pageEl().querySelector(".mb-texteditbar"), "Esc 关掉后自定义字号样式条移除");
+    }
 
     // 还原，后面的用例仍按「只有 note1」和编辑器原有默认样式计算
     store.data.pages[0].texts = [note1];

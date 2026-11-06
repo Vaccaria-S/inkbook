@@ -18,7 +18,14 @@ import { OneEuroFilter, shapePressure, speedWidthFactor, zoomNormalization } fro
 import { TouchArbiter, type PinchInfo, type PointerInfo, type TouchRole } from "./touch";
 import { drawPaper, paperBackground } from "./paper";
 import { BitmapCache } from "./cache";
-import { extractPdfText, openPdf, pdfPageSize, renderPdfPage, type PdfDoc } from "./pdf";
+import {
+  extractPdfText,
+  openPdf,
+  pdfPageSize,
+  pdfTargetWidthPx,
+  renderPdfPage,
+  type PdfDoc,
+} from "./pdf";
 import {
   clamp,
   splitStrokeByEraser,
@@ -208,7 +215,7 @@ function measureContext(font: string): CanvasRenderingContext2D | null {
  * 真正的解是 P3 的 tile 渲染（只画视口内那几块瓦片，分辨率与缩放解耦），
  * 届时才动这里。
  */
-const MAX_CANVAS_PIXELS = 16_000_000;
+export const MAX_CANVAS_PIXELS = 16_000_000;
 
 /** 导出的底图位图宽度上限（设备像素） */
 const MAX_EXPORT_PX = 4096;
@@ -1045,8 +1052,13 @@ export class BookEditor {
     /*
      * 点侧栏按钮会把焦点抢走，这里夺回来，用户改完样式可以直接接着打。
      * <select> 的下拉此时已经关闭（change 才触发），不会被打断。
+     * 但焦点在「自定义字号输入框」（.mb-tb-sizein / .mb-size-in）上时
+     * 不能抢：用户正在那儿打字，夺回来会把下一个字符落到 textarea 里。
      */
+    const ae = document.activeElement as HTMLElement | null;
+    const keep = !!ae && (ae.matches(".mb-tb-sizein") || ae.matches(".mb-size-in"));
     ta.focus();
+    if (keep && ae) ae.focus();
   }
 
   get textFont(): string {
@@ -1341,6 +1353,41 @@ export class BookEditor {
       bar.addEventListener(evName, eat, { passive: true });
     }
 
+    // 自定义字号：紧凑输入框（≤44px，见 .mb-texteditbar .mb-tb-sizein），
+    // 放在四档前面。数字直打 → setTextSize（内部 clamp 8~96）→
+    // applyTextEditStyle 实时预览（不重建 DOM，打字不断）。
+    const sizeIn = document.createElement("input");
+    sizeIn.type = "text";
+    sizeIn.className = "mb-tb-sizein";
+    sizeIn.inputMode = "numeric";
+    sizeIn.value = String(Math.round(ed.size));
+    sizeIn.title = "自定义字号（8~96）：直接输入数字";
+    // 没有这个标记，pointerdown 后 blur 会把空框提交掉（"先选样式再打字"直接断）
+    sizeIn.dataset.mbTextStyle = "1";
+    const applySize = () => {
+      const n = parseInt(sizeIn.value.replace(/\D/g, ""), 10);
+      if (Number.isNaN(n)) return;
+      // setTextSize → applyTextEditStyle：实时预览 + 高亮同步
+      this.setTextSize(n);
+    };
+    sizeIn.addEventListener("input", applySize);
+    sizeIn.addEventListener("change", () => {
+      // 离开输入框：不重复 setTextSize（会把焦点从用户要去的元素上抢走，
+      // 框里没提交的内容正需要焦点留在外面）；输入时已逐键应用，
+      // 这里只把显示值整理成 clamp 后的实际值（updateTextEditBar
+      // 也会兜一次，但输入框失焦后才会写回，change 时主动补一次）
+      const t = this.textEdit;
+      if (t) sizeIn.value = String(Math.round(t.size));
+    });
+    sizeIn.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        applySize();
+        sizeIn.blur();
+      }
+    });
+    bar.appendChild(sizeIn);
+
     // 字号：4 档常用大小，当前值高亮。数字按钮比 −/＋ 少一半点击次数
     for (const v of [14, 18, 24, 32]) {
       const b = document.createElement("button");
@@ -1390,6 +1437,15 @@ export class BookEditor {
     const bar = this.textEditBarEl;
     const ed = this.textEdit;
     if (!bar || !ed) return;
+    // 自定义入口：用户正在输入框里打字时不写回（会把正在输入的内容冲掉）；
+    // 失焦 / 其它样式变更时把显示值与强调态同步成实际值。
+    const sizeIn = bar.querySelector<HTMLInputElement>(".mb-tb-sizein");
+    if (sizeIn) {
+      if (document.activeElement !== sizeIn) {
+        sizeIn.value = String(Math.round(ed.size));
+      }
+      sizeIn.classList.toggle("is-custom", ![14, 18, 24, 32].includes(Math.round(ed.size)));
+    }
     for (const b of Array.from(bar.querySelectorAll<HTMLElement>(".mb-tb-btn[data-mb-size]"))) {
       b.classList.toggle("is-active", Number(b.dataset.mbSize) === Math.round(ed.size));
     }
@@ -2458,15 +2514,6 @@ export class BookEditor {
   }
 
   /**
-   * 底图在屏幕上占多宽（CSS 像素）。
-   *
-   * 页面坐标系里底图占 bg.width 宽，缩放后就是 bg.width × zoom。
-   */
-  private pdfScreenWidth(bg: PageBackground): number {
-    return bg.width * this.zoom;
-  }
-
-  /**
    * 渲染 PDF 页需要的目标位图宽度（设备像素）。
    *
    * 这就是之前模糊的根源：
@@ -2476,15 +2523,20 @@ export class BookEditor {
    * 的换算系数。漏掉它，位图就比显示尺寸小 1.33 倍，
    * 被拉伸显示 → 明显发虚。
    *
-   * 现在直接算「屏幕上的设备像素宽度」，一步到位：
-   *   设备像素宽 = CSS 宽度 × dpr
-   * 其中 CSS 宽度已经含了 PDF→页面的换算（bg.width）。
+   * 现在直接算「屏幕上的设备像素宽度」：
+   *   设备像素宽 = CSS 宽度 × dpr = 页面单位宽 × （zoom × dpr）
+   *
+   * 但**不能**让目标宽度跟着 zoom 一起降——那正是「缩小就糊」：
+   * zoom 0.5 时只剩 1.33 设备像素/pt，zoom 0.35 时只剩 0.47，
+   * pdf.js 被迫在亚像素倍率上光栅化中文，笔画粘连；而位图是手上唯一的
+   * 那张图，糊下去就回不来了。所以给「每页面单位设备像素」设一个
+   * 与 zoom、dpr 都无关的地板（PDF_FLOOR_PPU，见 src/pdf.ts）：
+   * 位图永远超采样，缩小靠画布 drawImage 高质量降采样，
+   * 放大时目标提高（max 的机制不变）继续重渲染更清的那份。
    */
   private pdfTargetWidth(bg: PageBackground): number {
-    const dpr = this.renderDpr();
-    const css = this.pdfScreenWidth(bg);
-    // 封顶：超大图会吃光显存，而且超过 2.8 倍缩放后肉眼也看不出差别
-    return Math.min(Math.round(css * dpr), 4096);
+    // 设备像素 / 页面单位 = 缩放 × 渲染像素比
+    return pdfTargetWidthPx(bg.width, this.zoom * this.renderDpr());
   }
 
   /**

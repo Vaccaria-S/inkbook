@@ -22,13 +22,21 @@ import {
   TEMPLATES,
   type InkBook,
   type InkbookSettings,
+  type Outline,
   type PaperId,
   type ShapeKind,
   type TemplateId,
   type ToolId,
 } from "./types";
 import { paintPaperPreview } from "./paper";
-import { NewBookModal, JumpPageModal, PromptModal, ImportSourceModal, ImportRangeModal } from "./modals";
+import {
+  NewBookModal,
+  JumpPageModal,
+  PromptModal,
+  OutlineModal,
+  ImportSourceModal,
+  ImportRangeModal,
+} from "./modals";
 import { importPdf, importWord } from "./importer";
 import { ExportCancelledError, exportBookPdf, exportPagePng } from "./export";
 
@@ -103,6 +111,23 @@ const PAGE_GRID_FULL_ROWS = 24;
 const PAGE_THUMB_POOL_MAX = 48;
 /** 与 styles.css 里 `.mb-thumb { aspect-ratio: 794 / 1123 }` 一致，只在量不到真实条目时兜底 */
 const PAGE_THUMB_ASPECT = 1123 / 794;
+
+/**
+ * 侧栏「目录」区的窗口化参数。
+ *
+ * 目录是用户自己写的条目，几十条很常见、上百条也不稀奇。
+ * 一次建几百个 DOM 还能忍，但没必要——目录区有自己的滚动容器，
+ * 只建可视区附近的那几条就够，滚到哪儿建到哪儿。
+ *
+ * 少于 FULL 条时直接全建：窗口化反而添乱（还要量高度、算偏移）。
+ */
+const OUTLINE_WINDOW_MAX = 60;
+/** 目录区可视区上下各多建几条 */
+const OUTLINE_OVERSCAN = 4;
+/** 量不到真实条目时的兜底行高（px） */
+const OUTLINE_ROW_H = 24;
+/** 量不到可视区高度时的兜底值（px） */
+const OUTLINE_VIEWPORT_H = 200;
 
 /**
  * 尾沿防抖，可带最大等待（maxWait）。
@@ -253,6 +278,25 @@ export class InkbookView extends FileView {
   private sideBtn!: HTMLElement;
   private layerListEl: HTMLElement | null = null;
   private pageListEl: HTMLElement | null = null;
+  /**
+   * 侧栏「目录」区的条目容器。
+   *
+   * 目录项可以很多（用户在一个 857 页的本子里手写几十条目录很正常），
+   * 所以这里**不**一次建几千个 DOM：
+   *   · 目录区有自己的滚动容器，超出可视区的条目不建；
+   *   · 只在内容真的变了（store.outlineRev 变了）才重建，
+   *     落笔时 updateUI 会跑几十次，但目录不变 → 一次 DOM 都不动。
+   */
+  private outlineListEl: HTMLElement | null = null;
+  /** 目录区的滚动容器（窗口化用） */
+  private outlineViewportEl: HTMLElement | null = null;
+  /** 上次建目录时用的 store.outlineRev（内容变了才重建） */
+  private outlineRev = -1;
+  /** 目录窗口：已建的条目区间 [lo, hi) */
+  private outlineWinLo = 0;
+  private outlineWinHi = 0;
+  /** 量到的条目行高（量一次就够，别每次滚动都 reflow 一遍） */
+  private outlineRowH = 0;
   private templateGrid: HTMLElement | null = null;
   private paperRow: HTMLElement | null = null;
   private statsEl: HTMLElement | null = null;
@@ -285,6 +329,37 @@ export class InkbookView extends FileView {
   private thumbPressId = -1;
   private thumbPressX = 0;
   private thumbPressY = 0;
+  /** 计时器已开、菜单已弹后手指仍按着：移动超阈值就承接到拖拽 */
+  private thumbPressDown = false;
+  /** 长按期的 document 级 pointermove 监听（菜单弹前判滚动 / 弹后转拖拽） */
+  private thumbPressMoveAbort: AbortController | null = null;
+  /** 拖拽进行中（菜单已关，松手/取消才结束） */
+  private thumbDragActive = false;
+  private thumbDragItem: HTMLElement | null = null;
+  private thumbDragPointerId = -1;
+  private thumbDragFromIndex = -1;
+  /** 抓取偏移：image 保持在同一相对位置，拖起来不会跳 */
+  private thumbDragGrabDX = 0;
+  private thumbDragGrabDY = 0;
+  private thumbDragPointerY = 0;
+  private thumbDragBefore = false;
+  private thumbDragTargetIndex = -1;
+  /** movePage 要的「最终下标」（0 起），算出后松手才调用 */
+  private thumbDragInsertPos = -1;
+  /** 松手自带的 click 屏蔽位：拖完再点这格不能顺手翻页 */
+  private thumbDragClickGuard = false;
+  private thumbDragGhost: HTMLElement | null = null;
+  private thumbDragIndicator: HTMLElement | null = null;
+  private thumbDragDocAbort: AbortController | null = null;
+  /**
+   * 触屏防抢手势：在 document 上挡 touchmove。
+   *
+   * touch-action 在手势开始时就定型，中途改 CSS 没用；这里用非 passive 的
+   * touchmove 监听，**仅当拖拽已启**时 preventDefault，让浏览器不把这次移动
+   * 判成侧栏滚动（否则会 pointcancel 把拖拽掐掉）。平时手指一移动浏览器正常
+   * 竖滚侧栏，不受影响（监听挂在 document，只在拖拽态吞掉默认动作）。
+   */
+  private thumbTouchGuardAbort: AbortController | null = null;
   /**
    * 侧栏页列表窗口化（`.mb-pages` 网格）。
    *
@@ -813,9 +888,19 @@ export class InkbookView extends FileView {
     this.sbThumbTop = 0;
     this.sideEl?.empty();
     this.toolButtons.clear();
+    // 拖拽态要收干净：ghost / 指示线挂在 document.body 上，不随侧栏一起走
+    this.cancelThumbDrag();
+    this.cancelThumbPress();
+    this.closeThumbMenu();
     this.floatEl = null as any;
     this.layerListEl = null;
     this.pageListEl = null;
+    this.outlineListEl = null;
+    this.outlineViewportEl = null;
+    this.outlineRev = -1;
+    this.outlineWinLo = 0;
+    this.outlineWinHi = 0;
+    this.outlineRowH = 0;
     this.templateGrid = null;
     this.paperRow = null;
     this.statsEl = null;
@@ -1887,7 +1972,12 @@ export class InkbookView extends FileView {
       /*
        * 文字工具参数压成**两行**（电脑端侧栏内容区只有 234px 宽）：
        *   第一行：[字号 14 18 24 32] [字体下拉，占剩余宽度]
-       *   第二行：[8 个色点，强制一行不折]
+       *   第二行：[自定义字号输入框] [8 个色点，强制一行不折]
+       *
+       * 用户要「在字号前面再加一个可以自由选字号的按钮」。入口挂
+       * 色点行最左的原因：放第一行会把字体下拉压到 80px 以下
+       * （dock 用例锁着它 ≥80px）；单独起一行又把 INK-154 刚压下去的
+       * 高度还回来。42px 宽不挤任何现控件，平板上高 30px 够点。
        *
        * 旧实现把提示 / 字号 / 字体 / 色点四组直接塞进 .mb-dyn
        * （nowrap 单行）：提示文字的最小宽度就 ~220px，整行最小内容宽
@@ -1935,7 +2025,54 @@ export class InkbookView extends FileView {
       };
 
       // 颜色（第二行；.mb-text-tools .mb-tcolor-row 强制 nowrap）
+      // + 自定义字号入口：挂在色点行最左（.mb-size-in，42px），不挤
+      // 第一行的字体下拉，也不额外起一行（INK-154 压下去的高度不还回来）
       const crow = tools.createDiv("mb-tcolor-row");
+      const sizeIn = crow.createEl("input", {
+        cls: "mb-size-in",
+        attr: {
+          type: "text",
+          inputmode: "numeric",
+          value: String(s.textSize),
+          title: "自定义字号（8~96）：直接输入数字",
+          "data-mb-text-style": "1",
+        },
+      });
+      // 当前是自定义值（不是四档之一）时给入口加个强调描边
+      sizeIn.classList.toggle("is-custom", ![14, 18, 24, 32].includes(Math.round(s.textSize)));
+      // 编辑框开着时点它不能把框提交掉（blur 判定靠上面的标记，不能用
+      // relatedTarget：iPad 上常为 null）。
+      // setTextSize → emitState → updateUI 会重建整个 .mb-text-tools
+      // （输入框 DOM 一起换掉）：重建后把打字内容与焦点补回新框，连续
+      // 输入不断。input 事件里做（正在打字）；change/离开时不做——
+      // 用户要去点导出 / 撤销，抢回焦点框里没提交的内容就静默丢了。
+      const applySize = (refocus: boolean) => {
+        const n = parseInt(sizeIn.value.replace(/\D/g, ""), 10);
+        if (Number.isNaN(n)) return;
+        this.editor?.setTextSize(n);
+        if (refocus) {
+          const again = this.dynEl?.querySelector<HTMLInputElement>(".mb-size-in");
+          if (again && document.activeElement !== again) {
+            again.value = sizeIn.value;
+            again.focus();
+            again.setSelectionRange(again.value.length, again.value.length);
+          }
+        }
+      };
+      sizeIn.addEventListener("input", () => applySize(true));
+      sizeIn.addEventListener("change", () => {
+        // 离开输入框：不重复 setTextSize（会把焦点从用户要去的元素上抢走）；
+        // 输入时已逐键应用过，这里只把显示值整理成 clamp 后的实际值
+        const t = this.editor?.textSize;
+        if (t !== undefined) sizeIn.value = String(t);
+      });
+      sizeIn.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          applySize(false);
+          sizeIn.blur();
+        }
+      });
       for (const c of PEN_COLORS) {
         const dot = crow.createEl("button", {
           cls:
@@ -2547,6 +2684,29 @@ export class InkbookView extends FileView {
     this.layerListEl = layerSec.createDiv("mb-layers");
     this.renderLayers();
 
+    /* ---------------------------- 目录 ---------------------------- */
+    /*
+     * 目录放在「页面」区**上方**——目录比缩略图常用（它是用户自己写的
+     * 路标，翻本子时第一眼看的就是它），缩略图区有几百上千格，
+     * 放上面会把路标挤到屏幕外。
+     */
+    const outSec = body.createDiv("mb-sec mb-sec-outline");
+    const outHead = outSec.createDiv("mb-sec-head");
+    outHead.createDiv({ cls: "mb-sec-title", text: "目录" });
+    const addOutline = outHead.createEl("button", { cls: "mb-link", text: "+ 添加目录" });
+    addOutline.onclick = () => this.showAddOutline();
+    // 目录区自己的滚动视口：条目多了只建可视区附近的那几条
+    this.outlineViewportEl = outSec.createDiv("mb-outlines");
+    this.outlineListEl = this.outlineViewportEl.createDiv("mb-outline-list");
+    this.renderOutlines(true);
+    // 滚动 → 重算窗口（只建可视区附近的条目）
+    this.outlineViewportEl.addEventListener(
+      "scroll",
+      () => {
+        this.buildOutlineWindow();
+      },
+      { passive: true }
+    );
     /* ---------------------------- 页面 ---------------------------- */
     const pageSec = body.createDiv("mb-sec");
     const pageHead = pageSec.createDiv("mb-sec-head");
@@ -2703,6 +2863,207 @@ export class InkbookView extends FileView {
         .map((l) => `${l.id}:${l.name}:${l.visible}:${l.strokes.length}:${l.opacity}`)
         .join(",")
     );
+  }
+
+  /* ------------------------------- 目录 ------------------------------- */
+
+  /**
+   * 渲染侧栏「目录」区。
+   *
+   * **只在内容真的变了才重建**：落笔时 updateUI 会跑几十次，
+   * 目录不变的话一次 DOM 都不动（`store.outlineRev` 是内容版本号，
+   * 改名/挪位置都会让它变，条数不够）。
+   *
+   * 条目多了也不一次建几千个 DOM：目录区有自己的滚动容器，
+   * 只建可视区附近的条目（见 buildOutlineWindow）。
+   */
+  private renderOutlines(force = false): void {
+    if (!this.outlineListEl || !this.store) return;
+    const rev = this.store.outlineRev;
+    if (!force && rev === this.outlineRev) return;
+    this.outlineRev = rev;
+    // 内容变了 → 窗口失效，重建可视区那几条
+    this.outlineWinLo = -1;
+    this.outlineWinHi = -1;
+    this.buildOutlineWindow(true);
+  }
+
+  /**
+   * 目录窗口：只建可视区附近的条目。
+   *
+   * 条目高度固定（单行），所以按「条」算就行：
+   *   · 可视区高 / 条高 = 能放几条；
+   *   · 上下各多建几条（overscan），滚动时不至于先看到空白；
+   *   · 上下用两个整块 spacer 撑高度（跟页列表的 buildPageWindow 一个路子），
+   *     滚动条长度与滚动位置都不变——加了目录不会把滚动位置顶走。
+   *
+   * 目录区是**独立滚动容器**（.mb-outlines 自己滚），所以可视区起点
+   * 就是它自己的 scrollTop。
+   */
+  private buildOutlineWindow(force = false): void {
+    const list = this.outlineListEl;
+    const viewport = this.outlineViewportEl;
+    if (!list) return;
+    const items = this.store?.outlines ?? [];
+    const total = items.length;
+
+    // 条目不多：全建（省掉量高度那点开销，几十条 DOM 无所谓）
+    if (!viewport || total <= OUTLINE_WINDOW_MAX) {
+      if (force || this.outlineWinLo !== 0 || this.outlineWinHi !== total) {
+        list.empty();
+        for (const o of items) this.buildOutlineRow(list, o);
+        this.outlineWinLo = 0;
+        this.outlineWinHi = total;
+      }
+      return;
+    }
+
+    /*
+     * 条目高度是 CSS 定死的（单行），量一次就够——
+     * 每次滚动都插一条探针再量一遍，白白多一次 reflow。
+     */
+    if (!this.outlineRowH) {
+      const probe = list.createDiv("mb-outline");
+      this.outlineRowH = probe.getBoundingClientRect().height || OUTLINE_ROW_H;
+      probe.remove();
+    }
+    const rowH = this.outlineRowH;
+    const vpH = viewport.clientHeight || OUTLINE_VIEWPORT_H;
+    const visible = Math.max(1, Math.ceil(vpH / rowH));
+    const scrollTop = viewport.scrollTop || 0;
+    const lo = Math.max(0, Math.floor(scrollTop / rowH) - OUTLINE_OVERSCAN);
+    const hi = Math.min(total, lo + visible + OUTLINE_OVERSCAN * 2);
+
+    // 窗口没变就不用重建（滚动时只有跨过边界才变）
+    if (!force && lo === this.outlineWinLo && hi === this.outlineWinHi) {
+      this.updateOutlineSpacers(lo, hi, rowH, total);
+      return;
+    }
+    this.outlineWinLo = lo;
+    this.outlineWinHi = hi;
+
+    list.empty();
+    // 上 spacer：高度 = 未建条数 × 行高
+    if (lo > 0) {
+      const pad = list.createDiv("mb-outline-pad");
+      pad.style.height = Math.max(0, lo * rowH) + "px";
+    }
+    for (let i = lo; i < hi; i++) this.buildOutlineRow(list, items[i]);
+    // 下 spacer
+    if (hi < total) {
+      const pad = list.createDiv("mb-outline-pad");
+      pad.style.height = Math.max(0, (total - hi) * rowH) + "px";
+    }
+  }
+
+  /**
+   * 上下 spacer 的高度（窗口没变但行高变了也要跟着改）。
+   */
+  private updateOutlineSpacers(lo: number, hi: number, rowH: number, total: number): void {
+    const list = this.outlineListEl;
+    if (!list) return;
+    const pads = list.querySelectorAll<HTMLElement>(".mb-outline-pad");
+    if (pads.length === 2) {
+      pads[0].style.height = Math.max(0, lo * rowH) + "px";
+      pads[1].style.height = Math.max(0, (total - hi) * rowH) + "px";
+    }
+  }
+
+  /**
+   * 建一条目录条目。
+   *
+   * 每条显示：名字 + 页码（1 起给人看；存的是 0 起下标）。
+   * 点击整条 → 跳到那一页；双击名字 → 改名；垃圾桶 → 删除。
+   */
+  private buildOutlineRow(list: HTMLElement, o: Outline): void {
+    const store = this.store;
+    if (!store) return;
+    const row = list.createDiv("mb-outline");
+    row.dataset.outlineId = o.id;
+    // 指向的页可能已经不存在了（页被删过）——夹到有效范围，绝不抛异常
+    const page = store.clampOutlinePage(o.page);
+    const stale = page !== o.page;
+
+    const name = row.createSpan({ cls: "mb-outline-name", text: o.title });
+    name.title = stale ? `${o.title}（原指向第 ${o.page + 1} 页，已超出范围）` : o.title;
+    name.ondblclick = (e) => {
+      e.stopPropagation();
+      this.showRenameOutline(o.id);
+    };
+    const pageTag = row.createSpan({
+      cls: "mb-outline-page" + (stale ? " is-stale" : ""),
+      text: `第 ${page + 1} 页`,
+    });
+
+    const act = row.createDiv("mb-outline-act");
+    const edit = act.createEl("button", { cls: "mb-outline-btn", attr: { "aria-label": "编辑目录" } });
+    setIcon(edit, "pencil");
+    edit.title = "改名 / 改页码";
+    edit.onclick = (e) => {
+      e.stopPropagation();
+      this.showEditOutline(o.id);
+    };
+    const del = act.createEl("button", { cls: "mb-outline-btn", attr: { "aria-label": "删除目录" } });
+    setIcon(del, "trash-2");
+    del.title = "删除";
+    del.onclick = (e) => {
+      e.stopPropagation();
+      store.removeOutline(o.id);
+      this.updateUI();
+    };
+
+    row.onclick = () => {
+      const at = store.clampOutlinePage(o.page);
+      this.editor?.goToPage(at);
+      this.updateUI();
+    };
+  }
+
+  /** 「+ 添加目录」：弹窗输入名字 + 页码 */
+  private showAddOutline(): void {
+    if (!this.store) return;
+    const total = this.store.pageCount;
+    const current = this.store.data.activePage;
+    new OutlineModal(
+      this.app,
+      total,
+      current,
+      "",
+      current,
+      (title, page) => {
+        this.store?.addOutline(title, page);
+        this.updateUI();
+      }
+    ).open();
+  }
+
+  /** 编辑一条目录：改名 + 改页码（一次操作 = 一条撤销记录） */
+  private showEditOutline(id: string): void {
+    if (!this.store) return;
+    const item = this.store.outlines.find((o) => o.id === id);
+    if (!item) return;
+    new OutlineModal(
+      this.app,
+      this.store.pageCount,
+      this.store.data.activePage,
+      item.title,
+      item.page,
+      (title, page) => {
+        this.store?.updateOutline(id, title, page);
+        this.updateUI();
+      }
+    ).open();
+  }
+
+  /** 双击名字 → 只改名（页码不动） */
+  private showRenameOutline(id: string): void {
+    if (!this.store) return;
+    const item = this.store.outlines.find((o) => o.id === id);
+    if (!item) return;
+    new PromptModal(this.app, "重命名目录", item.title, (v) => {
+      this.store?.renameOutline(id, v);
+      this.updateUI();
+    }).open();
   }
 
   /**
@@ -2875,6 +3236,8 @@ export class InkbookView extends FileView {
   ): void {
     const list = this.pageListEl;
     if (!list) return;
+    // 拖拽期间冻结窗口：不回收/补建条目，否则被拖的 DOM 节点会被换掉
+    if (this.thumbDragActive) return;
     const firstCell = rowLo * cols;
     const lastCell = Math.min(rowHi * cols, count + 1);
 
@@ -3012,6 +3375,9 @@ export class InkbookView extends FileView {
    * 正常滚动**不该**走这里——整屏重建正是缩略图闪烁的来源。
    */
   private resetPageWindowDom(list: HTMLElement): void {
+    // 若拖拽还在（不该发生，但为兜底）：先收掉 drag 态，避免 ghost/指示线
+    // 残留在 list.empty() 之后的文档里
+    if (this.thumbDragActive) this.cancelThumbDrag();
     this.thumbObserver?.disconnect();
     this.thumbObserver = null;
     // 长按菜单和计时器都挂在旧节点上，重建前先收掉（否则引用悬空）
@@ -3035,6 +3401,10 @@ export class InkbookView extends FileView {
    * 同时 editor 的 thumbShots LRU 也持有副本（池被淘汰后仍有兜底）。
    */
   private recycleThumbItem(index: number, item: HTMLElement): void {
+    // 中防御：正常拖拽期间 buildPageWindow 已被守卫冻结，不会走到回收；
+    // 万一命中（侧栏重建 / 宿主清空 DOM），安全取消拖拽并照常回收，绝不搬走
+    // 还在被拖的节点。
+    if (this.thumbDragItem === item) this.cancelThumbDrag();
     this.thumbObserver?.unobserve(item);
     if (this.thumbPressItem === item) this.cancelThumbPress();
     if (this.thumbMenuOwner === item) this.closeThumbMenu();
@@ -3097,17 +3467,29 @@ export class InkbookView extends FileView {
         this.editor?.deletePage(index);
       };
     }
-    // 长按（触屏/鼠标都可以）弹「上移 / 下移」，不做拖拽——拖拽会和侧栏滚动打架
+    // 长按：不动弹「上移/下移」菜单，移动即承接到拖拽重排（见 onThumbPressMove）
     item.addEventListener("pointerdown", (e) => this.onThumbPointerDown(e, item));
-    item.addEventListener("pointermove", (e) => this.onThumbPointerMove(e));
-    item.addEventListener("pointerup", () => this.cancelThumbPress());
-    item.addEventListener("pointercancel", () => this.cancelThumbPress());
-    item.addEventListener("pointerleave", () => this.cancelThumbPress());
+    /*
+     * pointerleave **故意什么都不做**。
+     *
+     * 以前这里调 cancelThumbPress()：鼠标按住第 1 页想拖到第 2 页时，
+     * 指针一离开第 1 页的边界就收到 leave，长按态被整个收掉——
+     * 而 pointermove 只投递给命中目标，离开后 move 也不再回到这条元素上，
+     * 于是菜单虽已弹出，拖拽却再也接不上（用户要的就是这个动作）。
+     *
+     * 现在移动判据统一在 document 级（armThumbPressMove）：
+     * 移够了 8px → 菜单开着就转拖拽、没开就当滚动取消。
+     */
     // 触屏长按会触发系统菜单，盖掉；桌面右键保持原样
     item.addEventListener("contextmenu", (e) => {
       if (this.thumbMenuEl) e.preventDefault();
     });
     item.onclick = () => {
+      if (this.thumbDragClickGuard) {
+        // 刚拖完的抬手 click 不能顺手翻页；下次按下再解除
+        this.thumbDragClickGuard = false;
+        return;
+      }
       const at = Number(item.dataset.longPressAt || 0);
       if (at && Date.now() - at < 1200) {
         // 这次 click 是长按抬手带出来的，不能当成"翻到这一页"
@@ -3128,17 +3510,37 @@ export class InkbookView extends FileView {
 
   private onThumbPointerDown(e: PointerEvent, item: HTMLElement): void {
     if (e.button !== 0) return;
+    // 拖拽中再来的第二指不参与，免得破坏当前拖拽
+    if (this.thumbDragActive) return;
     // 点在复制/删除按钮上不参与长按
     if ((e.target as Element | null)?.closest?.(".mb-thumb-act")) return;
+    // 解除上一次拖拽留下的 click 屏蔽
+    this.thumbDragClickGuard = false;
     this.cancelThumbPress();
+    this.armThumbTouchGuard();
     this.thumbPressItem = item;
     this.thumbPressId = e.pointerId;
     this.thumbPressX = e.clientX;
     this.thumbPressY = e.clientY;
+    this.thumbPressDown = true;
+    /*
+     * document 级 pointermove：按住之后**离开**那条条目，move 就不会再回到它身上
+     * （鼠标的 pointermove 只投递给命中目标；手指抬起前也不再有 pointerleave）。
+     * 不挂这个监听，「按住第 1 页 → 移到第 2 页」这条路径根本收不到移动，
+     * 菜单弹出后就再也接不上拖拽——用户要的就是这个动作。
+     *
+     * 菜单弹出前它兼做「滚动判定」（移动超 8px = 用户在滚侧栏，取消长按）；
+     * 菜单弹出后它把移动转交给拖拽（见 onThumbPressMove）。
+     */
+    this.armThumbPressMove();
     this.thumbPressTimer = window.setTimeout(() => {
       this.thumbPressTimer = 0;
       const it = this.thumbPressItem;
-      this.thumbPressItem = null;
+      /*
+       * **故意不清 thumbPressItem**：菜单开后手指还按着，移动超阈值要顺
+       * 利承接到拖拽（beginThumbDrag 靠它取源条目）。它只在 pointerup /
+       * 取消 / 窗口重建时由 cancelThumbPress 收掉。
+       */
       // 条目可能已经被滚动重建掉；菜单已开时也不再叠加
       if (!it || !it.isConnected || this.thumbMenuEl) return;
       it.dataset.longPressAt = String(Date.now());
@@ -3146,15 +3548,69 @@ export class InkbookView extends FileView {
     }, 450);
   }
 
-  /** 手指/鼠标在长按期间移动超过 8px 视为滚动，取消 */
-  private onThumbPointerMove(e: PointerEvent): void {
-    if (!this.thumbPressTimer || e.pointerId !== this.thumbPressId) return;
-    if (
+  /** 长按期间挂在 document 上的 pointermove（菜单弹前判滚动，弹后转拖拽） */
+  private armThumbPressMove(): void {
+    this.thumbPressMoveAbort?.abort();
+    const ac = new AbortController();
+    this.thumbPressMoveAbort = ac;
+    document.addEventListener(
+      "pointermove",
+      (e: PointerEvent) => this.onThumbPressMove(e),
+      { passive: true, signal: ac.signal }
+    );
+    /*
+     * 抬手 / 取消也挂 document：指针**离开**条目后在别处抬手，条目上的
+     * pointerup 收不到，长按态就会漏在「按着」上（下次按下时状态错乱、
+     * touch guard 也一直挂着）。这里兜住。
+     */
+    document.addEventListener(
+      "pointerup",
+      (e: PointerEvent) => {
+        if (e.pointerId !== this.thumbPressId) return;
+        // 拖拽已经接手时，抬手由拖拽自己的监听处理（finishThumbDrag）
+        if (this.thumbDragActive) return;
+        this.disarmThumbTouchGuard();
+        this.cancelThumbPress();
+      },
+      { signal: ac.signal }
+    );
+    document.addEventListener(
+      "pointercancel",
+      (e: PointerEvent) => {
+        if (e.pointerId !== this.thumbPressId) return;
+        if (this.thumbDragActive) return;
+        this.disarmThumbTouchGuard();
+        this.cancelThumbPress();
+      },
+      { signal: ac.signal }
+    );
+  }
+
+  /**
+   * 长按移动判据（挂在 document 上）。
+   *
+   * 必须挂 document：指针**离开**按下的那条条目后，pointermove 不再投递给它
+   * （鼠标的 move 只给命中目标），只有 document 级监听才收得到——
+   * 而「按住第 1 页 → 拖到第 2 页」正是要离开第 1 页的。
+   *
+   * 两条分支：
+   *   · 菜单已开 → 移动超 8px = 用户要拖，接手成拖拽；
+   *   · 菜单还没开（还在 450ms 计时）→ 移动超 8px = 用户在滚侧栏，取消长按。
+   */
+  private onThumbPressMove(e: PointerEvent): void {
+    if (this.thumbDragActive) return; // 拖拽中由 document 级监听接管
+    if (e.pointerId !== this.thumbPressId) return;
+    const moved =
       Math.abs(e.clientX - this.thumbPressX) > 8 ||
-      Math.abs(e.clientY - this.thumbPressY) > 8
-    ) {
-      this.cancelThumbPress();
+      Math.abs(e.clientY - this.thumbPressY) > 8;
+    if (!moved) return;
+    // 菜单已开、手指仍按着：移动超阈值 → 关菜单、进拖拽
+    if (this.thumbMenuEl && this.thumbPressDown) {
+      this.beginThumbDrag();
+      return;
     }
+    // 菜单尚未开（长按计时中）：移动超阈值视为侧栏滚动，取消
+    if (this.thumbPressTimer) this.cancelThumbPress();
   }
 
   private cancelThumbPress(): void {
@@ -3162,7 +3618,15 @@ export class InkbookView extends FileView {
       window.clearTimeout(this.thumbPressTimer);
       this.thumbPressTimer = 0;
     }
+    // 长按期的 document 监听：拖拽接手后由 drag 自己挂 document 监听，这里必须收掉
+    if (!this.thumbDragActive) {
+      this.thumbPressMoveAbort?.abort();
+      this.thumbPressMoveAbort = null;
+    }
     this.thumbPressItem = null;
+    this.thumbPressDown = false;
+    // 拖拽中不动 touchmove 兜底；松手/取消时收掉
+    if (!this.thumbDragActive) this.disarmThumbTouchGuard();
   }
 
   private openThumbMenu(item: HTMLElement): void {
@@ -3236,6 +3700,246 @@ export class InkbookView extends FileView {
      * （否则同一帧建两遍窗口、缩略图白画一次）。
      */
     this.editor?.movePage(at, to);
+  }
+
+  /* ------------------------- 缩略图拖拽重排 ------------------------- */
+
+  /** 长按菜单已开、又移动超阈值 → 从「菜单」切到「拖拽」 */
+  private beginThumbDrag(): void {
+    const item = this.thumbPressItem;
+    if (!item || !item.isConnected) {
+      this.cancelThumbPress();
+      return;
+    }
+    const from = this.pageIndexOfThumb(item);
+    if (from < 0) {
+      this.cancelThumbPress();
+      return;
+    }
+    // 菜单 → 拖拽交接：关菜单、撤掉 capture 监听、press 字段让位给 drag
+    this.closeThumbMenu();
+    // 长按期的 document 监听交棒给拖拽自己的那份，先收掉（否则两套判据同时跑）
+    this.thumbPressMoveAbort?.abort();
+    this.thumbPressMoveAbort = null;
+    this.thumbPressItem = null;
+    this.thumbPressTimer = 0;
+    this.thumbPressDown = false;
+    this.thumbDragPointerY = this.thumbPressY;
+    this.thumbDragBefore = false;
+    this.thumbDragTargetIndex = -1;
+    this.thumbDragInsertPos = -1;
+    const r = item.getBoundingClientRect();
+    this.thumbDragActive = true;
+    this.thumbDragItem = item;
+    this.thumbDragPointerId = this.thumbPressId;
+    this.thumbDragFromIndex = from;
+    // 抓取偏移：image 保持手指相对原条目右下角的位置，拖起来不跳
+    this.thumbDragGrabDX = this.thumbPressX - r.left;
+    this.thumbDragGrabDY = this.thumbPressY - r.top;
+    item.classList.add("mb-thumb-dragging");
+    // 半透明拖拽影像（document.body 独立节点，松手即删）
+    this.thumbDragGhost = this.makeThumbGhost(r.width, r.height);
+    document.body.appendChild(this.thumbDragGhost);
+    this.positionThumbGhost(this.thumbPressX, this.thumbPressY);
+    // 落点指示线
+    this.thumbDragIndicator = document.createElement("div");
+    this.thumbDragIndicator.className = "mb-thumb-drop-line";
+    document.body.appendChild(this.thumbDragIndicator);
+    // document 级监听：手指移到任意条目之外也继续跟
+    const ac = new AbortController();
+    this.thumbDragDocAbort = ac;
+    document.addEventListener(
+      "pointermove",
+      (e: PointerEvent) => {
+        if (e.pointerId !== this.thumbDragPointerId) return;
+        this.thumbDragPointerY = e.clientY;
+        this.positionThumbGhost(e.clientX, e.clientY);
+        this.updateThumbDragTarget(e.clientX, e.clientY);
+        this.maybeAutoScroll(e.clientY);
+      },
+      { passive: true, signal: ac.signal }
+    );
+    document.addEventListener(
+      "pointerup",
+      (e: PointerEvent) => {
+        if (e.pointerId !== this.thumbDragPointerId) return;
+        this.finishThumbDrag(e.clientX, e.clientY);
+      },
+      { signal: ac.signal }
+    );
+    document.addEventListener(
+      "pointercancel",
+      (e: PointerEvent) => {
+        if (e.pointerId !== this.thumbDragPointerId) return;
+        this.cancelThumbDrag();
+      },
+      { signal: ac.signal }
+    );
+    // 按当前落点初始化指示线
+    this.updateThumbDragTarget(this.thumbPressX, this.thumbPressY);
+  }
+
+  private makeThumbGhost(w: number, h: number): HTMLElement {
+    const g = document.createElement("div");
+    g.className = "mb-thumb-ghost";
+    g.style.width = Math.max(1, Math.round(w)) + "px";
+    g.style.height = Math.max(1, Math.round(h)) + "px";
+    return g;
+  }
+
+  private positionThumbGhost(x: number, y: number): void {
+    if (!this.thumbDragGhost) return;
+    const dx = x - this.thumbDragGrabDX;
+    const dy = y - this.thumbDragGrabDY;
+    this.thumbDragGhost.style.transform =
+      "translate(" + Math.round(dx) + "px," + Math.round(dy) + "px)";
+  }
+
+  /**
+   * 落点：当前**可见窗口**条目里，横向覆盖指针、纵向最近一条（跳过被拖的自己）。
+   *
+   * 用「相对其他条目的上/下半」算插入位置，**不按 clientY/行高硬算**——
+   * 窗口化后行高会变、上下还垫了 spacer，硬算必错。
+   *
+   * movePage(from, to) 的 `to` 是「移动完成后的最终下标」（splice 语义）：
+   *   插到目标 t 之前：(t<from ? t : t−1)
+   *   插到目标 t 之后：(t<from ? t+1 : t)
+   *   验证：第 1 页(from=0)拖到第 2 页(t=1)之后 → to=1；
+   *   movePage(0,1) = splice(0,1)+splice(1,0) ⇔ [第二页, 第一页]，正好对上。
+   */
+  private findThumbDropTarget(x: number, y: number): { index: number; rect: DOMRect } | null {
+    const want = this.thumbDragFromIndex;
+    if (want < 0) return null;
+    let best: { index: number; rect: DOMRect } | null = null;
+    let bestDist = Infinity;
+    for (const [idx, item] of this.thumbItems) {
+      if (idx === want) continue; // 跳过被拖的自己
+      const r = item.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      // 横向必须落到条目所在列范围，否则多列网格会选错列
+      if (x < r.left || x > r.right) continue;
+      const cy = (r.top + r.bottom) / 2;
+      const d = Math.abs(y - cy);
+      if (d < bestDist) {
+        bestDist = d;
+        best = { index: idx, rect: r };
+      }
+    }
+    return best;
+  }
+
+  private updateThumbDragTarget(x: number, y: number): void {
+    if (!this.thumbDragIndicator) return;
+    const t = this.findThumbDropTarget(x, y);
+    if (!t) {
+      this.thumbDragIndicator.style.display = "none";
+      this.thumbDragInsertPos = -1;
+      this.thumbDragBefore = false;
+      return;
+    }
+    const from = this.thumbDragFromIndex;
+    const before = y < (t.rect.top + t.rect.bottom) / 2;
+    this.thumbDragBefore = before;
+    this.thumbDragTargetIndex = t.index;
+    this.thumbDragInsertPos = before
+      ? t.index < from
+        ? t.index
+        : t.index - 1
+      : t.index < from
+        ? t.index + 1
+        : t.index;
+    // 指示线：标在目标的上/下边缘，横跨页列表
+    const list = this.pageListEl;
+    const listRect = list ? list.getBoundingClientRect() : t.rect;
+    const lineY = before ? t.rect.top : t.rect.bottom;
+    this.thumbDragIndicator.style.display = "";
+    this.thumbDragIndicator.style.transform =
+      "translate(" +
+      Math.round(listRect.left) +
+      "px," +
+      Math.round(lineY - 1.5) +
+      "px)";
+    this.thumbDragIndicator.style.width =
+      Math.max(1, Math.round(listRect.width)) + "px";
+  }
+
+  /** 落点靠近视口上/下缘时轻推侧栏，把已有条目挪到指下（窗口冻结，不重建） */
+  private maybeAutoScroll(clientY: number): void {
+    const vp = this.pageListViewportEl;
+    if (!vp) return;
+    const r = vp.getBoundingClientRect();
+    const edge = 56;
+    if (clientY < r.top + edge) {
+      vp.scrollTop -= Math.round((r.top + edge - clientY) * 0.5);
+    } else if (clientY > r.bottom - edge) {
+      vp.scrollTop += Math.round((clientY - (r.bottom - edge)) * 0.5);
+    }
+  }
+
+  private finishThumbDrag(x: number, y: number): void {
+    // 以松手落点再算一次最终目标
+    this.updateThumbDragTarget(x, y);
+    const from = this.thumbDragFromIndex;
+    const to = this.thumbDragInsertPos;
+    this.cleanupThumbDrag();
+    if (from < 0 || to < 0) return;
+    /*
+     * movePage → emitState → updateUI → refreshThumbs 检测到 pageOrderRev
+     * 变化会重建侧栏窗口（含被拖条目）。清理必须先于这次重建，
+     * 否则 is-dragging / ghost / 指示线会残留在即将被空的旧文档里。
+     */
+    this.editor?.movePage(from, to);
+    // 拖完自带的抬手 click：不能顺手翻到这一页
+    this.thumbDragClickGuard = true;
+  }
+
+  private cancelThumbDrag(): void {
+    this.cleanupThumbDrag();
+  }
+
+  private cleanupThumbDrag(): void {
+    this.thumbDragDocAbort?.abort();
+    this.thumbDragDocAbort = null;
+    // 长按期的 document 监听（拖拽中途被取消时可能还挂着）
+    this.thumbPressMoveAbort?.abort();
+    this.thumbPressMoveAbort = null;
+    this.thumbDragGhost?.remove();
+    this.thumbDragGhost = null;
+    this.thumbDragIndicator?.remove();
+    this.thumbDragIndicator = null;
+    this.thumbDragItem?.classList.remove("mb-thumb-dragging");
+    this.thumbDragItem = null;
+    this.thumbDragActive = false;
+    this.thumbDragPointerId = -1;
+    this.thumbDragFromIndex = -1;
+    this.thumbDragTargetIndex = -1;
+    this.thumbDragInsertPos = -1;
+    this.thumbDragBefore = false;
+    this.thumbPressDown = false;
+    this.thumbPressItem = null;
+    this.disarmThumbTouchGuard();
+  }
+
+  /**
+   * 装一个 document 级非-passive touchmove 监听：仅在拖拽态吞掉默认滚动，
+   * 让浏览器不把这次移动判成侧栏滚动（否则 pointcancel 掐掉拖拽）。
+   */
+  private armThumbTouchGuard(): void {
+    if (this.thumbTouchGuardAbort) return;
+    const ac = new AbortController();
+    this.thumbTouchGuardAbort = ac;
+    document.addEventListener(
+      "touchmove",
+      (e: TouchEvent) => {
+        if (this.thumbDragActive) e.preventDefault();
+      },
+      { passive: false, signal: ac.signal }
+    );
+  }
+
+  private disarmThumbTouchGuard(): void {
+    this.thumbTouchGuardAbort?.abort();
+    this.thumbTouchGuardAbort = null;
   }
 
   private createAddThumb(): HTMLElement {
@@ -3319,6 +4023,8 @@ export class InkbookView extends FileView {
    * 不直接同步跑：一次滚动会连发几十个 scroll，按帧合并后最多每跨一行更新一次。
    */
   private schedulePageWindowUpdate(): void {
+    // 拖拽中：冻结窗口更新（见 buildPageWindow 守卫），也不排下一帧
+    if (this.thumbDragActive) return;
     if (this.pageListRaf) return;
     const run = () => {
       this.pageListRaf = 0;
@@ -3363,6 +4069,14 @@ export class InkbookView extends FileView {
   private refreshThumbs(): void {
     if (!this.editor || !this.store) return;
     this.renderStats();
+    /*
+     * 目录区跟着刷。
+     *
+     * 放在 `thumbVisible()` 早退**之前**：侧栏收起时目录 DOM 还在
+     * （只是看不见），内容也得是最新的——否则收起状态下加了目录、
+     * 再展开时看到的还是旧的。
+     */
+    this.renderOutlines();
     /*
      * 侧栏收起 / 仅阅读：页列表和缩略图都看不见，什么活都不用干。
      * 这条也覆盖了「写字时 markDirty → thumbDebounce → refreshThumbs」——
@@ -3471,6 +4185,11 @@ export class InkbookView extends FileView {
     this.renderDynamicTools();
 
     if (this.layerSig !== this.layerSignature()) this.renderLayers();
+    /*
+     * 目录区：只在内容真的变了才重建（store.outlineRev）。
+     * 落笔时 updateUI 会跑几十次，目录不变 → 一次 DOM 都不动。
+     */
+    this.renderOutlines();
     // 侧栏收起时不建页列表（首次展开由 applySideVisibility → refreshThumbs 补建）
     if (
       this.thumbVisible() &&

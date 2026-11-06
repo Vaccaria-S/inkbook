@@ -241,6 +241,113 @@ export class PromptModal extends Modal {
   }
 }
 
+/* ------------------------------- 目录弹窗 ------------------------------- */
+
+/**
+ * 目录条目的编辑器：名字 + 指向的页。
+ *
+ * 为什么不用 PromptModal：PromptModal 只有一行文本输入，
+ * 而目录需要**两个字段**——名字和页码。页码用数字输入框（1 起给人看，
+ * 提交时 -1 变回 0 起下标）。
+ *
+ * 新增和编辑共用这一个弹窗：`title` 传空串就是「新增」，
+ * 传现有名字就是「编辑」（弹窗标题会跟着变）。
+ *
+ * @param total 本子总页数
+ * @param current 当前页（0 起下标），只用来在提示里说「当前在第几页」
+ * @param title 初始名字（空 = 新增）
+ * @param page 初始页码（0 起下标）
+ */
+export class OutlineModal extends Modal {
+  private total: number;
+  private current: number;
+  private title: string;
+  private page: number;
+  private onSubmit: (title: string, page: number) => void;
+
+  constructor(
+    app: App,
+    total: number,
+    current: number,
+    title: string,
+    page: number,
+    onSubmit: (title: string, page: number) => void
+  ) {
+    super(app);
+    this.total = Math.max(1, total);
+    this.current = current;
+    this.title = title;
+    this.page = page;
+    this.onSubmit = onSubmit;
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    const editing = !!this.title;
+    contentEl.addClass("mb-new-modal");
+    contentEl.createEl("h3", { text: editing ? "编辑目录" : "添加目录" });
+
+    const nameInput = contentEl.createEl("input", {
+      cls: "mb-prompt-input",
+      attr: { type: "text", value: this.title, placeholder: "例如：第三章 三角函数" },
+    });
+
+    const pageInput = contentEl.createEl("input", {
+      cls: "mb-prompt-input",
+      attr: {
+        type: "number",
+        min: "1",
+        max: String(this.total),
+        value: String(Math.max(1, Math.min(this.total, this.page + 1))),
+      },
+    });
+    const hint = contentEl.createDiv({
+      cls: "mb-jump-hint",
+      text: `页码（1 – ${this.total}，当前在第 ${this.current + 1} 页）`,
+    });
+
+    const actions = contentEl.createDiv("mb-new-actions");
+    const cancel = actions.createEl("button", { text: "取消" });
+    cancel.onclick = () => this.close();
+    const ok = actions.createEl("button", { cls: "mod-cta", text: "确定" });
+    const submit = () => {
+      const name = nameInput.value.trim();
+      if (!name) {
+        hint.setText("名字不能为空");
+        return;
+      }
+      const n = Math.trunc(Number(pageInput.value));
+      if (!Number.isFinite(n) || n < 1 || n > this.total) {
+        hint.setText(`页码要在 1 到 ${this.total} 之间`);
+        return;
+      }
+      this.close();
+      this.onSubmit(name, n - 1);
+    };
+    ok.onclick = submit;
+    nameInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        submit();
+      }
+    });
+    pageInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        submit();
+      }
+    });
+    setTimeout(() => {
+      nameInput.focus();
+      nameInput.select();
+    }, 30);
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
 /* ------------------------------- 导入弹窗 ------------------------------- */
 
 /**

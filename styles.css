@@ -1169,6 +1169,34 @@
   font-size: 12.5px;
 }
 
+/* 自定义字号入口：色点行最左的紧凑数字输入框（宽 42px，平板 30px 高当点区） */
+.mb-text-tools .mb-size-in {
+  box-sizing: border-box;
+  flex: 0 0 auto;
+  align-self: center;
+  width: 42px;
+  height: 20px;
+  padding: 0 4px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.mb-root.is-tablet .mb-text-tools .mb-size-in {
+  height: 30px;
+  font-size: 12px;
+}
+
+/* 当前值不是四档之一（自定义值，如 21）时给入口一个强调描边 */
+.mb-text-tools .mb-size-in.is-custom {
+  border-color: var(--interactive-accent, #6c5ce7);
+  color: var(--interactive-accent, #6c5ce7);
+}
+
 /* 平板：属性条得用手指点得准，按钮放大到 30px */
 .mb-tablet .mb-textbar {
   gap: 7px;
@@ -1257,6 +1285,36 @@
 .mb-tablet .mb-texteditbar .mb-tb-dot {
   width: 24px;
   height: 24px;
+}
+
+/* 新建样式条上的自定义字号输入：≤44px 宽、与按钮同高，单行不折
+ * （点按钮组是一档一档的，这个框让任意字号能直接打进去） */
+.mb-texteditbar .mb-tb-sizein {
+  box-sizing: border-box;
+  flex: 0 0 auto;
+  align-self: center;
+  width: 36px;
+  height: 26px;
+  padding: 0 2px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 5px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.mb-tablet .mb-texteditbar .mb-tb-sizein {
+  width: 38px;
+  height: 30px;
+  font-size: 12px;
+}
+
+/* 当前值不是四档之一（自定义值）时给入口一个强调描边 */
+.mb-texteditbar .mb-tb-sizein.is-custom {
+  border-color: var(--interactive-accent, #6c5ce7);
+  color: var(--interactive-accent, #6c5ce7);
 }
 
 .mb-canvas,
@@ -1798,6 +1856,127 @@
   margin-top: 8px;
 }
 
+/* -------------------------------- 目录 -------------------------------- */
+
+/*
+ * 侧栏「目录」区。
+ *
+ * 目录放在页面区**上方**：它是用户自己写的路标，翻本子时第一眼看的就是它；
+ * 缩略图区有几百上千格，放上面会把路标挤到屏幕外。
+ *
+ * 目录区是**独立滚动容器**（.mb-outlines 自己滚，最多 220px 高）：
+ * 条目多了只滚动这一块，侧栏整体不会被目录撑得很长，
+ * 页列表仍然在下面老位置。
+ */
+.mb-sec-outline {
+  margin-bottom: 12px;
+}
+
+.mb-outlines {
+  margin-top: 7px;
+  max-height: 220px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* 目录区自己滚，滚到边上不该带动整个侧栏 */
+  overscroll-behavior: contain;
+}
+
+.mb-outline-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/*
+ * 窗口化目录的上下占位：高度由 JS 按「未建条数 × 行高」写死，
+ * 撑住滚动条长度（跟 .mb-thumb-pad 一个路子）。
+ */
+.mb-outline-pad {
+  flex: 0 0 auto;
+  pointer-events: none;
+}
+
+.mb-outline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 3px 4px 3px 7px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.mb-outline:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+/* 名字：省略号截断（目录名可以很长） */
+.mb-outline-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 页码：固定宽度，数字对齐 */
+.mb-outline-page {
+  flex: 0 0 auto;
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+}
+
+/* 指向的页已经没了（页被删过）——标出来，别让用户以为点错了 */
+.mb-outline-page.is-stale {
+  color: var(--text-error, #d64545);
+}
+
+.mb-outline-act {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  opacity: 0;
+}
+
+.mb-outline:hover .mb-outline-act,
+.mb-outline:focus-within .mb-outline-act {
+  opacity: 1;
+}
+
+.mb-outline-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  min-width: 18px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.mb-outline-btn:hover {
+  color: var(--text-normal);
+}
+
+.mb-outline-btn .mb-ic {
+  width: 12px;
+  height: 12px;
+}
+
+/* 平板上鼠标没有 hover，按钮必须常驻 */
+.mb-root.is-tablet .mb-outline-act {
+  opacity: 1;
+}
+
 /*
  * 窗口化页列表的上下占位：高度由 JS 按「未建行数 × 行高」写死。
  * 横跨整行（grid 只把它当一行），从而把已建条目推到正确的滚动位置。
@@ -1913,6 +2092,40 @@
 .mb-root.is-tablet .mb-thumb-menu-btn {
   padding: 3px 0;
   font-size: 12px;
+}
+
+/*
+ * 长按拖拽重排：拖拽影像 + 落点指示线 + 被拖条目的虚化态。
+ * 三类都独立命名，不碰菜单 / 缩略图既有样式。
+ */
+.mb-thumb.mb-thumb-dragging {
+  opacity: 0.3;
+  pointer-events: none; /* 被拖时不吃事件，避免和落点检测抢手势 */
+}
+.mb-thumb-ghost {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 9000;
+  pointer-events: none;
+  opacity: 0.65;
+  border: 1px solid var(--interactive-accent);
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  transform-origin: 0 0;
+}
+.mb-thumb-drop-line {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 9001;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--interactive-accent);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.6);
+  pointer-events: none;
+  transform-origin: 0 0;
 }
 
 .mb-thumb:hover .mb-thumb-act {

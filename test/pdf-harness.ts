@@ -7,9 +7,21 @@
  *   - 按需渲染能真的画出像素（不是空图）
  *   - 渲染有缓存，重复翻页不重复光栅化
  *   - 位图缓存按预算淘汰
+ *   - 目标宽度地板（本轮）：缩小时位图仍按地板超采样——见「目标宽度地板」段的纯函数断言
  */
-import { extractPdfText, fitBackground, openPdf, renderPdfPage, initPdfjs, pdfPageSize } from "../src/pdf";
+import {
+  extractPdfText,
+  fitBackground,
+  initPdfjs,
+  openPdf,
+  pdfTargetWidthPx,
+  pdfPageSize,
+  PDF_FLOOR_PPU,
+  PDF_MAX_TARGET_PX,
+  renderPdfPage,
+} from "../src/pdf";
 import { BitmapCache } from "../src/cache";
+import { MAX_CANVAS_PIXELS } from "../src/editor";
 
 const lines: string[] = [];
 const out = document.getElementById("out")!;
@@ -209,6 +221,81 @@ async function main() {
       );
       r.bitmap.close();
     }
+  }
+
+  /* -------------------- 目标宽度地板：缩小时位图也必须超采样 -------------------- */
+  {
+    /*
+      「缩小就糊」的回归闸门：位图是手上唯一的那份图——缩小时目标宽度
+      不能跟着 zoom 一起降，否则 pdf.js 被迫在亚像素倍率上光栅化中文，
+      糊下去回不来。这里直接调纯函数 pdfTargetWidthPx（不碰编辑器状态）；
+      bgWidth 取真实 PDF 经 fitBackground 后的实际底图宽度（≈794，不写死）。
+    */
+    const size = await pdfPageSize(doc, 1);
+    const bgW = fitBackground(size.width, size.height, 0).width;
+
+    // 平板 Retina：zoom=1 → 2.0 设备px/单位；缩小到 0.5 → 1.0
+    const wZoom1 = pdfTargetWidthPx(bgW, 2.0);
+    const wShrink = pdfTargetWidthPx(bgW, 1.0);
+    // 桌面 dpr=1：zoom=0.5 → 0.5 设备px/单位（糊必须同样被地板挡住）
+    const wDesktop = pdfTargetWidthPx(bgW, 0.5);
+
+    pass(
+      wShrink >= wZoom1,
+      "缩小(1.0 设备px/单位)目标宽 " + wShrink + " ≥ zoom=1 的 " + wZoom1 + "（不再跟着 zoom 降）"
+    );
+    pass(
+      wShrink === wDesktop,
+      "1.0 与 0.5 设备px/单位得同一宽度 " + wShrink + "（地板与 dpr/zoom 解耦，不退化成 794）"
+    );
+    pass(
+      wShrink / bgW >= PDF_FLOOR_PPU - 0.01, // ± 取整容差
+      "地板 = " + (wShrink / bgW).toFixed(2) + " 设备px/页面单位 ≥ PDF_FLOOR_PPU(" + PDF_FLOOR_PPU + ")"
+    );
+    const pxPerPt = wShrink / size.width; // 真实 pt 宽由 pdfPageSize 给，不写死 595.28
+    pass(
+      pxPerPt >= 2.6,
+      "地板换算 = " + pxPerPt.toFixed(2) + " 设备px/pt ≥ 2.6（中文笔画在此倍率不粘连）"
+    );
+
+    // 封顶：devicePxPerUnit 再大，宽度钉在 PDF_MAX_TARGET_PX
+    let capW = 0;
+    for (const ppu of [10, 100, 1e5, 1e9]) capW = Math.max(capW, pdfTargetWidthPx(bgW, ppu));
+    pass(
+      capW === PDF_MAX_TARGET_PX,
+      "封顶生效：极大 devicePxPerUnit → 恒为 " + capW + " ≤ PDF_MAX_TARGET_PX(" + PDF_MAX_TARGET_PX + ")"
+    );
+
+    // 真的渲染一张地板位图，按实际像素数核对 16M 红线
+    const floorW = pdfTargetWidthPx(bgW, 0.5); // 0.5 < 地板 → 必然落到地板
+    const floor = await renderPdfPage(doc, 1, floorW);
+    const px = floor.bitmap.width * floor.bitmap.height;
+    pass(
+      Math.abs(floor.bitmap.width - floorW) <= 1,
+      "地板位图按 pdfTargetWidthPx 渲染：" + floor.bitmap.width + "×" + floor.bitmap.height + "（期望宽 " + floorW + "）"
+    );
+    pass(
+      px <= MAX_CANVAS_PIXELS,
+      "地板位图像素 " + px + "（" + ((px * 4) / 1048576).toFixed(1) + "MiB）≤ MAX_CANVAS_PIXELS(" + MAX_CANVAS_PIXELS + ")"
+    );
+    floor.bitmap.close();
+
+    // 单调性：sweep 不出现回落——缩放过程中目标宽度不会反复升降
+    let prev = -1;
+    let mono = true;
+    let wMin = Infinity;
+    let wMax = -1;
+    for (let i = 0; i <= 53; i += 1) {
+      const w = pdfTargetWidthPx(bgW, 0.3 + 0.1 * i); // 0.3 → 5.6
+      if (w < prev) mono = false;
+      prev = w;
+      wMin = Math.min(wMin, w);
+      wMax = Math.max(wMax, w);
+    }
+    pass(
+      mono,
+      "0.3→5.6 设备px/单位扫描单调不减（" + wMin + "–" + wMax + "px）"
+    );
   }
 
   /* -------------------- 位图缓存确实省事 -------------------- */

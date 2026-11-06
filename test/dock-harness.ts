@@ -738,6 +738,288 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
     );
   }
 
+  /* ============ 2.7 缩略图长按拖拽重排 ============ */
+  /*
+   * 用户原话：「侧边栏里页面这一栏就是缩略图，我想要长按具体的页面（比如第一页），
+   * 就可以把它拖动到任何地方。比如把第一页拖到第二页后面，那么第二页变成第一页、
+   * 第一页变成第二页。」
+   *
+   * 这条路径要走**真的 pointer 事件**（不是直接调 store.movePage）：
+   *   按下 → 等 450ms 让菜单弹出 → 移动超 8px 承接成拖拽 →
+   *   移到目标条目的下半 → 抬手。
+   *
+   * 这里同时验三件容易互相打架的事：
+   *   1. 拖完页序真的换了（且换到用户说的位置）；
+   *   2. 拖拽的中间态不把侧栏窗口化搞崩（被拖条目不能被重建掉）；
+   *   3. 拖完 / 取消之后不留幽灵（ghost、指示线、is-dragging、document 监听）。
+   */
+  {
+    const listEl = sideEl.querySelector(".mb-pages") as HTMLElement;
+    const sideBody = sideEl.querySelector(".mb-side-body") as HTMLElement;
+    /*
+     * 先把页列表滚进侧栏可视区（否则条目在视口外，拖拽时的边缘自动滚动
+     * 会把布局滚走，落点坐标全乱）。滚到顶 + 20px，留足上下空间。
+     */
+    {
+      const br = sideBody.getBoundingClientRect();
+      const lr = listEl.getBoundingClientRect();
+      sideBody.scrollTop += lr.top - br.top - 20;
+      sideBody.dispatchEvent(new Event("scroll"));
+      await sleep(250);
+    }
+    const thumbAt = (i: number) =>
+      listEl.querySelector(`.mb-thumb[data-page="${i}"]`) as HTMLElement | null;
+    /** 当前页序（页 id 顺序），比下标更能说明「哪一页跑到哪了」 */
+    const order = () => view.store!.data.pages.map((p: any) => p.id);
+    /** 侧栏条目渲染出来的页序 */
+    const domOrder = () =>
+      [...listEl.querySelectorAll(".mb-thumb:not(.mb-thumb-add)")].map(
+        (el: any) => el.dataset.pageId
+      );
+
+    /**
+     * 真 pointer 事件：按下 → 等待 → 移动若干点 → 抬手。
+     *
+     * 事件派发到**目标元素**上（bubbles:true 会一路冒到 document，
+     * document 级的长按监听因此收得到）。
+     */
+    const pe = (
+      target: HTMLElement,
+      type: string,
+      x: number,
+      y: number,
+      id = 91
+    ) =>
+      target.dispatchEvent(
+        new PointerEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          button: 0,
+          buttons: type === "pointerup" ? 0 : 1,
+          pointerId: id,
+          pointerType: "touch",
+          isPrimary: true,
+          clientX: Math.round(x),
+          clientY: Math.round(y),
+        })
+      );
+
+    const before = order();
+    const beforeDom = domOrder();
+    pass(
+      before.length === 3 && beforeDom.join(",") === before.join(","),
+      "2.7 前置：3 页且侧栏条目与 store 顺序一致"
+    );
+
+    /* ---- ① 长按 → 移动 → 拖到第 2 页下半 → 抬手 ---- */
+    const src = thumbAt(0)!;
+    const dst = thumbAt(1)!;
+    const srcR = src.getBoundingClientRect();
+    const dstR = dst.getBoundingClientRect();
+    const grabX = srcR.left + srcR.width / 2;
+    const grabY = srcR.top + srcR.height / 2;
+
+    pe(src, "pointerdown", grabX, grabY);
+    // 等 450ms：菜单弹出（长按态确立）
+    await sleep(600);
+    const menuOpen = !!thumbAt(0)?.querySelector(".mb-thumb-menu");
+    pass(menuOpen, "2.7 长按第 1 页 450ms 后弹出「上移/下移」菜单（菜单保留）");
+
+    // 移动超 8px → 承接成拖拽
+    pe(src, "pointermove", grabX + 20, grabY);
+    await sleep(60);
+    const dragging = (view as any).thumbDragActive === true;
+    pass(dragging, "2.7 菜单开着时移动超 8px 承接成拖拽（thumbDragActive）");
+    pass(
+      !!document.querySelector(".mb-thumb-ghost"),
+      "2.7 拖拽中生成拖拽影像 .mb-thumb-ghost"
+    );
+    pass(
+      !!document.querySelector(".mb-thumb-drop-line"),
+      "2.7 拖拽中生成落点指示线 .mb-thumb-drop-line"
+    );
+    pass(
+      src.classList.contains("mb-thumb-dragging"),
+      "2.7 被拖条目带 is-dragging 虚化态"
+    );
+
+    /*
+     * 窗口化共存：拖拽期间侧栏滚动 / 重算窗口**不能**把被拖条目换掉。
+     * 这里直接比对对象身份——换了节点，拖拽态就断了。
+     */
+    const stillSameNode = thumbAt(0) === src;
+    pass(
+      stillSameNode,
+      "2.7 拖拽期间被拖条目没有被窗口重建换掉（同一 DOM 节点）"
+    );
+
+    // 移到第 2 页的**下半**（下半 = 插到它后面）
+    const dstX = dstR.left + dstR.width / 2;
+    const dstY = dstR.bottom - 3;
+    pe(src, "pointermove", dstX, dstY);
+    await sleep(60);
+    const insertPos = (view as any).thumbDragInsertPos as number;
+    pass(
+      insertPos === 1,
+      "2.7 落在第 2 页下半 → 换算出的最终下标是 1（" + insertPos + "）"
+    );
+
+    // 抬手 → 落库
+    pe(src, "pointerup", dstX, dstY);
+    await sleep(300);
+
+    const after = order();
+    pass(
+      after[0] === before[1] && after[1] === before[0] && after[2] === before[2],
+      "2.7 第 1 页拖到第 2 页后面 → 顺序变成 [原2, 原1, 原3]（实际 " +
+        after.map((id: string) => before.indexOf(id)).join(",") +
+        "）"
+    );
+    const afterDom = domOrder();
+    pass(
+      afterDom.join(",") === after.join(","),
+      "2.7 拖完侧栏条目跟着换序（" +
+        afterDom.map((id: string) => before.indexOf(id)).join(",") +
+        "）"
+    );
+
+    /* ---- ② 幽灵状态必须收干净 ---- */
+    pass(
+      !document.querySelector(".mb-thumb-ghost"),
+      "2.7 松手后拖拽影像已移除"
+    );
+    pass(
+      !document.querySelector(".mb-thumb-drop-line"),
+      "2.7 松手后落点指示线已移除"
+    );
+    pass(
+      !document.querySelector(".mb-thumb-dragging"),
+      "2.7 松手后 is-dragging 虚化态已摘掉"
+    );
+    pass(
+      (view as any).thumbDragActive === false &&
+        (view as any).thumbDragInsertPos === -1 &&
+        (view as any).thumbDragItem === null,
+      "2.7 松手后拖拽内部状态复位（active/insertPos/item）"
+    );
+    pass(
+      (view as any).thumbDragDocAbort === null &&
+        (view as any).thumbPressMoveAbort === null &&
+        (view as any).thumbTouchGuardAbort === null,
+      "2.7 松手后 document 监听与 touch guard 全部解除"
+    );
+
+    /* ---- ③ 撤销后顺序换回来 ---- */
+    view.editor.undo();
+    await sleep(300);
+    const undone = order();
+    pass(
+      undone.join(",") === before.join(","),
+      "2.7 撤销后页序换回来（" +
+        undone.map((id: string) => before.indexOf(id)).join(",") +
+        "）"
+    );
+
+    /* ---- ④ 纯点击缩略图仍然能翻页（拖拽守卫没误伤） ---- */
+    const curBefore = view.editor.getState().pageIndex;
+    const clickTarget = thumbAt(2);
+    if (clickTarget) {
+      const cr = clickTarget.getBoundingClientRect();
+      const cxp = cr.left + cr.width / 2;
+      const cyp = cr.top + cr.height / 2;
+      // 纯点击：按下即抬手，不等 450ms，也不移动
+      pe(clickTarget, "pointerdown", cxp, cyp, 92);
+      await sleep(40);
+      pe(clickTarget, "pointerup", cxp, cyp, 92);
+      await sleep(80);
+      // click 由浏览器在 pointerup 后合成；脚本里手动补一个
+      (clickTarget as any).click();
+      await sleep(400);
+    }
+    pass(
+      view.editor.getState().pageIndex === 2,
+      "2.7 纯点击缩略图仍然翻到那一页（" +
+        curBefore +
+        " → " +
+        view.editor.getState().pageIndex +
+        "，期望 2）"
+    );
+
+    /* ---- ⑤ 长按期间（未到 450ms）移动超 8px → 当滚动，不重排 ---- */
+    const orderBeforeScroll = order();
+    const pageBeforeScroll = view.editor.getState().pageIndex;
+    const s5 = thumbAt(0)!;
+    const s5r = s5.getBoundingClientRect();
+    const sx = s5r.left + s5r.width / 2;
+    const sy = s5r.top + s5r.height / 2;
+    pe(s5, "pointerdown", sx, sy, 93);
+    // 还没到 450ms 就移动超 8px → 视作滚动
+    await sleep(60);
+    pe(s5, "pointermove", sx + 30, sy + 30, 93);
+    await sleep(500);
+    pass(
+      !thumbAt(0)?.querySelector(".mb-thumb-menu"),
+      "2.7 长按未满 450ms 就移动 >8px → 不弹菜单（当滚动处理）"
+    );
+    pass(
+      (view as any).thumbDragActive === false,
+      "2.7 长按未满 450ms 就移动 >8px → 不进拖拽"
+    );
+    pe(s5, "pointerup", sx + 30, sy + 30, 93);
+    await sleep(150);
+    pass(
+      order().join(",") === orderBeforeScroll.join(",") &&
+        view.editor.getState().pageIndex === pageBeforeScroll,
+      "2.7 长按期间移动（滚动）不触发任何重排"
+    );
+
+    /* ---- ⑥ 拖拽中取消（pointercancel）也必须收干净 ---- */
+    const c1 = thumbAt(0)!;
+    const c2 = thumbAt(1)!;
+    const c1r = c1.getBoundingClientRect();
+    const c2r = c2.getBoundingClientRect();
+    const cx = c1r.left + c1r.width / 2;
+    const cy = c1r.top + c1r.height / 2;
+    pe(c1, "pointerdown", cx, cy, 94);
+    await sleep(600);
+    pe(c1, "pointermove", cx + 20, cy, 94);
+    await sleep(60);
+    const inDrag = (view as any).thumbDragActive === true;
+    pe(c1, "pointercancel", c2r.left + c2r.width / 2, c2r.bottom - 3, 94);
+    await sleep(150);
+    pass(
+      inDrag && (view as any).thumbDragActive === false,
+      "2.7 拖拽被 pointercancel 掐掉后状态复位"
+    );
+    pass(
+      !document.querySelector(".mb-thumb-ghost") &&
+        !document.querySelector(".mb-thumb-drop-line") &&
+        !document.querySelector(".mb-thumb-dragging"),
+      "2.7 取消后不留 ghost / 指示线 / 虚化态"
+    );
+    pass(
+      order().join(",") === orderBeforeScroll.join(","),
+      "2.7 取消拖拽不改变页序"
+    );
+
+    /*
+     * 收尾：把本段留下的历史痕迹清干净。
+     *
+     * 上面 ③ 用过一次 undo()，那会把重做栈填上（undo → redoStack 有东西）。
+     * 后面第 4 段断言「还没有可撤销/可重做的内容时，两键都置灰」，
+     * 前提是**两个栈都空**——不清理的话那条会假失败（不是产品坏了，
+     * 是上一段测试留下的状态）。
+     *
+     * 直接把两个栈掏空最干净，也不依赖栈里恰好有几条。
+     */
+    const st = view.store as any;
+    if (st?.undoStack) st.undoStack.length = 0;
+    if (st?.redoStack) st.redoStack.length = 0;
+    if (st?.pendingBefore) st.pendingBefore = null;
+    view.editor.emitState?.();
+    await sleep(120);
+  }
+
   /* ============ 3. 图标真的看得见 ============ */
   /*
    * 用户反馈："每一个框里面也都还是看不到图标"。

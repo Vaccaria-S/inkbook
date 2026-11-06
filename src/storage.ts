@@ -312,6 +312,33 @@ export function normalizeBook(raw: any, fallbackTitle: string): InkBook {
       book.integrity = { pageCount, strokeCount };
     }
   }
+  /*
+   * 目录（不升版本，与 Page.texts 同批做法）：
+   *   · 老文件没有 outlines 字段 → 不写回 → undefined，UI 按空目录处理；
+   *   · 逐条白名单：id 存在、title 是非空字符串、page 是有限非负整数，
+   *     一条不满足就整条丢弃（脏数据不留在内存，也就不会被保存回去）；
+   *   · 过滤完为空时不写回——空目录 = 没这个字段，省体积、语义一致。
+   */
+  const outlines = Array.isArray(raw?.outlines)
+    ? raw.outlines
+        .filter(
+          (o: any) =>
+            o &&
+            typeof o === "object" &&
+            typeof o.id === "string" &&
+            o.id.length > 0 &&
+            typeof o.title === "string" &&
+            o.title.trim().length > 0 &&
+            Number.isInteger(Number(o.page)) &&
+            Number(o.page) >= 0
+        )
+        .map((o: any) => ({
+          id: String(o.id),
+          title: String(o.title),
+          page: Number(o.page),
+        }))
+    : undefined;
+  if (outlines !== undefined && outlines.length > 0) book.outlines = outlines;
   return book;
 }
 

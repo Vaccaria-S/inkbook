@@ -92,6 +92,45 @@ export interface RenderedPage {
 }
 
 /**
+ * 目标位图里「每 1 个页面单位」至少要有多少设备像素。
+ *
+ * 这是个**地板**，不是推荐值——见 pdfTargetWidthPx 的说明。
+ *
+ * 取 2.0 的依据：PDF 原生单位是 point（A4 = 595.28pt 宽），铺到 794 单位宽
+ * 的页面坐标系里乘了 1.3338 的换算系数。于是
+ *   2.0 设备像素/页面单位 ≈ 2.67 设备像素/pt
+ * 中文笔画密度远高于西文，在这个倍率上光栅化，笔画不会粘连成一团。
+ */
+export const PDF_FLOOR_PPU = 2.0;
+
+/** PDF 底图位图宽度上限（设备像素）——再大就是拿内存换肉眼看不见的清晰度 */
+export const PDF_MAX_TARGET_PX = 4096;
+
+/**
+ * 算 PDF 底图的目标位图宽度（设备像素）。
+ *
+ * 纯函数：只吃「底图在页面坐标系里多宽」和「现在每页面单位多少设备像素」，
+ * 不碰编辑器状态——测试可以直接跑它。
+ *
+ *   target = bgWidth × max(zoom × dpr, PDF_FLOOR_PPU)   （封顶 PDF_MAX_TARGET_PX）
+ *
+ * 为什么必须有那个 max：按 `zoom × dpr` 直接光栅化，缩小到 0.5 倍只剩
+ * 1.33 设备像素/pt、0.35 倍只剩 0.47——pdf.js 被迫在亚像素倍率上画字，
+ * 字形直接糊掉；而那张低清位图就是我们手上唯一的图，糊被原样显示出来
+ * （真机反馈：「缩小时字很糊，放大还能好一点」）。地板保证位图**永远超采样**，
+ * 缩小由画布 drawImage 高质量降采样得到平滑结果（imageSmoothingEnabled 默认开）。
+ *
+ * 地板量纲选「设备像素 / 页面单位」而不是「设备像素 / CSS 像素 × dpr」：
+ * 后者在 dpr=1 的桌面端会退化成一个跟 dpr 无关的固定像素数——而桌面端的
+ * 糊是一样的，必须同样被地板挡住。
+ */
+export function pdfTargetWidthPx(bgWidth: number, devicePxPerUnit: number): number {
+  const ppu = Math.max(devicePxPerUnit || 0, PDF_FLOOR_PPU);
+  const w = Math.max(bgWidth || 0, 1);
+  return Math.min(Math.round(w * ppu), PDF_MAX_TARGET_PX);
+}
+
+/**
  * 把 PDF 的第 pageNo 页（1 起）渲染成位图。
  *
  * @param targetWidthPx 目标位图宽度（**设备像素**）。

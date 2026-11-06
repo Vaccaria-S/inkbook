@@ -4,6 +4,7 @@ import {
   createPage,
   type InkBook,
   type Layer,
+  type Outline,
   type Page,
   type PaperId,
   type Stroke,
@@ -34,8 +35,14 @@ import {
 export type HistoryEntry =
   /** 整页快照（结构性改动） */
   | { kind: "page"; pageId: string; pageIndex: number; data: string }
-  /** 整本快照 */
-  | { kind: "book"; data: string }
+  /**
+   * 整本快照。
+   *
+   * 顺带带上 `outlines`：加页/删页会挪动目录里的页码，
+   * 撤销这一步时要把目录一起还原，否则「撤销删页」之后目录指错了页。
+   * 目录只有几十字节，附带的代价可以忽略。
+   */
+  | { kind: "book"; data: string; outlines?: Outline[] }
   /**
    * 增量：把某层**整个变成**这些笔迹。
    *
@@ -62,8 +69,24 @@ export type HistoryEntry =
    *
    * apply 时把 data.pages 按 order 重排；order 里没出现的页（理论上不会
    * 有，防御性兜底）保持原有相对顺序补在末尾。
+   *
+   * 顺带带上 `outlines`：换序会让目录里的页下标失效（目录存的是下标），
+   * 不带着一起还原的话，撤销换序之后目录会指着别的页。
    */
-  | { kind: "order"; order: string[] };
+  | { kind: "order"; order: string[]; outlines?: Outline[] }
+  /**
+   * 本子目录（用户自己加的条目：名字 + 指向的页）。
+   *
+   * **单独一种条目**，不套用整本快照：
+   *   · 整本快照是几十 MB 的 pages（857 页的本子），加一条目录就拷一遍
+   *     整本书，代价完全不成比例；
+   *   · 目录项本身只有几十字节（id + 名字 + 一个页下标），
+   *     整份拷一份进历史条目既便宜又简单。
+   *
+   * `outlines` 为 undefined 表示「原来没有目录」——还原时要把这个字段
+   * 整个去掉，而不是留一个空数组（空数组会被写回文件，多一个字段）。
+   */
+  | { kind: "outline"; outlines?: Outline[] };
 
 /** 撤销栈最多保留多少条 */
 const MAX_HISTORY = 60;
@@ -78,6 +101,14 @@ export class BookStore {
    * 只比 pageCount 会漏掉重排，导致主视图第 3 页还显示第 1 页的内容。
    */
   pageOrderRev = 0;
+  /**
+   * 目录版本号：目录内容真的变了就 +1。
+   *
+   * 侧栏靠它决定「要不要重建目录 DOM」。只比目录条数不够——
+   * 改名、挪位置条数不变但内容变了；删一条和加一条条数相同但内容不同。
+   * 版本号让 UI 一次比较就知道要不要重建，代价是 O(1)。
+   */
+  outlineRev = 0;
   /** 撤销栈：每项是一次操作的前后状态 */
   private undoStack: Array<{ before: HistoryEntry; after: HistoryEntry }> = [];
   private redoStack: Array<{ before: HistoryEntry; after: HistoryEntry }> = [];
@@ -139,10 +170,14 @@ export class BookStore {
    * 所以先记下 before，等下一次 touch() 时再补 after。
    * 这样调用方不用关心顺序：先 snapshot 再改，改完 touch 即可。
    */
-  /** 挂起快照只可能是页/整本（层与页顺序都是即改即记，不挂起） */
-  private pendingBefore: Extract<HistoryEntry, { kind: "page" } | { kind: "book" }> | null = null;
+  /** 挂起快照只可能是页/整本/目录（层与页顺序都是即改即记，不挂起） */
+  private pendingBefore:
+    | Extract<HistoryEntry, { kind: "page" } | { kind: "book" } | { kind: "outline" }>
+    | null = null;
 
-  private captureBefore(entry: Extract<HistoryEntry, { kind: "page" } | { kind: "book" }>): void {
+  private captureBefore(
+    entry: Extract<HistoryEntry, { kind: "page" } | { kind: "book" } | { kind: "outline" }>
+  ): void {
     this.pendingBefore = entry;
   }
 
@@ -161,13 +196,16 @@ export class BookStore {
           ? {
               kind: "book",
               data: JSON.stringify({ pages: this.data.pages, activePage: this.data.activePage }),
+              outlines: this.outlineSnapshot(),
             }
-          : {
-              kind: "page",
-              pageId: before.pageId,
-              pageIndex: before.pageIndex,
-              data: JSON.stringify(this.data.pages[this.pageIndexOf(before)]),
-            };
+          : before.kind === "outline"
+            ? { kind: "outline", outlines: this.outlineSnapshot() }
+            : {
+                kind: "page",
+                pageId: before.pageId,
+                pageIndex: before.pageIndex,
+                data: JSON.stringify(this.data.pages[this.pageIndexOf(before)]),
+              };
       this.pushHistory(before, after);
     } finally {
       this.settling = false;
@@ -192,6 +230,8 @@ export class BookStore {
     this.captureBefore({
       kind: "book",
       data: JSON.stringify({ pages: this.data.pages, activePage: this.data.activePage }),
+      // 带上目录：加页/删页会挪目录里的页码，撤销这一步要一起还原
+      outlines: this.outlineSnapshot(),
     });
   }
 
@@ -220,9 +260,11 @@ export class BookStore {
     };
   }
 
-  /** 找出条目对应的页下标（只看有 pageId 的条目） */
+  /**
+   * 找出条目对应的页下标（只看有 pageId 的条目）
+   */
   private pageIndexOf(
-    entry: Exclude<HistoryEntry, { kind: "book" } | { kind: "order" }>
+    entry: Exclude<HistoryEntry, { kind: "book" } | { kind: "order" } | { kind: "outline" }>
   ): number {
     const found = this.data.pages.findIndex((p) => p.id === entry.pageId);
     return found >= 0 ? found : Math.min(entry.pageIndex, this.data.pages.length - 1);
@@ -260,6 +302,15 @@ export class BookStore {
       const obj = JSON.parse(entry.data) as { pages: Page[]; activePage: number };
       this.data.pages = obj.pages;
       this.data.activePage = Math.min(obj.activePage, this.data.pages.length - 1);
+      /*
+       * 目录一起还原：加页/删页会挪目录里的页码，
+       * 不还原的话「撤销删页」之后目录还指着错位的页。
+       * undefined = 当时没有目录 → 字段整个去掉。
+       */
+      this.data.outlines = entry.outlines && entry.outlines.length
+        ? entry.outlines.map((o) => ({ ...o }))
+        : undefined;
+      this.bumpOutlineRev();
       // 整本快照也可能带来不同的页顺序（页数相同的情况），一并让 DOM 重建
       this.pageOrderRev += 1;
     } else if (entry.kind === "order") {
@@ -285,7 +336,24 @@ export class BookStore {
       const at = activeId ? next.findIndex((p) => p.id === activeId) : -1;
       this.data.activePage =
         at >= 0 ? at : Math.min(this.data.activePage, Math.max(0, next.length - 1));
+      // 目录一起还原：换序会让目录里的页下标失效
+      this.data.outlines = entry.outlines && entry.outlines.length
+        ? entry.outlines.map((o) => ({ ...o }))
+        : undefined;
+      this.bumpOutlineRev();
       this.pageOrderRev += 1;
+    } else if (entry.kind === "outline") {
+      /*
+       * 目录：整份还原。
+       *   · 记录是 undefined → 原来没有目录 → 把字段整个去掉（不留空数组）；
+       *   · 记录有值 → 整份替换（拷贝一份，别让历史条目和当前数据共用数组，
+       *     否则撤销两次会把「after」也一起改掉）。
+       */
+      this.data.outlines =
+        entry.outlines && entry.outlines.length
+          ? entry.outlines.map((o) => ({ ...o }))
+          : undefined;
+      this.bumpOutlineRev();
     } else if (entry.kind === "layer") {
       // 整层替换：把该层的笔迹列表换成记录里的那些
       const at = this.pageIndexOf(entry);
@@ -334,6 +402,8 @@ export class BookStore {
     const prev = this.data.pages[after];
     const page = createPage(prev ? prev.template : "grid", prev ? prev.paper : "white");
     this.data.pages.splice(after + 1, 0, page);
+    // 后面所有页下标 +1 → 目录里指向它们的页码也要 +1（不然指错页了）
+    this.shiftOutlines(after + 1, 1);
     this.data.activePage = after + 1;
     this.touch();
     return after + 1;
@@ -345,6 +415,8 @@ export class BookStore {
     this.snapshotBook();
     const clamped = Math.max(0, Math.min(this.data.pages.length, at));
     this.data.pages.splice(clamped, 0, ...pages);
+    // 插入的页往后挪 → 目录里指向它们后面的页码要 +pages.length
+    this.shiftOutlines(clamped, pages.length);
     if (source) this.data.source = source;
     this.data.activePage = clamped;
     this.touch();
@@ -355,6 +427,8 @@ export class BookStore {
     if (this.data.pages.length <= 1) return false;
     this.snapshotBook();
     this.data.pages.splice(index, 1);
+    // 后面所有页下标 -1 → 目录跟着挪；正好指向被删页的那条夹到删掉的位置
+    this.shiftOutlines(index, -1);
     this.data.activePage = Math.min(index, this.data.pages.length - 1);
     this.touch();
     return true;
@@ -372,6 +446,8 @@ export class BookStore {
     }
     copy.activeLayerId = copy.layers[0]?.id || "";
     this.data.pages.splice(index + 1, 0, copy);
+    // 复制页插在中间 → 后面的页下标 +1，目录跟着挪
+    this.shiftOutlines(index + 1, 1);
     this.data.activePage = index + 1;
     this.touch();
     return index + 1;
@@ -391,15 +467,32 @@ export class BookStore {
     if (from < 0 || from >= n || to < 0 || to >= n || from === to) return false;
     const activeId = this.data.pages[this.data.activePage]?.id;
     const before = this.data.pages.map((p) => p.id);
+    // 目录指向的是「哪一页」——换序时跟着那一页走（见 types.ts 的 Outline 注释）：
+    // 先记下每条目录当时指的是哪个页 id，换完序再换算成新下标。
+    const outlineBefore = this.outlineSnapshot();
+    const pageIdsBefore = new Map(outlineBefore?.map((o) => [o.id, this.data.pages[o.page]?.id ?? ""]));
     const [page] = this.data.pages.splice(from, 1);
     this.data.pages.splice(to, 0, page);
     // 当前页跟着自己的 id 走：挪的不是当前页时，用户视野不跳
     const at = activeId ? this.data.pages.findIndex((p) => p.id === activeId) : -1;
     this.data.activePage = at >= 0 ? at : Math.min(this.data.activePage, n - 1);
+    // 目录换算成新下标（按页 id 找，找不到就夹住）
+    if (outlineBefore) {
+      this.data.outlines = outlineBefore.map((o) => {
+        const pid = pageIdsBefore.get(o.id) ?? "";
+        const idx = pid ? this.data.pages.findIndex((p) => p.id === pid) : -1;
+        return {
+          id: o.id,
+          title: o.title,
+          page: idx >= 0 ? idx : Math.max(0, Math.min(this.data.pages.length - 1, o.page)),
+        };
+      });
+      this.bumpOutlineRev();
+    }
     this.pageOrderRev += 1;
     this.pushHistory(
-      { kind: "order", order: before },
-      { kind: "order", order: this.data.pages.map((p) => p.id) }
+      { kind: "order", order: before, outlines: outlineBefore },
+      { kind: "order", order: this.data.pages.map((p) => p.id), outlines: this.outlineSnapshot() }
     );
     this.touch();
     return true;
@@ -472,6 +565,213 @@ export class BookStore {
     if (!page || !page.layers.some((l) => l.id === layerId)) return;
     page.activeLayerId = layerId;
     this.touch();
+  }
+
+  /* ------------------------------- 目录 ------------------------------- */
+
+  /**
+   * 目录的当前状态（进历史条目的那一份）。
+   *
+   * undefined = 本子**没有**目录（字段整个不存在）。
+   * 空数组 = 有目录但一条没有——这两种在文件里是不同的形态：
+   * 前者不写字段，后者写 `"outlines": []`。normalizeBook 的约定是
+   * 「空目录不写回字段」，所以这里保持一致：没有条目时给 undefined。
+   */
+  private outlineSnapshot(): Outline[] | undefined {
+    const list = this.data.outlines;
+    if (!list || !list.length) return undefined;
+    return list.map((o) => ({ ...o }));
+  }
+
+  /** 目录的当前列表（UI 用；没有目录时给空数组，不给 undefined） */
+  get outlines(): Outline[] {
+    return this.data.outlines ?? [];
+  }
+
+  /**
+   * 拍一份「操作前」的目录状态。
+   *
+   * 目录改动**不用** snapshotBook：整本快照是几十 MB 的 pages，
+   * 加一条目录就拷一遍整本书，代价完全不成比例。
+   * 目录项只有几十字节，整份拷进一条专用历史条目既便宜又简单。
+   */
+  snapshotOutline(): void {
+    this.captureBefore({ kind: "outline", outlines: this.outlineSnapshot() });
+  }
+
+  /**
+   * 目录内容真的变了 → 版本号 +1（UI 靠它决定重建 DOM）。
+   */
+  private bumpOutlineRev(): void {
+    this.outlineRev += 1;
+  }
+
+  /**
+   * 目录指向的页下标 → 有效下标。
+   *
+   * 页被删了 / 目录指向的页超范围时夹住（夹到最后一页 / 第一页），
+   * 不抛异常——跳到「最接近的那一页」比报错好。
+   */
+  clampOutlinePage(page: number): number {
+    const n = this.data.pages.length;
+    if (!n) return 0;
+    const p = Math.trunc(Number(page));
+    if (!Number.isFinite(p)) return 0;
+    return Math.max(0, Math.min(n - 1, p));
+  }
+
+  /**
+   * 加一条目录。
+   *
+   * @param title 名字（空 / 全空白视为无效，不加）
+   * @param page 指向的页（0 起下标；越界会夹到有效范围）
+   * @returns 新目录项的 id；无效时不加，返回 ""
+   */
+  addOutline(title: string, page: number): string {
+    const name = String(title ?? "").trim();
+    if (!name) return "";
+    const at = this.clampOutlinePage(page);
+    const id = uid("outline");
+    this.snapshotOutline();
+    const list = (this.data.outlines ?? []).slice();
+    list.push({ id, title: name, page: at });
+    this.data.outlines = list;
+    this.bumpOutlineRev();
+    this.touch();
+    return id;
+  }
+
+  /**
+   * 改目录项的名字。
+   *
+   * @returns 是否真的改了（找不到 / 名字没变 → false，不记历史）
+   */
+  renameOutline(id: string, title: string): boolean {
+    const name = String(title ?? "").trim();
+    if (!name) return false;
+    const item = this.data.outlines?.find((o) => o.id === id);
+    if (!item || item.title === name) return false;
+    this.snapshotOutline();
+    item.title = name;
+    this.bumpOutlineRev();
+    this.touch();
+    return true;
+  }
+
+  /**
+   * 改目录项指向的页。
+   *
+   * @param page 0 起下标；越界夹到有效范围
+   * @returns 是否真的改了
+   */
+  setOutlinePage(id: string, page: number): boolean {
+    const item = this.data.outlines?.find((o) => o.id === id);
+    if (!item) return false;
+    const at = this.clampOutlinePage(page);
+    if (item.page === at) return false;
+    this.snapshotOutline();
+    item.page = at;
+    this.bumpOutlineRev();
+    this.touch();
+    return true;
+  }
+
+  /**
+   * 一次改完目录项的名字和页码（编辑弹窗的提交）。
+   *
+   * 走**一条**历史，而不是改名/改页各记一条——
+   * 否则用户在弹窗里改一次（名字 + 页码），撤销要按两下才回得去，
+   * 撤销一次反而落在「名字改了、页码没改」的中间态上。
+   *
+   * @returns 是否真的改了（都没变 → false，不记历史）
+   */
+  updateOutline(id: string, title: string, page: number): boolean {
+    const name = String(title ?? "").trim();
+    const item = this.data.outlines?.find((o) => o.id === id);
+    if (!item || !name) return false;
+    const at = this.clampOutlinePage(page);
+    if (item.title === name && item.page === at) return false;
+    this.snapshotOutline();
+    item.title = name;
+    item.page = at;
+    this.bumpOutlineRev();
+    this.touch();
+    return true;
+  }
+
+  /**
+   * 删除一条目录。
+   *
+   * @returns 是否真的删了
+   */
+  removeOutline(id: string): boolean {
+    const list = this.data.outlines;
+    if (!list || !list.some((o) => o.id === id)) return false;
+    this.snapshotOutline();
+    const next = list.filter((o) => o.id !== id);
+    // 删到一条不剩 → 字段整个去掉（和 normalizeBook「空目录不写回」一致）
+    this.data.outlines = next.length ? next : undefined;
+    this.bumpOutlineRev();
+    this.touch();
+    return true;
+  }
+
+  /**
+   * 把一条目录往前/往后挪。
+   *
+   * @param delta 位移（正数往后，负数往前）
+   * @returns 是否真的挪了（越界 / 原地不动 → false，不记历史）
+   */
+  moveOutline(id: string, delta: number): boolean {
+    const list = this.data.outlines;
+    if (!list) return false;
+    const at = list.findIndex((o) => o.id === id);
+    if (at < 0) return false;
+    const to = at + Math.trunc(Number(delta) || 0);
+    if (to < 0 || to >= list.length || to === at) return false;
+    this.snapshotOutline();
+    const next = list.slice();
+    const [item] = next.splice(at, 1);
+    next.splice(to, 0, item);
+    this.data.outlines = next;
+    this.bumpOutlineRev();
+    this.touch();
+    return true;
+  }
+
+  /**
+   * 页的位置变了之后，目录里的页码跟着挪。
+   *
+   * 目录存的是**页下标**，不是页 id——页一动，下标就变（这是下标语义的
+   * 固有局限，与缩略图长按菜单一致，见 types.ts 的 Outline 注释）。
+   * 这里让目录尽量还指着同一页内容：
+   *   · 在 at 处**插入**一页：at 及其之后的页整体后移一位，
+   *     指向它们的目录也 +1；
+   *   · 删掉 at 这一页：at 之后的页整体前移一位，指向它们的目录 -1；
+   *     正好指向被删页的那条 → 指向「原来下一页」现在所在的位置
+   *     （删的是最后一页就指向前一页）。
+   *
+   * 为什么不干脆删掉那条目录：目录是用户手写的路标，删页是顺手的事，
+   * 顺手把路标也删了等于替用户做决定。夹住之后目录还在，指向的是
+   * 语义上最接近的那一页。
+   */
+  private shiftOutlines(insertAt: number, delta: number): void {
+    const list = this.data.outlines;
+    if (!list || !list.length) return;
+    const n = this.data.pages.length;
+    this.data.outlines = list.map((o) => {
+      let page = o.page;
+      if (delta > 0) {
+        // 在 insertAt 处插入：insertAt 及其之后的 +1
+        if (page >= insertAt) page += delta;
+      } else if (delta < 0) {
+        // 删掉 insertAt 这一页：insertAt 之后的 -1
+        if (page > insertAt) page += delta;
+        else if (page === insertAt) page = Math.min(insertAt, Math.max(0, n - 1));
+      }
+      return { ...o, page };
+    });
+    this.bumpOutlineRev();
   }
 
   /* ------------------------------- 笔迹 ------------------------------- */
