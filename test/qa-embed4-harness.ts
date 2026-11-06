@@ -399,14 +399,14 @@ async function main() {
   }
 
   /* ============ 1b. 连画多张大图：缓存不超预算 + 是否真淘汰 ============ */
-  group("1b. 连画大图 → 缓存 ≤32MB；dpr=1 要真淘汰，dpr>1 要能留住 ≥2 条");
+  group("1b. 连画大图 → 缓存不超预算；dpr=1 要真淘汰，dpr>1 要能留住 ≥2 条");
   {
     const file = fileOf[P_MAIN] as EmbedFile;
     invalidateEmbedCache();
     /*
      * dpr=1：5 个不同宽度 = 5 个不同的键，单张最大 21.6MB → 必须淘汰到 1 条。
      * dpr=2：宽度都会被夹到同一个 840，只能靠"不同页"造出不同的键；
-     *        单张 15.2MiB，32MB 预算正好放 2 张 → 断言"不再画完即弃"。
+     *        单张 15.2MiB，64MB 预算能放下 3 张 → 断言"不再画完即弃"。
      */
     const widths = dpr > 1 ? [2000, 2000, 2000] : [1000, 1300, 1600, 1900, 2000];
     const pagesFor = dpr > 1 ? [1, 2, 3] : [2, 2, 2, 2, 2];
@@ -422,7 +422,10 @@ async function main() {
     for (const s of steps) log("    " + s);
     const st = embedCacheStats();
     num("连画大图后", `${st.bitmaps} 条 / ${(st.bytes / MB).toFixed(1)}MB`);
-    check(st.bytes <= 32 * MB, `缓存字节受限（${(st.bytes / MB).toFixed(1)}MB ≤ 32MB）`);
+    check(
+      st.bytes <= st.limit,
+      `缓存字节受限（${(st.bytes / MB).toFixed(1)}MB ≤ ${(st.limit / MB).toFixed(0)}MB）`
+    );
     if (dpr > 1) {
       check(
         st.bitmaps >= 2,

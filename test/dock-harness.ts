@@ -22,6 +22,24 @@ function pass(ok: boolean, msg: string) {
   log((ok ? "PASS " : "FAIL ") + msg);
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/**
+ * 真计时轮询：等某个 DOM 状态出现 / 消失。
+ *
+ * 滑条淡出是 setTimeout(1300) + CSS opacity 过渡驱动的，必须用真时间等；
+ * 用假时钟会让「停手后自己淡出」永远等不到。
+ */
+async function waitUntil(
+  pred: () => boolean,
+  timeout = 3000,
+  step = 40
+): Promise<boolean> {
+  const t0 = performance.now();
+  while (performance.now() - t0 < timeout) {
+    if (pred()) return true;
+    await sleep(step);
+  }
+  return pred();
+}
 window.addEventListener("error", (e) => log("ERROR " + e.message + " @ " + e.filename + ":" + e.lineno));
 window.addEventListener("unhandledrejection", (e) => log("REJECT " + (e.reason?.stack || e.reason)));
 
@@ -235,21 +253,32 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       " ≤ 2px）"
   );
 
-  /* ============ 2.5 侧边拖动滑条 ============ */
+  /* ============ 2.5 右缘小滑块：只有滑块可拖 / 滚动才显现 ============ */
   /*
-   * 系统滚动条在平板上拖不动（只能甩），几十页的本子想跳页只能一页页滑。
-   * 这条自己画的滑条必须：常显、贴右缘、拖得动、松手退出拖动态。
+   * 用户要的是「享做笔记」那种：右缘只有一枚小滑块，没有长轨道。
+   *   · 平时藏起来，滚动页面才浮现，停手约 1.3s 自己淡出
+   *   · 只有 thumb 收 pointer；容器和轨道 pointer-events:none 穿透
+   *   · 点轨道空白 / 右缘非滑块处**不能**跳页——以前掌根一压就飞
+   *   · 拖动期间保持可见；内容不足一屏彻底隐藏（is-idle）
+   *
+   * 注意：thumb 默认 pointer-events:none，只有 is-visible 时才 auto；
+   * 所以凡是测拖动，都先触发一次 scroll 让滑块可见（模拟真实用户）。
    */
   const sb = root.querySelector(".mb-sb") as HTMLElement;
   const thumb = sb?.querySelector(".mb-sb-thumb") as HTMLElement;
   const track = sb?.querySelector(".mb-sb-track") as HTMLElement;
   pass(!!sb, "纸面右缘有拖动滑条 .mb-sb");
   pass(!!thumb, "滑条上有滑块 .mb-sb-thumb");
+  pass(!!track, "滑块有定位容器 .mb-sb-track");
 
   const sbRect = sb.getBoundingClientRect();
   pass(
-    !sb.classList.contains("is-idle") && sbRect.width >= 10,
-    "多页时滑条常显（宽 " + sbRect.width.toFixed(0) + "px）"
+    !sb.classList.contains("is-idle") &&
+      sbRect.width >= 10 &&
+      sbRect.width <= 24,
+    "多页时不 is-idle，且只是窄窄一枚滑块（宽 " +
+      sbRect.width.toFixed(0) +
+      "px）"
   );
   pass(
     Math.abs(sbRect.right - scrollRect.right) <= 16,
@@ -258,28 +287,293 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       "px）"
   );
 
-  const peSb = (type: string, y: number) =>
-    new PointerEvent(type, {
+  // 长轨道不再可见：track 只当定位容器，背景 / 边框 / 阴影都不能画出来
+  const trackCs = getComputedStyle(track);
+  const transparentBg =
+    trackCs.backgroundColor === "rgba(0, 0, 0, 0)" ||
+    trackCs.backgroundColor === "transparent";
+  pass(
+    transparentBg &&
+      trackCs.backgroundImage === "none" &&
+      (trackCs.boxShadow === "none" || trackCs.boxShadow === ""),
+    "轨道没有可见背景线（bg=" +
+      trackCs.backgroundColor +
+      " image=" +
+      trackCs.backgroundImage +
+      "）"
+  );
+
+  // 容器与轨道永远穿透；否则笔尖落在纸面右缘会被拦下
+  pass(
+    getComputedStyle(sb).pointerEvents === "none" &&
+      trackCs.pointerEvents === "none",
+    "容器与轨道不吃指针事件（pointer-events:none）"
+  );
+
+  // 滑块本身要够大：电脑下限 28px
+  const thumbH0 = parseFloat(thumb.style.height || "0");
+  pass(thumbH0 >= 28, "滑块高度下限 28px（实测 " + thumbH0.toFixed(0) + "px）");
+
+  /*
+   * 打开本子 / resize / updateUI 只是「布局同步」（woke=false），
+   * 不能把滑块闪出来——用户要的是没滚动时看不见。
+   * 这里在触发任何 scroll 之前断言，正好卡住「一打开就闪」的回归。
+   */
+  pass(
+    !sb.classList.contains("is-visible"),
+    "有内容但没滚动时滑块不带 is-visible（打开不闪）"
+  );
+  pass(
+    getComputedStyle(sb).opacity === "0" &&
+      getComputedStyle(thumb).pointerEvents === "none",
+    "隐藏态 opacity 0 且滑块不吃事件（opacity=" +
+      getComputedStyle(sb).opacity +
+      "）"
+  );
+
+  // 触发一次真滚动 → 立刻浮现
+  scroll.scrollTop = 320;
+  scroll.dispatchEvent(new Event("scroll"));
+  await sleep(350); // rAF 合并 + 0.22s opacity 过渡
+  pass(
+    sb.classList.contains("is-visible"),
+    "触发 scroll 后滑块浮现（is-visible）"
+  );
+  pass(
+    getComputedStyle(sb).opacity === "1" &&
+      getComputedStyle(thumb).pointerEvents === "auto" &&
+      getComputedStyle(sb).pointerEvents === "none" &&
+      getComputedStyle(track).pointerEvents === "none",
+    "浮现后只有 thumb 可点（thumb auto，容器/轨道仍 none）"
+  );
+
+  /*
+   * 触摸兜底只该挂在 thumb 上。
+   * 以前整条右缘都吞 touchstart，宿主会以为用户在下拉，弹出命令面板；
+   * 现在纸面右缘的触摸必须原样穿透，只有按在滑块上才吃。
+   */
+  const touchPrevented = (target: HTMLElement) => {
+    const ev = new TouchEvent("touchstart", {
       bubbles: true,
       cancelable: true,
-      pointerId: 9,
-      pointerType: "touch",
-      clientX: Math.round(track.getBoundingClientRect().left + 3),
-      clientY: Math.round(y),
     });
-  const tr = track.getBoundingClientRect();
-  const beforeTop = scroll.scrollTop;
-  sb.dispatchEvent(peSb("pointerdown", tr.top + 8));
-  sb.dispatchEvent(peSb("pointermove", tr.bottom - 8));
-  await sleep(150);
-  const afterTop = scroll.scrollTop;
-  sb.dispatchEvent(peSb("pointerup", tr.bottom - 8));
+    target.dispatchEvent(ev);
+    return ev.defaultPrevented;
+  };
+  pass(
+    !touchPrevented(track),
+    "轨道不吞触摸（touchstart defaultPrevented=false）"
+  );
+  pass(
+    touchPrevented(thumb),
+    "只有 thumb 吞触摸（防宿主下拉命令面板）"
+  );
+
+  // 停手约 1.5s（真计时）→ 自动淡出
+  const faded = await waitUntil(
+    () => !sb.classList.contains("is-visible"),
+    3000
+  );
+  await sleep(300); // 等 opacity 过渡走完
+  pass(faded, "停手约 1.5s 后滑块自己淡出（无 is-visible）");
+  pass(getComputedStyle(sb).opacity === "0", "淡出后 opacity 回到 0");
+
+  /*
+   * 平板手指粗：thumb 按比例算出来很小时，下限必须从 28px 抬到 34px。
+   *
+   * 只有三页时按比例算出的滑块已经远高于 34px，看不出差别；
+   * 临时把页高撑到 15000px，让「可视比例」小到 13px 左右，
+   * 再分别用桌面 / 平板模式同步，才能量到真正的下限分支。
+   */
+  const sbDocEl = root.querySelector(".mb-doc") as HTMLElement;
+  const savedPageH = sbDocEl.style.getPropertyValue("--mb-page-h");
+  sbDocEl.style.setProperty("--mb-page-h", "15000px");
+  (view as any).tabletMode = true;
+  scroll.dispatchEvent(new Event("scroll"));
+  await sleep(250);
+  const thumbTablet = parseFloat(thumb.style.height || "0");
+  (view as any).tabletMode = false;
+  scroll.dispatchEvent(new Event("scroll"));
+  await sleep(250);
+  const thumbDesktopMin = parseFloat(thumb.style.height || "0");
+  sbDocEl.style.setProperty("--mb-page-h", savedPageH);
+  scroll.dispatchEvent(new Event("scroll"));
+  await sleep(250);
+  pass(
+    thumbTablet >= 34 && thumbTablet > thumbDesktopMin,
+    "平板模式滑块下限 34px（桌面 " +
+      thumbDesktopMin.toFixed(0) +
+      " → 平板 " +
+      thumbTablet.toFixed(0) +
+      "px）"
+  );
+
+  /* ---------------- 只有 thumb 能拖；轨道空白不响应 ---------------- */
+  // 先把滑块滚到顶再唤醒，thumb 就停在轨道顶部，下面一大片是「空白」
+  scroll.scrollTop = 0;
+  scroll.dispatchEvent(new Event("scroll"));
+  await sleep(350);
+
+  const peSb = (target: HTMLElement, type: string, y: number, pid: number) =>
+    target.dispatchEvent(
+      new PointerEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        pointerId: pid,
+        pointerType: "touch",
+        isPrimary: true,
+        button: 0,
+        buttons: type === "pointerup" ? 0 : 1,
+        clientX: Math.round(
+          track.getBoundingClientRect().left + track.clientWidth / 2
+        ),
+        clientY: Math.round(y),
+      })
+    );
+
+  // 盯住 setPointerCapture：轨道空白处绝不能抢指针
+  let captureCalls = 0;
+  const origSetCapture = thumb.setPointerCapture.bind(thumb);
+  (thumb as any).setPointerCapture = (id: number) => {
+    captureCalls += 1;
+    return origSetCapture(id);
+  };
+
+  const trackRect = track.getBoundingClientRect();
+  const thumbRect = thumb.getBoundingClientRect();
+  const blankY = Math.round(trackRect.bottom - 10);
+  const blankOutsideThumb =
+    blankY < thumbRect.top - 6 || blankY > thumbRect.bottom + 6;
+
+  const beforeBlank = scroll.scrollTop;
+  // ① 轨道空白处 ② .mb-sb 右缘但非滑块处，两套完整 pointer 序列
+  peSb(track, "pointerdown", blankY, 21);
+  peSb(track, "pointermove", trackRect.top + 10, 21);
+  peSb(sb, "pointerdown", blankY, 22);
+  peSb(sb, "pointermove", trackRect.top + 10, 22);
+  await sleep(180);
+  const afterBlank = scroll.scrollTop;
+  peSb(track, "pointerup", blankY, 21);
+  peSb(sb, "pointerup", blankY, 22);
   await sleep(120);
   pass(
-    afterTop > beforeTop + 50,
-    "拖滑条能一路滚下去（" + beforeTop.toFixed(0) + " → " + afterTop.toFixed(0) + "）"
+    blankOutsideThumb && afterBlank === beforeBlank,
+    "点轨道空白 / 右缘非滑块处不跳页（" +
+      beforeBlank.toFixed(0) +
+      " → " +
+      afterBlank.toFixed(0) +
+      "）"
   );
+  pass(
+    !sb.classList.contains("is-drag") && captureCalls === 0,
+    "轨道空白不进入拖动态、不抢指针（capture=" + captureCalls + "）"
+  );
+
+  // 拖 thumb：派发到 thumb 本身（clientX 取 thumb 中心）
+  const beforeTop = scroll.scrollTop;
+  const thumbCenterX = Math.round(
+    thumb.getBoundingClientRect().left + thumb.getBoundingClientRect().width / 2
+  );
+  const peThumb = (type: string, y: number) =>
+    thumb.dispatchEvent(
+      new PointerEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        pointerId: 23,
+        pointerType: "touch",
+        isPrimary: true,
+        button: 0,
+        buttons: type === "pointerup" ? 0 : 1,
+        clientX: thumbCenterX,
+        clientY: Math.round(y),
+      })
+    );
+
+  peThumb("pointerdown", thumb.getBoundingClientRect().top + 8);
+  await sleep(250); // 等 tip 的 0.14s 过渡
+  pass(
+    sb.classList.contains("is-drag") && sb.classList.contains("is-visible"),
+    "按下滑块立即进入拖动态并保持可见"
+  );
+  const tipCs = getComputedStyle(sb.querySelector(".mb-sb-tip") as HTMLElement);
+  pass(tipCs.opacity === "1", "拖动时页码提示可见（tip opacity=1）");
+
+  // 拖住不放 1.5s：远超 1.3s 的淡出时限，滑块必须还在
+  await sleep(1300);
+  pass(
+    sb.classList.contains("is-visible") && sb.classList.contains("is-drag"),
+    "拖动 1.5s 期间滑块不消失（不被淡出计时器收走）"
+  );
+
+  peThumb("pointermove", trackRect.bottom - 10);
+  await sleep(200);
+  const afterTop = scroll.scrollTop;
+  pass(
+    afterTop > beforeTop + 50,
+    "拖 thumb 按比例滚动（" +
+      beforeTop.toFixed(0) +
+      " → " +
+      afterTop.toFixed(0) +
+      "）"
+  );
+  pass(
+    captureCalls === 1,
+    "只有 thumb 抢指针（setPointerCapture 调了 " + captureCalls + " 次）"
+  );
+
+  peThumb("pointerup", trackRect.bottom - 10);
+  await sleep(80);
   pass(!sb.classList.contains("is-drag"), "松手后退出拖动态");
+  pass(sb.classList.contains("is-visible"), "刚松手滑块仍可见");
+  await sleep(400);
+  pass(
+    sb.classList.contains("is-visible"),
+    "松手 0.4s 内不立刻消失（留出看清位置的时间）"
+  );
+  const dragFaded = await waitUntil(
+    () => !sb.classList.contains("is-visible"),
+    2500
+  );
+  pass(dragFaded, "松手约 0.9s 后滑块淡出");
+
+  /* ---------------- 内容不足一屏：彻底隐藏（is-idle） ---------------- */
+  /*
+   * 把每一页临时缩矮，让 scrollHeight 不再超出一屏，再触发 sync。
+   * 真实行为对应「打开一本只有一页、且整页放得下的本子」。
+   *
+   * 这里改每页的 inline height，而不是 .mb-doc 上的 --mb-page-h：
+   * 编辑器的 ResizeObserver 会调 applyLayout 重写 CSS 变量，
+   * inline height 不受它影响，测量才稳定。
+   */
+  const idlePages = Array.from(
+    root.querySelectorAll(".mb-page")
+  ) as HTMLElement[];
+  const savedPageHeights = idlePages.map((p) => p.style.height);
+  for (const p of idlePages) p.style.height = "120px";
+  scroll.scrollTop = 0;
+  scroll.dispatchEvent(new Event("scroll"));
+  await sleep(250);
+  const idleRange = scroll.scrollHeight - scroll.clientHeight;
+  pass(
+    idleRange <= 2,
+    "缩到不足一屏（range " + idleRange.toFixed(0) + "px）"
+  );
+  pass(
+    sb.classList.contains("is-idle") && !sb.classList.contains("is-visible"),
+    "内容不足一屏时滑条彻底隐藏（is-idle，无 is-visible）"
+  );
+  await sleep(300);
+  pass(
+    getComputedStyle(sb).opacity === "0" &&
+      getComputedStyle(sb).pointerEvents === "none",
+    "is-idle 时 opacity 0 且不吃事件"
+  );
+
+  // 恢复页面尺寸，别把后面的断言带歪
+  idlePages.forEach((p, i) => (p.style.height = savedPageHeights[i]));
+  scroll.dispatchEvent(new Event("scroll"));
+  await sleep(250);
+  pass(!sb.classList.contains("is-idle"), "恢复多页后退出 is-idle");
   scroll.scrollTop = 0;
   await sleep(120);
 

@@ -150,19 +150,42 @@ function drawUserTextsPdf(page: PDFPage, src: Page, font: PDFFont, pageH: number
   }
 }
 
+/**
+ * 导出整本或指定页范围。
+ *
+ * `range` 是 1 起的闭区间 `{ from, to }`；不传或非法一律回落整本。
+ * 只夹「等哪些底图 / 循环哪些页 / 文件名」三处，
+ * 批注矢量、原 PDF 保矢量、生僻字回退这些链路完全不动。
+ */
 export async function exportBookPdf(
   vault: Vault,
   editor: BookEditor,
   file: TFile,
-  scale = 2
+  scale = 2,
+  range?: { from: number; to: number }
 ): Promise<string> {
   const state = editor.getState();
-  new Notice(`正在导出 ${state.pageCount} 页 PDF…`, 3000);
-  // 等底图加载完，否则导出的 PDF 会缺内容
-  await editor.waitBackgrounds(
-    Array.from({ length: state.pageCount }, (_, i) => i),
-    scale
+  const total = state.pageCount;
+  let from = 1;
+  let to = total;
+  if (range && Number.isFinite(range.from) && Number.isFinite(range.to)) {
+    const a = Math.max(1, Math.min(total, Math.floor(range.from)));
+    const b = Math.max(1, Math.min(total, Math.floor(range.to)));
+    if (a <= b) {
+      from = a;
+      to = b;
+    }
+  }
+  const isPartial = from > 1 || to < total;
+  const indices = Array.from({ length: to - from + 1 }, (_, k) => from - 1 + k);
+  new Notice(
+    isPartial
+      ? `正在导出第 ${from}–${to} 页 PDF…`
+      : `正在导出 ${total} 页 PDF…`,
+    3000
   );
+  // 等底图加载完，否则导出的 PDF 会缺内容；只等真正要导出的那几页
+  await editor.waitBackgrounds(indices, scale);
 
   const doc = await PDFDocument.create();
   const pages = editor.store.data.pages;
@@ -241,7 +264,8 @@ export async function exportBookPdf(
   let textPages = 0;
   let fallbackPages = 0;
 
-  for (let i = 0; i < state.pageCount; i++) {
+  for (let k = 0; k < indices.length; k++) {
+    const i = indices[k];
     const page = pages[i];
     const pdfRef = page?.background?.pdf;
     /* 这一页的批注能不能写成矢量文字？写不了就烤进位图（内容不能丢） */
@@ -326,10 +350,11 @@ export async function exportBookPdf(
   const bytes = await doc.save();
   const folder = file.parent && file.parent.path !== "/" ? file.parent.path + "/" : "";
   const base = safeName(file.basename);
-  let name = `${base}-手写本.pdf`;
+  const suffix = isPartial ? `-第${from}-${to}页` : "";
+  let name = `${base}-手写本${suffix}.pdf`;
   let n = 1;
   while (await vault.adapter.exists(folder + name)) {
-    name = `${base}-手写本 ${++n}.pdf`;
+    name = `${base}-手写本${suffix} ${++n}.pdf`;
   }
   await vault.adapter.writeBinary(
     folder + name,

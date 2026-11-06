@@ -200,6 +200,36 @@ async function main() {
   const doc = await pdfjs.getDocument({ data: bytes!.slice() }).promise;
   pass(doc.numPages === 4, "导出的 PDF 有 " + doc.numPages + " 页");
 
+  /* -------------------- 指定页范围导出（INK-133） -------------------- */
+  {
+    const rangePath = await exportBookPdf(vault, editor, file, 2, { from: 2, to: 3 });
+    pass(
+      /第2-3页/.test(rangePath),
+      "页范围导出：文件名带范围（" + rangePath.split("/").pop() + "）"
+    );
+    const rb = written.get(rangePath);
+    const rdoc = await pdfjs.getDocument({ data: rb!.slice() }).promise;
+    pass(rdoc.numPages === 2, "页范围导出：PDF 恰好 2 页（实际 " + rdoc.numPages + "）");
+    // 第 2 页的内容要与整本导出的第 2 页一致（矢量链路不走样）
+    const r2 = await rdoc.getPage(1);
+    const r2t = (await r2.getTextContent()).items as any[];
+    const full2 = await doc.getPage(2);
+    const f2t = (await full2.getTextContent()).items as any[];
+    const joined = (a: any[]) => a.map((it) => it.str || "").join("");
+    pass(
+      joined(r2t) === joined(f2t),
+      "页范围导出：第 2 页文字与整本导出一致（" + joined(r2t).length + " 字）"
+    );
+    await rdoc.destroy();
+
+    // 非法范围回落整本，不能生成 0 页或越界
+    const fallbackPath = await exportBookPdf(vault, editor, file, 2, { from: 9, to: 2 });
+    const fb = written.get(fallbackPath);
+    const fdoc = await pdfjs.getDocument({ data: fb!.slice() }).promise;
+    pass(fdoc.numPages === 4, "非法页范围：回落整本（" + fdoc.numPages + " 页）");
+    await fdoc.destroy();
+  }
+
   const page1 = await doc.getPage(1);
   const tc = await page1.getTextContent();
   const text1 = (tc.items as any[]).map((it) => it.str || "").join("");

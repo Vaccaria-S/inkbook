@@ -553,7 +553,9 @@ async function main() {
     check(st0.bitmaps === 0 && st0.bytes === 0, "清空后归零 " + JSON.stringify(st0));
 
     const KEY_W0 = 400;
-    const N = 60;
+    // 64MB 预算下 60 条约 62MB 放得下、不会淘汰；用 90 条（约 94MB）逼出 LRU 淘汰。
+    // 这组断言验的是「预算到了真的会淘汰」，不是验某个固定张数。
+    const N = 90;
     for (let i = 0; i < N; i += 1) {
       await renderEmbedForFile(app as any, f1, (i % 3) + 1, KEY_W0 + i);
     }
@@ -561,8 +563,13 @@ async function main() {
     const perEntry = KEY_W0 * Math.round((KEY_W0 * 1123) / 794) * 4;
     num("LRU 后 stats", JSON.stringify(st1));
     num("单张估算", Math.round(perEntry / 1024) + " KB（未乘 dpr）");
-    check(st1.bitmaps < N, "60 个不同键后确实发生了淘汰", `剩 ${st1.bitmaps} 条`);
-    check(st1.bytes <= 32 * 1024 * 1024, "缓存字节数不超 32MB", Math.round(st1.bytes / 1024 / 1024 * 10) / 10 + " MB");
+    check(st1.bitmaps < N, `${N} 个不同键后确实发生了淘汰`, `剩 ${st1.bitmaps} 条`);
+    check(
+      st1.bytes <= st1.limit,
+      "缓存字节数不超预算",
+      Math.round(st1.bytes / 1024 / 1024 * 10) / 10 + " MB / 上限 " +
+        Math.round(st1.limit / 1024 / 1024) + " MB"
+    );
 
     // 最新那条仍在缓存：再渲一次不该增加字节
     const newestW = KEY_W0 + (N - 1);

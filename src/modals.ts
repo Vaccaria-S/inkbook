@@ -323,18 +323,22 @@ export class ImportRangeModal extends Modal {
   private to: number;
   private onDone: (from: number, to: number) => void;
   private infoEl!: HTMLElement;
+  /** 按钮/文案里的动作名：导入用默认「导入」，导出页范围传「导出」 */
+  private action: string;
 
   constructor(
     app: App,
     kind: "pdf" | "word",
     total: number,
-    onDone: (from: number, to: number) => void
+    onDone: (from: number, to: number) => void,
+    action = "导入"
   ) {
     super(app);
     this.kind = kind;
     this.total = total;
     this.to = total;
     this.onDone = onDone;
+    this.action = action;
   }
 
   onOpen(): void {
@@ -368,7 +372,7 @@ export class ImportRangeModal extends Modal {
         })
       );
 
-    const all = contentEl.createEl("button", { cls: "mb-import-all", text: "全部导入" });
+    const all = contentEl.createEl("button", { cls: "mb-import-all", text: `全部${this.action}` });
     all.onclick = () => {
       this.from = 1;
       this.to = this.total;
@@ -378,7 +382,7 @@ export class ImportRangeModal extends Modal {
     const actions = contentEl.createDiv("mb-new-actions");
     const cancel = actions.createEl("button", { text: "取消" });
     cancel.onclick = () => this.close();
-    const ok = actions.createEl("button", { cls: "mod-cta", text: "导入" });
+    const ok = actions.createEl("button", { cls: "mod-cta", text: this.action });
     ok.onclick = () => this.finish();
   }
 

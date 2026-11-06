@@ -165,6 +165,17 @@ export class InkbookView extends FileView {
   private sbTip: HTMLElement | null = null;
   private sbAbort: AbortController | null = null;
   private sbRaf = 0;
+  /** 本帧里有没有真的滚动事件（区别于打开/resize/updateUI 的布局同步） */
+  private sbWoke = false;
+  /**
+   * 挂载后的头两帧：编辑器会用 goToPage 做程序化定位（恢复上次阅读页），
+   * 那也会派发 scroll 事件，但不是用户滑动，别把滑块闪出来。
+   */
+  private sbQuiet = false;
+  /** 防止快速重建时旧的 rAF 把新挂载的静默期提前清掉 */
+  private sbQuietSeq = 0;
+  /** 停手后让滑块淡出的定时器（滚动停下 / 拖动松手都走它） */
+  private sbHideTimer = 0;
   private sbThumbH = 0;
   private sbThumbTop = 0;
   private sbDrag: { pid: number; grab: number } | null = null;
@@ -559,6 +570,11 @@ export class InkbookView extends FileView {
       window.cancelAnimationFrame?.(this.sbRaf);
       this.sbRaf = 0;
     }
+    window.clearTimeout(this.sbHideTimer);
+    this.sbHideTimer = 0;
+    this.sbWoke = false;
+    this.sbQuiet = false;
+    this.sbQuietSeq++;
     this.sbEl?.remove();
     this.sbEl = null;
     this.sbTrack = null;
@@ -1096,22 +1112,28 @@ export class InkbookView extends FileView {
   /* ---------------------------- 侧边拖动滑条 ---------------------------- */
 
   /**
-   * 纸面右缘一条自己画的滑条。
+   * 纸面右缘一枚可拖动的小滑块（不是长轨道）。
    *
-   * 为什么不用系统滚动条：
-   *   · 平板上系统滚动条只有鼠标滚轮/手指甩动，**拖不了**
+   * 为什么自己画：
+   *   · 平板上系统滚动条只有滚轮/甩动，**拖不了**
    *   · 几十页的本子想从第 3 页跳到第 27 页，只能一页页滑
-   *   · 触屏上它还会自己淡出，连"这里能拖"都看不见
    *
-   * 所以自己画一条常驻的：滑块高度按可视比例算，拖它按比例改 scrollTop，
-   * 拖动时旁边浮一枚页码，松手就消失。
+   * 交互边界是防误触的关键：
+   *   · **只有滑块本身**收 pointer / touch；容器与轨道一律穿透，
+   *     笔尖落在纸面右缘时和没有滑条时完全一样
+   *   · 不画长轨道，平时整枚滑块淡出，滚动 / 拖动时才浮现
+   *   · 滑块高度按可视比例算，拖它按比例改 scrollTop，
+   *     拖动时旁边浮一枚页码，松手稍后整个淡出
    */
   private buildScrollbar(): void {
     this.sbAbort?.abort();
+    window.clearTimeout(this.sbHideTimer);
+    this.sbHideTimer = 0;
     const ac = new AbortController();
     this.sbAbort = ac;
 
-    const el = this.paperHost.createDiv("mb-sb is-idle");
+    // 默认就是隐藏态：由 scroll / 拖动 / syncScrollbar 加 is-visible 唤醒
+    const el = this.paperHost.createDiv("mb-sb");
     this.sbEl = el;
     const track = el.createDiv("mb-sb-track");
     this.sbTrack = track;
@@ -1122,17 +1144,35 @@ export class InkbookView extends FileView {
     const sc = this.editor?.scrollEl;
     if (!sc) return;
 
-    sc.addEventListener("scroll", () => this.requestScrollbarSync(), {
-      passive: true,
-      signal: ac.signal,
+    /*
+     * 挂载期编辑器会 goToPage(current) 做一次程序化定位（恢复上次阅读页），
+     * 即使不是用户滑动也会派发 scroll。头两帧把它当布局同步处理：
+     * 挂载的 scroll 事件在同一帧的 scroll steps 里派发，早于下一帧 rAF，
+     * 所以双 rAF 之后解除是安全的。否则打开非首页的本子会闪一下滑块。
+     */
+    this.sbQuiet = true;
+    const quietSeq = ++this.sbQuietSeq;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (this.sbQuietSeq === quietSeq) this.sbQuiet = false;
+      });
     });
+
+    sc.addEventListener(
+      "scroll",
+      () => this.requestScrollbarSync(!this.sbQuiet),
+      {
+        passive: true,
+        signal: ac.signal,
+      }
+    );
     window.addEventListener("resize", () => this.requestScrollbarSync(), {
       signal: ac.signal,
     });
 
     /*
-     * 拖到哪算哪：抓滑块时保持"手指在滑块上的相对位置"，
-     * 直接点轨道则把滑块中心挪过去——两种都符合直觉。
+     * 拖到哪算哪：保持"手指按在滑块上的相对位置"，按比例改 scrollTop。
+     * 只有按在滑块上才会走到这里（监听挂在 thumb 上），轨道空白不响应。
      */
     const apply = (clientY: number, grab: number) => {
       const range = sc.scrollHeight - sc.clientHeight;
@@ -1143,17 +1183,20 @@ export class InkbookView extends FileView {
       this.updateSbTip();
     };
 
-    el.addEventListener(
+    thumb.addEventListener(
       "pointerdown",
       (e) => {
         if (e.pointerType === "mouse" && e.button !== 0) return;
         const tr = thumb.getBoundingClientRect();
-        const inside = e.clientY >= tr.top && e.clientY <= tr.bottom;
-        const grab = inside ? e.clientY - tr.top : tr.height / 2;
+        const grab = e.clientY - tr.top;
         this.sbDrag = { pid: e.pointerId, grab };
         el.addClass("is-drag");
+        // 拖动期间必须一直看得见，别拖到一半淡出
+        el.addClass("is-visible");
+        window.clearTimeout(this.sbHideTimer);
+        this.sbHideTimer = 0;
         try {
-          el.setPointerCapture(e.pointerId);
+          thumb.setPointerCapture(e.pointerId);
         } catch (_) {}
         e.preventDefault();
         e.stopPropagation();
@@ -1163,7 +1206,7 @@ export class InkbookView extends FileView {
       { signal: ac.signal }
     );
 
-    el.addEventListener(
+    thumb.addEventListener(
       "pointermove",
       (e) => {
         const d = this.sbDrag;
@@ -1180,17 +1223,22 @@ export class InkbookView extends FileView {
       this.sbDrag = null;
       el.removeClass("is-drag");
       try {
-        el.releasePointerCapture(e.pointerId);
+        thumb.releasePointerCapture(e.pointerId);
       } catch (_) {}
+      // 刚松手先留一会儿，让人看清滑块停在哪，再淡出
+      this.scheduleSbHide(900);
     };
-    el.addEventListener("pointerup", finish, { signal: ac.signal });
-    el.addEventListener("pointercancel", finish, { signal: ac.signal });
+    thumb.addEventListener("pointerup", finish, { signal: ac.signal });
+    thumb.addEventListener("pointercancel", finish, { signal: ac.signal });
+    // 兜底：指针被系统抢走（通知栏 / 手势）时 capture 会丢，别卡在拖动态
+    thumb.addEventListener("lostpointercapture", finish, { signal: ac.signal });
 
     /*
-     * 触摸兜底：平板上从滑条往下拖，宿主会当成「下拉打开命令面板」。
+     * 触摸兜底：平板上从滑块往下拖，宿主会当成「下拉打开命令面板」。
      *
      * pointer 事件宿主未必看，touch 才是它认的东西——在元素捕获阶段
      * 就把 touchstart / touchmove 吃掉（必须 passive:false 才能 preventDefault）。
+     * 只挂在 thumb 上：整条右缘不再吞触摸，纸面该画画该滚就滚。
      * 注意：宿主若把监听挂在 window 捕获阶段，我们拦不住（它比插件早注册），
      * 那种情况靠设置里的「屏蔽命令面板」在命令层兜底。
      */
@@ -1198,12 +1246,12 @@ export class InkbookView extends FileView {
       if (e.cancelable) e.preventDefault();
       e.stopPropagation();
     };
-    el.addEventListener("touchstart", eatTouch, {
+    thumb.addEventListener("touchstart", eatTouch, {
       passive: false,
       capture: true,
       signal: ac.signal,
     });
-    el.addEventListener("touchmove", eatTouch, {
+    thumb.addEventListener("touchmove", eatTouch, {
       passive: false,
       capture: true,
       signal: ac.signal,
@@ -1212,21 +1260,33 @@ export class InkbookView extends FileView {
     this.requestScrollbarSync();
   }
 
-  /** 滚动事件很密：合并到一帧里算，别每次都读 clientHeight */
-  private requestScrollbarSync(): void {
-    if (this.sbRaf) return;
+  /**
+   * 滚动事件很密：合并到一帧里算，别每次都读 clientHeight。
+   *
+   * `woke` 区分「真的滚动了」和「只是布局/状态同步」：
+   * 打开本子、resize、updateUI 都会调它一次，但那些不该把滑块闪出来——
+   * 用户要的是「没滑动时看不见，滑动了才显现」。只有 scroll 事件传 true。
+   */
+  private requestScrollbarSync(woke = false): void {
+    if (this.sbRaf) {
+      if (woke) this.sbWoke = true;
+      return;
+    }
+    if (woke) this.sbWoke = true;
     const raf =
       typeof window.requestAnimationFrame === "function"
         ? window.requestAnimationFrame.bind(window)
         : (fn: FrameRequestCallback) => window.setTimeout(() => fn(0), 16);
     this.sbRaf = raf(() => {
       this.sbRaf = 0;
-      this.syncScrollbar();
+      const wake = this.sbWoke;
+      this.sbWoke = false;
+      this.syncScrollbar(wake);
     });
   }
 
   /** 按「可视高度 / 内容高度」摆滑块 */
-  private syncScrollbar(): void {
+  private syncScrollbar(woke = false): void {
     const sc = this.editor?.scrollEl;
     const el = this.sbEl;
     const track = this.sbTrack;
@@ -1236,16 +1296,31 @@ export class InkbookView extends FileView {
     const vh = sc.clientHeight;
     const sh = sc.scrollHeight;
     const range = sh - vh;
-    // 内容没超出一屏就不给拖：一条拖不动的滑条只会让人以为坏了
+    // 内容没超出一屏就不给拖：一条拖不动的滑块只会让人以为坏了
     if (vh < 60 || range <= 2) {
       el.addClass("is-idle");
+      el.removeClass("is-visible");
+      window.clearTimeout(this.sbHideTimer);
+      this.sbHideTimer = 0;
       this.sbThumbH = 0;
       return;
     }
     el.removeClass("is-idle");
+    /*
+     * 只有「真的滚动了」或「正在拖」才浮现。
+     * 打开本子 / resize / updateUI 只是布局同步（woke=false），
+     * 别把它们当成滚动——否则一打开就闪一下滑块，且每次状态同步
+     * 都把淡出计时重置，滑块一直赖着不走。
+     */
+    if (woke || this.sbDrag) {
+      el.addClass("is-visible");
+      this.scheduleSbHide();
+    }
 
     const trackH = track.clientHeight || el.clientHeight;
-    const thumbH = Math.max(28, Math.round((trackH * vh) / sh));
+    // 平板上手指粗，滑块再高一点才好按
+    const minThumbH = this.tabletMode ? 34 : 28;
+    const thumbH = Math.max(minThumbH, Math.round((trackH * vh) / sh));
     const top = Math.round(
       (trackH - thumbH) * Math.min(1, Math.max(0, sc.scrollTop / range))
     );
@@ -1254,6 +1329,21 @@ export class InkbookView extends FileView {
     thumb.style.height = thumbH + "px";
     thumb.style.transform = "translateY(" + top + "px)";
     if (this.sbDrag) this.updateSbTip();
+  }
+
+  /**
+   * 停手后延时淡出。滚动事件很密，每次进来都重置计时；
+   * 拖动期间不排程——松手时 `finish` 会重新起表，免得拖到一半消失。
+   */
+  private scheduleSbHide(delay = 1300): void {
+    window.clearTimeout(this.sbHideTimer);
+    this.sbHideTimer = 0;
+    if (this.sbDrag) return;
+    this.sbHideTimer = window.setTimeout(() => {
+      this.sbHideTimer = 0;
+      if (this.sbDrag) return;
+      this.sbEl?.removeClass("is-visible");
+    }, delay);
   }
 
   /** 拖动页数提示：跟着滑块走，平时不可见 */
@@ -1666,17 +1756,36 @@ export class InkbookView extends FileView {
         .setIcon("file-text")
         .onClick(() => this.runExport("pdf"))
     );
+    menu.addItem((item) =>
+      item
+        .setTitle("导出指定页 PDF…")
+        .setIcon("file-text")
+        .onClick(() => {
+          const st = this.editor?.getState();
+          if (!st) return;
+          new ImportRangeModal(
+            this.app,
+            "pdf",
+            st.pageCount,
+            (from, to) => void this.runExport("pdf", { from, to }),
+            "导出"
+          ).open();
+        })
+    );
     menu.showAtMouseEvent(e);
   }
 
-  private async runExport(kind: "png" | "pdf"): Promise<void> {
+  private async runExport(
+    kind: "png" | "pdf",
+    range?: { from: number; to: number }
+  ): Promise<void> {
     if (!this.editor || !this.file) return;
     // 编辑框里没提交的文字先落库，否则导出的文件会少这一段
     this.editor.commitTextEditNow();
     try {
       const scale = 2;
       if (kind === "png") await exportPagePng(this.app.vault, this.editor, this.file, scale);
-      else await exportBookPdf(this.app.vault, this.editor, this.file, scale);
+      else await exportBookPdf(this.app.vault, this.editor, this.file, scale, range);
     } catch (e: any) {
       new Notice("导出失败：" + (e && e.message ? e.message : e), 8000);
     }

@@ -4091,7 +4091,20 @@ export class BookEditor {
     this.mount(rec);
     const sr = this.scrollEl.getBoundingClientRect();
     const top = rec.wrap.getBoundingClientRect().top - sr.top + this.scrollEl.scrollTop - 16;
-    this.scrollEl.scrollTo({ top: Math.max(0, top), behavior: smooth ? "smooth" : "auto" });
+    /*
+     * 第 0 页上面没有"上一页"，目标就是 0。
+     * 公式里的 -16 会把顶部留白算成 scrollTop≈6；把它写进去等于
+     * 内容纹丝不动却触发一次真 scroll 事件——右缘滑块会在本子刚
+     * 打开时白闪一下（用户要的是"滑动才显现"）。
+     */
+    const target = rec.index === 0 ? 0 : Math.max(0, top);
+    // 已经在目标位置（差值 ≤1px）就别写：scrollTo 同值也会派发 scroll
+    if (Math.abs(target - this.scrollEl.scrollTop) > 1) {
+      this.scrollEl.scrollTo({
+        top: target,
+        behavior: smooth ? "smooth" : "auto",
+      });
+    }
     this.emitState();
     if (this.opts.onPageChange) this.opts.onPageChange(rec.index);
   }

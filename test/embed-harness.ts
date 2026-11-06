@@ -378,8 +378,9 @@ async function main() {
 
     const stBig = embedCacheStats();
     pass(
-      stBig.bytes <= 32 * MB,
-      "|3000 之后缓存不超 32MB（" + (stBig.bytes / MB).toFixed(1) + "MB / " + stBig.bitmaps + " 条）"
+      stBig.bytes <= stBig.limit,
+      "|3000 之后缓存不超预算（" + (stBig.bytes / MB).toFixed(1) + "MB / 上限 " +
+        (stBig.limit / MB).toFixed(0) + "MB / " + stBig.bitmaps + " 条）"
     );
 
     invalidateEmbedCache();
@@ -397,8 +398,9 @@ async function main() {
       "|100000 不抛异常，宽度同样夹到 2000 以内（" + hugeW + "px）"
     );
     pass(
-      stHuge.bytes <= 32 * MB,
-      "|100000 之后缓存不超 32MB（" + (stHuge.bytes / MB).toFixed(1) + "MB）"
+      stHuge.bytes <= stHuge.limit,
+      "|100000 之后缓存不超预算（" + (stHuge.bytes / MB).toFixed(1) + "MB / 上限 " +
+        (stHuge.limit / MB).toFixed(0) + "MB）"
     );
     if (huge) {
       const [hx, hy, hw, hh] = strokeRegion(huge);
@@ -407,8 +409,9 @@ async function main() {
     }
 
     /*
-     * 4 张大图：单条就可能接近预算，`evictBitmaps` 若保底「至少留一条」
-     * 缓存会永远停在超限状态。这里要求它真的能淘汰。
+     * INK-117：4 张满栏嵌入（不同宽度）要能同时留在缓存里，
+     * 滚回去不用重新光栅化。旧 32MB 预算下这里会淘汰到 2~3 条。
+     * 同时仍要求缓存不超预算——evictBitmaps 不能保底「至少留一条」。
      */
     invalidateEmbedCache();
     for (const w of [1400, 1600, 1800, 2000]) {
@@ -416,9 +419,13 @@ async function main() {
     }
     const st4 = embedCacheStats();
     pass(
-      st4.bytes <= 32 * MB && st4.bitmaps < 4,
-      "连续 4 张 |1400–2000 后缓存不超上限且已淘汰（" +
-        st4.bitmaps + " 条 / " + (st4.bytes / MB).toFixed(1) + "MB）"
+      st4.bytes <= st4.limit,
+      "连续 4 张满栏嵌入后缓存仍不超预算（" + st4.bitmaps + " 条 / " +
+        (st4.bytes / MB).toFixed(1) + "MB / 上限 " + (st4.limit / MB).toFixed(0) + "MB）"
+    );
+    pass(
+      st4.bitmaps >= 4,
+      "INK-117：4 张满栏嵌入能同时缓存，来回滚动不重画（" + st4.bitmaps + " 条）"
     );
     invalidateEmbedCache();
   }
@@ -472,7 +479,11 @@ async function main() {
           "dpr=2 的 |2000 位图能缓存 ≥2 条，不再画完即弃（实际 " +
             st.bitmaps + " 条 / " + (st.bytes / MB).toFixed(1) + "MB）"
         );
-        pass(st.bytes <= 32 * MB, "dpr=2 两张之后缓存仍 ≤32MB（" + (st.bytes / MB).toFixed(1) + "MB）");
+        pass(
+          st.bytes <= st.limit,
+          "dpr=2 两张之后缓存仍不超预算（" + (st.bytes / MB).toFixed(1) + "MB / 上限 " +
+            (st.limit / MB).toFixed(0) + "MB）"
+        );
       } finally {
         invalidateEmbedCache();
       }
@@ -756,9 +767,10 @@ async function main() {
       "|3000 在真实布局里出图宽也夹到 2000 以内（" + geoW + "px）"
     );
     pass(
-      embedCacheStats().bytes <= 32 * 1024 * 1024,
-      "|3000 走完 postprocessor 后缓存仍不超 32MB（" +
-        (embedCacheStats().bytes / 1024 / 1024).toFixed(1) + "MB）"
+      embedCacheStats().bytes <= embedCacheStats().limit,
+      "|3000 走完 postprocessor 后缓存仍不超预算（" +
+        (embedCacheStats().bytes / 1024 / 1024).toFixed(1) + "MB / 上限 " +
+        (embedCacheStats().limit / 1024 / 1024).toFixed(0) + "MB）"
     );
 
     geoHost.remove();
@@ -859,7 +871,7 @@ async function main() {
     );
     const stRefresh = embedCacheStats();
     pass(
-      stRefresh.bitmaps >= 1 && stRefresh.bytes <= 32 * 1024 * 1024,
+      stRefresh.bitmaps >= 1 && stRefresh.bytes <= stRefresh.limit,
       "重画后缓存重新填充且未超限（" + stRefresh.bitmaps + " 条 / " +
         (stRefresh.bytes / 1024 / 1024).toFixed(1) + "MB）"
     );

@@ -248,7 +248,7 @@ export const MAX_EMBED_WIDTH = 2000;
 /**
  * 单张位图的**设备像素**上限：4M ≈ 16MB @4Bpp。
  *
- * 按 32MB 预算算正好能放两张，既能命中缓存又不至于一保存重画就重新分配
+ * 按 64MB 预算算能放四张满栏嵌入，既能命中缓存又不至于一保存重画就重新分配
  * 几十 MB。这是给平板/手机设的：dpr=2 的 iPad 上，`|2000` 的**位图**宽
  * 折成 841 CSS px（841×2 = 1682 像素宽），肉眼和 2000 看不出差别，
  * 内存差一个量级。
@@ -293,7 +293,7 @@ export function clampEmbedWidth(
   /*
    * dpr <= 1：沿用老的 2000 上限。
    * 这一步是刻意的——2000 CSS px 在 dpr=1 下是 5.66M 设备像素（22.6MB），
-   * 仍在 32MB 缓存预算内，不会造成"画完即弃"；而桌面一直是这个行为，
+   * 仍在 64MB 缓存预算内，不会造成"画完即弃"；而桌面一直是这个行为，
    * 改小只会让人发现"嵌入变糊了"，没有任何收益。
    * dpr > 1：按设备像素预算往回折（dpr=2 → 840 CSS px ≈ 16MB 一张），
    * 这才是平板/手机上的内存事故来源。
@@ -619,13 +619,18 @@ function drawUserTexts(
 /* ------------------------------- 缓存 ------------------------------- */
 
 /**
- * 缓存上限 32MB。
+ * 缓存上限 64MB（INK-117）。
  *
- * 按「一张 300px 宽的嵌入 ≈ 300×424×dpr² × 4 字节 ≈ 2MB」算，
- * 32MB 能放十几张——够一篇笔记里的嵌入来回滚动不重画，又不会
- * 让一本书的几十页把内存吃光。
+ * 以前是 32MB：一张满栏嵌入（dpr=2、位图宽 840、A4 比例）约 16MB，
+ * 32MB 只放得下 2 张，一篇笔记里 3 个以上满栏嵌入时，滚回去就得
+ * 用 pdf.js 重画（单张 40–60ms），用户感觉「滚一下卡一下」。
+ * 抬到 64MB 正好放下 4 张，来回滚动不再重画。
+ *
+ * 仍然远低于主视图的 160MiB 挂载预算，且不碰 MAX_CANVAS_PIXELS=16M。
+ * 单条位图超预算时 evictBitmaps 照样把它淘汰掉，不会无限涨。
  */
-const MAX_CACHE_BYTES = 32 * 1024 * 1024;
+export const EMBED_CACHE_BYTES = 64 * 1024 * 1024;
+const MAX_CACHE_BYTES = EMBED_CACHE_BYTES;
 /** 页面数据（InkBook）缓存条数：一本几十 MB 的 JSON 不能按嵌入数复制几十份 */
 const MAX_BOOK_CACHE = 6;
 
@@ -760,9 +765,19 @@ export function invalidateEmbedCache(path?: string): void {
   }
 }
 
-/** 缓存现状（测试断言 / 排查内存用） */
-export function embedCacheStats(): { bitmaps: number; bytes: number; books: number } {
-  return { bitmaps: bitmapCache.size, bytes: bitmapBytes, books: bookCache.size };
+/** 缓存现状（测试断言 / 排查内存用）；limit 一起给，避免测试硬编码预算数字 */
+export function embedCacheStats(): {
+  bitmaps: number;
+  bytes: number;
+  books: number;
+  limit: number;
+} {
+  return {
+    bitmaps: bitmapCache.size,
+    bytes: bitmapBytes,
+    books: bookCache.size,
+    limit: EMBED_CACHE_BYTES,
+  };
 }
 
 /**

@@ -607,11 +607,14 @@
   height: 0;
 }
 
-/* ---------------------------- 侧边拖动滑条 ----------------------------
+/* ---------------------------- 侧边拖动滑块 ----------------------------
  *
  * 系统滚动条在平板上拖不动（只有滚轮 / 甩动），几十页的本子想从第 3 页
- * 跳到第 27 页只能一页页滑。这条是自己画的：拖滑块按比例改 scrollTop，
- * 拖动时旁边浮一枚页码。所有设备都常显——藏起来就没人知道它能拖。
+ * 跳到第 27 页只能一页页滑。这是自己画的一枚小滑块：
+ *   · 不画长轨道——右缘只有拇指大的那个块，摸到哪才算哪
+ *   · 平时透明且不吃事件，滚动 / 拖动时才淡入，停手约 1.3s 后淡出
+ *   · 只有 .mb-sb-thumb 响应 pointer / touch，容器与轨道一律穿透，
+ *     笔尖落在纸面右缘时和没有滑条时完全一样
  */
 .mb-sb {
   position: absolute;
@@ -623,42 +626,55 @@
   display: flex;
   justify-content: center;
   touch-action: none;
-  transition: opacity 0.18s ease;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.22s ease;
 }
 
-/* 内容没超出一屏：藏掉，免得拖了个寂寞 */
+/* 滚动 / 拖动时浮现 */
+.mb-sb.is-visible {
+  opacity: 1;
+}
+
+/* 内容没超出一屏：彻底藏掉，免得拖了个寂寞（放在 .is-visible 之后保证优先） */
 .mb-sb.is-idle {
   opacity: 0;
   pointer-events: none;
 }
 
+/* 唯一的热区就是滑块本身；容器再宽也不挡笔 */
+.mb-sb.is-visible:not(.is-idle) .mb-sb-thumb {
+  pointer-events: auto;
+}
+
+/* 轨道只当定位容器，不画背景线 */
 .mb-sb-track {
   position: relative;
-  width: 6px;
+  width: 12px;
   height: 100%;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--text-muted) 16%, transparent);
 }
 
 .mb-sb-thumb {
   position: absolute;
   left: 0;
   top: 0;
-  width: 6px;
+  width: 12px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--text-muted) 60%, transparent);
+  background: color-mix(in srgb, var(--text-muted) 78%, transparent);
+  box-shadow: 0 1px 4px -1px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
   will-change: transform;
+  transition: background 0.12s ease;
 }
 
-.mb-sb.is-drag .mb-sb-thumb,
-.mb-sb:active .mb-sb-thumb {
+.mb-sb.is-drag .mb-sb-thumb {
   background: var(--interactive-accent);
 }
 
 /* 拖动时跟着滑块走的页码 */
 .mb-sb-tip {
   position: absolute;
-  right: 20px;
+  right: 18px;
   top: 0;
   padding: 4px 9px;
   border: 1px solid var(--background-modifier-border);
@@ -679,15 +695,15 @@
   opacity: 1;
 }
 
-/* 平板：热区加宽到 22px，轨道仍细——手指按得着，纸面也不花 */
+/* 平板：滑块加宽到 16px（热区仍只包住它），高度下限由 JS 提到 34px */
 .mb-root.is-tablet .mb-sb {
-  width: 22px;
+  width: 20px;
   right: 0;
 }
 
 .mb-root.is-tablet .mb-sb-track,
 .mb-root.is-tablet .mb-sb-thumb {
-  width: 8px;
+  width: 16px;
 }
 
 .mb-doc {
