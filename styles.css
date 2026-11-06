@@ -1477,6 +1477,15 @@
   margin-top: 8px;
 }
 
+/*
+ * 窗口化页列表的上下占位：高度由 JS 按「未建行数 × 行高」写死。
+ * 横跨整行（grid 只把它当一行），从而把已建条目推到正确的滚动位置。
+ */
+.mb-thumb-pad {
+  grid-column: 1 / -1;
+  pointer-events: none;
+}
+
 .mb-thumb {
   position: relative;
   aspect-ratio: 794 / 1123;

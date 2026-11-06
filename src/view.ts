@@ -34,6 +34,14 @@ import { exportBookPdf, exportPagePng } from "./export";
 
 export const VIEW_TYPE = "inkbook-view";
 
+/**
+ * 自动保存为「正在书写的笔」让路的最长时间。
+ *
+ * 正常情况抬笔就会恢复排程；这个上限只兜底事件丢失（pointerup 永远不来、
+ * gesture 卡在 "draw"）——到点强制落一次盘，不能永远不存（INK-129）。
+ */
+const INK_DEFER_MAX_MS = 10_000;
+
 const HIGHLIGHTER_PALETTE = ["#F6E05E", "#9AE6B4", "#90CDF4", "#FBB6CE", "#FBD38D"];
 
 const TOOLS: Array<{ id: ToolId; icon: string; name: string; short: string }> = [
@@ -53,6 +61,23 @@ const SHAPES: Array<{ id: ShapeKind; label: string }> = [
   { id: "line", label: "直线" },
   { id: "arrow", label: "箭头" },
 ];
+
+/**
+ * 侧栏页列表窗口化。
+ *
+ * `.mb-pages` 是「固定列数的等高网格」：同一行里每个条目、以及每一行
+ * 的高度都由列宽 × `aspect-ratio` 决定，所以行高一致，可以按「第几行」
+ * 算窗口，不用逐条测量。但**列宽会随侧栏宽度 / 断点变**（258 / 280 / 340），
+ * 行高必须按真实条目现量（量不到时才用宽度兜底估算），
+ * 并由 ResizeObserver 在侧栏尺寸变化时重算。
+ *
+ * 视口上下各多建 OVERSCAN 行：滚动时不至于先看到一片空白再补。
+ * 行数不多时窗口化没有意义，直接全建。
+ */
+const PAGE_GRID_OVERSCAN_ROWS = 2;
+const PAGE_GRID_FULL_ROWS = 24;
+/** 与 styles.css 里 `.mb-thumb { aspect-ratio: 794 / 1123 }` 一致，只在量不到真实条目时兜底 */
+const PAGE_THUMB_ASPECT = 1123 / 794;
 
 /**
  * 尾沿防抖，可带最大等待（maxWait）。
@@ -191,13 +216,39 @@ export class InkbookView extends FileView {
   private templateGrid: HTMLElement | null = null;
   private paperRow: HTMLElement | null = null;
   private statsEl: HTMLElement | null = null;
-  private thumbCanvases: HTMLCanvasElement[] = [];
+  /**
+   * 页序号 → 缩略图 canvas。
+   *
+   * **键是页号，不是数组下标**：窗口化后只有可视区附近的页有 DOM，
+   * 锚点必须是页号，否则滚动后整个列表的页号会错位
+   * （drawThumbRange / onThumbNeedsRedraw 都按页号取）。
+   */
+  private thumbCanvases = new Map<number, HTMLCanvasElement>();
   /** 缩略图懒渲染：滚进视口才画，避免几百页时卡顿 */
   private thumbObserver: IntersectionObserver | null = null;
   private templateCards = new Map<TemplateId, HTMLElement>();
   private paperChips = new Map<PaperId, HTMLElement>();
   private layerSig = "";
   private pageCountSig = -1;
+  /**
+   * 侧栏页列表窗口化（`.mb-pages` 网格）。
+   *
+   * 侧栏展开时不再给 857 页各建一个条目，只建「可视行 ± overscan」，
+   * 滚出视口的行随窗口一起回收。未建的行用上下两个整行 spacer 撑高度，
+   * 保证滚动条长度不变、跳转位置不漂。
+   */
+  private pageListViewportEl: HTMLElement | null = null;
+  /** 重建侧栏时取消旧滚动监听（旧节点随后就被丢弃） */
+  private pageListAbort: AbortController | null = null;
+  private pageListResizeObs: ResizeObserver | null = null;
+  /** 窗口刷新已排进下一帧（scroll 每帧只算一次） */
+  private pageListRaf = 0;
+  /** 当前已建窗口按「行」记（不是页）：[pageWinRowLo, pageWinRowHi) */
+  private pageWinRowLo = -1;
+  private pageWinRowHi = -1;
+  /** 建窗口时用的行高 / 列数；侧栏宽度变化时与实时测量对比后重算 */
+  private pageWinRowH = 0;
+  private pageWinCols = 0;
   /**
    * 当前高亮的缩略图条目。
    *
@@ -239,6 +290,27 @@ export class InkbookView extends FileView {
   private lastZoom = -1;
   private touchBtn!: HTMLButtonElement;
   private dirty = false;
+  /**
+   * 「内容变脏」代次：markDirty 一次加一。
+   *
+   * 保存要跨好几个 await（指纹、备份、tmp 写入）。期间用户可能又落了一笔，
+   * 而这一笔**不在已经 stringify 出去的那版 JSON 里**。只有 dirty 布尔的话，
+   * 保存成功时会把这一笔的脏标记一起清掉，它就悄悄等不到下一次落盘。
+   * 保存结束对比代次：变了 = 存完再排一次。
+   */
+  private dirtyEpoch = 0;
+  /** 元数据（activePage）代次，用途同 dirtyEpoch；翻页本身不触发整本写盘 */
+  private metaEpoch = 0;
+  /**
+   * 自动保存开始避让书写的时刻（0 = 当前没在避让）。
+   *
+   * 只用来算 10s 硬上限：如果手势因为事件丢失卡在 "draw"（pointerup 永远不来），
+   * 不能一直「等抬笔」——上限一到就强制存一次，宁可让这一笔卡一下，
+   * 也不能让整本书永远不落盘（INK-129 的教训）。
+   */
+  private inkDeferAt = 0;
+  /** 硬上限的唤醒定时器 */
+  private inkDeferRetry = 0;
   /** 只有翻页/切页这类「没动笔迹的改动」变脏，单独一个标记，避免整本写盘 */
   private metaDirty = false;
   /** 上次成功写盘时文件在磁盘上的指纹；null = 拿不到指纹，不做冲突检测 */
@@ -260,8 +332,9 @@ export class InkbookView extends FileView {
   /** 打开中的占位（见 showLoading）；没有占位时是 null */
   private loadingEl: HTMLElement | null = null;
   private _loadToken = 0;
-  // 连写一整页时每笔都重置 850ms 尾沿，必须有个最大等待兜底（10s）
-  private saveDebounce = debounce(() => this.saveNow(), 850, 10_000);
+  // 连写一整页时每笔都重置 850ms 尾沿，必须有个最大等待兜底（10s）。
+  // 到点后走 runAutoSave：正在落笔的话会先避让，抬手后再排。
+  private saveDebounce = debounce(() => this.runAutoSave(), 850, 10_000);
   private thumbDebounce = debounce(() => this.refreshThumbs(), 320);
 
   constructor(leaf: any, plugin: InkbookPluginLike) {
@@ -298,9 +371,21 @@ export class InkbookView extends FileView {
      * （saveNow 自带并发保护，重复调用安全）。
      */
     this.registerDomEvent(document, "visibilitychange", () => {
-      if (document.visibilityState === "hidden") void this.flushSave();
+      if (document.visibilityState === "hidden") {
+        /*
+         * 先把正在画的一笔收尾（commitDraft 提交成正式笔迹），再强制落盘。
+         * 顺序不能反：flushSave 只写已提交内容，半笔还躺在 draft 里的话
+         * 这次切后台就直接把它丢了。editor 自己也监听 visibilitychange，
+         * 这里是提前、确定性的那一次（重复调用是安全的空操作）。
+         */
+        this.editor?.finishInkGesture();
+        void this.flushSave();
+      }
     });
-    this.registerDomEvent(window, "pagehide", () => void this.flushSave());
+    this.registerDomEvent(window, "pagehide", () => {
+      this.editor?.finishInkGesture();
+      void this.flushSave();
+    });
   }
 
   async onClose(): Promise<void> {
@@ -322,7 +407,10 @@ export class InkbookView extends FileView {
   private syncActivePage(): void {
     if (!this.store || !this.editor) return;
     this.store.data.activePage = this.editor.getState().pageIndex;
-    if (this.savedActivePage !== this.store.data.activePage) this.metaDirty = true;
+    if (this.savedActivePage !== this.store.data.activePage) {
+      this.metaDirty = true;
+      this.metaEpoch += 1;
+    }
   }
 
   /** 装载一本书（首次读成功、以及从备份恢复时共用） */
@@ -509,6 +597,8 @@ export class InkbookView extends FileView {
       onState: () => this.updateUI(),
       onChange: () => this.markDirty(),
       onPageChange: () => this.onPageChanged(),
+      // 抬笔 / 擦除收手：把书写期间避让掉的自动保存重新排上
+      onInkGestureEnd: () => this.onInkGestureEnd(),
       /*
        * 底图（PDF 页 / 图片）渲染好了 → 补画那一页的缩略图。
        *
@@ -520,7 +610,8 @@ export class InkbookView extends FileView {
         // 侧栏收起/仅阅读时不要画：隐藏状态的 rect 是 0，会走 60×84 的回退尺寸，
         // 白白把 PDF 页排进光栅化队列（展开时会统一补画）
         if (!this.thumbVisible()) return;
-        const cv = this.thumbCanvases[i];
+        const cv = this.thumbCanvases.get(i);
+        // 页号可能不在当前窗口里（大本子只物化可视区），拿不到就等它滚进来再画
         if (cv && cv.isConnected) this.editor?.renderThumbnail(cv, i);
       },
     });
@@ -548,6 +639,8 @@ export class InkbookView extends FileView {
   private destroyEditor(): void {
     this.editor?.destroy();
     this.editor = null;
+    this.cancelInkDeferRetry();
+    this.inkDeferAt = 0;
     // 顶栏那一行挂在标题栏/自建条上，不跟着 editorHost 走，得单独摘
     this.topRowEl?.remove();
     this.topBarEl?.remove();
@@ -594,8 +687,19 @@ export class InkbookView extends FileView {
     // 侧栏收起时列表可能还没建，观察器只在 renderPageList 里断会漏
     this.thumbObserver?.disconnect();
     this.thumbObserver = null;
-    this.thumbCanvases = [];
+    this.thumbCanvases.clear();
     this.activeThumbEl = null;
+    // 页列表窗口化：旧节点已经随 sideEl.empty() 一起拆掉，监听/观察一并断
+    this.pageListAbort?.abort();
+    this.pageListAbort = null;
+    this.pageListResizeObs?.disconnect();
+    this.pageListResizeObs = null;
+    this.pageListViewportEl = null;
+    this.cancelPageListRaf();
+    this.pageWinRowLo = -1;
+    this.pageWinRowHi = -1;
+    this.pageWinRowH = 0;
+    this.pageWinCols = 0;
     this.templateCards.clear();
     this.paperChips.clear();
     this.layerSig = "";
@@ -655,8 +759,14 @@ export class InkbookView extends FileView {
      * 展开侧栏（或退出仅阅读）时补建/补画缩略图。
      * 收起状态下不建页列表、不渲染缩略图：857 页的本子光建 DOM 就要几十毫秒，
      * 更贵的是会立刻用 pdf.js 渲 5 页缩略图，和首屏抢同一份 PDF。
+     *
+     * 顺序：先把页列表窗口按当前滚动位置摆好（display:none 期间量不到尺寸），
+     * 再补画缩略图——否则 refreshThumbs 画的还是收起前那批 canvas。
      */
-    if (visible) this.refreshThumbs();
+    if (visible) {
+      this.updatePageWindow(false);
+      this.refreshThumbs();
+    }
   }
 
   /** 缩略图/页列表现在有必要维护吗（侧栏收起或仅阅读时都不必要） */
@@ -1823,6 +1933,8 @@ export class InkbookView extends FileView {
     closeBtn.onclick = () => this.toggleSide();
 
     const body = side.createDiv("mb-side-body");
+    // 页列表的窗口随这个滚动容器移动；侧栏尺寸/断点变化也要重算行高
+    this.attachPageListScroll(body);
 
     /* ---------------------------- 工具行 ---------------------------- */
     /*
@@ -2136,59 +2248,28 @@ export class InkbookView extends FileView {
   /**
    * 渲染侧栏页列表。
    *
-   * 大 PDF 可能有几百页——每页都建 canvas 并立刻绘制会明显卡顿。
-   * 所以改成**懒渲染**：先只建 DOM（便宜），真正画缩略图
-   * 交给 IntersectionObserver，只在缩略图滚进可视区时才画。
+   * 大本子（857 页）不能给每页都建 canvas + 3 个子节点：光建 DOM 就是
+   * 几十毫秒，等于打开时间的一半。现在按「行」窗口化：
+   *   · `.mb-pages` 是固定列数的等高网格，行高 = 列宽 × aspect-ratio + 行距；
+   *   · 只给可视区上下各 OVERSCAN 行建条目，其余用两个整行 spacer 撑高度；
+   *   · 滚动时按行重建窗口，滚出视口的条目连 canvas 一起回收；
+   *   · 缩略图仍由 IntersectionObserver 负责「进视口才画」——
+   *     窗口只决定「有哪些条目」，不改变懒画语义。
    */
   private renderPageList(): void {
     if (!this.pageListEl || !this.store || !this.editor) return;
-    this.pageListEl.empty();
-    this.thumbCanvases = [];
-    this.thumbObserver?.disconnect();
-    this.thumbObserver = null;
-    const count = this.store.pageCount;
-    const current = this.store.data.activePage;
-    for (let i = 0; i < count; i++) {
-      const item = this.pageListEl.createDiv("mb-thumb" + (i === current ? " is-active" : ""));
-      item.dataset.page = String(i);
-      const cv = document.createElement("canvas");
-      cv.className = "mb-thumb-canvas";
-      item.appendChild(cv);
-      item.createDiv({ cls: "mb-thumb-num", text: String(i + 1) });
-      const dup = item.createEl("button", { cls: "mb-thumb-act mb-thumb-dup", attr: { "aria-label": "复制本页" } });
-      setIcon(dup, "copy");
-      dup.onclick = (e) => {
-        e.stopPropagation();
-        this.editor?.duplicatePage(i);
-      };
-      if (count > 1) {
-        const del = item.createEl("button", {
-          cls: "mb-thumb-act mb-thumb-del",
-          attr: { "aria-label": "删除本页" },
-        });
-        setIcon(del, "trash-2");
-        del.onclick = (e) => {
-          e.stopPropagation();
-          this.editor?.deletePage(i);
-        };
-      }
-      item.onclick = () => this.editor?.goToPage(i);
-      this.thumbCanvases.push(cv);
-    }
-    const add = this.pageListEl.createDiv("mb-thumb mb-thumb-add");
-    add.createDiv({ cls: "mb-thumb-plus", text: "+" });
-    add.createDiv({ cls: "mb-thumb-add-label", text: "加一页" });
-    add.onclick = () => this.editor?.addPage();
-    this.pageCountSig = count;
-    this.activeThumbEl = (this.thumbCanvases[current]?.parentElement as HTMLElement) ?? null;
+    // 页数变了：立刻失效窗口（不跨页复用 DOM，闭包里捕获的页号会过期）
+    this.pageWinRowLo = -1;
+    this.pageWinRowHi = -1;
+    this.updatePageWindow(true);
 
-    // 只在缩略图进入可视区时才绘制
-    this.observeThumbs();
     /*
      * 先只画当前页；相邻页延到空闲时再画。
      * 857 页的本子打开时，5 张缩略图会同时排进 pdf.js 的渲染队列，
      * 和首屏那一页抢 IO/CPU，用户感觉就是「打开半天」。
+     * 窗口里没有当前页时 drawThumbRange 会自然跳过，等滚进来由 IO 补画。
      */
+    const current = this.store.data.activePage;
     this.drawThumbRange(current, 0);
     const idle = (window as any).requestIdleCallback as
       | ((cb: () => void, opts?: { timeout: number }) => number)
@@ -2197,21 +2278,249 @@ export class InkbookView extends FileView {
     else window.setTimeout(() => this.drawThumbRange(current, 2), 300);
   }
 
-  /** 只切换新旧两个缩略图的选中态（不扫全列表） */
+  /**
+   * 按当前滚动位置重算页列表窗口。
+   *
+   * @param force 忽略「窗口没变」的快路径（页数变化 / 展开侧栏时用）
+   */
+  private updatePageWindow(force: boolean): void {
+    const list = this.pageListEl;
+    const viewport = this.pageListViewportEl;
+    if (!list || !viewport || !this.store || !this.editor) return;
+    if (!this.thumbVisible()) return;
+    // display:none / 尚未布局时量不到宽度，等展开事件或 ResizeObserver 再来
+    if (list.clientWidth <= 0) return;
+
+    const count = this.store.pageCount;
+    const { cols, gap, rowH } = this.measurePageGrid(list);
+    if (!(cols > 0) || !(rowH > 0)) return;
+    // 每页一格 + 末尾一个「加一页」
+    const totalRows = Math.ceil((count + 1) / cols);
+    const full = totalRows <= PAGE_GRID_FULL_ROWS;
+
+    let rowLo = 0;
+    let rowHi = totalRows;
+    if (!full) {
+      const listRect = list.getBoundingClientRect();
+      const vpRect = viewport.getBoundingClientRect();
+      const top = Math.max(0, vpRect.top - listRect.top);
+      const bottom = Math.min(listRect.height, vpRect.bottom - listRect.top);
+      if (bottom <= top) {
+        /*
+         * 页列表整个在视口外（很常见：刚展开侧栏，页列表还在下面没滚到）。
+         * 先只建第一行：一是给用户滚下来时立刻有内容，
+         * 二是靠真实条目把行高量准——下方 spacer 有上万像素，估错会累积。
+         */
+        rowLo = 0;
+        rowHi = Math.min(totalRows, 1);
+      } else {
+        const topRow = this.pageListYToRow(top, rowH);
+        const bottomRow = this.pageListYToRow(bottom, rowH);
+        rowLo = Math.max(0, Math.floor(topRow) - PAGE_GRID_OVERSCAN_ROWS);
+        rowHi = Math.min(totalRows, Math.ceil(bottomRow) + PAGE_GRID_OVERSCAN_ROWS);
+        if (rowHi <= rowLo) rowHi = Math.min(totalRows, rowLo + 1);
+        rowLo = Math.min(rowLo, totalRows - 1);
+      }
+    }
+    // DOM 被外部清空（测试 / 宿主重置）时窗口状态不可信，必须重建
+    if (!list.firstElementChild) force = true;
+    if (
+      !force &&
+      rowLo === this.pageWinRowLo &&
+      rowHi === this.pageWinRowHi &&
+      cols === this.pageWinCols &&
+      Math.abs(rowH - this.pageWinRowH) < 1
+    ) {
+      // 窗口没变，但页数可能变了（例如删页后仍停在同一个窗口）
+      this.pageCountSig = count;
+      return;
+    }
+    this.buildPageWindow(rowLo, rowHi, cols, gap, rowH, totalRows, count);
+  }
+
+  /**
+   * 列表纵坐标（px）→ 行号。
+   *
+   * 侧栏宽度变化后，旧 spacer 还是按旧行高撑的，条目却按新行高排。
+   * 直接 y / 新行高 会在「上 spacer + 已建行 + 下 spacer」三段之间算错，
+   * 这里分段换算：上 spacer 用旧行高，已建行用新行高，下 spacer 继续按
+   * 新行高外推。重建后视口仍落在同一页附近，不会跳到列表另一端。
+   */
+  private pageListYToRow(y: number, rowH: number): number {
+    const prevLo = this.pageWinRowLo;
+    const prevHi = this.pageWinRowHi;
+    const prevH = this.pageWinRowH;
+    if (prevLo <= 0 || prevH <= 0) return y / rowH;
+    const firstRowY = prevLo * prevH; // 上 spacer 占 prevLo 行；行距已含在 rowH 里
+    if (y <= firstRowY) return y / prevH;
+    const renderedEndY = firstRowY + Math.max(0, prevHi - prevLo) * rowH;
+    if (y <= renderedEndY) return prevLo + (y - firstRowY) / rowH;
+    return prevHi + (y - renderedEndY) / rowH;
+  }
+
+  /** 量网格：列数、行距、行高（真实条目优先；量不到才按列宽估） */
+  private measurePageGrid(list: HTMLElement): { cols: number; gap: number; rowH: number } {
+    const cs = window.getComputedStyle(list);
+    const tracks = (cs.gridTemplateColumns || "")
+      .trim()
+      .split(/\s+/)
+      .filter((s) => /^-?\d+(\.\d+)?px$/.test(s));
+    const cols = Math.max(1, tracks.length || 4);
+    let gap = parseFloat(cs.rowGap);
+    if (!Number.isFinite(gap)) gap = 7;
+
+    const probe = list.querySelector(".mb-thumb:not(.mb-thumb-add)") as HTMLElement | null;
+    let itemH = probe ? probe.getBoundingClientRect().height : 0;
+    if (!(itemH > 2)) {
+      // 还没有条目（首次渲染）：按列宽 × 宽高比估一个，建完再用真实条目校准
+      let colW = tracks.length ? parseFloat(tracks[0]) : 0;
+      if (!(colW > 0)) colW = (list.clientWidth - gap * (cols - 1)) / cols;
+      itemH = Math.max(1, colW) * PAGE_THUMB_ASPECT;
+    }
+    return { cols, gap, rowH: Math.max(1, itemH + gap) };
+  }
+
+  /**
+   * 按行区间重建页列表 DOM。
+   *
+   * 高度守恒：上下 spacer + 已建行的总高度 = 未窗口化时整个网格的高度，
+   * 所以滚动条长度与滚动位置都不变（滑到底、跳页都不会漂）。
+   */
+  private buildPageWindow(
+    rowLo: number,
+    rowHi: number,
+    cols: number,
+    gap: number,
+    rowH: number,
+    totalRows: number,
+    count: number,
+    allowRemeasure = true
+  ): void {
+    const list = this.pageListEl;
+    if (!list) return;
+    /*
+     * 重建窗口时**不复用**旧节点：闭包里的页号、dataset.page、canvas 映射
+     * 必须一起换掉，复用最容易出现「点了删除，删的是另一页」。
+     */
+    this.thumbObserver?.disconnect();
+    this.thumbObserver = null;
+    list.empty();
+    this.thumbCanvases.clear();
+    this.activeThumbEl = null;
+
+    const current = this.store?.data.activePage ?? 0;
+    if (rowLo > 0) {
+      // 上 spacer 独占一行（grid-column: 1/-1），与下一行之间还有一个 gap
+      const pad = document.createElement("div");
+      pad.className = "mb-thumb-pad";
+      pad.style.height = Math.max(0, rowLo * rowH - gap) + "px";
+      list.appendChild(pad);
+    }
+    const firstCell = rowLo * cols;
+    const lastCell = Math.min(rowHi * cols, count + 1);
+    for (let i = firstCell; i < lastCell; i++) {
+      if (i < count) this.createThumbItem(list, i, i === current);
+      else this.createAddThumb(list);
+    }
+    if (rowHi < totalRows) {
+      const pad = document.createElement("div");
+      pad.className = "mb-thumb-pad";
+      pad.style.height = Math.max(0, (totalRows - rowHi) * rowH - gap) + "px";
+      list.appendChild(pad);
+    }
+
+    this.pageCountSig = count;
+    this.pageWinRowLo = rowLo;
+    this.pageWinRowHi = rowHi;
+    this.pageWinCols = cols;
+    this.pageWinRowH = rowH;
+    // 当前页不在窗口里时保持 null：updateUI 里的 setActiveThumb 会安全地清掉旧高亮
+    this.activeThumbEl = (this.thumbCanvases.get(current)?.parentElement as HTMLElement) ?? null;
+
+    this.observeThumbs();
+
+    /*
+     * 首次渲染没有条目可量，行高是估的。建完立刻用真实条目校准：
+     * 857 页时下 spacer 约 200 行，每行差 0.5px 就是上百像素的滚动误差。
+     */
+    if (allowRemeasure) {
+      const probe = list.querySelector(".mb-thumb:not(.mb-thumb-add)") as HTMLElement | null;
+      const measured = probe ? probe.getBoundingClientRect().height + gap : 0;
+      if (measured > 2 && Math.abs(measured - rowH) > 0.5) {
+        this.buildPageWindow(rowLo, rowHi, cols, gap, measured, totalRows, count, false);
+      }
+    }
+  }
+
+  private createThumbItem(list: HTMLElement, index: number, active: boolean): void {
+    const item = list.createDiv("mb-thumb" + (active ? " is-active" : ""));
+    item.dataset.page = String(index);
+    const cv = document.createElement("canvas");
+    cv.className = "mb-thumb-canvas";
+    item.appendChild(cv);
+    item.createDiv({ cls: "mb-thumb-num", text: String(index + 1) });
+    const dup = item.createEl("button", { cls: "mb-thumb-act mb-thumb-dup", attr: { "aria-label": "复制本页" } });
+    setIcon(dup, "copy");
+    dup.onclick = (e) => {
+      e.stopPropagation();
+      this.editor?.duplicatePage(index);
+    };
+    if ((this.store?.pageCount ?? 0) > 1) {
+      const del = item.createEl("button", {
+        cls: "mb-thumb-act mb-thumb-del",
+        attr: { "aria-label": "删除本页" },
+      });
+      setIcon(del, "trash-2");
+      del.onclick = (e) => {
+        e.stopPropagation();
+        this.editor?.deletePage(index);
+      };
+    }
+    item.onclick = () => this.editor?.goToPage(index);
+    this.thumbCanvases.set(index, cv);
+  }
+
+  private createAddThumb(list: HTMLElement): void {
+    const add = list.createDiv("mb-thumb mb-thumb-add");
+    add.createDiv({ cls: "mb-thumb-plus", text: "+" });
+    add.createDiv({ cls: "mb-thumb-add-label", text: "加一页" });
+    add.onclick = () => this.editor?.addPage();
+  }
+
+  /**
+   * 只切换新旧两个缩略图的选中态（不扫全列表）。
+   *
+   * 窗口化后当前页可能不在窗口里（用户把侧栏滚到了别的页段）：
+   * 这时 next 为 null，只是清掉旧高亮，**绝不滚动侧栏**；
+   * 等条目被物化时 createThumbItem 会按 store.data.activePage 补上 is-active。
+   */
   private setActiveThumb(index: number): void {
-    const next = (this.thumbCanvases[index]?.parentElement as HTMLElement) ?? null;
+    const next = (this.thumbCanvases.get(index)?.parentElement as HTMLElement | undefined) ?? null;
     if (next === this.activeThumbEl) return;
     this.activeThumbEl?.classList.remove("is-active");
     next?.classList.add("is-active");
     this.activeThumbEl = next;
   }
 
-  /** 监听缩略图可见性，进入视口才渲染 */
+  /**
+   * 监听缩略图可见性，进入视口才渲染。
+   *
+   * root 必须是真正的滚动容器 `.mb-side-body`。以前用 `.mb-sec`（页列表的
+   * 父节点）当 root，所有条目都在它里面，等于全部「相交」——几百页时会
+   * 一次画满整个列表。窗口化后条目少了，但每滚一行都会重建，
+   * root 不对就会把刚建出来的几十张全画一遍，白白排满 pdf.js 队列。
+   */
   private observeThumbs(): void {
+    const list = this.pageListEl;
+    if (!list) return;
     if (typeof IntersectionObserver === "undefined") {
-      // 兜底：没有 IO 就全画
-      for (let i = 0; i < this.thumbCanvases.length; i++) {
-        this.editor?.renderThumbnail(this.thumbCanvases[i], i);
+      // 兜底：没有 IO 就把**当前窗口里的**都画了（窗口最多几十条，不再是全本）
+      for (const item of Array.from(list.children)) {
+        if (!(item instanceof HTMLElement)) continue;
+        const idx = Number(item.dataset.page);
+        if (!Number.isFinite(idx)) continue;
+        const cv = this.thumbCanvases.get(idx);
+        if (cv) this.editor?.renderThumbnail(cv, idx);
       }
       return;
     }
@@ -2222,25 +2531,80 @@ export class InkbookView extends FileView {
           const el = entry.target as HTMLElement;
           const idx = Number(el.dataset.page);
           if (!Number.isFinite(idx)) continue;
-          this.editor?.renderThumbnail(this.thumbCanvases[idx], idx);
+          /*
+           * 节点可能已经被下一次窗口重建换掉了（滚动很快时 IO 回调会迟到）：
+           * 只画「还在文档里、且 dataset 对得上当前映射」的那张 canvas。
+           */
+          const cv = this.thumbCanvases.get(idx);
+          if (cv && cv.isConnected && el.isConnected && el.dataset.page === String(idx)) {
+            this.editor?.renderThumbnail(cv, idx);
+          }
         }
       },
-      { root: this.pageListEl?.parentElement ?? null, rootMargin: "300px 0px" }
+      { root: this.pageListViewportEl ?? list.parentElement ?? null, rootMargin: "300px 0px" }
     );
-    const list = this.pageListEl;
-    if (!list) return;
     for (const item of Array.from(list.children)) {
+      if (!(item instanceof HTMLElement) || !item.classList.contains("mb-thumb")) continue;
       if (item.classList.contains("mb-thumb-add")) continue;
       this.thumbObserver.observe(item);
     }
   }
 
-  /** 画一段范围内的缩略图（当前页附近） */
+  /** 画一段范围内的缩略图（当前页附近；窗口里没有的页等滚进来再画） */
   private drawThumbRange(center: number, span: number): void {
+    if (!this.store) return;
     const lo = Math.max(0, center - span);
-    const hi = Math.min(this.thumbCanvases.length - 1, center + span);
+    const hi = Math.min(this.store.pageCount - 1, center + span);
     for (let i = lo; i <= hi; i++) {
-      this.editor?.renderThumbnail(this.thumbCanvases[i], i);
+      const cv = this.thumbCanvases.get(i);
+      if (cv && cv.isConnected) this.editor?.renderThumbnail(cv, i);
+    }
+  }
+
+  /**
+   * 页列表滚动 / 侧栏尺寸变化 → 下一帧重算窗口。
+   *
+   * 不直接同步跑：一次滚动会连发几十个 scroll，按帧合并后最多每跨一行重建一次。
+   */
+  private schedulePageWindowUpdate(): void {
+    if (this.pageListRaf) return;
+    const run = () => {
+      this.pageListRaf = 0;
+      this.updatePageWindow(false);
+    };
+    if (typeof window.requestAnimationFrame === "function") {
+      this.pageListRaf = window.requestAnimationFrame(run);
+    } else {
+      this.pageListRaf = window.setTimeout(run, 16);
+    }
+  }
+
+  private cancelPageListRaf(): void {
+    if (!this.pageListRaf) return;
+    if (typeof window.cancelAnimationFrame === "function") window.cancelAnimationFrame(this.pageListRaf);
+    else window.clearTimeout(this.pageListRaf);
+    this.pageListRaf = 0;
+  }
+
+  /** 把页列表接到侧栏滚动容器上（重建侧栏时换新，旧的走 abort） */
+  private attachPageListScroll(body: HTMLElement): void {
+    this.pageListAbort?.abort();
+    this.pageListResizeObs?.disconnect();
+    const ac = new AbortController();
+    this.pageListAbort = ac;
+    this.pageListViewportEl = body;
+    body.addEventListener("scroll", () => this.schedulePageWindowUpdate(), {
+      passive: true,
+      signal: ac.signal,
+    });
+    /*
+     * 侧栏宽度在三种断点（258 / 280 / 340）之间变化时，网格列宽和行高都变；
+     * 视口高度变化也会改变「可视几行」。两者都只能重算窗口。
+     * 只观察滚动容器本身：观察列表会被我们自己的 spacer 改高反馈成循环。
+     */
+    if (typeof ResizeObserver !== "undefined") {
+      this.pageListResizeObs = new ResizeObserver(() => this.schedulePageWindowUpdate());
+      this.pageListResizeObs.observe(body);
     }
   }
 
@@ -2350,13 +2714,17 @@ export class InkbookView extends FileView {
       ? this.store.data.activePage
       : -1;
     // 页码和上次写盘时一样 → 这次翻页没产生任何需要落盘的改动
-    if (page !== this.savedActivePage) this.metaDirty = true;
+    if (page !== this.savedActivePage) {
+      this.metaDirty = true;
+      this.metaEpoch += 1;
+    }
     this.updateUI();
     this.thumbDebounce();
   }
 
   private markDirty(): void {
     this.dirty = true;
+    this.dirtyEpoch += 1;
     this.saveState = "dirty";
     this.updateStatus();
     // 只读态（备份恢复 / 打不开）下的改动一律不会落盘，必须当场说清楚，
@@ -2394,6 +2762,51 @@ export class InkbookView extends FileView {
   }
 
   /* ------------------------------- 保存 ------------------------------- */
+
+  /** 编辑器是否有一笔墨压在纸上（见 BookEditor.isInkBusy） */
+  private isInkBusy(): boolean {
+    return !!this.editor && this.editor.isInkBusy();
+  }
+
+  /**
+   * 自动保存的唯一入口（850ms 尾沿 / 10s maxWait 到点后走这里）。
+   *
+   * 是否避让由 saveNow(false) 自己判断——这样所有自动路径都从同一道门过，
+   * markDirty() 绝不拦截（它还驱动 thumbDebounce，拦了缩略图会停更）。
+   */
+  private runAutoSave(): void {
+    void this.saveNow(false);
+  }
+
+  /**
+   * 一次墨水手势结束（抬笔 / 擦除收手 / 手势被取消）。
+   *
+   * 自动保存避让期间是不排定时器的，抬手必须把那次「欠着的保存」重新排上。
+   * 不能只靠 markDirty：橡皮停住不动再抬手时，最后一次擦除早就入了改脏，
+   * 抬手本身不会再触发 onChange——没有这一步，那次保存就永远排不上。
+   *
+   * 但**不能顺手清掉 10s 硬上限**：连续书写时每笔间隔 < 850ms，
+   * 每次抬手都重置上限的话，一笔接一笔写下去就又变回「永远不落盘」
+   * （INK-129）。上限的时间戳和兜底定时器要一直留到真正存成功为止。
+   */
+  private onInkGestureEnd(): void {
+    if (this.dirty && this.plugin.settings.autosave) this.saveDebounce();
+  }
+
+  /** 硬上限到点后来敲门：不 busy 了就正常存，还 busy 就让 saveNow 强制存 */
+  private armInkDeferRetry(delayMs: number): void {
+    this.cancelInkDeferRetry();
+    this.inkDeferRetry = window.setTimeout(() => {
+      this.inkDeferRetry = 0;
+      if (!this.dirty && !this.metaDirty) return;
+      this.runAutoSave();
+    }, Math.max(0, delayMs) + 50);
+  }
+
+  private cancelInkDeferRetry(): void {
+    if (this.inkDeferRetry) window.clearTimeout(this.inkDeferRetry);
+    this.inkDeferRetry = 0;
+  }
 
   /**
    * 长条「立即保存」按钮的入口。
@@ -2489,7 +2902,18 @@ export class InkbookView extends FileView {
     }
   }
 
-  async saveNow(): Promise<void> {
+  /**
+   * 写盘。
+   *
+   * `force = false` 只给**自动保存**用：正在落笔时先避让（不 stringify），
+   * 把那次保存欠着。显式路径——切后台 / 关文件 / Ctrl+S / 手动保存 / 导入——
+   * 一律用默认的 `force = true`，必须当场写，不能被书写挡住。
+   *
+   * 避让判断的位置很讲究：放在「保存中 → saveAgain 排队」**之后**、
+   * 置 saving **之前**。放在前面会把正在进行的保存误当成「又排一次」，
+   * 放在后面则会让 UI 永远卡在「保存中…」。
+   */
+  async saveNow(force = true): Promise<void> {
     if (!this.store || !this.file || this.readOnly || this.conflict) {
       /*
        * 兜底：只读态下有改动却走到这里（万一以后又冒出别的只读路径），
@@ -2502,6 +2926,19 @@ export class InkbookView extends FileView {
       this.saveAgain = true;
       return;
     }
+    if (!force && this.isInkBusy()) {
+      const now = Date.now();
+      if (!this.inkDeferAt) this.inkDeferAt = now;
+      if (now - this.inkDeferAt < INK_DEFER_MAX_MS) {
+        // 只欠着，不序列化；抬笔（onInkGestureEnd）或 10s 上限会再来
+        this.armInkDeferRetry(INK_DEFER_MAX_MS - (now - this.inkDeferAt));
+        return;
+      }
+      // 手势卡死超过上限（事件丢失）：不等了，强制写一次
+      console.warn("[inkbook] 书写手势超过 10s 未结束，强制保存一次");
+    }
+    this.inkDeferAt = 0;
+    this.cancelInkDeferRetry();
     this.saving = true;
     this.saveAgain = false;
     this.saveState = "saving";
@@ -2524,11 +2961,27 @@ export class InkbookView extends FileView {
         return;
       }
 
+      /*
+       * 记下代次再进 writeBook：它一进去就 stringify，之后备份 / tmp 写入
+       * 都在 await——那段时间用户再落的笔**不在这一版 JSON 里**。
+       * 存完对比代次，变了就保留 dirty 并再排一次，不能把「已保存」当终点。
+       */
+      const dirtyEpoch = this.dirtyEpoch;
+      const metaEpoch = this.metaEpoch;
       await writeBook(adapter, path, this.store.data);
-      this.dirty = false;
-      this.metaDirty = false;
-      this.saveState = "saved";
-      this.savedActivePage = this.store.data.activePage;
+      if (this.dirtyEpoch === dirtyEpoch) {
+        this.dirty = false;
+        this.saveState = "saved";
+      } else {
+        // 写盘期间又有新改动：这一版写的是旧内容，存完再存一次
+        this.dirty = true;
+        this.saveState = "dirty";
+        this.saveAgain = true;
+      }
+      if (this.metaEpoch === metaEpoch) {
+        this.metaDirty = false;
+        this.savedActivePage = this.store.data.activePage;
+      }
       this.fp = await fingerprint(adapter, path);
       /*
        * 本子落盘之后再更新文字索引：索引是派生物，
@@ -2670,6 +3123,13 @@ export class InkbookView extends FileView {
 
   async flushSave(): Promise<void> {
     this.saveDebounce.cancel();
+    /*
+     * 显式落盘路径，**不避让书写**：切后台 / 关文件 / 切文件时，
+     * 正在写的那一笔会先由 `finishInkGesture()` 收尾提交（见 visibilitychange
+     * 处理器），这里负责把已提交的内容一条不落地写下去。
+     * 即便 gesture 仍是 "draw"（收尾失败等异常情况），也照样 saveNow——
+     * 已提交的笔迹一条都不能少。
+     */
     if (this.dirty || this.metaDirty) await this.saveNow();
     /*
      * saveNow 成功时只负责「排一个 1 秒后的索引定时器」，而随后 destroyEditor()

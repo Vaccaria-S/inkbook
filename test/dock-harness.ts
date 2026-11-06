@@ -577,6 +577,95 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   scroll.scrollTop = 0;
   await sleep(120);
 
+  /* ============ 2.6 侧栏页列表窗口化（大本子不一次建满） ============ */
+  /*
+   * 用户那本 857 页：旧实现给每页建 canvas + 3 个子节点，侧栏展开时一次
+   * 建 857 个条目（实测 46ms，占打开时间一半）。现在只建「可视行 ± overscan」，
+   * 滚动时再按行补建 / 回收。这里用 400 页验证四件事：
+   *   1. 一开始只建可视区那一小批（远小于 400）；
+   *   2. 滚下去条目变多、能见到最后一页；
+   *   3. 滚回顶部，后面的条目被回收（不是只增不减）；
+   *   4. 上下 spacer 撑住总高度（否则根本滚不到最后一页）。
+   */
+  {
+    const sideBody = sideEl.querySelector(".mb-side-body") as HTMLElement;
+    const listEl = sideEl.querySelector(".mb-pages") as HTMLElement;
+    const origPages = view.store!.data.pages;
+    const N = 400;
+    const big = origPages.slice();
+    for (let i = big.length; i < N; i++) big.push(createPage("blank", "white"));
+    const thumbCount = () =>
+      listEl.querySelectorAll(".mb-thumb:not(.mb-thumb-add)").length;
+
+    sideBody.scrollTop = 0;
+    view.store!.data.pages = big;
+    (view as any).pageCountSig = -1;
+    (view as any).renderPageList();
+    await sleep(120);
+
+    const first = thumbCount();
+    pass(
+      first > 0 && first < 80,
+      "400 页侧栏初始只建可视区条目（" + first + " 个，远小于 400）"
+    );
+    pass(
+      !listEl.querySelector('.mb-thumb[data-page="399"]'),
+      "初始窗口里没有第 400 页（没有一次性建满）"
+    );
+
+    // 滚到页列表底部：可视区换了，窗口应该按需补建到最后一页
+    sideBody.scrollTop = sideBody.scrollHeight;
+    sideBody.dispatchEvent(new Event("scroll"));
+    await sleep(300);
+    const bottom = thumbCount();
+    pass(bottom > first, "滚动后按需补建条目（" + first + " → " + bottom + "）");
+    pass(
+      !!listEl.querySelector('.mb-thumb[data-page="399"]'),
+      "滚到底能看到最后一页条目（data-page=399）"
+    );
+    pass(!!listEl.querySelector(".mb-thumb-add"), "滚到底时「加一页」条目也在");
+
+    // 总高度守恒：窗口化不能把列表缩短（否则滚动条变短、最后一页到不了）
+    const cs = getComputedStyle(listEl);
+    const cols = Math.max(1, cs.gridTemplateColumns.split(/\s+/).filter((s) => s.endsWith("px")).length || 4);
+    let gap = parseFloat(cs.rowGap);
+    if (!Number.isFinite(gap)) gap = 7;
+    const rowThumb = listEl.querySelector(".mb-thumb:not(.mb-thumb-add)") as HTMLElement | null;
+    const rowH = rowThumb ? rowThumb.getBoundingClientRect().height + gap : 0;
+    const expectH = rowH > 0 ? Math.ceil((N + 1) / cols) * rowH - gap : 0;
+    const listH = listEl.getBoundingClientRect().height;
+    pass(
+      expectH > 0 && Math.abs(listH - expectH) < Math.max(10, rowH),
+      "窗口化后列表总高度仍对应 400 页（" +
+        listH.toFixed(0) +
+        "px，约 " +
+        expectH.toFixed(0) +
+        "px）"
+    );
+
+    // 滚回顶部：窗口后面的条目要回收，不能只增不减
+    sideBody.scrollTop = 0;
+    sideBody.dispatchEvent(new Event("scroll"));
+    await sleep(300);
+    const back = thumbCount();
+    pass(
+      back < bottom && !listEl.querySelector('.mb-thumb[data-page="399"]'),
+      "滚回顶部后多余条目被回收（" + bottom + " → " + back + "）"
+    );
+
+    // 还原成原来的 3 页，后面的断言仍按原书
+    sideBody.scrollTop = 0;
+    view.store!.data.pages = origPages;
+    (view as any).pageCountSig = -1;
+    (view as any).renderPageList();
+    await sleep(120);
+    const restored = sideEl.querySelectorAll(".mb-thumb").length;
+    pass(
+      restored === 4,
+      "还原 3 页后侧栏条目恢复（3 页 + 加页，实际 " + restored + " 个）"
+    );
+  }
+
   /* ============ 3. 图标真的看得见 ============ */
   /*
    * 用户反馈："每一个框里面也都还是看不到图标"。

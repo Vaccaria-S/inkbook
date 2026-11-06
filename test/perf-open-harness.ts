@@ -851,9 +851,13 @@ async function main() {
     const sample = SAMPLES.find((s) => s.key === r.key)!;
     pass(r.pageCountOk, `${r.key}：视图里页数正确（应为 ${sample.expectPages}）`);
     pass(r.errors.length === 0, `${r.key}：视图链路无异常${r.errors.length ? "：" + r.errors[0] : ""}`);
+    /*
+     * 页列表按可视窗口懒建：条目数应远小于页数，但必须真的建出了可视区那一批
+     * （0 个 = 列表没建 / 窗口算错；接近全量 = 窗口化失效）。
+     */
     pass(
-      r.thumbs === sample.expectPages + 1, // 每页一个 + 末尾"加一页"
-      `${r.key}：侧栏缩略图条目数 ${r.thumbs}（应为 ${sample.expectPages + 1}）`
+      r.thumbs > 0 && r.thumbs < sample.expectPages + 1,
+      `${r.key}：侧栏只建可视窗口条目 ${r.thumbs} 个（全量 ${sample.expectPages + 1}）`
     );
     pass(
       r.openBest > 0 && r.openBest <= sample.limit.openMs,

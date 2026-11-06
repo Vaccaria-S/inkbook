@@ -266,6 +266,14 @@ export interface EditorOptions {
   onChange?: () => void;
   onPageChange?: (index: number) => void;
   /**
+   * 一次墨水手势（落笔 / 形状 / 擦除）结束了。
+   *
+   * 自动保存在书写期间会避让；收到这个回调时 view 重新排一次保存，
+   * 这样不依赖「抬手刚好又改脏了」——橡皮停住不动再抬手时
+   * 最后一次擦除早已 markDirty 过，不会再有新的 onChange。
+   */
+  onInkGestureEnd?: () => void;
+  /**
    * 某页的底图（PDF / 图片）渲染好了，通知侧栏重画那一页的缩略图。
    *
    * 缩略图是懒渲染的：进视口时先画一张（那时 PDF 位图多半还没有），
@@ -401,6 +409,20 @@ export class BookEditor {
     if (this.gesture === "none" || this.pointerId !== e.pointerId) return;
     const rec = this.recs[this.current];
     if (rec) this.onUp(e, rec);
+  };
+  /**
+   * 切后台 / 窗口失焦：收尾墨水手势。
+   *
+   * 平板上切 App 时 pointerup 可能永远不来，gesture 会卡在 "draw"，
+   * 自动保存一避让就成了「永远不落盘」。这里主动结束手势：
+   * 正在画的那一笔提交（而不是丢），橡皮则补好撤销记录。
+   * 之后 view 的 flushSave 一定能把这部分写下去。
+   */
+  private onWindowBlur = () => {
+    this.finishInkGesture();
+  };
+  private onVisibilityHidden = () => {
+    if (document.visibilityState === "hidden") this.finishInkGesture();
   };
   private resizeObserver: ResizeObserver | null = null;
   private resizeRaf = 0;
@@ -586,6 +608,8 @@ export class BookEditor {
 
     window.addEventListener("pointerup", this.globalUp, true);
     window.addEventListener("pointercancel", this.globalUp, true);
+    window.addEventListener("blur", this.onWindowBlur);
+    document.addEventListener("visibilitychange", this.onVisibilityHidden);
 
     this.scrollEl.addEventListener(
       "scroll",
@@ -710,6 +734,70 @@ export class BookEditor {
   }
 
   /* ------------------------------- 状态 ------------------------------- */
+
+  /**
+   * 是否有一笔「墨」还压在纸上：落笔 / 画形状 / 擦除。
+   *
+   * 自动保存据此避让：笔还压着时去 `JSON.stringify(整本)`，平板大本子
+   * 会把主线程冻 1.5~2.5s，这一笔卡在半空。
+   *
+   * 判据是**手势 + pointerId**，不是 `draft !== null`：橡皮没有 draft，
+   * 只看 draft 会漏掉橡皮；翻页 / 捏合 / 甩滚动（pan）不算——页面在滚，
+   * 它们不改内容，不该为它们推迟落盘。
+   */
+  isInkBusy(): boolean {
+    return (
+      this.pointerId != null &&
+      (this.gesture === "draw" || this.gesture === "shape" || this.gesture === "erase")
+    );
+  }
+
+  /**
+   * 强制收尾当前墨水手势（切后台 / 窗口失焦 / 事件丢失兜底）。
+   *
+   * 为什么必须「提交」而不是丢弃：view 的 flushSave 只写已提交内容，
+   * 正在画的 draft 若不提交，这一笔就永远只活在内存里。
+   * 橡皮的改动本来就是实时写进 layer 的，这里只需补上撤销记录并结束手势，
+   * 否则 gesture 会一直停在 "erase"，把自动保存永远挡在门外。
+   *
+   * 返回是否真的结束了一个墨水手势。
+   */
+  finishInkGesture(): boolean {
+    if (this.gesture === "draw" || this.gesture === "shape") {
+      const rec = this.draftRec;
+      // 先把手势状态清掉，再提交：commitDraft → changed → markDirty
+      // 期间若有人问 isInkBusy，答案应该是「已经结束了」。
+      this.gesture = "none";
+      this.pointerId = null;
+      this.smoother.reset();
+      if (rec) {
+        this.commitDraft(rec);
+      } else {
+        this.draft = null;
+        this.draftRec = null;
+      }
+      if (this.opts.onInkGestureEnd) this.opts.onInkGestureEnd();
+      return true;
+    }
+    if (this.gesture === "erase") {
+      this.gesture = "none";
+      this.pointerId = null;
+      this.eraserPos = null;
+      // 与 onUp 的 erase 分支保持一致：整条擦除手势合成一条历史
+      if (this.eraseBefore && this.eraseAfter) {
+        this.store.recordLayerChange(this.eraseBefore, this.eraseAfter);
+      }
+      this.eraseBefore = null;
+      this.eraseAfter = null;
+      this.undoPushed = false;
+      const rec = this.recs[this.current];
+      if (rec) this.renderOverlay(rec);
+      this.emitState();
+      if (this.opts.onInkGestureEnd) this.opts.onInkGestureEnd();
+      return true;
+    }
+    return false;
+  }
 
   getState(): EditorState {
     const page = this.store.page;
@@ -1979,6 +2067,8 @@ export class BookEditor {
       this.smoother.reset();
       const rec = this.recs[this.current];
       if (rec) this.renderOverlay(rec);
+      // 手势结束要通知 view：避让中的自动保存该恢复排程了
+      if (this.opts.onInkGestureEnd) this.opts.onInkGestureEnd();
     }
   }
 
@@ -3891,6 +3981,11 @@ export class BookEditor {
       this.renderOverlay(rec);
     }
     this.emitState();
+    // 抬手了：自动保存可以从「避让」恢复排程（橡皮尤其需要，
+    // 它最后一次 eraseAt 早已 markDirty 过，抬手本身不再产生 onChange）
+    if (gesture === "draw" || gesture === "shape" || gesture === "erase") {
+      if (this.opts.onInkGestureEnd) this.opts.onInkGestureEnd();
+    }
   }
 
   private onLeave(e: PointerEvent, rec: PageRec): void {
@@ -4537,6 +4632,8 @@ export class BookEditor {
     this.uninstallEdgeSwipeGuard();
     window.removeEventListener("pointerup", this.globalUp, true);
     window.removeEventListener("pointercancel", this.globalUp, true);
+    window.removeEventListener("blur", this.onWindowBlur);
+    document.removeEventListener("visibilitychange", this.onVisibilityHidden);
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     if (this.resizeRaf) cancelAnimationFrame(this.resizeRaf);

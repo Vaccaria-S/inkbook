@@ -200,7 +200,7 @@ async function main() {
     v.sideShown = false;
     v.applySideVisibility();
     v.pageListEl.empty();
-    v.thumbCanvases = [];
+    v.thumbCanvases.clear();
     v.pageCountSig = -1;
     calls = 0;
     v.refreshThumbs();
@@ -273,6 +273,146 @@ async function main() {
     // 收尾：撤掉这一笔并落盘，后面的断言仍按「1 条笔迹」计算
     view.editor!.undo();
     await view.flushSave();
+  }
+
+  /*
+   * 保存不打断书写。
+   *
+   * 用户平板实测：70MB 的本子自动保存一次，主线程冻 1.5~2.5s，
+   * 而且这一下可能正好落在**下一笔书写中途**。修法不是让序列化变快，
+   * 而是自动保存先避让：笔还压在纸上时只欠着，抬手后再落盘。
+   *
+   * 这里用 JSON.stringify 探针证明「正在落笔时一次整本序列化都没有」，
+   * 而不是只看最终文件对不对——只看文件的话，保存提前发生也看不出来。
+   */
+  {
+    const realStringify = JSON.stringify;
+    let bookStringifies = 0;
+    (JSON as any).stringify = function (this: any, value: any, ...rest: any[]): string {
+      if (
+        value &&
+        typeof value === "object" &&
+        value.title === "测试手写本" &&
+        Array.isArray(value.pages)
+      ) {
+        bookStringifies += 1;
+      }
+      return (realStringify as any).apply(this, [value, ...rest]);
+    };
+    try {
+      const strokesOnDisk = () =>
+        JSON.parse(files.get("测试手写本.inkbook")).pages[0].layers[0].strokes.length;
+
+      // 第 1 笔：正常落笔提交 → 变脏，850ms 尾沿开始计时
+      pageEl.dispatchEvent(pe("pointerdown", 100, 300, 1));
+      for (let i = 1; i <= 8; i++) {
+        pageEl.dispatchEvent(pe("pointermove", 100 + i * 20, 300 + i * 6, 1));
+      }
+      pageEl.dispatchEvent(pe("pointerup", 260, 348, 0));
+
+      // 第 2 笔：立刻起笔并一直不抬（模拟一笔写很久，跨过防抖到点）
+      pageEl.dispatchEvent(pe("pointerdown", 200, 500, 1));
+      for (let i = 1; i <= 6; i++) {
+        pageEl.dispatchEvent(pe("pointermove", 200 + i * 30, 500 + i * 4, 1));
+      }
+      await sleep(950); // > 850ms：防抖确实到点了，但笔没抬
+
+      pass(
+        (view.editor as any).gesture === "draw",
+        "长笔画期间编辑器 gesture=draw"
+      );
+      pass(
+        bookStringifies === 0,
+        "正在落笔（gesture=draw）时不触发整本 stringify（" + bookStringifies + " 次）"
+      );
+      pass(
+        strokesOnDisk() === 1,
+        "正在落笔期间不写盘（磁盘仍 " + strokesOnDisk() + " 条笔迹）"
+      );
+
+      // 抬笔 → commitDraft → markDirty → 850ms 后自动落盘
+      pageEl.dispatchEvent(pe("pointerup", 380, 524, 0));
+      await sleep(1000);
+      pass(
+        bookStringifies >= 1,
+        "抬笔后才开始序列化（" + bookStringifies + " 次）"
+      );
+      pass(
+        strokesOnDisk() === 3,
+        "抬笔后自动保存把两笔都落盘（磁盘 " + strokesOnDisk() + " 条）"
+      );
+
+      // 第 3 笔：已提交但没落盘；第 4 笔正写到一半时切后台
+      pageEl.dispatchEvent(pe("pointerdown", 120, 600, 1));
+      for (let i = 1; i <= 4; i++) {
+        pageEl.dispatchEvent(pe("pointermove", 120 + i * 25, 600 + i * 5, 1));
+      }
+      pageEl.dispatchEvent(pe("pointerup", 220, 620, 0));
+      pageEl.dispatchEvent(pe("pointerdown", 300, 650, 1));
+      pageEl.dispatchEvent(pe("pointermove", 360, 670, 1));
+
+      const beforeHidden = strokesOnDisk();
+      const origVis = Object.getOwnPropertyDescriptor(document, "visibilityState");
+      try {
+        Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+        document.dispatchEvent(new Event("visibilitychange"));
+        await sleep(200);
+      } finally {
+        if (origVis) Object.defineProperty(document, "visibilityState", origVis);
+        else delete (document as any).visibilityState;
+      }
+      // 切后台不能因为「正在写」就跳过：手势被收尾，正在画的半笔也一并提交
+      pass(
+        (view.editor as any).gesture === "none",
+        "切后台时书写手势被收尾（gesture 回到 none）"
+      );
+      pass(
+        strokesOnDisk() === beforeHidden + 2,
+        "正在落笔时切后台照样落盘，且半笔被提交（" + beforeHidden + " → " + strokesOnDisk() + "）"
+      );
+
+      // 第 5 笔：已提交但没落盘；第 6 笔起笔后「pointerup 永远不来」
+      pageEl.dispatchEvent(pe("pointerdown", 150, 700, 1));
+      for (let i = 1; i <= 3; i++) {
+        pageEl.dispatchEvent(pe("pointermove", 150 + i * 25, 700 + i * 5, 1));
+      }
+      pageEl.dispatchEvent(pe("pointerup", 230, 718, 0));
+      pageEl.dispatchEvent(pe("pointerdown", 400, 760, 1));
+      pageEl.dispatchEvent(pe("pointermove", 430, 772, 1));
+      const beforeStuck = strokesOnDisk();
+
+      // 自动保存到点：手势卡住（仍在 draw），先避让不写盘
+      (view as any).runAutoSave();
+      await sleep(60);
+      pass(
+        strokesOnDisk() === beforeStuck,
+        "手势卡住但未到 10s：仍然避让，不写盘（磁盘 " + strokesOnDisk() + " 条）"
+      );
+      // 把「开始避让」的时刻往前拨，模拟手势已经卡住超过硬上限
+      (view as any).inkDeferAt = Date.now() - 10_050;
+      (view as any).runAutoSave();
+      await sleep(150);
+      pass(
+        strokesOnDisk() === beforeStuck + 1,
+        "手势卡住超过 10s：硬上限强制落盘（" + beforeStuck + " → " + strokesOnDisk() + "）"
+      );
+      pass(
+        (view.editor as any).gesture === "draw",
+        "强制落盘后手势仍卡在 draw（证明上限是「不等了」，不是提前结束手势）"
+      );
+    } finally {
+      (JSON as any).stringify = realStringify;
+    }
+
+    // 收尾：结束卡住的手势（会提交那半笔），再撤掉本用例新增的 6 笔
+    view.editor!.finishInkGesture();
+    const added = view.store!.strokeCount - 1;
+    for (let i = 0; i < added; i++) view.editor!.undo();
+    await view.flushSave();
+    pass(
+      view.store!.strokeCount === 1,
+      "保存避让用例收尾：回到 1 条笔迹（" + view.store!.strokeCount + "）"
+    );
   }
 
   /* 模板 / 纸色 */
