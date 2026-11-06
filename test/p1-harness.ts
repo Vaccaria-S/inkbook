@@ -1206,6 +1206,39 @@ async function K() {
   await v3.onClose();
   v3.containerEl.remove();
 
+  /* ---------- ②b 重复 id：只留第一条（2026-11-07 补） ---------- */
+  /*
+   * UI 全用 id 定位目录条目（findIndex / find），重复 id 会让第二条
+   * 永远选不中也删不掉，变成点不到的孤儿。正常流程不会产生重复
+   * （uid("outline") 唯一），但手改文件 / 两份文件合并会带进来。
+   */
+  {
+    const dup: any = mkBook("重复id本", 3, 0);
+    dup.outlines = [
+      { id: "same", title: "第一条", page: 0 },
+      { id: "same", title: "重复的", page: 1 },
+      { id: "other", title: "另一条", page: 2 },
+    ];
+    const dp2 = "K-dup.inkbook";
+    seed(dp2, JSON.stringify(dup));
+    const v4 = await openView();
+    await v4.onLoadFile(tf(dp2));
+    await sleep(400);
+    const list = v4.store.outlines;
+    pass(
+      list.length === 2 && list[0].title === "第一条" && list[1].title === "另一条",
+      "K3b normalizeBook 去掉重复 id：留下 " + list.length + " 条（" +
+        JSON.stringify(list.map((o) => o.title)) +
+        "，期望 [第一条, 另一条]）"
+    );
+    pass(
+      new Set(list.map((o) => o.id)).size === list.length,
+      "K3b 去重后所有 id 唯一（" + list.map((o) => o.id).join(",") + "）"
+    );
+    await v4.onClose();
+    v4.containerEl.remove();
+  }
+
   /* ---------- ③ 撤销 / 重做 ---------- */
   const up = "K-undo.inkbook";
   seed(up, JSON.stringify(mkBook("撤销本", 4, 0)));

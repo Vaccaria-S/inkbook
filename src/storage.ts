@@ -317,6 +317,10 @@ export function normalizeBook(raw: any, fallbackTitle: string): InkBook {
    *   · 老文件没有 outlines 字段 → 不写回 → undefined，UI 按空目录处理；
    *   · 逐条白名单：id 存在、title 是非空字符串、page 是有限非负整数，
    *     一条不满足就整条丢弃（脏数据不留在内存，也就不会被保存回去）；
+   *   · **id 去重**：只保留第一次出现的。UI 全用 id 定位条目
+   *     （`findIndex` / `find`），重复 id 会让第二条永远选不中也删不掉，
+   *     变成点不到的孤儿条目。正常流程不会产生重复（`uid("outline")`
+   *     唯一），但手改文件、或两份文件合并时可能带进来。
    *   · 过滤完为空时不写回——空目录 = 没这个字段，省体积、语义一致。
    */
   const outlines = Array.isArray(raw?.outlines)
@@ -337,6 +341,7 @@ export function normalizeBook(raw: any, fallbackTitle: string): InkBook {
           title: String(o.title),
           page: Number(o.page),
         }))
+        .filter((o: any, i: number, arr: any[]) => arr.findIndex((x: any) => x.id === o.id) === i)
     : undefined;
   if (outlines !== undefined && outlines.length > 0) book.outlines = outlines;
   return book;

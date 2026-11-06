@@ -26,7 +26,7 @@ const only = process.argv[2] || "";
 const PAGES = [
   ["test.html", 247],
   ["export.html", 105],
-  ["p1.html", 85],
+  ["p1.html", 87],
   ["view.html", 113],
   ["tablet.html", 26],
   ["zoom.html", 21],
