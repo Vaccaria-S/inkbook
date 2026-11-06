@@ -153,6 +153,14 @@ export interface InkbookSettings {
   defaultTemplate: TemplateId;
   defaultPaper: PaperId;
   penOnly: boolean;
+  /**
+   * 允许手指书写（平板没笔时用手指写）。
+   *
+   * 侧栏「输入方式」里的开关会写回这里；重启后按这个值恢复。
+   * 默认关：手指的第一职责是滚动，单指书写要用户主动打开并承担
+   * 「一碰就落笔、滚动改用双指」的代价。
+   */
+  touchDraw: boolean;
   pressure: number;
   /** 手写平滑 0–1：去手抖，越大越稳 */
   smoothing: number;
@@ -200,8 +208,6 @@ export interface InkbookSettings {
    * 关掉后跳转行为完全不变，只是不再闪这一下。
    */
   jumpHint: boolean;
-  /** 浮层工具盘的位置与方向（缺省 = 左侧居中竖排） */
-  toolPanel?: { left: number; top: number; vertical: boolean };
 }
 
 export const A4_WIDTH = 794;
@@ -211,6 +217,7 @@ export const DEFAULT_SETTINGS: InkbookSettings = {
   defaultTemplate: "grid",
   defaultPaper: "white",
   penOnly: false,
+  touchDraw: false,
   pressure: 1,
   smoothing: 0.55,
   prediction: true,

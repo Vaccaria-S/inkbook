@@ -27,7 +27,7 @@ const PAGES = [
   ["test.html", 238],
   ["export.html", 105],
   ["p1.html", 66],
-  ["view.html", 79],
+  ["view.html", 110],
   ["tablet.html", 26],
   ["zoom.html", 21],
   ["dist.html", 29],

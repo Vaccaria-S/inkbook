@@ -527,6 +527,13 @@ export default class InkbookPlugin extends Plugin {
 
   async loadSettings(): Promise<void> {
     const data = (await this.loadData()) || {};
+    /*
+     * 旧版本遗留的死字段：曾经打算把浮层工具盘的位置存进 settings.toolPanel，
+     * 后来工具盘并进了顶栏，源码里已经没有任何地方读它（types.ts 里的
+     * 声明也一并删了）。老 data.json 里可能还留着这个键，读到就丢掉，
+     * 免得下次保存又写回去、让后来的人以为它有用。
+     */
+    delete data.toolPanel;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
   }
 

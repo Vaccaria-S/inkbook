@@ -143,8 +143,8 @@
  * 7 支笔（钢笔 / 圆珠 / 荧光 / 橡皮 / 套索 / 形状 / 拖动）+ 三个视图动作，
  * 一起挤在标题栏那一行里。
  *
- * 这些笔原先浮在纸上（可拖动、可横竖切换、位置记在 settings.toolPanel），
- * 平板上等于白占一列 86px 的纸宽；顶栏本来就有空位，一行排得下。
+ * 这些笔原先浮在纸上（可拖动、可横竖切换），平板上等于白占一列
+ * 86px 的纸宽；顶栏本来就有空位，一行排得下。
  * 代价是图标下面写不了字，全名放进 title。
  *
  * 图标尺寸：
@@ -301,6 +301,85 @@
 
 .mb-toprow .mb-topbtn:active {
   transform: scale(0.93);
+}
+
+/*
+ * 顶栏的「当前笔」chip：一枚色点 + 粗细数值。
+ *
+ * 侧栏收起时（平板默认如此）顶栏只有工具图标亮着，看不出当前笔色 / 粗细。
+ * 这枚小 chip 挂在工具组右侧：高 30px、宽约 40px，不把顶栏塞满；
+ * 点它开合侧栏，等于把调参入口也放到手边。
+ *
+ * 单独一套类名，故意**不带 .mb-topbtn**：那一套是 30×30 的方按钮，
+ * 也用于测试里数顶栏动作按钮的个数（8 笔 + 3 动作 = 11）。
+ */
+.mb-pen-chip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  height: 30px;
+  min-width: 0;
+  margin: 0;
+  padding: 0 6px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted, var(--text-normal, #666));
+  font-size: 10px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  box-shadow: none;
+  transition:
+    background 0.16s ease,
+    color 0.16s ease;
+}
+
+.mb-pen-chip:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.mb-pen-chip:active {
+  transform: scale(0.95);
+}
+
+/* text / select / hand 没有笔参数：整枚收起，别留一个空壳 */
+.mb-pen-chip.is-hidden {
+  display: none;
+}
+
+.mb-pen-chip-dot {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  box-sizing: border-box;
+  border-radius: 50%;
+  border: 1px solid var(--background-modifier-border);
+  /* 浅色（米黄 / 浅绿）在白底上也能看出边界 */
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.35);
+}
+
+/* 橡皮没有颜色：用虚线圈表示「当前参数是模式 + 大小」 */
+.mb-pen-chip-dot.is-eraser {
+  background: transparent;
+  border: 1.5px dashed var(--text-faint, #999);
+  box-shadow: none;
+}
+
+/* 平板上跟着顶栏按钮放大一档，手指点得准 */
+.mb-tablet .mb-toprow .mb-pen-chip {
+  height: 34px;
+  gap: 6px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.mb-tablet .mb-toprow .mb-pen-chip-dot {
+  width: 17px;
+  height: 17px;
 }
 
 
@@ -1549,13 +1628,40 @@
 .mb-layer {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 5px;
-  height: 26px;
-  padding: 0 5px;
+  /* 不是固定高度：第二行是透明度滑杆，行高随内容撑开 */
+  min-height: 26px;
+  padding: 2px 5px;
   border-radius: 5px;
   cursor: pointer;
   font-size: 10.5px;
   color: var(--text-muted);
+}
+
+/* 图层透明度：滑杆独占第二行，缩进对齐到图层名（眼睛 18px + gap 5px） */
+.mb-layer-op {
+  flex: 1 0 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 0 1px 23px;
+  cursor: default;
+}
+
+.mb-layer-op-range {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+  height: 14px;
+}
+
+.mb-layer-op-val {
+  min-width: 30px;
+  text-align: right;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
 }
 
 .mb-layer:hover {
@@ -2069,6 +2175,10 @@
 .mb-root.is-tablet .mb-range {
   height: 30px;
   width: 130px;
+}
+
+.mb-root.is-tablet .mb-layer-op-range {
+  height: 26px;
 }
 
 .mb-root.is-tablet .mb-size-lbl {

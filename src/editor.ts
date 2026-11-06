@@ -4489,6 +4489,26 @@ export class BookEditor {
     this.emitState();
   }
 
+  /**
+   * 设置图层透明度（0–1），立即重绘当前页。
+   *
+   * `snapshot` 只在一次拖动/一次键盘调整的**第一次**调用时传 true：
+   * 撤销栈里只留一条「拖动前 → 拖动后」。每来一个 input 都拍快照的话，
+   * 拖一次滑杆就能塞满 60 层撤销栈，之前写的字全部撤不回去。
+   */
+  setLayerOpacity(id: string, opacity: number, snapshot = false): void {
+    const layer = this.store.page.layers.find((l) => l.id === id);
+    if (!layer) return;
+    const v = Math.max(0, Math.min(1, opacity));
+    if (Math.abs(layer.opacity - v) < 1e-9) return;
+    if (snapshot) this.store.snapshotPage(this.current);
+    layer.opacity = v;
+    const rec = this.recs[this.current];
+    if (rec?.mounted) this.renderRec(rec);
+    this.changed();
+    this.store.touch();
+  }
+
   deleteLayer(id: string): void {
     if (!this.store.deleteLayer(this.current, id)) return;
     const rec = this.recs[this.current];

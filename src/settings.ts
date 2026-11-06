@@ -70,6 +70,52 @@ export class InkbookSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("默认荧光笔粗细")
+      .setDesc("侧栏「荧光 细 / 中 / 粗」的选择也会写回这里；页面坐标里的粗细，随缩放变化")
+      .addSlider((s) =>
+        s
+          .setLimits(4, 40, 1)
+          .setValue(this.plugin.settings.defaultHighlighterSize || 24)
+          .setDynamicTooltip()
+          .onChange(async (v) => {
+            this.plugin.settings.defaultHighlighterSize = v;
+            await this.plugin.saveSettings();
+            this.plugin.refreshViews();
+          })
+      );
+
+    /*
+     * 「上次用的颜色」以前只存在侧栏，设置页看不到也改不了。
+     * 补一个取色器：改完立即同步到已经打开的墨本（refreshViews →
+     * view.syncSettings），下次打开也会从 settings 恢复。
+     */
+    new Setting(containerEl)
+      .setName("上次用的笔色")
+      .setDesc("侧栏里点过的笔色会写回这里；改这里也会成为当前笔色")
+      .addColorPicker((c) =>
+        c
+          .setValue(this.plugin.settings.lastPenColor || "#1A1A1A")
+          .onChange(async (v) => {
+            this.plugin.settings.lastPenColor = v;
+            await this.plugin.saveSettings();
+            this.plugin.refreshViews();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("上次用的荧光色")
+      .setDesc("侧栏里点过的荧光色会写回这里；改这里也会成为当前荧光色")
+      .addColorPicker((c) =>
+        c
+          .setValue(this.plugin.settings.lastHighlighterColor || "#F6E05E")
+          .onChange(async (v) => {
+            this.plugin.settings.lastHighlighterColor = v;
+            await this.plugin.saveSettings();
+            this.plugin.refreshViews();
+          })
+      );
+
+    new Setting(containerEl)
       .setName("压感灵敏度")
       .setDesc("越大，轻写和重写的粗细差别越明显（0.3–1.5）")
       .addSlider((s) =>
@@ -116,6 +162,22 @@ export class InkbookSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(this.plugin.settings.penOnly).onChange(async (v) => {
           this.plugin.settings.penOnly = v;
+          await this.plugin.saveSettings();
+          this.plugin.refreshViews();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("允许手指书写")
+      .setDesc(
+        "打开后手指可以直接在纸上写字（平板没笔时用），代价是单指不再滚页——滚动改用双指或右缘滑条。以前这个开关每次打开 Obsidian 都会复位，现在会记住。"
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.touchDraw === true).onChange(async (v) => {
+          this.plugin.settings.touchDraw = v;
+          // 与侧栏开关一致：打开手指书写时一并关掉「只认触控笔」，
+          // 否则后者会把手写压住，开关看起来像没生效。
+          if (v) this.plugin.settings.penOnly = false;
           await this.plugin.saveSettings();
           this.plugin.refreshViews();
         })

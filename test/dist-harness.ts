@@ -39,6 +39,10 @@ async function main() {
   const obsidianStub = `
     export class Notice {
       constructor(msg){ console.log('[Notice] ' + msg); }
+      /* 真实的 Obsidian Notice 有这两个方法；少了 hide 会在导入/导出路径上抛
+         "n.hide is not a function"，产物级测试直接 FATAL。 */
+      hide(){}
+      setMessage(m){ this.msg = String(m); }
     }
     export function setIcon(el, name){
       el.innerHTML = '<svg class="svg-icon" viewBox="0 0 24 24"><path d="M4 4h10l6 6v10H4z"/></svg>';
@@ -77,6 +81,9 @@ async function main() {
       addSlider(cb){ const c = { value:0, setLimits(){return c;}, setValue(v){c.value=v;return c;}, setDynamicTooltip(){return c;}, onChange(){return c;}, sliderEl: document.createElement('input') }; if(cb) cb(c); return this; }
       addDropdown(cb){ const c = { value:'', addOption(){return c;}, setValue(v){c.value=v;return c;}, onChange(){return c;}, selectEl: document.createElement('select') }; if(cb) cb(c); return this; }
       addButton(cb){ const c = { buttonEl: document.createElement('button'), setButtonText(){return c;}, setIcon(){return c;}, onClick(){return c;}, setTooltip(){return c;} }; if(cb) cb(c); return this; }
+      addColorPicker(cb){ const c = { value:'#000000', setValue(v){c.value=v;return c;}, onChange(){return c;}, colorEl: document.createElement('input') }; if(cb) cb(c); return this; }
+      addExtraButton(cb){ const c = { extraSettingsEl: document.createElement('div'), setTooltip(){return c;}, setIcon(){return c;}, onClick(){return c;} }; if(cb) cb(c); return this; }
+      then(cb){ if(cb) cb(this); return this; }
     }
     export class Plugin {
       constructor(app, manifest){ this.app = app; this.manifest = manifest; this.__views = {}; this.__cmds = []; this.__ribbons = []; this.__settingsTab = null; this.__data = {}; this.__protocols = {}; }

@@ -63,6 +63,22 @@ const SHAPES: Array<{ id: ShapeKind; label: string }> = [
 ];
 
 /**
+ * 切过去时要自动展开侧栏的工具。
+ *
+ * 判据是「专属参数控件是不是只住在侧栏 .mb-sec-dyn 里」：
+ *   · text   —— 字号 / 字体 / 颜色
+ *   · eraser —— 整笔 / 局部 + 橡皮大小
+ *   · shape  —— 形状种类（矩形 / 椭圆 / 直线 / 箭头）
+ *
+ * 不展开：
+ *   · pen / ballpoint / highlighter —— 颜色和粗细都在笔盒区，而且顶栏新增的
+ *     当前笔 chip 已经露出「什么色、多粗」；这三支换得最勤，每换一次就把
+ *     侧栏盖到纸上（平板）反而碍事。
+ *   · select / hand —— 没有可调参数，侧栏里只有一句操作提示。
+ */
+const TOOLS_NEED_SIDE = new Set<ToolId>(["text", "eraser", "shape"]);
+
+/**
  * 侧栏页列表窗口化。
  *
  * `.mb-pages` 是「固定列数的等高网格」：同一行里每个条目、以及每一行
@@ -224,6 +240,16 @@ export class InkbookView extends FileView {
   private floatRedoBtn: HTMLButtonElement | null = null;
   private stylusBtn!: HTMLButtonElement;
   private toolButtons = new Map<ToolId, HTMLButtonElement>();
+  /**
+   * 顶栏上的「当前笔」提示：一枚色点 + 粗细数值。
+   *
+   * 平板侧栏默认收起，顶栏又只亮工具图标——写之前看不到自己拿的
+   * 是什么颜色、多粗。这枚 chip 常驻在工具组右侧，点它开合侧栏。
+   * 由 updatePenChip 在 updateUI 里刷新（纯显示，绝不在这里自动展开侧栏）。
+   */
+  private penChipEl: HTMLElement | null = null;
+  private penChipDotEl: HTMLElement | null = null;
+  private penChipSizeEl: HTMLElement | null = null;
   private sideBtn!: HTMLElement;
   private layerListEl: HTMLElement | null = null;
   private pageListEl: HTMLElement | null = null;
@@ -679,6 +705,9 @@ export class InkbookView extends FileView {
     this.editor.penSize = this.plugin.settings.defaultPenSize || 2.8;
     this.editor.highlighterColor = this.plugin.settings.lastHighlighterColor || "#F6E05E";
     this.editor.highlighterSize = this.plugin.settings.defaultHighlighterSize || 24;
+    // 「允许手指书写」以前只活在编辑器实例上，每次打开都回默认 false；
+    // 现在从 settings 恢复（侧栏开关 / 设置页都会写回这里）。
+    this.editor.touchDraw = this.plugin.settings.touchDraw === true;
     this.buildHeaderActions();
     // 标题栏放不下十个按钮时（平板常见），下一帧会把整行搬到自建顶栏条
     this.scheduleTopRowFit();
@@ -1010,20 +1039,92 @@ export class InkbookView extends FileView {
   }
 
   /**
+   * 顶栏上的「当前笔」提示：一枚色点 + 粗细数值。
+   *
+   * 侧栏收起时（平板默认如此）顶栏只有工具图标亮着，看不出当前是
+   * 什么颜色、多粗。这枚 chip 只占 30px 高、约 40px 宽，挂在工具组右侧，
+   * 不把顶栏塞满；点它开合侧栏——调参入口也就在手边。
+   *
+   * 注意：这里只建 DOM，显示内容全交给 updatePenChip（updateUI 里刷新）。
+   * 任何「自动展开侧栏」的逻辑都不能跑到 updateUI 里，否则用户手动收起后
+   * 落笔 / 翻页又会把它弹回来。
+   */
+  private buildPenChip(row: HTMLElement): void {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "mb-pen-chip";
+    chip.setAttribute("aria-label", "当前笔色 / 粗细");
+    const dot = chip.createSpan({ cls: "mb-pen-chip-dot" });
+    const size = chip.createSpan({ cls: "mb-pen-chip-size" });
+    chip.onclick = () => this.toggleSide();
+    row.appendChild(chip);
+    this.penChipEl = chip;
+    this.penChipDotEl = dot;
+    this.penChipSizeEl = size;
+    this.updatePenChip();
+  }
+
+  /** 当前工具的颜色 / 粗细；text / select / hand 没有笔参数，整枚收起 */
+  private updatePenChip(): void {
+    const chip = this.penChipEl;
+    const dot = this.penChipDotEl;
+    const size = this.penChipSizeEl;
+    if (!chip || !dot || !size || !this.editor) return;
+
+    const s = this.editor.getState();
+    const fmt = (v: number) => String(Math.round(v * 10) / 10);
+    let name = "";
+    let color = "";
+    let text = "";
+    if (s.tool === "pen" || s.tool === "ballpoint" || s.tool === "shape") {
+      /*
+       * 圆珠笔和形状也用 penColor / penSize 落笔（见 editor.onDown 的
+       * draft 组装），所以三支共用同一组显示，换哪支都不会读错参数。
+       */
+      name = s.tool === "ballpoint" ? "圆珠笔" : s.tool === "shape" ? "形状" : "钢笔";
+      color = s.penColor;
+      text = fmt(s.penSize);
+    } else if (s.tool === "highlighter") {
+      name = "荧光笔";
+      color = s.highlighterColor;
+      text = fmt(s.highlighterSize);
+    } else if (s.tool === "eraser") {
+      name = "橡皮";
+      text = (this.editor.eraserMode === "whole" ? "整笔 " : "局部 ") + fmt(this.editor.eraserSize);
+    } else {
+      chip.toggleClass("is-hidden", true);
+      return;
+    }
+
+    chip.toggleClass("is-hidden", false);
+    dot.style.background = color;
+    dot.toggleClass("is-eraser", !color);
+    size.setText(text);
+    chip.title = color
+      ? `当前：${name} · ${color} · 粗细 ${text}（点按展开侧栏调参）`
+      : `当前：${name} · ${text}（点按展开侧栏调参）`;
+    chip.setAttribute("aria-label", chip.title);
+  }
+
+  /**
    * 切工具，并处理「这个工具的参数面板在侧栏里」的情况。
    *
-   * 字号 / 字体 / 颜色住在侧栏的「当前工具」区，而平板上侧栏默认收起：
-   * 用户点顶栏「文字」后只切了工具，找不到调参入口（真机反馈：
+   * 文字的字号 / 字体 / 颜色，橡皮的整笔 / 局部，形状的种类，
+   * 都只住在侧栏「当前工具」区（.mb-sec-dyn），而平板上侧栏默认收起：
+   * 用户点顶栏换工具后只切了工具，找不到调参入口（真机反馈：
    * 「点击输入的按钮后，侧边栏不会弹出来，无法调整字体大小和颜色」）。
    *
-   * 只在**工具真的从别的工具切到文字**这一下展开一次。
+   * 只在**工具真的从别的工具切到这些工具**这一下展开一次
+   * （见 TOOLS_NEED_SIDE；钢笔 / 圆珠笔 / 荧光笔刻意不展开）。
    * 不能放进 updateUI：那样用户手动收起侧栏后，落笔 / 翻页触发的
    * updateUI 又会把它弹出来。
    */
   private chooseTool(id: ToolId): void {
-    const wasText = this.editor?.getState().tool === "text";
+    const prev = this.editor?.getState().tool;
     this.editor?.setTool(id);
-    if (id !== "text" || wasText) return;
+    // 重复点同一支笔：不重新弹侧栏（用户可能刚手动收起）
+    if (id === prev) return;
+    if (!TOOLS_NEED_SIDE.has(id)) return;
     // 仅阅读时纸面优先；侧栏已经开着也不用动
     if (this.reading || this.sideShown) return;
     this.sideShown = true;
@@ -1105,6 +1206,8 @@ export class InkbookView extends FileView {
     this.actionsHostEl = host;
     host.appendChild(row);
     this.buildToolRow(row);
+    // 当前笔色 / 粗细：紧挨着工具组，不占额外一整排
+    this.buildPenChip(row);
     row.appendChild(row.createDiv("mb-sep"));
     row.appendChild(save);
     row.appendChild(side);
@@ -1735,6 +1838,8 @@ export class InkbookView extends FileView {
         if (!this.editor) return;
         this.editor.eraserSize = Number(range.value);
         lbl.setText(range.value);
+        // 橡皮大小是直接改字段（不发 state），顶栏 chip 手动跟一下
+        this.updatePenChip();
       };
       return;
     }
@@ -1834,6 +1939,13 @@ export class InkbookView extends FileView {
         dot.title = c;
         dot.onclick = () => {
           this.editor?.setPenColor(c);
+          /*
+           * 形状拿 penColor 落笔，所以这也是一次「选笔色」，必须写回
+           * settings.lastPenColor。否则下次打开（mountEditor 按它恢复）
+           * 或设置页任意改动触发 syncSettings 时，颜色会被打回旧值。
+           */
+          this.plugin.settings.lastPenColor = c;
+          void this.plugin.saveSettings();
           this.renderDynamicTools();
         };
       }
@@ -2200,8 +2312,14 @@ export class InkbookView extends FileView {
       b.dataset.color = c;
       b.dataset.kind = "pen";
       b.title = "钢笔 / 圆珠笔颜色";
+      /*
+       * 只改颜色，**不切工具**。
+       *
+       * 以前这里第一句是 setTool("pen")：圆珠笔用户点一下色板，
+       * 手里的笔就被悄悄换回钢笔了。钢笔和圆珠笔共用 penColor，
+       * 这排色板本来就该作用于「当前那支笔」，而不是替用户选笔。
+       */
       b.onclick = () => {
-        this.editor?.setTool("pen");
         this.editor?.setPenColor(c);
         this.plugin.settings.lastPenColor = c;
         void this.plugin.saveSettings();
@@ -2219,8 +2337,12 @@ export class InkbookView extends FileView {
         text: ["细", "中", "粗"][i],
         attr: { "data-size": String(PEN_SIZES[i]) },
       });
+      /*
+       * 同色板：只调粗细，不切工具。penSize 是钢笔 / 圆珠笔 / 形状
+       * 三者共用的落笔参数（见 editor.onDown），切到钢笔会让正在画的
+       * 形状或圆珠笔断掉，也是同一种「偷切工具」。
+       */
       b.onclick = () => {
-        this.editor?.setTool("pen");
         this.editor?.setPenSize(PEN_SIZES[i]);
         // 粗细要跟着用户走：重启后 mountEditor 读的是 settings.defaultPenSize
         this.plugin.settings.defaultPenSize = PEN_SIZES[i];
@@ -2289,6 +2411,9 @@ export class InkbookView extends FileView {
       const on = !this.editor?.touchDraw;
       if (!on) {
         this.editor?.setTouchDraw(false);
+        // 关掉也要写回：否则下次打开 Obsidian 又从 settings 恢复成「开」
+        this.plugin.settings.touchDraw = false;
+        void this.plugin.saveSettings();
         this.updateUI();
         new Notice("手指只负责滚动页面", 2200);
         return;
@@ -2319,6 +2444,9 @@ export class InkbookView extends FileView {
         undone.push("已关闭「只认触控笔」");
       }
       this.editor?.setTouchDraw(true);
+      // 写回 settings：以前只在编辑器实例上置位，重启就复位了
+      this.plugin.settings.touchDraw = true;
+      void this.plugin.saveSettings();
       this.updateUI();
       new Notice(
         (undone.length ? "已允许手指书写（" + undone.join("，") + "）。" : "已允许手指书写。") +
@@ -2464,6 +2592,49 @@ export class InkbookView extends FileView {
           this.editor?.deleteLayer(layer.id);
         };
       }
+      /*
+       * 透明度滑杆。
+       *
+       * `Layer.opacity` 一直参与渲染（editor 的 renderRec / 导出都按它画），
+       * 但以前侧栏没有入口，只能改文件。这里补上「看得到、改得动」。
+       *
+       * 交互细节：
+       *   · 滑杆上的点击不能冒泡到行，否则会触发 setActiveLayer → updateUI；
+       *     一旦图层签名变了整行会重建，正在拖的滑杆就从 DOM 里消失了。
+       *   · 一次拖动只在第一次 input 时拍撤销快照（editor.setLayerOpacity 的
+       *     snapshot 参数），否则拖一下就能塞满 60 层撤销栈。
+       */
+      const op = row.createDiv("mb-layer-op");
+      op.addEventListener("pointerdown", (e) => e.stopPropagation());
+      op.addEventListener("click", (e) => e.stopPropagation());
+      const opRange = op.createEl("input", {
+        cls: "mb-layer-op-range",
+        attr: {
+          type: "range",
+          min: "0",
+          max: "100",
+          step: "1",
+          value: String(Math.round(layer.opacity * 100)),
+          "aria-label": "图层透明度",
+        },
+      });
+      const opVal = op.createSpan({
+        cls: "mb-layer-op-val",
+        text: Math.round(layer.opacity * 100) + "%",
+      });
+      let opDragging = false;
+      opRange.oninput = () => {
+        const v = Number(opRange.value) / 100;
+        this.editor?.setLayerOpacity(layer.id, v, !opDragging);
+        opDragging = true;
+        opVal.setText(String(opRange.value) + "%");
+      };
+      // 一次拖动结束（鼠标/触摸松开、键盘调整完失焦）：下一次重新记撤销
+      const endOpacityDrag = () => {
+        opDragging = false;
+      };
+      opRange.onchange = endOpacityDrag;
+      opRange.onpointerup = endOpacityDrag;
       row.onclick = () => {
         this.editor?.setActiveLayer(layer.id);
       };
@@ -2477,7 +2648,11 @@ export class InkbookView extends FileView {
     return (
       p.activeLayerId +
       "|" +
-      p.layers.map((l) => `${l.id}:${l.name}:${l.visible}:${l.strokes.length}`).join(",")
+      // 带上 opacity：撤销 / 重做改了透明度时，侧栏滑杆要跟着回位。
+      // 拖动过程中不经过这里——oninput 只 markDirty，不触发 updateUI。
+      p.layers
+        .map((l) => `${l.id}:${l.name}:${l.visible}:${l.strokes.length}:${l.opacity}`)
+        .join(",")
     );
   }
 
@@ -3241,6 +3416,8 @@ export class InkbookView extends FileView {
       this.showZoomHint();
     }
 
+    // 顶栏「当前笔」提示：色点 + 粗细。纯显示，放 updateUI 不会弹侧栏
+    this.updatePenChip();
     this.renderColors();
     this.renderDynamicTools();
 
@@ -3777,12 +3954,17 @@ export class InkbookView extends FileView {
       }
       return;
     }
-    if (k === "p") this.editor.setTool("pen");
-    else if (k === "b") this.editor.setTool("ballpoint");
-    else if (k === "h") this.editor.setTool("highlighter");
-    else if (k === "e") this.editor.setTool("eraser");
-    else if (k === "v") this.editor.setTool("select");
-    else if (k === "r") this.editor.setTool("shape");
+    /*
+     * 键盘切工具也走 chooseTool：和点顶栏是同一种「用户动作入口」。
+     * 这样按 E / R 切到橡皮 / 形状时同样会展开侧栏（参数只住在那里），
+     * 而按 P / B / H 不会——展开策略只维护一处。
+     */
+    if (k === "p") this.chooseTool("pen");
+    else if (k === "b") this.chooseTool("ballpoint");
+    else if (k === "h") this.chooseTool("highlighter");
+    else if (k === "e") this.chooseTool("eraser");
+    else if (k === "v") this.chooseTool("select");
+    else if (k === "r") this.chooseTool("shape");
     else if (k === "t") this.chooseTool("text");
     else if (k === "i") {
       const on = !this.plugin.settings.penOnly;
@@ -3799,12 +3981,18 @@ export class InkbookView extends FileView {
   syncSettings(): void {
     if (!this.editor) return;
     this.editor.setPenOnly(!!this.plugin.settings.penOnly);
+    // 设置页现在也能改「允许手指书写」：同步到已打开的视图，
+    // 不能让设置页里改完、当前笔记还是老样子。
+    this.editor.setTouchDraw(this.plugin.settings.touchDraw === true);
     this.editor.setPressure(this.plugin.settings.pressure);
     this.editor.setSmoothing(this.plugin.settings.smoothing ?? 0.55);
     this.editor.setPrediction(this.plugin.settings.prediction !== false);
     this.editor.setEdgeSwipeBlock(this.plugin.settings.blockEdgeSwipe !== false);
     this.editor.setStraighten(this.plugin.settings.straightLine === true);
     this.editor.penSize = this.plugin.settings.defaultPenSize;
+    // 设置页里的「上次用的笔色 / 荧光色 / 荧光粗细」改完立即生效
+    this.editor.penColor = this.plugin.settings.lastPenColor || "#1A1A1A";
+    this.editor.highlighterColor = this.plugin.settings.lastHighlighterColor || "#F6E05E";
     this.editor.highlighterSize = this.plugin.settings.defaultHighlighterSize || 24;
     this.updateUI();
   }

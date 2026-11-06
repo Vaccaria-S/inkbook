@@ -215,6 +215,151 @@ async function main() {
   }
 
   /*
+   * 只有「参数面板只住在侧栏里」的工具才自动展开：橡皮 / 形状。
+   * 钢笔 / 圆珠笔 / 荧光笔的颜色、粗细都在笔盒区，换得又勤，
+   * 每换一次都把侧栏盖到纸上反而碍事，所以不展开。
+   */
+  {
+    const v = view as any;
+    const sideEl = view.sideEl;
+    const topBtn = (prefix: string) =>
+      [...view.containerEl.querySelectorAll(".mb-top-tool")].find((b) =>
+        (b as HTMLElement).title.startsWith(prefix)
+      ) as HTMLElement;
+
+    // 起点：侧栏收起、当前是钢笔
+    view.editor!.setTool("pen");
+    v.sideShown = false;
+    v.applySideVisibility();
+    v.updateUI();
+
+    topBtn("橡皮").click();
+    pass(
+      !sideEl.classList.contains("is-hidden") &&
+        view.editor!.getState().tool === "eraser",
+      "点顶栏「橡皮」后侧栏自动展开"
+    );
+    pass(
+      !!sideEl.querySelector(".mb-sec-dyn .mb-seg"),
+      "展开后侧栏里有橡皮的整笔 / 局部切换"
+    );
+
+    // 形状同理：形状种类只在侧栏「当前工具」区里
+    v.sideShown = false;
+    v.applySideVisibility();
+    topBtn("形状").click();
+    pass(
+      !sideEl.classList.contains("is-hidden") &&
+        view.editor!.getState().tool === "shape",
+      "点顶栏「形状」后侧栏自动展开"
+    );
+    pass(
+      !!sideEl.querySelector(".mb-sec-dyn .mb-mini-btn"),
+      "展开后侧栏里有形状种类按钮"
+    );
+
+    // 钢笔不展开：颜色 / 粗细在笔盒，顶栏 chip 已露出来
+    v.sideShown = false;
+    v.applySideVisibility();
+    topBtn("钢笔").click();
+    pass(
+      sideEl.classList.contains("is-hidden") &&
+        view.editor!.getState().tool === "pen",
+      "点顶栏「钢笔」不展开侧栏（不打扰写字）"
+    );
+  }
+
+  /*
+   * 点笔盒色板只改颜色，不切工具。
+   * 旧实现里 onclick 第一句是 setTool("pen")：圆珠笔用户点一下色板，
+   * 手里的笔就被偷换成钢笔。圆珠笔与钢笔共用 penColor，没有独立色板。
+   */
+  {
+    const v = view as any;
+    v.sideShown = true;
+    v.applySideVisibility();
+    view.editor!.setTool("ballpoint");
+    await sleep(20);
+
+    const swatch = [...view.sideEl.querySelectorAll(".mb-swatch")].find(
+      (el) =>
+        (el as HTMLElement).dataset.kind === "pen" &&
+        (el as HTMLElement).dataset.color !== view.editor!.penColor
+    ) as HTMLElement;
+    swatch.click();
+    await sleep(20);
+    pass(
+      view.editor!.getState().tool === "ballpoint",
+      "点笔盒钢笔色板不改变当前工具（仍是圆珠笔）"
+    );
+    pass(
+      view.editor!.penColor.toLowerCase() === (swatch.dataset.color || "").toLowerCase(),
+      "点色板颜色确实生效（" + view.editor!.penColor + "）"
+    );
+  }
+
+  /*
+   * 顶栏常驻「当前笔」chip：色点 + 粗细。
+   * 侧栏收起时也能知道当前是什么笔、什么色、多粗；点它展开侧栏。
+   */
+  {
+    const v = view as any;
+    v.sideShown = false;
+    v.applySideVisibility();
+    view.editor!.setTool("pen");
+    view.editor!.setPenColor("#D64545");
+    view.editor!.setPenSize(4.6);
+    await sleep(20);
+
+    const chip = view.containerEl.querySelector(".mb-pen-chip") as HTMLElement;
+    const dot = chip?.querySelector(".mb-pen-chip-dot") as HTMLElement;
+    pass(!!chip, "顶栏有当前笔 chip（侧栏收起也看得见）");
+    pass(
+      !!dot && getComputedStyle(dot).backgroundColor === "rgb(214, 69, 69)",
+      "chip 色点显示当前笔色"
+    );
+    pass(
+      (chip?.textContent || "").includes("4.6"),
+      "chip 显示当前粗细数值（4.6）"
+    );
+
+    chip.click();
+    pass(!view.sideEl.classList.contains("is-hidden"), "点当前笔 chip 展开侧栏");
+  }
+
+  /*
+   * 形状色板也要写回 settings.lastPenColor。
+   *
+   * 形状拿 penColor 落笔；若不写回，下次打开（mountEditor 按 lastPenColor
+   * 恢复）或设置页任意改动触发 syncSettings 时，刚选的形状色就被打回旧值。
+   */
+  {
+    const v = view as any;
+    v.sideShown = true;
+    v.applySideVisibility();
+    view.editor!.setTool("shape");
+    await sleep(20);
+
+    // 先把旧值设成黑色，确保下面断言的是「这次点击写回的新值」
+    plugin.settings.lastPenColor = "#1A1A1A";
+    const shapeDot = [...view.sideEl.querySelectorAll(".mb-sec-dyn .mb-tcolor")].find(
+      (el) => (el as HTMLElement).title === "#7C5CD6"
+    ) as HTMLElement;
+    shapeDot.click();
+    await sleep(20);
+    pass(
+      plugin.settings.lastPenColor === "#7C5CD6",
+      "形状色板写回 settings.lastPenColor（" + plugin.settings.lastPenColor + "）"
+    );
+    view.syncSettings();
+    pass(
+      view.editor!.penColor === "#7C5CD6",
+      "syncSettings 不再把形状选的色打回旧值（" + view.editor!.penColor + "）"
+    );
+    view.editor!.setTool("pen");
+  }
+
+  /*
    * 侧栏收起时不能预渲染缩略图（大本子打开提速）。
    * 用户那本 857 页的本子，打开时侧栏是收起的：以前照样建 857 个条目、
    * 还立刻用 pdf.js 渲 5 页缩略图，和首屏抢同一份 PDF。
@@ -655,6 +800,56 @@ async function main() {
       !penThin.classList.contains("is-active"),
       "未选中的档位没有选中态（不会两个都亮）"
     );
+
+    /*
+     * 侧栏点颜色 → 写回「上次用的颜色」。
+     * 设置页现在会显示这两个值（此前只在侧栏存在，设置页找不到）。
+     */
+    const penSwatch = [...view.sideEl.querySelectorAll(".mb-swatch")].find(
+      (el) =>
+        (el as HTMLElement).dataset.kind === "pen" &&
+        (el as HTMLElement).dataset.color === "#7C5CD6"
+    ) as HTMLElement;
+    penSwatch.click();
+    await sleep(20);
+    pass(
+      plugin.settings.lastPenColor === "#7C5CD6",
+      "点侧栏笔色后 settings.lastPenColor 写回（" + plugin.settings.lastPenColor + "）"
+    );
+
+    const hlSwatch = [...view.sideEl.querySelectorAll(".mb-swatch")].find(
+      (el) =>
+        (el as HTMLElement).dataset.kind === "hl" &&
+        (el as HTMLElement).dataset.color === "#90CDF4"
+    ) as HTMLElement;
+    hlSwatch.click();
+    await sleep(20);
+    pass(
+      plugin.settings.lastHighlighterColor === "#90CDF4",
+      "点侧栏荧光色后 settings.lastHighlighterColor 写回（" +
+        plugin.settings.lastHighlighterColor +
+        "）"
+    );
+    // 收尾：切回钢笔，后面的落笔/图层用例按钢笔走
+    view.editor!.setTool("pen");
+  }
+
+  /*
+   * 「允许手指书写」持久化（本轮修复的核心回归）。
+   * 以前 touchDraw 只是编辑器实例上的一个布尔，每次打开 Obsidian 都复位。
+   */
+  {
+    const touchBtn = view.sideEl.querySelector(
+      'button[aria-label="允许手指书写"]'
+    ) as HTMLElement;
+    pass(!!touchBtn, "侧栏有「允许手指书写」按钮");
+    touchBtn.click();
+    await sleep(20);
+    pass(view.editor!.touchDraw === true, "点开后编辑器 touchDraw=true");
+    pass(
+      plugin.settings.touchDraw === true,
+      "点开后 settings.touchDraw 写回（下次打开不再复位）"
+    );
   }
 
   /* 图层 */
@@ -665,6 +860,49 @@ async function main() {
   await sleep(80);
   pass(view.store!.page.layers.length === 2, "新增图层");
   pass(view.sideEl.querySelectorAll(".mb-layer").length === 2, "侧栏出现 2 个图层");
+
+  /*
+   * 图层透明度：Layer.opacity 一直参与渲染（renderRec / 导出都按它画），
+   * 但以前侧栏没有入口。这里验证滑杆能看、能改、能撤销。
+   */
+  {
+    const row = view.sideEl.querySelector(".mb-layer") as HTMLElement;
+    const range = row.querySelector(".mb-layer-op-range") as HTMLInputElement;
+    const val = row.querySelector(".mb-layer-op-val") as HTMLElement;
+    pass(!!range && !!val, "图层行有透明度滑杆与百分比");
+    pass(range.value === "100", "图层默认透明度显示 100%（" + range.value + "）");
+
+    range.value = "40";
+    range.dispatchEvent(new Event("input", { bubbles: true }));
+    await sleep(30);
+    pass(
+      Math.abs(view.store!.page.layers[0].opacity - 0.4) < 1e-9,
+      "拖滑杆后图层 opacity=0.4（实际 " + view.store!.page.layers[0].opacity + "）"
+    );
+    pass(val.textContent === "40%", "百分比跟着更新（" + val.textContent + "）");
+    range.dispatchEvent(new Event("change", { bubbles: true }));
+
+    view.editor!.undo();
+    await sleep(60);
+    pass(
+      view.store!.page.layers[0].opacity === 1,
+      "撤销透明度回 100%（整次拖动只记一条历史）"
+    );
+    view.editor!.redo();
+    await sleep(60);
+    pass(
+      view.store!.page.layers[0].opacity === 0.4,
+      "重做透明度回 40%"
+    );
+
+    // 还原，后面的导出/截图仍按不透明图层走。撤销/重做重建过行，必须重新取节点。
+    const row2 = view.sideEl.querySelector(".mb-layer") as HTMLElement;
+    const range2 = row2.querySelector(".mb-layer-op-range") as HTMLInputElement;
+    range2.value = "100";
+    range2.dispatchEvent(new Event("input", { bubbles: true }));
+    range2.dispatchEvent(new Event("change", { bubbles: true }));
+    await sleep(30);
+  }
 
   /* 页面 */
   // 「加一页」现在在侧栏的「页面」区里
@@ -898,8 +1136,58 @@ async function main() {
       Math.abs(restarted.editor!.highlighterSize - HIGHLIGHTER_SIZES[2]) < 1e-9,
       "重新 new 一个 view 后荧光笔粗细仍是上次选的（" + restarted.editor!.highlighterSize + "）"
     );
+    pass(
+      restarted.editor!.touchDraw === true,
+      "重新 new 一个 view 后「允许手指书写」仍是上次的值（" + restarted.editor!.touchDraw + "）"
+    );
+    pass(
+      restarted.editor!.penColor === "#7C5CD6",
+      "重新 new 一个 view 后上次笔色仍是 #7C5CD6（" + restarted.editor!.penColor + "）"
+    );
+    pass(
+      restarted.editor!.highlighterColor === "#90CDF4",
+      "重新 new 一个 view 后上次荧光色仍是 #90CDF4（" +
+        restarted.editor!.highlighterColor +
+        "）"
+    );
+
+    // 关掉也要持久化：否则重启后又从 settings 恢复成「开」
+    const touchBtn2 = restarted.sideEl.querySelector(
+      'button[aria-label="允许手指书写"]'
+    ) as HTMLElement;
+    touchBtn2.click();
+    await sleep(20);
+    pass(
+      plugin.settings.touchDraw === false,
+      "再点一下关掉后 settings.touchDraw 也写回 false（" + plugin.settings.touchDraw + "）"
+    );
+
     await restarted.onClose();
     restarted.containerEl.remove();
+  }
+
+  /*
+   * 设置页里改「上次笔色 / 荧光色 / 荧光粗细」要立即同步到已打开的笔记。
+   * 设置项 onChange 走的是 refreshViews → view.syncSettings，这里直接调
+   * syncSettings 验证这条链路的末端。
+   */
+  {
+    plugin.settings.lastPenColor = "#2E8B57";
+    plugin.settings.lastHighlighterColor = "#9AE6B4";
+    plugin.settings.defaultHighlighterSize = HIGHLIGHTER_SIZES[0];
+    view.syncSettings();
+    pass(
+      view.editor!.penColor === "#2E8B57",
+      "设置页改上次笔色后当前编辑器立即生效（" + view.editor!.penColor + "）"
+    );
+    pass(
+      view.editor!.highlighterColor === "#9AE6B4",
+      "设置页改上次荧光色后当前编辑器立即生效（" + view.editor!.highlighterColor + "）"
+    );
+    pass(
+      Math.abs(view.editor!.highlighterSize - HIGHLIGHTER_SIZES[0]) < 1e-9,
+      "设置页改荧光笔粗细后当前编辑器立即生效（" + view.editor!.highlighterSize + "）"
+    );
   }
 
   /* 展示本：丰富笔迹，用于截图 */
