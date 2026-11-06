@@ -630,6 +630,79 @@ async function main() {
       await sleep(30);
       pass(ed.textSize === 96, "输入框输入 200：被 clamp 到 96");
       pass(csizeIn.value === "96", `输入框输入 200：显示值整理成 clamp 后的实际值（${csizeIn.value}）`);
+
+      /* ---- −/＋ 字号步进按钮：点一下 ±1、按住连调、数字框显示同步 ---- */
+      const plusBtn = cbar.querySelector<HTMLElement>(".mb-tb-sizestep-add") as HTMLElement | null;
+      const minusBtn = cbar.querySelector<HTMLElement>(".mb-tb-sizestep-sub") as HTMLElement | null;
+      pass(!!plusBtn && !!minusBtn, "样式条上有 −/＋ 步进按钮（贴在自定义字号框右边）");
+      pass(
+        !!plusBtn && !!minusBtn &&
+          plusBtn.dataset.mbTextStyle === "1" &&
+          minusBtn.dataset.mbTextStyle === "1",
+        "步进按钮带 data-mb-text-style（编辑框开着时点它不提交）"
+      );
+      /* 步进按钮绑定在 pointerdown 上（bindHoldStepBtn），点它 = 派发指针序列 */
+      const tapStep = (b: HTMLElement, pid: number) => {
+        b.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerId: pid, pointerType: "touch" }));
+        document.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, cancelable: true, pointerId: pid, pointerType: "touch" }));
+      };
+      const holdStep = (b: HTMLElement, pid: number) => {
+        b.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerId: pid, pointerType: "touch" }));
+      };
+      const releaseStep = (pid: number) => {
+        document.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, cancelable: true, pointerId: pid, pointerType: "touch" }));
+      };
+      // 从 20 起步，上方输入的都是合法值（越界 clamp 已在上面验过）
+      csizeIn.value = "20";
+      csizeIn.dispatchEvent(new Event("input", { bubbles: true }));
+      await sleep(30);
+      pass(ed.textSize === 20, "步进测试背景：输入框设为 20");
+
+      tapStep(minusBtn!, 95);
+      await sleep(30);
+      pass(ed.textSize === 19, "点「−」一次：editor.textSize 从 20 减到 19");
+      pass(csizeIn.value === "19", `步进后数字框显示同步（${csizeIn.value}）`);
+      tapStep(plusBtn!, 96);
+      await sleep(30);
+      pass(ed.textSize === 20, "点「＋」一次：editor.textSize 从 19 加到 20");
+      // 连续点「−」到下限：clamp 8 生效，数字框显示同步
+      for (let i = 0; i < 12; i += 1) tapStep(minusBtn!, 100 + i);
+      await sleep(30);
+      pass(ed.textSize === 8, "连续点「−」12 次：被 clamp 到 8（不再降）");
+      pass(csizeIn.value === "8", `clamp 后数字框显示 8（${csizeIn.value}）`);
+      tapStep(minusBtn!, 112);
+      tapStep(minusBtn!, 113);
+      await sleep(30);
+      pass(ed.textSize === 8, "到 8 后再点「−」：不再降（clamp 生效）");
+      // 连续点「＋」到上限
+      for (let i = 0; i < 90; i += 1) tapStep(plusBtn!, 200 + i);
+      await sleep(30);
+      pass(ed.textSize === 96, "连续点「＋」90 次：被 clamp 到 96（不再升）");
+      pass(csizeIn.value === "96", `到 96 后数字框显示 96（${csizeIn.value}）`);
+      // 按住不放连续增减：先 400ms 等一步，之后每 100ms 一步
+      csizeIn.value = "40";
+      csizeIn.dispatchEvent(new Event("input", { bubbles: true }));
+      await sleep(30);
+      holdStep(plusBtn!, 301);
+      await sleep(30);
+      pass(ed.textSize === 41, "按住「＋」：pointerdown 当场 +1（40→41）");
+      await sleep(600);
+      const heldAt = ed.textSize;
+      pass(heldAt >= 42, `按住不放连续增加：600ms 后到 ${heldAt}（400ms 后每 100ms 一步）`);
+      releaseStep(301);
+      await sleep(150);
+      const settled1 = ed.textSize;
+      await sleep(400);
+      pass(ed.textSize === settled1, `pointerup 收走连调：松手后停在 ${settled1}（后面没有再变）`);
+      // 点步进按钮不提交编辑框：pointerdown 标记过 data-mb-text-style，blur 不提交
+      const taBox = pageEl().querySelector(".mb-text-edit") as HTMLTextAreaElement | null;
+      holdStep(minusBtn!, 302);
+      holdStep(plusBtn!, 303);
+      taBox?.blur();
+      await sleep(60);
+      pass(!!pageEl().querySelector(".mb-text-edit"), "点步进按钮后输入框还在（没被提交掉）");
+      releaseStep(302);
+      releaseStep(303);
       // 输入框带着 data-mb-text-style：编辑框开着时点它不能把框提交掉
       csizeIn.dispatchEvent(
         new PointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerId: 93 })

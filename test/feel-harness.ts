@@ -1,6 +1,6 @@
 import { OneEuroFilter, shapePressure, speedWidthFactor, zoomNormalization } from "../src/filter";
 import { predictTail, effectivePressures, strokePath, drawStroke, paintStroke, invalidateStroke } from "../src/ink";
-import { BookEditor } from "../src/editor";
+import { BookEditor, inkRenderDpr } from "../src/editor";
 import { BookStore } from "../src/store";
 import { createBook } from "../src/types";
 import type { Pt, Stroke } from "../src/types";
@@ -220,6 +220,91 @@ async function main() {
     );
     pass(zoomNormalization(0.5) === 1, "缩放归一化：低倍不放大（下限 1）");
     pass(zoomNormalization(NaN) === 1, "缩放归一化：非法 zoom 回落 1");
+  }
+
+  /* -------------------- 桌面端渲染超采样（INK-162） --------------------
+   *
+   * 用户报「用电脑写的时候边缘不够丝滑」。根因（实测 5 seed × 2 笔画 ×
+   * 真 Chrome 合成，每格 n=10）：dpr=1 时画布 backing 只有 1 个设备像素/
+   * 页面单位，笔迹边缘**一次采样就定了** → 呈台阶状。
+   *
+   * 实测硬台阶占比（越低越丝滑）：
+   *   z=0.8  鼠标 17.61% → 5.26%（dpr 1→1.25）   笔 17.14% → 5.77%
+   *   z=2.8  鼠标  7.34% → 2.80%                  笔  8.47% → 3.87%
+   *
+   * 为什么是 1.25 而不是 2：**整数比会被重新量化**——dpr=2 时浏览器做
+   * 2:1 降采样，每个输出像素恰是 2×2 源像素的平均 → 已抗锯齿的边缘被
+   * 压成一档灰阶 → 硬台阶反弹回 17.37%（比 1.25 差 3 倍多）。
+   * 非整数比（1.25）没有这个问题。
+   *
+   * 断言怎么写才能**不依赖测试机实际 dpr**：
+   * 无头 Edge 的 devicePixelRatio 可能是 1 也可能是 2，两种都要能过。
+   * 所以分两层：
+   *   ① 纯函数层：inkRenderDpr(1) === 1.25、inkRenderDpr(2) === 2 —— 与机器无关
+   *   ② 集成层：现读 window.devicePixelRatio，按它推出应有的渲染 dpr，
+   *      再跟编辑器实际画出来的 backing 比
+   * ------------------------------------------------------------------ */
+  {
+    /* ① 纯函数层：跟测试机 dpr 完全无关 */
+    pass(
+      inkRenderDpr(1) === 1.25,
+      "超采样：设备 dpr=1 → 渲染 dpr 补到 1.25（桌面端笔迹边缘更丝滑）"
+    );
+    pass(
+      inkRenderDpr(2) === 2,
+      "超采样：设备 dpr=2 → 渲染 dpr 仍是 2（平板手感不动）"
+    );
+    pass(
+      inkRenderDpr(1.5) === 1.5 && inkRenderDpr(0) === 1.25,
+      "超采样：dpr=1.5 保持 1.5、非法值按 1 处理"
+    );
+
+    /* ② 集成层：编辑器实际画出来的 backing */
+    const { editor, store } = makeAbHost();
+    await sleep(500); // 等页面挂载
+
+    const rawDpr = Math.min(window.devicePixelRatio || 1, 2);
+    const wantDpr = inkRenderDpr(rawDpr);
+
+    editor.setZoom(0.8);
+    await sleep(400);
+
+    const rec = (editor as any).recs[0];
+    const canvas = rec.canvas as HTMLCanvasElement;
+    const cssW = canvas.getBoundingClientRect().width;
+    const actualDpr = cssW > 0 ? canvas.width / cssW : 0;
+
+    pass(
+      canvas.width > 0 && cssW > 0,
+      "超采样：画布已挂载（backing " + canvas.width + "×" + canvas.height + "）"
+    );
+    pass(
+      Math.abs(actualDpr - wantDpr) < 0.02,
+      "超采样：实际渲染 dpr = " +
+        actualDpr.toFixed(3) +
+        "（期望 " +
+        wantDpr.toFixed(2) +
+        "，设备 dpr=" +
+        rawDpr +
+        "）"
+    );
+
+    /*
+     * 内存账（红线 MAX_CANVAS_PIXELS = 16M 不许降，这里是加不是减）：
+     * 单块画布 = 794×zoom×dpr × 1123×zoom×dpr 像素，必须仍然远小于 16M。
+     */
+    const zoom = 0.8;
+    const perCanvasPx = 794 * zoom * wantDpr * 1123 * zoom * wantDpr;
+    pass(
+      perCanvasPx < 16_000_000,
+      "超采样：单块画布 " +
+        (perCanvasPx / 1e6).toFixed(2) +
+        "M px，仍在 16M 红线内"
+    );
+
+    editor.destroy();
+    document.querySelectorAll(".mb-root").forEach((el) => el.remove());
+    void store;
   }
 
   /* -------------------- 1€ 滤波：去抖 -------------------- */

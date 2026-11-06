@@ -1113,8 +1113,10 @@
  *   第二行：8 个 16px 色点，nowrap，总宽 8×16+7×6 = 170px
  * 两行合计 ~48px。
  *
- * 平板（.mb-root.is-tablet）色点放大到 22px，触摸目标够大；
- * 侧栏在平板上最窄也有 ~292px 内容宽，8×22+7×6 = 218px 仍放得下。
+ * 平板（.mb-root.is-tablet）色点缩到 20px、行距 6→4：8×20+7×4 = 188px；
+ * 字号框平板收窄到 32px。整行 ~224px（含 −/＋ 步进按钮约 +32 ≈ 256px）。
+ * 平板侧栏内容区常态 ~316px、窄视口 ~264px（288px 侧栏），都放得下；
+ * 改前 42+6+218 = 266px 在窄视口会被挤出右缘（INK-160）。
  */
 .mb-text-tools {
   display: flex;
@@ -1145,10 +1147,17 @@
   font-size: 11.5px;
 }
 
-/* 色点强制一行：侧栏再窄也不许折成两行（折行会把整区撑高） */
+/*
+ * 色点强制一行：侧栏再窄也不许折成两行（折行会把整区撑高）。
+ *
+ * gap 从 6 收到 4：这行现在还要塞「字号框 + −/＋ 两枚步进按钮」，
+ * 桌面内容区只有 241px（258 侧栏减 padding）。按 gap=6 算：
+ *   42 + 12 + 12 + 8×16 + 10×6 = 254px → 溢出 13px（dock 有硬断言）。
+ * gap=4：42 + 12 + 12 + 8×16 + 10×4 = 234px ≤ 241 ✓
+ */
 .mb-text-tools .mb-tcolor-row {
   flex-wrap: nowrap;
-  gap: 6px;
+  gap: 4px;
   margin: 0;
 }
 
@@ -1159,6 +1168,14 @@
   height: 16px;
 }
 
+/*
+ * 平板：色点保持 22px 触摸目标（INK-154 定的，手指要按得准，不许缩）。
+ *
+ * 真正该收窄的是**字号框**：原来 42px 宽、30px 高，在平板那行里显得
+ * 跟两枚步进按钮加起来一样宽，视觉上「占了一整行」。
+ * 收到 34px 后整行 = 34 + 2×14 + 8×22 + 10×4 = 278px，
+ * 平板侧栏内容区 ~323px（340 侧栏减 padding）→ 余 45px ✓
+ */
 .mb-root.is-tablet .mb-text-tools .mb-tcolor {
   width: 22px;
   height: 22px;
@@ -1169,7 +1186,13 @@
   font-size: 12.5px;
 }
 
-/* 自定义字号入口：色点行最左的紧凑数字输入框（宽 42px，平板 30px 高当点区） */
+/*
+ * 自定义字号入口：色点行最左的紧凑数字输入框。
+ *
+ * 宽 42px 是桌面值。平板下收窄到 34px —— 平板那行还要放两枚步进按钮
+ * 和 8 个色点，不收窄的话整行超出侧栏内容区，色点被推到屏幕外
+ * （用户原话：「自定义字体大小框占满一整行，后面的颜色都被挤出去了」）。
+ */
 .mb-text-tools .mb-size-in {
   box-sizing: border-box;
   flex: 0 0 auto;
@@ -1187,14 +1210,59 @@
 }
 
 .mb-root.is-tablet .mb-text-tools .mb-size-in {
+  width: 34px;
   height: 30px;
   font-size: 12px;
+  padding: 0 2px;
 }
 
 /* 当前值不是四档之一（自定义值，如 21）时给入口一个强调描边 */
 .mb-text-tools .mb-size-in.is-custom {
   border-color: var(--interactive-accent, #6c5ce7);
   color: var(--interactive-accent, #6c5ce7);
+}
+
+/* −/＋ 字号步进小按钮：贴着 .mb-size-in 右边、色点行最前面的两枚。
+ * 色点行是 nowrap 的固定行（字号框 + 8 个色点已经占满）；两枚按钮
+ * 各自只占 12px 宽——再宽一点整行就溢出侧栏内容区。
+ * 竖向与邻控件同高（18px），行高由 .mb-size-in 的 20px 决定，不撑行 */
+.mb-text-tools .mb-size-step {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  width: 12px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-normal);
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.mb-text-tools .mb-size-step:hover {
+  background: var(--background-modifier-hover);
+}
+
+/* 按住连调时的按压反馈（侧栏这位子颜色是主题 accent，避免和色点打架） */
+.mb-text-tools .mb-size-step.is-held {
+  background: var(--interactive-accent, #6c5ce7);
+  color: var(--text-on-accent, #fff);
+}
+
+/*
+ * 平板：手指要能按准，两枚放大到 14×24（仍不撑高 30px 的行）。
+ *
+ * 宽度是算出来的：平板那行 = 字号框 34 + 2×步进 + 8×色点 20 + 10×gap 4。
+ * 窄视口（288px 侧栏 → 264px 内容区）下两枚步进要是 16px 就超 2px，
+ * 所以压到 14px：34 + 28 + 160 + 40 = **262px ≤ 264** ✓
+ */
+.mb-root.is-tablet .mb-text-tools .mb-size-step {
+  width: 14px;
+  height: 24px;
+  font-size: 13px;
 }
 
 /* 平板：属性条得用手指点得准，按钮放大到 30px */
@@ -1315,6 +1383,41 @@
 .mb-texteditbar .mb-tb-sizein.is-custom {
   border-color: var(--interactive-accent, #6c5ce7);
   color: var(--interactive-accent, #6c5ce7);
+}
+
+/* −/＋ 字号步进按钮：贴着 .mb-tb-sizein 右边的小按钮，
+ * 与四档数字按钮同高同色系（底色透明、hover 才变深），
+ * 不抢数字按钮的高亮（步进按钮没有"当前值等于它"的意义） */
+.mb-texteditbar .mb-tb-sizestep {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  min-width: 22px;
+  height: 26px;
+  padding: 0 3px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-normal, #1a1a1a);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.mb-texteditbar .mb-tb-sizestep:hover {
+  background: var(--background-modifier-hover);
+}
+
+/* 按住连调时的按压感 */
+.mb-texteditbar .mb-tb-sizestep.is-held {
+  background: var(--interactive-accent, #6c5ce7);
+  color: var(--text-on-accent, #fff);
+}
+
+.mb-tablet .mb-texteditbar .mb-tb-sizestep {
+  min-width: 26px;
+  height: 28px;
+  font-size: 14px;
 }
 
 .mb-canvas,
@@ -2095,32 +2198,58 @@
 }
 
 /*
- * 长按拖拽重排：拖拽影像 + 落点指示线 + 被拖条目的虚化态。
+ * 长按拖拽重排：拖拽影像 + 落点指示竖条 + 被拖条目的虚化态。
  * 三类都独立命名，不碰菜单 / 缩略图既有样式。
  */
 .mb-thumb.mb-thumb-dragging {
   opacity: 0.3;
   pointer-events: none; /* 被拖时不吃事件，避免和落点检测抢手势 */
 }
+/*
+ * 拖拽影像：里面是**被拖缩略图的真内容**（canvas 位图用 drawImage 复制，
+ * cloneNode 复制不过来）。以前这里只是个空白框，用户看到的是块空白。
+ *
+ * 描边用 box-shadow 而不是 border：border 会占掉 1~2px 内容区，
+ * 复制过来的缩略图就被横向压扁一点；box-shadow 画在框外，不影响内容尺寸。
+ */
 .mb-thumb-ghost {
   position: fixed;
   left: 0;
   top: 0;
   z-index: 9000;
   pointer-events: none;
-  opacity: 0.65;
-  border: 1px solid var(--interactive-accent);
+  opacity: 0.85;
+  overflow: hidden;
   border-radius: 3px;
   background: rgba(255, 255, 255, 0.92);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35), 0 0 0 1px var(--interactive-accent);
   transform-origin: 0 0;
 }
-.mb-thumb-drop-line {
+.mb-thumb-ghost-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+/*
+ * 落点指示：**紫色竖条**。
+ *
+ * 用户原话：「长按页面挪动的时候，得加一个紫色的竖条，这样能更直观地
+ * 看到我挪到哪儿了」——竖条画在**插入位置**：
+ *   插到目标前面 → 目标缩略图的左边缘；
+ *   插到目标后面 → 目标缩略图的右边缘。
+ *
+ * 以前那条横线（.mb-thumb-drop-line）去掉了：它横跨整个页列表，
+ * 在 4 列网格里画的是"某两行之间的缝"，看不出要插到哪一列，
+ * 反而误导。两条同时显示更乱（一条说行、一条说列）。
+ *
+ * 颜色用 --interactive-accent（主题强调色，跟随主题；Obsidian 默认就是紫色）。
+ */
+.mb-thumb-drop-bar {
   position: fixed;
   left: 0;
   top: 0;
   z-index: 9001;
-  height: 3px;
+  width: 3px;
   border-radius: 2px;
   background: var(--interactive-accent);
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.6);

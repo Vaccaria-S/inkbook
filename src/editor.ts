@@ -217,6 +217,43 @@ function measureContext(font: string): CanvasRenderingContext2D | null {
  */
 export const MAX_CANVAS_PIXELS = 16_000_000;
 
+/**
+ * 笔迹画布的**渲染超采样倍数**（INK-162）。
+ *
+ * 纯函数：只吃「设备像素比」，不碰编辑器状态 —— 测试可以直接跑它，
+ * 也不依赖测试机的实际 dpr（无头 Edge 可能是 1 也可能是 2）。
+ *
+ * ── 为什么桌面要补到 1.25 ──
+ *
+ * 根因（实测：5 个 seed × 2 种笔画 × 真 Chrome 合成，每格 n=10）：
+ * dpr=1 时画布 backing 只有 1 个设备像素/页面单位，笔迹边缘
+ * **一次采样就定了** → 呈台阶状，用户看到的正是「边缘不够丝滑」。
+ * 超采样后 backing 变 1.25 倍，浏览器用**非整数比**降采样，
+ * 每个输出像素按 1 或 2 个源像素加权 → 灰阶过渡摊开 → 边缘细腻。
+ *
+ * 实测硬台阶占比（越低越丝滑）：
+ *   z=0.8   鼠标 17.61% → 5.26%（-70%）  笔 17.14% → 5.77%（-66%）
+ *   z=2.8   鼠标  7.34% → 2.80%（-62%）  笔  8.47% → 3.87%（-54%）
+ *
+ * 为什么是 1.25 而不是 2：**整数比会被重新量化**。dpr=2 时浏览器做
+ * 2:1 降采样，每个输出像素恰好是 2×2 源像素的平均 → 已经抗锯齿过
+ * 的边缘被压成一档灰阶 → 硬台阶反弹回 17.37%（比 1.25 差 3 倍多）。
+ * 非整数比（1.25）没有这个问题。实测 dpr=1.5 是 6.85%，也不如 1.25。
+ *
+ * 为什么 dpr=2 的设备（平板）**不动**：用户天天用平板写字，
+ * 平板现在的手感没被抱怨，不拿没问题的场景去冒险。实测平板的
+ * dpr=2 → 17.14%，改 1.25（5.77%）确实更平滑，但那属于
+ * 「用户没要求的大改动」，等真机验证过再说。
+ *
+ * @param deviceDpr 设备的 devicePixelRatio（会先被夹到 ≤2）
+ * @returns 画布 backing 相对 CSS 尺寸的倍数
+ */
+export function inkRenderDpr(deviceDpr: number): number {
+  const raw = Math.min(deviceDpr || 1, 2);
+  // 桌面（dpr=1）补到 1.25；dpr≥2 的设备（平板）保持原样
+  return raw < 1.5 ? 1.25 : raw;
+}
+
 /** 导出的底图位图宽度上限（设备像素） */
 const MAX_EXPORT_PX = 4096;
 
@@ -315,6 +352,74 @@ export interface EditorOptions {
    * 位图渲染完必须补一次，否则侧栏会一直停在灰底占位上。
    */
   onThumbNeedsRedraw?: (index: number) => void;
+}
+
+/** 按住连调：第一次重复前的等待（先 400ms 再开始加速） */
+const SIZE_STEP_WAIT_MS = 400;
+/** 按住连调：之后每步的间隔（平板单步太慢） */
+const SIZE_STEP_REPEAT_MS = 100;
+
+/**
+ * 按住按钮连续步进的交互绑定（点一下走一档，按住连调）。
+ *
+ * 平板上字号一档一档点太慢：按下立刻走第一步（pointerdown 当场
+ * 触发），400ms 后开始加速重复（每 100ms 一步），松指 / 指针离开
+ * 按钮 / 窗口失焦 都停。
+ *
+ * 停摆判据挂在 document（**不是按钮上**）：侧栏的字号工具区每次
+ * setTextSize 都会整体重建（setTextSize → emitState → updateUI →
+ * renderDynamicTools），按住中的按钮会被换掉——按钮自身的 pointerup
+ * 永远等不到，timer 会一路跑到底（− 按到底 8、＋ 按到底 96）。重建
+ * 出的新按钮由下次 renderDynamicTools 重新绑定，旧闭包的监听随这次
+ * pointerup 到 document 后随之移除，不泄漏。
+ *
+ * @param btn   目标按钮
+ * @param onStep 每步动作（调用方只负责「走一档」，clamp 由内部完成）
+ */
+export function bindHoldStepBtn(btn: HTMLElement, onStep: () => void): void {
+  let timer: number | null = null;
+
+  function stop(): void {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    document.removeEventListener("pointerup", onUp);
+    document.removeEventListener("pointercancel", onCancel);
+    window.removeEventListener("blur", onWinBlur);
+    btn.classList.remove("is-held");
+  }
+
+  const repeat = (): void => {
+    onStep();
+    timer = window.setTimeout(repeat, SIZE_STEP_REPEAT_MS);
+  };
+
+  function onUp(): void {
+    stop();
+  }
+
+  function onCancel(): void {
+    stop();
+  }
+
+  function onWinBlur(): void {
+    stop();
+  }
+
+  btn.addEventListener("pointerdown", (e: PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    /* 只认主指针：鼠标右键留给浏览器菜单 */
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    onStep();
+    btn.classList.add("is-held");
+    timer = window.setTimeout(repeat, SIZE_STEP_WAIT_MS);
+    btn.addEventListener("pointerleave", stop);
+    document.addEventListener("pointerup", onUp);
+    document.addEventListener("pointercancel", onCancel);
+    window.addEventListener("blur", onWinBlur);
+  });
 }
 
 export class BookEditor {
@@ -1009,6 +1114,23 @@ export class BookEditor {
   }
 
   /**
+   * 字号步进按钮的「走一档」动作（值 ±1）。
+   *
+   * 编辑框开着时按框里**待提交**的值算（新建框 = 预览值），
+   * 否则按当前字号算；结果永远交给 setTextSize 的 clamp 8~96，
+   * 调用方不许直接写字段。
+   *
+   * 「值取哪个」判据放在这里而不在按钮侧：编辑已有文字（.mb-textbar
+   * 那条）时框里的值与 textSizeValue 可能不一致（比如选中 30 号文字、
+   * 当前字号默认 18，按 textSizeValue 步进会从 18 起步而不是 30）。
+   */
+  stepTextSize(delta: number): void {
+    const ed = this.textEdit;
+    const cur = ed ? ed.size : this.textSizeValue;
+    this.setTextSize(cur + delta);
+  }
+
+  /**
    * 把样式改动实时喂给正在打开的输入框。
    *
    * 只改**预览**（textarea 的样式与待提交的 size/color/font），
@@ -1387,6 +1509,28 @@ export class BookEditor {
       }
     });
     bar.appendChild(sizeIn);
+
+    // −/＋ 字号步进：点一下走一档，按住连调（见 bindHoldStepBtn），
+    // 与四档数字按钮并存——直接输入框旁边既给精确改值（4 档）也给
+    // 微调步进（±1）。clamp 8~96 由 setTextSize 统一兜底。
+    for (const d of [-1, 1] as const) {
+      const step = document.createElement("button");
+      step.type = "button";
+      step.className = "mb-tb-sizestep" + (d < 0 ? " mb-tb-sizestep-sub" : " mb-tb-sizestep-add");
+      step.textContent = d < 0 ? "−" : "＋";
+      step.title = d < 0 ? "字号 −1（按住连减）" : "字号 +1（按住连加）";
+      // 编辑框开着时点它不能把框提交掉（blur 判定靠这个标记）
+      step.dataset.mbTextStyle = "1";
+      bindHoldStepBtn(step, () => {
+        // setTextSize → applyTextEditStyle：实时预览 + 高亮同步
+        this.stepTextSize(d);
+        // updateTextEditBar 不敢覆盖正在输入的框；既然按了步进按钮，
+        // 说明这一格的输入已结束，主动把显示值同步成新值
+        const bi = bar.querySelector<HTMLInputElement>(".mb-tb-sizein");
+        if (bi) bi.value = String(this.textSize);
+      });
+      bar.appendChild(step);
+    }
 
     // 字号：4 档常用大小，当前值高亮。数字按钮比 −/＋ 少一半点击次数
     for (const v of [14, 18, 24, 32]) {
@@ -2470,13 +2614,42 @@ export class BookEditor {
    *
    * 上限按「单张画布的像素预算」算。缩放很大时 dpr 自动下降，
    * 宁可略微软一点，也不能让内存爆掉。
+   *
+   * ── 桌面端（devicePixelRatio = 1）超采样到 1.25 ──
+   *
+   * 根因（实测：5 个 seed × 2 种笔画 × 真 Chrome 合成，每格 n=10）：
+   * dpr=1 时画布 backing 只有 1 个设备像素/页面单位，笔迹边缘
+   * **一次采样就定了** → 呈台阶状，用户看到的正是「边缘不够丝滑」。
+   * 超采样后 backing 变 1.25 倍，浏览器用**非整数比**降采样，
+   * 每个输出像素按 1 或 2 个源像素加权 → 灰阶过渡摊开 → 边缘细腻。
+   *
+   * 实测硬台阶占比（越低越丝滑）：
+   *   z=0.8   鼠标 17.61% → 5.26%（-70%）  笔 17.14% → 5.77%（-66%）
+   *   z=2.8   鼠标  7.34% → 2.80%（-62%）  笔  8.47% → 3.87%（-54%）
+   *
+   * 为什么是 1.25 而不是 2：**整数比会被重新量化**。dpr=2 时浏览器做
+   * 2:1 降采样，每个输出像素恰好是 2×2 源像素的平均 → 已经抗锯齿过
+   * 的边缘被压成一档灰阶 → 硬台阶反弹回 17.37%（比 1.25 差 3 倍多）。
+   * 非整数比（1.25）没有这个问题。实测 dpr=1.5 是 6.85%，也不如 1.25。
+   *
+   * 为什么 dpr=2 的设备（平板）**不动**：用户天天用平板写字，
+   * 平板现在的手感没被抱怨，不拿没问题的场景去冒险。实测平板的
+   * dpr=2 → 17.14%，改 1.25（5.77%）确实更平滑，但那属于
+   * 「用户没要求的大改动」，等真机验证过再说。
+   *
+   * 内存（fit 档 zoom≈0.8，794×1123 页面）：
+   *   dpr=1     → 635×898  = 0.57M px = 2.2MB/块，两块/页 4.4MB
+   *   dpr=1.25  → 794×1123 = 0.89M px = 3.4MB/块，两块/页 6.8MB
+   *   8 页挂满：35MB → 54MB，仍远低于 MOUNT_BUDGET_BYTES(160MB)。
+   *   单块 0.89M px 远小于 MAX_CANVAS_PIXELS(16M)，红线未动。
    */
   private renderDpr(): number {
     const raw = Math.min(window.devicePixelRatio || 1, 2);
+    const want = inkRenderDpr(raw);
     const perZoom = this.store.data.width * this.store.data.height * this.zoom * this.zoom;
-    if (perZoom <= 0) return raw;
+    if (perZoom <= 0) return want;
     const maxDpr = Math.sqrt(MAX_CANVAS_PIXELS / perZoom);
-    return clamp(Math.min(raw, maxDpr), 0.75, raw);
+    return clamp(Math.min(want, maxDpr), 0.75, want);
   }
 
   /**

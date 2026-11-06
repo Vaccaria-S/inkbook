@@ -835,9 +835,42 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       "2.7 拖拽中生成拖拽影像 .mb-thumb-ghost"
     );
     pass(
-      !!document.querySelector(".mb-thumb-drop-line"),
-      "2.7 拖拽中生成落点指示线 .mb-thumb-drop-line"
+      !!document.querySelector(".mb-thumb-drop-bar"),
+      "2.7 拖拽中生成落点指示竖条 .mb-thumb-drop-bar"
     );
+    pass(
+      !document.querySelector(".mb-thumb-drop-line"),
+      "2.7 拖拽中不再有旧的横线指示 .mb-thumb-drop-line（只留竖条）"
+    );
+    /*
+     * 拖拽影像里必须有**真缩略图**，不是空白框。
+     *
+     * 用户原话：「显示的缩略图还是不太直观」——以前 ghost 只是个带边框的
+     * 空 div，用户看到的是块空白。位图靠 cloneNode 复制不过来（克隆出来是
+     * 0×0 的空 canvas），必须用 drawImage 画过去。
+     */
+    {
+      const g = document.querySelector(".mb-thumb-ghost") as HTMLElement | null;
+      const gcv = g?.querySelector(".mb-thumb-ghost-canvas") as HTMLCanvasElement | null;
+      let painted = false;
+      if (gcv && gcv.width > 0 && gcv.height > 0) {
+        const gctx = gcv.getContext("2d");
+        if (gctx) {
+          const data = gctx.getImageData(0, 0, gcv.width, gcv.height).data;
+          // 纸面底色不透明 → 画过 = 有 alpha≠0 的像素
+          for (let i = 3; i < data.length; i += 4) {
+            if (data[i] !== 0) {
+              painted = true;
+              break;
+            }
+          }
+        }
+      }
+      pass(
+        !!gcv && painted,
+        "2.7 拖拽影像里是**真缩略图**（ghost canvas 有内容，不是空白框）"
+      );
+    }
     pass(
       src.classList.contains("mb-thumb-dragging"),
       "2.7 被拖条目带 is-dragging 虚化态"
@@ -864,8 +897,128 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       "2.7 落在第 2 页下半 → 换算出的最终下标是 1（" + insertPos + "）"
     );
 
-    // 抬手 → 落库
-    pe(src, "pointerup", dstX, dstY);
+    /*
+     * 紫色竖条：用户原话「长按页面挪动的时候，得加一个紫色的竖条，
+     * 这样能更直观地看到我挪到哪儿了」。
+     *
+     * 竖条画在**插入位置**：
+     *   插到目标前面 → 目标缩略图的**左**边缘；
+     *   插到目标后面 → 目标缩略图的**右**边缘。
+     * 这里落在第 2 页下半 = 插到它**后面** → 竖条应在目标右边缘。
+     */
+    {
+      const bar = document.querySelector(".mb-thumb-drop-bar") as HTMLElement | null;
+      pass(!!bar, "2.7 拖拽中存在落点竖条 .mb-thumb-drop-bar");
+      if (bar) {
+        // 现量一次目标 rect（拖拽期间侧栏可能被边缘自动滚动量挪过）
+        const tR = dst.getBoundingClientRect();
+        const br = bar.getBoundingClientRect();
+        // 竖条：细长的一条（宽度远小于缩略图宽度）
+        pass(
+          br.width > 0 && br.width <= 8 && br.width < tR.width / 2,
+          "2.7 竖条是细长的一条（宽 " + br.width.toFixed(1) + "px ≤ 8px）"
+        );
+        // 竖直方向覆盖目标缩略图的高度（别高出一截、也别短一截）
+        pass(
+          Math.abs(br.height - tR.height) <= 2,
+          "2.7 竖条高度覆盖目标缩略图（" +
+            br.height.toFixed(1) +
+            " vs " +
+            tR.height.toFixed(1) +
+            "）"
+        );
+        pass(
+          Math.abs(br.top - tR.top) <= 2 && Math.abs(br.bottom - tR.bottom) <= 2,
+          "2.7 竖条上下沿与目标缩略图对齐（上 " +
+            br.top.toFixed(1) +
+            " / 下 " +
+            br.bottom.toFixed(1) +
+            "）"
+        );
+        /*
+         * 插到目标**后面** → 竖条贴在目标的**右边缘**（条身在那条缝里，
+         * 左沿 == 目标右沿）。
+         */
+        pass(
+          Math.abs(br.left - tR.right) <= 2,
+          "2.7 插到目标后面 → 竖条在目标缩略图的右边缘（左 " +
+            br.left.toFixed(1) +
+            " vs 目标右 " +
+            tR.right.toFixed(1) +
+            "）"
+        );
+        // 颜色：主题强调色（Obsidian 默认紫色），不是透明/白
+        const cs = getComputedStyle(bar);
+        const bg = cs.backgroundColor;
+        const m = /rgba?\(([^)]+)\)/.exec(bg);
+        const parts = m ? m[1].split(",").map((s) => parseFloat(s.trim())) : [];
+        const alpha = parts.length >= 4 ? parts[3] : parts.length >= 3 ? 1 : 0;
+        const accent = getComputedStyle(document.documentElement)
+          .getPropertyValue("--interactive-accent")
+          .trim();
+        pass(
+          alpha > 0.5 && bg !== "transparent" && bg !== "rgba(0, 0, 0, 0)",
+          "2.7 竖条用不透明的强调色（background " + bg + "）"
+        );
+        // 强调色确实解析成了紫色系（Obsidian 默认 #6c5ce7 / 类似紫）
+        const isPurple =
+          /#([0-9a-f]{6})/i.test(accent) &&
+          (() => {
+            const hex = /#([0-9a-f]{6})/i.exec(accent)![1];
+            const r = parseInt(hex.slice(0, 2), 16);
+            const g = parseInt(hex.slice(2, 4), 16);
+            const b = parseInt(hex.slice(4, 6), 16);
+            return b > g && r > g; // 紫：蓝和红都压过绿
+          })();
+        pass(
+          !!accent && isPurple,
+          "2.7 竖条颜色跟随主题强调色 --interactive-accent（" + accent + "）"
+        );
+      }
+    }
+
+    /*
+     * 插到目标**前面**时，竖条挪到目标的**左边缘**。
+     * 这里再拖一次：移到第 2 页的**上半**（= 插到它前面），看条是否换边。
+     *
+     * 注意：指针靠近侧栏视口上缘时 maybeAutoScroll 会轻推侧栏，
+     * 所以断言只比**水平**关系（竖向位移与本断言无关），
+     * 看完再把指针挪回下半，保证抬手时落点仍是"插到第 2 页后面"。
+     */
+    {
+      const tR2 = dst.getBoundingClientRect();
+      const dstTopY = tR2.top + 3;
+      pe(src, "pointermove", dstX, dstTopY);
+      await sleep(60);
+      const bar = document.querySelector(".mb-thumb-drop-bar") as HTMLElement | null;
+      const tR3 = dst.getBoundingClientRect();
+      // 插到前面 → 条身贴在目标的**左沿外侧**（右沿 == 目标左沿）
+      pass(
+        !!bar && Math.abs(bar.getBoundingClientRect().right - tR3.left) <= 2,
+        "2.7 插到目标前面 → 竖条换到目标缩略图的左边缘"
+      );
+      // 插到目标前面时，落点下标也要跟着变（第 1 页插到第 2 页前 = 下标 0）
+      pass(
+        (view as any).thumbDragInsertPos === 0,
+        "2.7 落在第 2 页上半 → 换算出的最终下标是 0（" +
+          (view as any).thumbDragInsertPos +
+          "）"
+      );
+      // 挪回下半：把落点恢复到「插到第 2 页后面」
+      const tR4 = dst.getBoundingClientRect();
+      pe(src, "pointermove", dstX, tR4.bottom - 3);
+      await sleep(60);
+      pass(
+        (view as any).thumbDragInsertPos === 1,
+        "2.7 挪回下半 → 落点恢复成插到第 2 页后面（下标 1）"
+      );
+    }
+
+    // 抬手 → 落库（用当前实时坐标，避免自动滚动后坐标过期）
+    {
+      const tR5 = dst.getBoundingClientRect();
+      pe(src, "pointerup", dstX, tR5.bottom - 3);
+    }
     await sleep(300);
 
     const after = order();
@@ -889,8 +1042,8 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       "2.7 松手后拖拽影像已移除"
     );
     pass(
-      !document.querySelector(".mb-thumb-drop-line"),
-      "2.7 松手后落点指示线已移除"
+      !document.querySelector(".mb-thumb-drop-bar"),
+      "2.7 松手后落点竖条已移除"
     );
     pass(
       !document.querySelector(".mb-thumb-dragging"),
@@ -993,9 +1146,9 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
     );
     pass(
       !document.querySelector(".mb-thumb-ghost") &&
-        !document.querySelector(".mb-thumb-drop-line") &&
+        !document.querySelector(".mb-thumb-drop-bar") &&
         !document.querySelector(".mb-thumb-dragging"),
-      "2.7 取消后不留 ghost / 指示线 / 虚化态"
+      "2.7 取消后不留 ghost / 竖条 / 虚化态"
     );
     pass(
       order().join(",") === orderBeforeScroll.join(","),
@@ -1731,6 +1884,53 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
         tabletDot.getBoundingClientRect().width >= 22,
         "平板色点 ≥22px 可点（" + tabletDot.getBoundingClientRect().width + "px）"
       );
+
+      /*
+       * 平板：字号框不许把色点挤出屏幕（INK-160）。
+       *
+       * 用户原话：「自定义字体大小框占满了一整行，导致后面的颜色啥的
+       * 都挤到屏幕外面去了」。
+       *
+       * 判据用**真实 DOM rect**：每个色点的右边缘都必须落在侧栏内容区
+       * 的右边缘之内（不是算宽度，是量位置）—— 这才对应「看得见、点得到」。
+       * 顺带验字号框没占满一整行（宽度上限），以及色点仍在一行内
+       * （没被挤成竖排，那是 INK-154 修过的退步）。
+       */
+      {
+        const sideBody2 = view.sideEl.querySelector(".mb-side-body") as HTMLElement;
+        const bRect2 = sideBody2.getBoundingClientRect();
+        const cs2 = getComputedStyle(sideBody2);
+        const contentRight2 =
+          bRect2.left + sideBody2.clientLeft + sideBody2.clientWidth - parseFloat(cs2.paddingRight);
+        const tabletDots = [...dyn.querySelectorAll(".mb-tcolor")] as HTMLElement[];
+        const dotRights = tabletDots.map((d) => d.getBoundingClientRect().right);
+        const overflowDots = dotRights.filter((r) => r > contentRight2 + 0.5);
+        pass(
+          overflowDots.length === 0,
+          "平板：8 个色点全在侧栏内容区内（最右 " +
+            Math.max(...dotRights).toFixed(1) +
+            " / 内容区右缘 " +
+            contentRight2.toFixed(1) +
+            "，溢出 " +
+            overflowDots.length +
+            " 个）"
+        );
+        const sizeIn2 = dyn.querySelector(".mb-size-in") as HTMLElement | null;
+        pass(
+          !!sizeIn2 && sizeIn2.getBoundingClientRect().width <= 36,
+          "平板：字号框不占满一整行（宽 " +
+            (sizeIn2 ? sizeIn2.getBoundingClientRect().width.toFixed(1) : "缺失") +
+            "px ≤ 36px）"
+        );
+        const tabletTops = [
+          ...new Set(tabletDots.map((d) => Math.round(d.getBoundingClientRect().top))),
+        ];
+        pass(
+          tabletTops.length === 1,
+          "平板：色点仍在一行内（没被挤成竖排，top 档数 " + tabletTops.length + "）"
+        );
+      }
+
       root.classList.remove("is-tablet");
       await sleep(30);
     }

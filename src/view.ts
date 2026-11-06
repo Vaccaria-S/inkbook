@@ -1,6 +1,6 @@
 import { FileView, Menu, Notice, type TFile } from "obsidian";
 import { setIcon } from "./icons";
-import { BookEditor, TEXT_FONTS } from "./editor";
+import { BookEditor, bindHoldStepBtn, TEXT_FONTS } from "./editor";
 import { indexDirFor, writeTextIndex } from "./indexer";
 import { BookStore } from "./store";
 import {
@@ -349,7 +349,10 @@ export class InkbookView extends FileView {
   /** 松手自带的 click 屏蔽位：拖完再点这格不能顺手翻页 */
   private thumbDragClickGuard = false;
   private thumbDragGhost: HTMLElement | null = null;
+  /** 落点指示（紫色竖条） */
   private thumbDragIndicator: HTMLElement | null = null;
+  /** 竖条的实测宽度（CSS 里定的 3~4px）：定位时用它把条压在目标边缘上 */
+  private thumbDropBarW = 3;
   private thumbDragDocAbort: AbortController | null = null;
   /**
    * 触屏防抢手势：在 document 上挡 touchmove。
@@ -2073,6 +2076,26 @@ export class InkbookView extends FileView {
           sizeIn.blur();
         }
       });
+      /* −/＋ 字号步进：点一下 ±1，按住连调（见 bindHoldStepBtn）。
+       * 挂在色点行里、紧跟输入框右边：色点行是 nowrap 的固定行，
+       * 两枚小按钮各占 ~14px（比字号框更窄，不把 8 色点挤出一行）。 */
+      for (const d of [-1, 1] as const) {
+        const step = crow.createEl("button", {
+          cls:
+            "mb-size-step" + (d < 0 ? " mb-size-step-sub" : " mb-size-step-add"),
+          attr: {
+            // 编辑框开着时点它不能把框提交掉（blur 判定靠这个标记）
+            "data-mb-text-style": "1",
+            "aria-label": d < 0 ? "字号减一（按住连减）" : "字号加一（按住连加）",
+          },
+        });
+        step.textContent = d < 0 ? "−" : "＋";
+        step.title = d < 0 ? "字号 −1（按住连减）" : "字号 +1（按住连加）";
+        bindHoldStepBtn(step, () => {
+          // 每步走 editor 内的 clamp（8~96），不绕过 setTextSize
+          this.editor?.stepTextSize(d);
+        });
+      }
       for (const c of PEN_COLORS) {
         const dot = crow.createEl("button", {
           cls:
@@ -3733,18 +3756,62 @@ export class InkbookView extends FileView {
     this.thumbDragItem = item;
     this.thumbDragPointerId = this.thumbPressId;
     this.thumbDragFromIndex = from;
-    // 抓取偏移：image 保持手指相对原条目右下角的位置，拖起来不跳
-    this.thumbDragGrabDX = this.thumbPressX - r.left;
-    this.thumbDragGrabDY = this.thumbPressY - r.top;
     item.classList.add("mb-thumb-dragging");
-    // 半透明拖拽影像（document.body 独立节点，松手即删）
-    this.thumbDragGhost = this.makeThumbGhost(r.width, r.height);
+    /*
+     * 拖拽影像（document.body 独立节点，松手即删）。
+     *
+     * 这里复制被拖缩略图的**真内容**：以前只做了个带边框的空白框，
+     * 用户看到的其实是块空白（"显示的缩略图还是不太直观"）。
+     *
+     * canvas 的位图**不能靠 cloneNode 带过来**——克隆出来是一块 0×0 的空
+     * canvas，必须用 drawImage 把原 canvas 的像素画过去。
+     */
+    const srcCv = item.querySelector(".mb-thumb-canvas") as HTMLCanvasElement | null;
+    /*
+     * 缩略图是懒渲染的（进视口才画）：还没画过的那格此刻是块空 canvas，
+     * 直接复制过去仍是空白。这里补画一次（editor 侧有 LRU，
+     * 画过的话只是一次 blit）。
+     */
+    if (srcCv && !this.thumbCanvasPainted(srcCv)) {
+      this.editor?.renderThumbnail(srcCv, from);
+    }
+    /*
+     * 影像的尺寸取**缩略图本体**（canvas 的 CSS 尺寸），不是条目框：
+     * 条目还有 1px 边框，拿条目的尺寸会把画面横向/纵向各撑 2px。
+     * 拿不到 canvas 就退回条目尺寸（空白框也比没有强）。
+     */
+    const cvRect = srcCv ? srcCv.getBoundingClientRect() : null;
+    const ghostW = cvRect && cvRect.width > 0 ? cvRect.width : r.width;
+    const ghostH = cvRect && cvRect.height > 0 ? cvRect.height : r.height;
+    /*
+     * 抓取偏移：影像保持在手指相对原缩略图的同一个位置，拖起来不跳。
+     *
+     * 用 canvas 的 rect（不是条目框的）当基准——影像画的是缩略图**内容**，
+     * 条目的 1px 边框不属于内容，拿条目框当基准会差 1px。
+     */
+    const anchor = cvRect && cvRect.width > 0 ? cvRect : r;
+    this.thumbDragGrabDX = this.thumbPressX - anchor.left;
+    this.thumbDragGrabDY = this.thumbPressY - anchor.top;
+    this.thumbDragGhost = this.makeThumbGhost(ghostW, ghostH, srcCv);
     document.body.appendChild(this.thumbDragGhost);
     this.positionThumbGhost(this.thumbPressX, this.thumbPressY);
-    // 落点指示线
+    /*
+     * 落点指示：紫色竖条。
+     *
+     * 以前是一条横线，横跨整个页列表宽度——4 列网格里根本看不出
+     * 要插到哪一列，横线反而误导。现在改成竖条，画在**插入位置**：
+     *   插到目标前面 → 目标缩略图的左边缘；
+     *   插到目标后面 → 目标缩略图的右边缘。
+     * 横线就此去掉（只留竖条），理由见 updateThumbDragTarget 的注释。
+     */
     this.thumbDragIndicator = document.createElement("div");
-    this.thumbDragIndicator.className = "mb-thumb-drop-line";
+    this.thumbDragIndicator.className = "mb-thumb-drop-bar";
     document.body.appendChild(this.thumbDragIndicator);
+    /*
+     * 竖条宽度由 CSS 定（3~4px），定位时要用它把条压在边缘上。
+     * 元素刚挂上、还没设高度，此刻量出来的宽度就是 CSS 里那个值。
+     */
+    this.thumbDropBarW = this.thumbDragIndicator.getBoundingClientRect().width || 3;
     // document 级监听：手指移到任意条目之外也继续跟
     const ac = new AbortController();
     this.thumbDragDocAbort = ac;
@@ -3754,8 +3821,14 @@ export class InkbookView extends FileView {
         if (e.pointerId !== this.thumbDragPointerId) return;
         this.thumbDragPointerY = e.clientY;
         this.positionThumbGhost(e.clientX, e.clientY);
-        this.updateThumbDragTarget(e.clientX, e.clientY);
+        /*
+         * 顺序要紧：**先**轻推侧栏（边缘自动滚动），**再**算落点。
+         *
+         * 反过来的话，条目被滚动带走之后竖条还停在滚动前的位置，
+         * 视觉上「条指着的那一格」和「实际要插进去的那一格」对不上。
+         */
         this.maybeAutoScroll(e.clientY);
+        this.updateThumbDragTarget(e.clientX, e.clientY);
       },
       { passive: true, signal: ac.signal }
     );
@@ -3779,12 +3852,68 @@ export class InkbookView extends FileView {
     this.updateThumbDragTarget(this.thumbPressX, this.thumbPressY);
   }
 
-  private makeThumbGhost(w: number, h: number): HTMLElement {
+  /**
+   * 拖拽影像：被拖缩略图的**真缩略图**（不是空框）。
+   *
+   * canvas 的位图不会被 cloneNode 复制——克隆出来是块 0×0 的空 canvas，
+   * 必须用 drawImage 把原 canvas 的像素画到新 canvas 上。
+   *
+   * 尺寸：w/h 是**缩略图本体**（canvas 的 CSS 尺寸）。缩略图是 aspect-ratio
+   * 撑的，取 canvas 的 rect 正好是这个比例；条目的 1px 边框不算内容。
+   */
+  private makeThumbGhost(
+    w: number,
+    h: number,
+    srcCv: HTMLCanvasElement | null
+  ): HTMLElement {
     const g = document.createElement("div");
     g.className = "mb-thumb-ghost";
     g.style.width = Math.max(1, Math.round(w)) + "px";
     g.style.height = Math.max(1, Math.round(h)) + "px";
+    if (!srcCv) return g;
+    const sw = srcCv.width;
+    const sh = srcCv.height;
+    if (!(sw > 0 && sh > 0)) return g;
+    const cv = document.createElement("canvas");
+    cv.className = "mb-thumb-ghost-canvas";
+    // ghost 的 CSS 尺寸就是 w×h，按 dpr 铺满，免得发虚
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    cv.width = Math.max(1, Math.round(w * dpr));
+    cv.height = Math.max(1, Math.round(h * dpr));
+    const ctx = cv.getContext("2d");
+    if (!ctx) return g;
+    try {
+      ctx.drawImage(srcCv, 0, 0, cv.width, cv.height);
+    } catch (_) {
+      /* 源 canvas 不可用（已回收 / 上下文丢失）：保持空白，不拖垮拖拽 */
+      return g;
+    }
+    g.appendChild(cv);
     return g;
+  }
+
+  /**
+   * 这块 canvas 画过东西没有（缩略图是懒渲染的，没进视口时是块空布）。
+   *
+   * 判据用**尺寸**而不是读像素：renderThumbnail 每次都会把 canvas.width/
+   * height 设成算好的缩略图尺寸（cssW×dpr × cssH×dpr），没画过的 canvas
+   * 保持浏览器默认的 300×150。这个组合（宽=300 且 高=150）不可能是缩略图
+   * 尺寸（两者比值恒为 794/1123 ≈ 0.707），所以判定是准的，而且比
+   * getImageData 便宜（不用把像素读回 JS）。
+   */
+  private thumbCanvasPainted(cv: HTMLCanvasElement): boolean {
+    const w = cv.width;
+    const h = cv.height;
+    if (!(w > 0 && h > 0)) return false;
+    // 浏览器给 canvas 的默认尺寸 300×150 = 没被 renderThumbnail 碰过
+    if (w === 300 && h === 150) return false;
+    /*
+     * 再兜一道：缩略图铺满 aspect-ratio 的条目，长宽比恒为 794/1123 ≈ 0.707。
+     * 比值明显不符的 canvas 也不是缩略图（别把别的东西当成"画过了"）。
+     */
+    const ratio = w / h;
+    if (ratio < 0.6 || ratio > 0.8) return false;
+    return true;
   }
 
   private positionThumbGhost(x: number, y: number): void {
@@ -3848,19 +3977,34 @@ export class InkbookView extends FileView {
       : t.index < from
         ? t.index + 1
         : t.index;
-    // 指示线：标在目标的上/下边缘，横跨页列表
-    const list = this.pageListEl;
-    const listRect = list ? list.getBoundingClientRect() : t.rect;
-    const lineY = before ? t.rect.top : t.rect.bottom;
+    /*
+     * 指示：**紫色竖条**，画在插入位置。
+     *
+     *   插到目标前面（before）→ 竖条在目标缩略图的**左边缘**（条身靠在左沿外侧的缝里）；
+     *   插到目标后面          → 竖条在目标缩略图的**右边缘**（条身靠在右沿外侧的缝里）。
+     *
+     * 竖直方向严格覆盖目标缩略图的高度（top→bottom），不高出一截。
+     *
+     * 条身**放在缝里（贴着边缘的外侧）**而不是压在缩略图上：
+     * 压上去会盖住页面内容，看着像"页面被划了一道"，不像"插在这里"。
+     * 网格列间距 7px，条宽 3px，正好塞得下。
+     *
+     * 为什么不留原来那条横线：
+     *   横线横跨**整个页列表**的宽度，在 4 列网格里根本看不出要插到哪一列
+     *   ——它画的是"某一行之间的缝"，用户真正想知道的是"插到哪一格旁边"。
+     *   两条同时显示更乱（一条说行、一条说列），所以横线直接去掉。
+     */
+    const barW = this.thumbDropBarW > 0 ? this.thumbDropBarW : 3;
+    // 插前：条身贴在左沿外侧（右沿 == 目标左沿）
+    // 插后：条身贴在右沿外侧（左沿 == 目标右沿）
+    const barX = before ? t.rect.left - barW : t.rect.right;
+    const barY = t.rect.top;
+    const barH = t.rect.height;
     this.thumbDragIndicator.style.display = "";
+    this.thumbDragIndicator.style.width = Math.max(1, Math.round(barW)) + "px";
+    this.thumbDragIndicator.style.height = Math.max(1, Math.round(barH)) + "px";
     this.thumbDragIndicator.style.transform =
-      "translate(" +
-      Math.round(listRect.left) +
-      "px," +
-      Math.round(lineY - 1.5) +
-      "px)";
-    this.thumbDragIndicator.style.width =
-      Math.max(1, Math.round(listRect.width)) + "px";
+      "translate(" + Math.round(barX) + "px," + Math.round(barY) + "px)";
   }
 
   /** 落点靠近视口上/下缘时轻推侧栏，把已有条目挪到指下（窗口冻结，不重建） */
