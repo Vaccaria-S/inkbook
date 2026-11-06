@@ -502,6 +502,26 @@ async function main() {
         plugin.settings.defaultHighlighterSize +
         "）"
     );
+
+    /*
+     * 当前粗细必须**看得见**：以前粗细按钮没有选中态，
+     * 选了「粗」侧栏上还是三个一样的按钮，写字时不知道笔有多粗。
+     */
+    pass(
+      penThick.classList.contains("is-active"),
+      "钢笔「粗」按钮有选中态（当前粗细一眼可见）"
+    );
+    pass(
+      hlThick.classList.contains("is-active"),
+      "荧光笔「粗」按钮有选中态"
+    );
+    const penThin = [...penRow.querySelectorAll(".mb-size-btn")].find(
+      (b) => (b as HTMLElement).textContent === "细"
+    ) as HTMLElement;
+    pass(
+      !penThin.classList.contains("is-active"),
+      "未选中的档位没有选中态（不会两个都亮）"
+    );
   }
 
   /* 图层 */

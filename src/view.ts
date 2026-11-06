@@ -2090,8 +2090,12 @@ export class InkbookView extends FileView {
     penSizes.createSpan({ cls: "mb-row-label", text: "钢笔" });
     for (let i = 0; i < PEN_SIZES.length; i++) {
       const b = penSizes.createEl("button", {
-        cls: "mb-size-btn",
+        // 当前粗细要看得见：以前粗细按钮没有选中态，选了「粗」也不知道现在多粗
+        cls:
+          "mb-size-btn" +
+          (Math.abs(this.editor.penSize - PEN_SIZES[i]) < 0.01 ? " is-active" : ""),
         text: ["细", "中", "粗"][i],
+        attr: { "data-size": String(PEN_SIZES[i]) },
       });
       b.onclick = () => {
         this.editor?.setTool("pen");
@@ -2121,8 +2125,14 @@ export class InkbookView extends FileView {
     hlSizes.createSpan({ cls: "mb-row-label", text: "荧光" });
     for (let i = 0; i < HIGHLIGHTER_SIZES.length; i++) {
       const b = hlSizes.createEl("button", {
-        cls: "mb-size-btn",
+        // 与钢笔同理：当前粗细要有选中态
+        cls:
+          "mb-size-btn" +
+          (Math.abs(this.editor.highlighterSize - HIGHLIGHTER_SIZES[i]) < 0.01
+            ? " is-active"
+            : ""),
         text: ["细", "中", "粗"][i],
+        attr: { "data-size": String(HIGHLIGHTER_SIZES[i]) },
       });
       b.onclick = () => {
         this.editor?.setTool("highlighter");
@@ -3036,11 +3046,36 @@ export class InkbookView extends FileView {
 
   /* ------------------------------- 状态同步 ------------------------------- */
 
+  /**
+   * 同步侧栏「钢笔 / 荧光」粗细按钮的选中态。
+   *
+   * 粗细按钮是 buildSide 里一次性建的静态 DOM，不会随 updateUI 重建，
+   * 所以选中态必须单独刷（颜色点同理，但它们在 buildSide 时算过）。
+   * 没有这个的话：选了「粗」侧栏上还是三个一样的按钮，写字时不知道笔有多粗。
+   */
+  private syncPenSizeButtons(): void {
+    const rows = this.sideEl?.querySelectorAll(".mb-size-row");
+    if (!rows || rows.length < 2) return;
+    const pen = this.editor?.penSize ?? 0;
+    const hl = this.editor?.highlighterSize ?? 0;
+    const mark = (row: Element, value: number, sizes: number[]) => {
+      // NodeList 没有迭代器（target/lib 限制），用 Array.from 取
+      for (const b of Array.from(row.querySelectorAll(".mb-size-btn"))) {
+        const idx = sizes.indexOf(Number(b.getAttribute("data-size")));
+        b.classList.toggle("is-active", idx >= 0 && Math.abs(sizes[idx] - value) < 0.01);
+      }
+    };
+    mark(rows[0], pen, PEN_SIZES);
+    mark(rows[1], hl, HIGHLIGHTER_SIZES);
+  }
+
   private updateUI(): void {
     if (!this.editor) return;
     const s = this.editor.getState();
 
     for (const [id, btn] of this.toolButtons) btn.toggleClass("is-active", id === s.tool);
+
+    this.syncPenSizeButtons();
 
     if (this.pageLbl) this.pageLbl.setText(`${s.pageIndex + 1} / ${s.pageCount}`);
     if (this.sbTip) this.sbTip.setText(`${s.pageIndex + 1} / ${s.pageCount}`);

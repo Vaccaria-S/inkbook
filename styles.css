@@ -1434,6 +1434,19 @@
   color: var(--text-normal);
 }
 
+/*
+ * 当前选中的粗细档位。
+ *
+ * 以前粗细按钮**没有任何选中态**——用户点了「粗」，侧栏上看不出现在是粗的，
+ * 写字时也不知道笔有多粗。颜色点有 `.mb-swatch.is-active`，粗细这里补上同样的。
+ */
+.mb-size-btn.is-active {
+  border-color: var(--interactive-accent);
+  background: color-mix(in srgb, var(--interactive-accent) 16%, transparent);
+  color: var(--text-normal);
+  font-weight: 600;
+}
+
 .mb-templates {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
