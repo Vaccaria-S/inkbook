@@ -54,20 +54,40 @@ const SHAPES: Array<{ id: ShapeKind; label: string }> = [
   { id: "arrow", label: "箭头" },
 ];
 
-function debounce<T extends (...args: any[]) => void>(fn: T, wait: number): T & {
-  cancel: () => void;
-} {
+/**
+ * 尾沿防抖，可带最大等待（maxWait）。
+ *
+ * 为什么保存必须带 maxWait：纯尾沿防抖每来一次改动就重置定时器，
+ * 用户连续写几分钟、每笔间隔 <850ms 时**一次都不会落盘**——
+ * 这时被系统杀掉/切 App 就丢内容。maxWait 保证「再忙也最多等这么久」。
+ * 缩略图刷新不需要它（纯尾沿即可，重画越晚越好）。
+ */
+export function debounce<T extends (...args: any[]) => void>(
+  fn: T,
+  wait: number,
+  maxWait = 0
+): T & { cancel: () => void } {
   let t: number | null = null;
+  let firstAt = 0;
   const wrapped = ((...args: any[]) => {
+    const now = Date.now();
+    if (!firstAt) firstAt = now;
     if (t) window.clearTimeout(t);
-    t = window.setTimeout(() => {
+    const fire = () => {
       t = null;
+      firstAt = 0;
       fn(...args);
-    }, wait);
+    };
+    if (maxWait > 0 && now - firstAt >= maxWait) {
+      fire();
+      return;
+    }
+    t = window.setTimeout(fire, maxWait > 0 ? Math.min(wait, maxWait - (now - firstAt)) : wait);
   }) as T & { cancel: () => void };
   wrapped.cancel = () => {
     if (t) window.clearTimeout(t);
     t = null;
+    firstAt = 0;
   };
   return wrapped;
 }
@@ -229,7 +249,8 @@ export class InkbookView extends FileView {
   /** 打开中的占位（见 showLoading）；没有占位时是 null */
   private loadingEl: HTMLElement | null = null;
   private _loadToken = 0;
-  private saveDebounce = debounce(() => this.saveNow(), 850);
+  // 连写一整页时每笔都重置 850ms 尾沿，必须有个最大等待兜底（10s）
+  private saveDebounce = debounce(() => this.saveNow(), 850, 10_000);
   private thumbDebounce = debounce(() => this.refreshThumbs(), 320);
 
   constructor(leaf: any, plugin: InkbookPluginLike) {
@@ -258,6 +279,17 @@ export class InkbookView extends FileView {
     this.renderEmpty();
     this.registerDomEvent(document, "keydown", (e) => this.onKeyDown(e));
     this.registerDomEvent(window, "resize", () => this.scheduleTopRowFit());
+    /*
+     * 切到后台 / 关页面前把没落盘的内容冲掉。
+     *
+     * 平板上被系统回收、或用户直接切去别的应用时，onClose 不一定来得及跑；
+     * 这时 850ms 尾沿防抖里还压着最后几笔。flushSave 会把它们写完
+     * （saveNow 自带并发保护，重复调用安全）。
+     */
+    this.registerDomEvent(document, "visibilitychange", () => {
+      if (document.visibilityState === "hidden") void this.flushSave();
+    });
+    this.registerDomEvent(window, "pagehide", () => void this.flushSave());
   }
 
   async onClose(): Promise<void> {

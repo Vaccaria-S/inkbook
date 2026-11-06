@@ -355,6 +355,15 @@ async function main() {
     log(`编辑框：width=${ta.style.width}，chrome=${chrome}px，内容宽 = ${contentPage.toFixed(1)} 页面单位（可用 ${avail}）`);
     pass(Math.abs(contentPage - avail) < 1, `编辑框内容宽 ≈ 可折行宽度（差 ${Math.abs(contentPage - avail).toFixed(2)} 单位）`);
     pass(ta.value === note1.text, "编辑框预填原文");
+    /*
+     * 编辑旧批注时光标必须在末尾：以前 ta.select() 全选，
+     * 用户点开只想补一句，一打字就把整段覆盖掉。
+     */
+    await sleep(30);
+    pass(
+      ta.selectionStart === ta.value.length && ta.selectionEnd === ta.value.length,
+      `编辑旧文字：光标在末尾（${ta.selectionStart}/${ta.value.length}，不是全选）`
+    );
 
     const taLines = cssLines(ta.value, note1.size, cs.fontFamily, contentPage);
     pass(sameLines(taLines, canvasLines), `编辑框内断字位置 = 提交后画布断字位置（框 ${taLines.length} 行 / 画布 ${canvasLines.length} 行）`);
@@ -393,6 +402,20 @@ async function main() {
     pass(!!ta, "新建：出现输入框");
     pass(ta?.placeholder === "请输入", "新建：空框显示「请输入」");
     pass(ta?.value === "", "占位符不进 value（提交时不会多出三个字）");
+
+    /* 中文输入法选词时的回车不能提交（候选词还没上屏） */
+    {
+      ta.value = "还没选完";
+      ta.dispatchEvent(new Event("input", { bubbles: true }));
+      const ime = new KeyboardEvent("keydown", { key: "Enter", bubbles: true });
+      Object.defineProperty(ime, "isComposing", { value: true });
+      ta.dispatchEvent(ime);
+      await sleep(30);
+      pass(!!pageEl().querySelector(".mb-text-edit"), "IME 组字中按回车：输入框不关闭（不误提交）");
+      // 收尾：清空，后面的样式预览断言仍按空框算
+      ta.value = "";
+      ta.dispatchEvent(new Event("input", { bubbles: true }));
+    }
 
     const z = zoom();
 

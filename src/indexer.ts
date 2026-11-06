@@ -398,16 +398,35 @@ export async function writeTextIndex(app: App, file: TFile, book: InkBook): Prom
   }
 }
 
-/** 删掉整份索引（本子被删/改名时用；失败也无所谓，它只是派生数据） */
-export async function removeTextIndex(app: App, file: TFile): Promise<void> {
+/**
+ * 删掉整份索引（本子被删/改名时用；失败也无所谓，它只是派生数据）。
+ *
+ * `oldPath`：**改名**时 vault 传进来的 `f` 已经是新路径，
+ * 按它算出来的目录是「新的、还没生成」的——旧目录永远删不掉，
+ * 于是搜索结果里留着旧本子名，点开报「找不到这本手写本」。
+ * 所以 rename 必须把 oldPath 传进来，按旧路径算目录。
+ */
+export async function removeTextIndex(
+  app: App,
+  file: TFile,
+  oldPath?: string
+): Promise<void> {
   const vault = app.vault as unknown as VaultLike;
   const adapter = (vault.adapter || (app.vault.adapter as unknown as AdapterLike));
   try {
-    const legacy = legacyIndexPath(file);
+    // 用一个「路径伪装成 TFile」的对象复用 dirOf/baseOf/indexDirFor
+    const target = oldPath
+      ? ({
+          path: oldPath,
+          basename: oldPath.split("/").pop()!.replace(/\.inkbook$/i, ""),
+          parent: { path: oldPath.includes("/") ? oldPath.slice(0, oldPath.lastIndexOf("/")) : "/" },
+        } as unknown as TFile)
+      : file;
+    const legacy = legacyIndexPath(target);
     if (await adapter.exists(legacy)) {
       await removeIndexFile(vault, adapter, legacy);
     }
-    const dir = indexDirFor(file);
+    const dir = indexDirFor(target);
     if (typeof adapter.list !== "function") return;
     if (!(await adapter.exists(dir))) return;
     const listed = await adapter.list(dir);

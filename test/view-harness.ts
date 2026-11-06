@@ -1,4 +1,4 @@
-import { InkbookView } from "../src/view";
+import { InkbookView, debounce } from "../src/view";
 import { createBook, createPage, DEFAULT_SETTINGS, type Pt } from "../src/types";
 import { NewBookModal } from "../src/modals";
 
@@ -132,6 +132,24 @@ const plugin: any = {
 };
 
 async function main() {
+  /*
+   * 自动保存兜底：纯尾沿防抖每来一次改动就重置，连续写可能一次都不落盘。
+   * 这里用小时间窗（wait 50 / maxWait 120）验证「再忙也最多等 maxWait」。
+   */
+  {
+    let fires = 0;
+    const f = debounce(() => fires++, 50, 120);
+    for (let i = 0; i < 12; i++) {
+      f();
+      await sleep(20);
+    }
+    pass(fires >= 1, "debounce 带 maxWait：连续调用也会在最大等待内触发（fires=" + fires + "）");
+    f.cancel();
+    const before = fires;
+    await sleep(80);
+    pass(fires === before, "debounce.cancel：取消后不再触发");
+  }
+
   const view = new InkbookView(leaf, plugin);
   await view.onOpen();
   await view.onLoadFile(file);
@@ -228,6 +246,34 @@ async function main() {
   const saved = JSON.parse(files.get("测试手写本.inkbook"));
   pass(saved.pages[0].layers[0].strokes.length === 1, "保存文件里有 1 条笔迹");
   pass(saved.updated > 0, "保存更新了 updated 时间");
+
+  /* 切后台时把未落盘的内容冲掉（平板被系统回收前 onClose 来不及跑） */
+  {
+    // 再改脏一次，但不手动 flush
+    view.editor!.setTool("pen");
+    pageEl.dispatchEvent(pe("pointerdown", 200, 400, 1));
+    pageEl.dispatchEvent(pe("pointermove", 260, 420, 1));
+    pageEl.dispatchEvent(pe("pointerup", 260, 420, 0));
+    await sleep(60);
+    const beforeHidden = JSON.parse(files.get("测试手写本.inkbook")).pages[0].layers[0].strokes.length;
+    const orig = Object.getOwnPropertyDescriptor(document, "visibilityState");
+    try {
+      Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+      document.dispatchEvent(new Event("visibilitychange"));
+      await sleep(120);
+    } finally {
+      if (orig) Object.defineProperty(document, "visibilityState", orig);
+      else delete (document as any).visibilityState;
+    }
+    const afterHidden = JSON.parse(files.get("测试手写本.inkbook")).pages[0].layers[0].strokes.length;
+    pass(
+      afterHidden > beforeHidden,
+      "切到后台（visibilitychange hidden）自动把未落盘的笔迹冲掉（" + beforeHidden + " → " + afterHidden + "）"
+    );
+    // 收尾：撤掉这一笔并落盘，后面的断言仍按「1 条笔迹」计算
+    view.editor!.undo();
+    await view.flushSave();
+  }
 
   /* 模板 / 纸色 */
   const tplCard = [...view.sideEl.querySelectorAll(".mb-tpl")].find((el) =>

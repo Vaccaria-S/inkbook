@@ -3,7 +3,7 @@ import { InkbookView, VIEW_TYPE } from "./view";
 import { InkbookSettingTab, DEFAULT_SETTINGS } from "./settings";
 import { NewBookModal } from "./modals";
 import type { InkbookSettings } from "./types";
-import { parseIndexPath, writeTextIndex } from "./indexer";
+import { parseIndexPath, removeTextIndex, writeTextIndex } from "./indexer";
 import { readBook } from "./storage";
 import {
   disposeEmbeds,
@@ -209,12 +209,28 @@ export default class InkbookPlugin extends Plugin {
         refreshEmbedsForPath(f.path);
       })
     );
-    this.registerEvent(vault.on("delete", dropIfBook));
+    const isBook = (f: any): boolean =>
+      !!f && String(f.extension || "").toLowerCase() === "inkbook";
+    this.registerEvent(
+      vault.on("delete", (f: any) => {
+        if (!isBook(f)) return;
+        dropIfBook(f);
+        // 本子删了：对应的索引 md 也该从搜索结果里消失
+        void removeTextIndex(this.app, f);
+      })
+    );
     this.registerEvent(
       vault.on("rename", (f: any, oldPath: string) => {
         // 旧路径下的缓存再也命中不了，直接丢掉（不清会一直占着内存）
         if (oldPath) invalidateEmbedCache(oldPath);
         dropIfBook(f);
+        /*
+         * 改名后旧 `.墨本索引/` 目录还留着旧本子名：
+         * 搜索结果会点开不存在的文件，下次保存又多出一份新目录。
+         * 用 oldPath 删旧目录（f 已经是新路径，按它算会删错）。
+         * 新索引由随后 modify/save 的 scheduleTextIndex 自动重建。
+         */
+        if (oldPath && isBook(f)) void removeTextIndex(this.app, f, oldPath);
       })
     );
   }
@@ -365,21 +381,41 @@ export default class InkbookPlugin extends Plugin {
 
   /** 被替换掉的 commands 方法，卸载时原样放回 */
   private paletteRestore: Array<() => void> = [];
+  /** 最近一次真实触摸的时间戳（用来区分「手势误触」和「键盘 Ctrl+P」） */
+  private lastTouchAt = 0;
+  private touchWatchers: Array<() => void> = [];
 
   /**
-   * 在墨本里吞掉「打开命令面板」这条命令。
+   * 在墨本里吞掉「触摸误触打开命令面板」这条命令，但**放行键盘 Ctrl+P**。
    *
    * 真机现象：平板上拖右缘滑条往下，宿主把这段触摸认成
    * 「下拉打开命令面板」，一拖就弹一层搜索面板糊在纸上。
    *
    * 手势本身拦不住——它挂 window 捕获阶段，比插件早注册（右滑那条踩过一模一样的坑）。
-   * 但它最后一定要走 commands.executeCommandById("command-palette:open")，
-   * 在派发层把这条命令丢掉，比跟手势坐标较劲可靠得多；快捷键 Ctrl/Cmd+P 也一并失效。
+   * 但它最后一定要走 commands.executeCommandById("command-palette:open")。
+   *
+   * 旧做法把这条命令**无条件**吞掉，连 Ctrl+P 打开的面板也一起没了——
+   * 于是墨本自己注册的 4 条命令在 Obsidian 里根本搜不到。
+   * 现在按「最近 600ms 内有没有真实触摸」区分：
+   *   · 下拉手势一定伴随 pointerdown/touchstart → 拦
+   *   · 键盘快捷键没有触摸 → 放行，命令面板可用
+   * 判定出错时一律放行（宁可不拦，也不能把别的命令一起堵死）。
    */
   private installPaletteGuard(): void {
     if (this.paletteRestore.length) return;
     const commands = (this.app as any)?.commands;
     if (!commands || typeof commands.executeCommandById !== "function") return;
+
+    // 触摸打点：捕获阶段、被动监听，不干扰书写
+    const markTouch = () => {
+      this.lastTouchAt = Date.now();
+    };
+    const watch = (name: string) => {
+      document.addEventListener(name, markTouch, { capture: true, passive: true });
+      this.touchWatchers.push(() => document.removeEventListener(name, markTouch, true));
+    };
+    watch("pointerdown");
+    watch("touchstart");
 
     // 热重载时先剥掉上一次的包装，避免层层套娃
     const orig =
@@ -391,7 +427,8 @@ export default class InkbookPlugin extends Plugin {
           typeof id === "string" &&
           id.indexOf("command-palette:") === 0 &&
           self.settings.blockCommandPalette !== false &&
-          self.isInkbookActive()
+          self.isInkbookActive() &&
+          Date.now() - self.lastTouchAt < 600
         ) {
           return false;
         }
@@ -418,6 +455,14 @@ export default class InkbookPlugin extends Plugin {
       }
     }
     this.paletteRestore = [];
+    for (const off of this.touchWatchers) {
+      try {
+        off();
+      } catch (_) {
+        /* 同上 */
+      }
+    }
+    this.touchWatchers = [];
   }
 
   private uninstallSwipeGuard(): void {

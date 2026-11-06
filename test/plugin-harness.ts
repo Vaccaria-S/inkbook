@@ -127,11 +127,26 @@ async function main() {
       commandsApi.executeCommandById(id);
       return cmdCalls.length - b;
     };
+    /** 模拟一次真实触摸（下拉手势一定伴随它） */
+    const touch = () =>
+      document.dispatchEvent(
+        new PointerEvent("pointerdown", { bubbles: true, pointerType: "touch", pointerId: 99 })
+      );
     activeFile = { extension: "inkbook" };
     plugin.settings.blockCommandPalette = true;
+    touch();
     log(
       (fireCmd("command-palette:open") === 0 ? "PASS" : "FAIL") +
-        " 墨本里命令面板被吞掉：宿主收到 0 次"
+        " 墨本里触摸误触命令面板被吞掉：宿主收到 0 次"
+    );
+    /*
+     * 键盘 Ctrl+P 不该被拦：否则墨本自己注册的 4 条命令在 Obsidian 里
+     * 根本搜不到。判据是「最近 600ms 内没有触摸」。
+     */
+    (plugin as any).lastTouchAt = 0;
+    log(
+      (fireCmd("command-palette:open") === 1 ? "PASS" : "FAIL") +
+        " 墨本里键盘 Ctrl+P 放行：宿主收到 1 次（墨本命令可搜）"
     );
     log(
       (fireCmd("editor:save-file") === 1 ? "PASS" : "FAIL") + " 别的命令照常派发：1 次"

@@ -11,6 +11,7 @@ import {
   indexPagePath,
   isLegacyIndexPageName,
   parseIndexPath,
+  removeTextIndex,
   writeTextIndex,
 } from "../src/indexer";
 import { importPdf } from "../src/importer";
@@ -718,6 +719,36 @@ async function main() {
       !isLegacyIndexPageName("说明.md") && !isLegacyIndexPageName("数学.md"),
       "旧命名识别：普通 md 不算旧索引页"
     );
+
+    /*
+     * 本子改名/删除：旧索引目录必须跟着清掉。
+     * removeTextIndex 以前写了却从没被调用，改名后旧目录留在原地，
+     * 搜索结果点开报「找不到这本手写本」。
+     * rename 时 vault 传进来的 f 已经是新路径，必须靠 oldPath 删旧目录。
+     */
+    {
+      const renamed = { ...mockFile, path: "笔记/数学（新）.inkbook", basename: "数学（新）" } as any;
+      await removeTextIndex(mockApp, renamed, "笔记/数学.inkbook");
+      pass(
+        !fsMap.has("笔记/数学.墨本索引/数学 · 第 1 页.md") &&
+          !fsMap.has("笔记/数学.墨本索引/数学 · 第 2 页.md"),
+        "本子改名：旧索引目录被删掉（搜索结果不再指向不存在的路径）"
+      );
+      // 重新按新名字写一遍，确认新目录能正常生成
+      await writeTextIndex(mockApp, renamed, bk);
+      pass(
+        fsMap.has("笔记/数学（新）.墨本索引/数学（新） · 第 1 页.md"),
+        "本子改名：按新名字重建了索引目录"
+      );
+      // 删除：新目录也要清掉
+      await removeTextIndex(mockApp, renamed);
+      pass(
+        !fsMap.has("笔记/数学（新）.墨本索引/数学（新） · 第 1 页.md"),
+        "本子删除：索引目录一并清掉"
+      );
+      // 还原本段开始时的状态，别带红后面的断言
+      await writeTextIndex(mockApp, mockFile, bk);
+    }
 
     const w1 = writes;
     await writeTextIndex(mockApp, mockFile, bk);

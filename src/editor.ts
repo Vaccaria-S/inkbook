@@ -2971,6 +2971,14 @@ export class BookEditor {
     ta.addEventListener("pointerdown", (e) => e.stopPropagation());
     ta.addEventListener("keydown", (e) => {
       e.stopPropagation();
+      /*
+       * 中文/日文输入法选词时按回车，浏览器会先发一个 isComposing=true
+       * （或 keyCode 229）的 keydown。这时提交会把「候选词还没上屏」的内容
+       * 当成最终文字写进本子，用户看到的是「词只打了一半就固定了」。
+       * 组字期间一律放行给 IME，等 compositionend 之后再判回车。
+       */
+      const composing = (e as any).isComposing || e.keyCode === 229;
+      if (composing) return;
       if (e.key === "Escape") {
         e.preventDefault();
         finish(false);
@@ -3011,7 +3019,17 @@ export class BookEditor {
 
     requestAnimationFrame(() => {
       ta.focus();
-      ta.select();
+      /*
+       * 编辑已有文字：光标放末尾，别 ta.select() 全选——
+       * 用户点开旧批注只是想补一句，一打字就把整段覆盖掉是最恼人的。
+       * 新建空框无所谓（没有内容可选），保持全选行为一致。
+       */
+      if (hit) {
+        const end = ta.value.length;
+        ta.setSelectionRange(end, end);
+      } else {
+        ta.select();
+      }
       ta.style.height = `${ta.scrollHeight}px`;
     });
   }
