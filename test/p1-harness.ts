@@ -1372,6 +1372,34 @@ async function K() {
     uiThrew === "" && domCount > 0 && domCount < 501,
     "K5 侧栏没一次建 501 个 DOM：实际建了 " + domCount + " 个条目（窗口化生效）"
   );
+  /*
+   * 窗口化的 spacer 总高度必须与「真实条目数 × 真实行高」一致
+   * （2026-11-07 补）：行高量到 0 时曾被兜底成 24（真实约 30），
+   * 于是 spacer 每行少算 6px × 500 条 = 3000px，滚动条比例失真、
+   * 滚到「视觉底部」时实际还有内容没到。
+   */
+  {
+    const listEl = v4.contentEl.querySelector(".mb-outline-list") as HTMLElement | null;
+    const rows = v4.contentEl.querySelectorAll(".mb-outline") as NodeListOf<HTMLElement>;
+    if (listEl && rows.length > 0) {
+      const realRowH = rows[0].getBoundingClientRect().height;
+      const listH = listEl.getBoundingClientRect().height;
+      // 列表总高应约等于 501 × 真实行高（容差 2 行，spacer 与条目取整会有零头）
+      const expect = v4.store.outlines.length * realRowH;
+      pass(
+        Math.abs(listH - expect) <= realRowH * 2 + 2,
+        "K5 窗口化 spacer 总高与真实行高一致（列表 " +
+          listH.toFixed(0) +
+          "px / 期望 " +
+          expect.toFixed(0) +
+          "px，行高 " +
+          realRowH.toFixed(1) +
+          "px）"
+      );
+    } else {
+      pass(false, "K5 目录列表/条目没建出来，无法核对 spacer 高度");
+    }
+  }
   // 逐条撤销不能炸（撤销栈有 60 层上限，撤 500 次会撤到底但不能抛异常）
   let undoThrew = "";
   let undoed = 0;

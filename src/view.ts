@@ -124,8 +124,15 @@ const PAGE_THUMB_ASPECT = 1123 / 794;
 const OUTLINE_WINDOW_MAX = 60;
 /** 目录区可视区上下各多建几条 */
 const OUTLINE_OVERSCAN = 4;
-/** 量不到真实条目时的兜底行高（px） */
-const OUTLINE_ROW_H = 24;
+/**
+ * 量不到真实条目时的兜底行高（px）。
+ *
+ * 必须贴近 CSS 实际高度（`.mb-outline` 是 `min-height:24px` +
+ * `padding:3px 4px 3px 7px` + `font-size:10.5px` → 实测约 30px）。
+ * 兜底值偏小会让 spacer 总高度算少，滚动条比例失真、滚到底时还有内容
+ * 没到；偏大则留空白。取 30。
+ */
+const OUTLINE_ROW_H = 30;
 /** 量不到可视区高度时的兜底值（px） */
 const OUTLINE_VIEWPORT_H = 200;
 
@@ -2951,13 +2958,20 @@ export class InkbookView extends FileView {
     /*
      * 条目高度是 CSS 定死的（单行），量一次就够——
      * 每次滚动都插一条探针再量一遍，白白多一次 reflow。
+     *
+     * **量到 0 时不要缓存**：侧栏可能是 display:none（收起状态），
+     * 探针量出 0 会被 `|| OUTLINE_ROW_H` 兜底成常量并存下来，
+     * 之后就再也不会重测 —— 一旦常量与真实行高不符，spacer 总高度
+     * 会一直算错（滚动条比例失真）。所以只有量到正数才缓存。
      */
     if (!this.outlineRowH) {
       const probe = list.createDiv("mb-outline");
-      this.outlineRowH = probe.getBoundingClientRect().height || OUTLINE_ROW_H;
+      const measured = probe.getBoundingClientRect().height;
       probe.remove();
+      // 量到正数才缓存；量到 0（不可见）就用兜底算这一次，下次再量
+      if (measured > 0) this.outlineRowH = measured;
     }
-    const rowH = this.outlineRowH;
+    const rowH = this.outlineRowH || OUTLINE_ROW_H;
     const vpH = viewport.clientHeight || OUTLINE_VIEWPORT_H;
     const visible = Math.max(1, Math.ceil(vpH / rowH));
     const scrollTop = viewport.scrollTop || 0;
