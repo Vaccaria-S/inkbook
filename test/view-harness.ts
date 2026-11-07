@@ -862,6 +862,92 @@ async function main() {
   pass(view.sideEl.querySelectorAll(".mb-layer").length === 2, "侧栏出现 2 个图层");
 
   /*
+   * 落笔不重建图层列表 DOM（2026-11-07 修）：
+   * layerSig 原来含 strokes.length，每写一笔就整块重建图层行 ——
+   * 行里的透明度滑杆、双击改名的监听全被换掉。现在笔迹数由
+   * syncLayerCounts 就地刷 textContent。
+   *
+   * 注意：这段会**加一笔再撤销**，必须原样还原（后面有
+   * 「重新打开后笔迹还在」按 strokeCount===1 断言，污染了会假失败）。
+   */
+  {
+    const activeLayerId = view.store!.page.activeLayerId;
+    const layerIdx = view.store!.page.layers.findIndex((l) => l.id === activeLayerId);
+    /** 第 idx 个图层行（DOM 顺序 = layers 数组顺序） */
+    const rowAt = (idx: number) =>
+      view.sideEl.querySelectorAll(".mb-layer")[idx] as HTMLElement | undefined;
+    const rowBefore = rowAt(layerIdx)!;
+    const countBefore = Number(
+      rowBefore.querySelector(".mb-layer-count")?.textContent ?? "-1"
+    );
+    view.store!.addStroke(
+      {
+        id: "stroke-layer-count-test",
+        tool: "pen",
+        color: "#1A1A1A",
+        size: 2.8,
+        opacity: 1,
+        points: [
+          [60, 60, 0.5],
+          [90, 90, 0.5],
+        ],
+      } as any,
+      view.store!.data.activePage
+    );
+    /*
+     * 走真实链路：emitState → updateUI。直接调 store.addStroke 只 markDirty
+     * （防抖），不会立刻 updateUI —— 真实落笔是 commitDraft 之后 emitState。
+     */
+    view.editor!.emitState();
+    await sleep(150);
+    const rowAfter = rowAt(layerIdx)!;
+    const countAfter = Number(
+      rowAfter.querySelector(".mb-layer-count")?.textContent ?? "-1"
+    );
+    pass(
+      rowBefore === rowAfter,
+      "落笔后图层行 DOM 节点没被重建（身份不变，滑杆/监听不被换掉）"
+    );
+    pass(
+      countAfter === countBefore + 1,
+      "落笔后图层笔迹数就地刷新（第 " +
+        (layerIdx + 1) +
+        " 层 " +
+        countBefore +
+        " → " +
+        countAfter +
+        "）"
+    );
+    pass(
+      view.store!.page.layers[layerIdx].strokes.length === countAfter,
+      "显示的笔迹数与数据一致（数据 " + view.store!.page.layers[layerIdx].strokes.length + "）"
+    );
+    /*
+     * 还原：直接把刚加的那一笔从数组里摘掉，并清空历史栈。
+     * 不走 `undo()` —— 前面的用例可能留下 pendingBefore 之类的中间态，
+     * undo 的结算时机不确定，容易撤到别的操作上（实测确实撤错了）。
+     */
+    const ls = view.store!.page.layers[layerIdx];
+    ls.strokes = ls.strokes.filter((x) => x.id !== "stroke-layer-count-test");
+    const st = view.store as any;
+    if (st?.undoStack) st.undoStack.length = 0;
+    if (st?.redoStack) st.redoStack.length = 0;
+    if (st?.pendingBefore) st.pendingBefore = null;
+    view.editor!.emitState();
+    await sleep(120);
+    await sleep(80);
+    // 比对**活动层**的笔迹数（strokeCount 是全本总数，含别的层，不能直接比）
+    pass(
+      view.store!.page.layers[layerIdx].strokes.length === countBefore,
+      "测试收尾：活动层笔迹数回到 " +
+        countBefore +
+        "（实际 " +
+        view.store!.page.layers[layerIdx].strokes.length +
+        "）"
+    );
+  }
+
+  /*
    * 图层透明度：Layer.opacity 一直参与渲染（renderRec / 导出都按它画），
    * 但以前侧栏没有入口。这里验证滑杆能看、能改、能撤销。
    */

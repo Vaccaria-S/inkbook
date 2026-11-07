@@ -1029,6 +1029,18 @@ export class InkbookView extends FileView {
      */
     if (visible) {
       this.updatePageWindow(false);
+      /*
+       * 目录窗口也要重算（2026-11-07 补）：
+       * 收起期间 `renderOutlines` 可能已经用**兜底行高/视口高**建过一轮
+       * （display:none 时量不到真实尺寸），而展开时 `refreshThumbs →
+       * renderOutlines` 会因 `outlineRev` 没变直接早退，永远不会重测。
+       * 结果：目录区在 >60 条时可能少建几条或位置偏，要等用户滚一下才恢复。
+       * 这里强制重建一次窗口（目录视口没有 ResizeObserver，只能靠这个入口）。
+       */
+      this.outlineWinLo = -1;
+      this.outlineWinHi = -1;
+      this.outlineRowH = 0; // 重新量一次真实行高
+      this.buildOutlineWindow(true);
       this.refreshThumbs();
     }
   }
@@ -2338,6 +2350,12 @@ export class InkbookView extends FileView {
       if (hl) this.editor.setHighlighterSize(Number(range.value), true);
       else this.editor.setPenSize(Number(range.value), true);
       lbl.setText(String(Math.round(Number(range.value) * 10) / 10));
+      /*
+       * 粗细是 silent 改的（不 emitState），所以顶栏「当前笔」chip
+       * 不会自己更新 —— 得手动跟一下，否则拖动滑杆时 chip 一直显示旧粗细，
+       * 要等下一次 updateUI（下一笔落下）才刷新。橡皮滑杆早就这么做了。
+       */
+      this.updatePenChip();
     };
     // 拖滑杆也是一次明确的粗细选择：松手（change）时写回设置。
     // 不在 input 里写盘，避免拖一次滑块就 saveData 几十次。
@@ -3045,10 +3063,30 @@ export class InkbookView extends FileView {
       "|" +
       // 带上 opacity：撤销 / 重做改了透明度时，侧栏滑杆要跟着回位。
       // 拖动过程中不经过这里——oninput 只 markDirty，不触发 updateUI。
-      p.layers
-        .map((l) => `${l.id}:${l.name}:${l.visible}:${l.strokes.length}:${l.opacity}`)
-        .join(",")
+      //
+      // **刻意不含 strokes.length**（2026-11-07 修）：每落一笔
+      // （onUp → emitState → updateUI）笔迹数都会变，带着它就会**每写一笔
+      // 整块重建图层列表 DOM** —— 行里的透明度滑杆、双击改名的监听全被换掉。
+      // 笔迹数只是个数字，由 `syncLayerCounts()` 就地刷 textContent 即可。
+      p.layers.map((l) => `${l.id}:${l.name}:${l.visible}:${l.opacity}`).join(",")
     );
+  }
+
+  /**
+   * 就地刷新图层行里的「笔迹数」（不重建 DOM）。
+   *
+   * 每次 updateUI 都调，代价是「图层数」次 `querySelector`，通常 1~3 行。
+   * 比每写一笔重建整个图层列表便宜得多。
+   */
+  private syncLayerCounts(): void {
+    if (!this.store || !this.layerListEl) return;
+    const layers = this.store.page.layers;
+    const rows = this.layerListEl.querySelectorAll<HTMLElement>(".mb-layer");
+    for (let i = 0; i < rows.length && i < layers.length; i += 1) {
+      const el = rows[i].querySelector<HTMLElement>(".mb-layer-count");
+      const n = String(layers[i].strokes.length);
+      if (el && el.textContent !== n) el.textContent = n;
+    }
   }
 
   /* ------------------------------- 目录 ------------------------------- */
@@ -4517,6 +4555,19 @@ export class InkbookView extends FileView {
     this.requestScrollbarSync();
     // 宿主重建标题栏时会把我们那一行一起清掉，发现掉了就重装
     if (this.topRowEl && !this.topRowEl.parentElement) this.buildHeaderActions();
+    /*
+     * 侧栏被宿主清空（主题重载 / 布局切换）时也要重建（2026-11-07 补）。
+     *
+     * 老代码只检测 topRowEl，侧栏没有。sideEl 被清空后 `dynEl` /
+     * `layerListEl` / `pageListEl` 等引用全部悬空 —— 侧栏永久空白，
+     * 而 `renderXxx` 还在往那些已脱离文档的节点里写，用户什么都看不到。
+     * 判据用 `sideEl.firstElementChild`：`buildSide` 一定会建出内容。
+     */
+    if (this.sideEl && !this.sideEl.firstElementChild) {
+      this.buildSide();
+      this.updatePageWindow(true);
+      this.refreshThumbs();
+    }
     if (this.zoomLbl) this.zoomLbl.setText(Math.round(s.zoom * 100) + "%");
     if (this.undoBtn) this.undoBtn.toggleClass("is-disabled", !s.canUndo);
     if (this.redoBtn) this.redoBtn.toggleClass("is-disabled", !s.canRedo);
@@ -4559,6 +4610,8 @@ export class InkbookView extends FileView {
     this.renderDynamicTools();
 
     if (this.layerSig !== this.layerSignature()) this.renderLayers();
+    // 笔迹数不进结构签名，每帧就地刷数字（比重建整块 DOM 便宜得多）
+    else this.syncLayerCounts();
     /*
      * 目录区：只在内容真的变了才重建（store.outlineRev）。
      * 落笔时 updateUI 会跑几十次，目录不变 → 一次 DOM 都不动。
