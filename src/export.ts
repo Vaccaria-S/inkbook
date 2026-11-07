@@ -80,10 +80,19 @@ async function writeExportFile(
 ): Promise<void> {
   throwIfCancelled(signal);
   const adapter = vault.adapter;
-  const buffer = bytes.buffer.slice(
-    bytes.byteOffset,
-    bytes.byteOffset + bytes.byteLength
-  ) as ArrayBuffer;
+  /*
+   * 别整份复制字节（2026-11-07 修）。
+   *
+   * 老写法 `bytes.buffer.slice(offset, offset+len)` 会再分配一份同样大小的
+   * ArrayBuffer —— 300 页的导出件几十 MB，峰值内存直接翻倍，平板上容易卡死。
+   *
+   * 两个来源（`doc.save()` 与 `canvasBytes`）都是**整块新分配**的
+   * Uint8Array（offset=0、length=buffer.byteLength），可以直接传 `.buffer`。
+   * 只有视图不对齐时才复制（防御，正常走不到）。
+   */
+  const whole =
+    bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength;
+  const buffer = (whole ? bytes.buffer : bytes.slice().buffer) as ArrayBuffer;
   if (typeof adapter.rename === "function") {
     const tmp = path + ".tmp";
     try {

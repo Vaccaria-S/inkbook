@@ -232,9 +232,28 @@ export default class InkbookPlugin extends Plugin {
          * 改名后旧 `.墨本索引/` 目录还留着旧本子名：
          * 搜索结果会点开不存在的文件，下次保存又多出一份新目录。
          * 用 oldPath 删旧目录（f 已经是新路径，按它算会删错）。
-         * 新索引由随后 modify/save 的 scheduleTextIndex 自动重建。
          */
-        if (oldPath && isBook(f)) void removeTextIndex(this.app, f, oldPath);
+        if (oldPath && isBook(f)) {
+          void (async () => {
+            try {
+              await removeTextIndex(this.app, f, oldPath);
+              /*
+               * **立刻重建新索引**（2026-11-07 补）。
+               *
+               * 老代码只删旧索引，指望「随后 modify/save 的
+               * scheduleTextIndex 自动重建」—— 但本子**没开着**的时候
+               * 根本不会有保存，于是全局搜索里这本书整本消失，
+               * 用户搜「傅里叶」0 结果，会以为笔记丢了。
+               * 改名是显式动作，当场重建最稳妥。
+               */
+              const book = await readBook(this.app.vault.adapter, f.path, f.basename);
+              await writeTextIndex(this.app, f, book);
+            } catch (e) {
+              // 读不出/写不进都不影响改名本身；失败原因 writeTextIndex 自己会提示
+              console.warn("[inkbook] 改名后重建索引失败：" + f.path, e);
+            }
+          })();
+        }
       })
     );
   }

@@ -2417,12 +2417,21 @@ export class InkbookView extends FileView {
    */
   private async runImport(kind: "pdf" | "word", file: TFile): Promise<void> {
     if (!this.store || !this.file) return;
+    /*
+     * 记下「开始导入时的本子」（2026-11-07 修）：
+     * 抽 300 页文字要几十秒，这期间用户完全可能切到另一个本子。
+     * 老代码 await 之后直接用 `this.store` / `this.file` —— 那已经是
+     * **新本子**了，于是几百页被插进新本子并落盘（新本还没加载完时
+     * this.store 为 null，直接抛错）。两本都遭殃。
+     */
+    const startFile = this.file;
+    const startStore = this.store;
     const notice = new Notice(
       kind === "pdf" ? "正在读取 PDF…" : "正在解析 Word…",
       0
     );
     try {
-      const bookPath = this.file.path;
+      const bookPath = startFile.path;
       const result =
         kind === "pdf"
           ? await importPdf(this.app, file, bookPath, 0, (done, total) => {
@@ -2431,6 +2440,20 @@ export class InkbookView extends FileView {
           : await importWord(this.app, file, bookPath, (done, total) => {
               notice.setMessage(`正在生成页面：${done}/${total} 页`);
             });
+
+      /*
+       * 导入期间用户切了本子 / 关了本子 → 丢弃这次结果，别插进别的本子。
+       * 这是「宁可不导入，也不能污染另一本」的取舍：重试一次很便宜，
+       * 把几百页混进别的本子很难收拾。
+       */
+      if (this.file !== startFile || this.store !== startStore) {
+        notice.hide();
+        new Notice(
+          `导入期间切换了本子，这次导入已取消（${result.pages.length} 页没有写入）。请在本子里重新导入。`,
+          8000
+        );
+        return;
+      }
 
       notice.setMessage(`已导入 ${result.pages.length} 页，正在写入…`);
       // 插到当前页后面
@@ -4847,10 +4870,65 @@ export class InkbookView extends FileView {
       this.pendingPage = null;
       this.pendingPageHint = false;
       if (hint) this.editor.locatePage(idx);
+      /*
+       * **显式跳页**时把侧栏缩略图滚到当前页（2026-11-07 补）。
+       *
+       * 普通翻页刻意不滚侧栏（会和用户手动浏览缩略图打架，见
+       * `setActiveThumb` 的注释）；但「从搜索 / 目录 / 跳页弹窗跳过来」
+       * 是用户明确要去那一页 —— 857 页的本子里如果侧栏还停在第 1 页，
+       * 用户完全看不出自己在哪，也没法看邻近几页。
+       */
+      this.revealThumbForPage(idx);
     } else {
       this.pendingPage = idx;
       this.pendingPageHint = hint;
     }
+  }
+
+  /**
+   * 把侧栏滚到某一页的缩略图，让它进入可视区。
+   *
+   * 只给**显式跳页**用（见 `gotoPageFromLink`）。侧栏收起 / 页列表还没建时
+   * 静默返回 —— 展开时会由 `applySideVisibility → updatePageWindow` 补建。
+   *
+   * **坐标系要换算**（踩过）：`rowTop = row × rowH` 是**列表内部**坐标，
+   * 而 `viewport.scrollTop` 是**侧栏**坐标。页列表在侧栏底部（笔盒 / 纸张 /
+   * 图层 / 目录之后），列表顶部离侧栏顶部有几百像素。直接拿 rowTop 跟
+   * scrollTop 比会误判「已经在可视区」，于是什么都不滚（实测：3 页的本子
+   * 缩略图停在 y=853，而视口只到 750，用户根本看不到）。
+   * 所以先把列表顶部在侧栏坐标系里的位置算出来，再加上行偏移。
+   */
+  private revealThumbForPage(index: number): void {
+    const viewport = this.pageListViewportEl;
+    const list = this.pageListEl;
+    if (!viewport || !list || !this.thumbVisible()) return;
+    if (list.clientWidth <= 0) return; // 还没布局（侧栏刚展开）
+    const count = this.store?.pageCount ?? 0;
+    if (index < 0 || index >= count) return;
+    const { cols, gap, rowH } = this.measurePageGrid(list);
+    if (!(cols > 0) || !(rowH > 0)) return;
+    const row = Math.floor(index / cols);
+    const rowTop = row * rowH; // 列表内部坐标
+    const rowBottom = rowTop + rowH - gap;
+    /*
+     * 列表顶部在侧栏滚动坐标系里的位置：
+     *   rect 差值（当前相对位置）+ 当前 scrollTop = 滚动内容里的绝对位置
+     * 只在这里调一次 getBoundingClientRect —— 显式跳页才走，不是每帧。
+     */
+    const vpRect = viewport.getBoundingClientRect();
+    const listRect = list.getBoundingClientRect();
+    const listTopInScroll = listRect.top - vpRect.top + viewport.scrollTop;
+    const absTop = listTopInScroll + rowTop;
+    const absBottom = listTopInScroll + rowBottom;
+    const vpTop = viewport.scrollTop;
+    const vpBottom = vpTop + viewport.clientHeight;
+    // 已经在可视区里就不动，别打断用户
+    if (absTop >= vpTop && absBottom <= vpBottom) return;
+    // 滚到「让这一行落在视口中部偏上」，上下都留点邻居
+    const target = Math.max(0, absTop - Math.round(viewport.clientHeight * 0.3));
+    viewport.scrollTop = target;
+    // 滚完立刻按新位置重建窗口，别等 scroll 事件（无头环境可能不触发）
+    this.updatePageWindow(false);
   }
 
   /**

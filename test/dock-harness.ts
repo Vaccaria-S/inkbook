@@ -2316,6 +2316,57 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
     (view as any).plugin.settings.jumpHint = true;
   }
 
+  /*
+   * 显式跳页时侧栏缩略图要跟过去（2026-11-07 补）。
+   *
+   * 普通翻页刻意不滚侧栏（会和用户手动浏览缩略图打架）；但「从搜索 /
+   * 目录 / 跳页弹窗跳过来」是用户明确要去那一页 —— 857 页的本子里
+   * 侧栏还停在第 1 页的话，用户完全看不出自己在哪。
+   */
+  {
+    const v = view as any;
+    const count = view.store!.pageCount;
+    if (count >= 3) {
+      // 先把侧栏滚到顶
+      const vp = v.pageListViewportEl as HTMLElement | null;
+      if (vp) {
+        vp.scrollTop = 0;
+        v.updatePageWindow(false);
+        await sleep(100);
+      }
+      const before = vp ? vp.scrollTop : -1;
+      // 跳到最后一页
+      view.gotoPageFromLink(count);
+      await sleep(200);
+      const after = vp ? vp.scrollTop : -1;
+      pass(
+        vp != null && after > before,
+        "显式跳页后侧栏缩略图跟过去（scrollTop " + before + " → " + after + "）"
+      );
+      // 当前页那条要落在可视区内
+      const cur = view.editor!.getState().pageIndex;
+      const curThumb = v.thumbCanvases.get(cur)?.parentElement as HTMLElement | null;
+      if (vp && curThumb) {
+        const vr = vp.getBoundingClientRect();
+        const tr = curThumb.getBoundingClientRect();
+        pass(
+          tr.top >= vr.top - 2 && tr.bottom <= vr.bottom + 2,
+          "跳页后当前页缩略图在侧栏可视区内（thumb " +
+            tr.top.toFixed(0) +
+            "~" +
+            tr.bottom.toFixed(0) +
+            " / 视口 " +
+            vr.top.toFixed(0) +
+            "~" +
+            vr.bottom.toFixed(0) +
+            "）"
+        );
+      } else {
+        pass(false, "跳页后当前页缩略图没建出来（thumbCanvases 缺该页）");
+      }
+    }
+  }
+
   log("");
   const fails = lines.filter((l) => l.startsWith("FAIL")).length;
   log(fails === 0 ? "ALL PASS" : fails + " FAILED");
