@@ -39,7 +39,7 @@ const PAGES = [
   ["qa-open.html", 49],
   ["dock.html", 210],
   ["thumb.html", 12],
-  ["pdf.html", 40],
+  ["pdf.html", 43],
   ["bigpdf.html", 13],
   ["touch.html", 17, "touch-run.mjs"],
   ["swipe.html", 7, "swipe-run.mjs"],

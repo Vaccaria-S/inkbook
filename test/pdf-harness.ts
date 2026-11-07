@@ -18,6 +18,7 @@ import {
   pdfPageSize,
   PDF_FLOOR_PPU,
   PDF_MAX_TARGET_PX,
+  PDF_BITMAP_MAX_PIXELS,
   renderPdfPage,
 } from "../src/pdf";
 import { BitmapCache } from "../src/cache";
@@ -258,13 +259,57 @@ async function main() {
       "地板换算 = " + pxPerPt.toFixed(2) + " 设备px/pt ≥ 2.6（中文笔画在此倍率不粘连）"
     );
 
-    // 封顶：devicePxPerUnit 再大，宽度钉在 PDF_MAX_TARGET_PX
+    /*
+     * 封顶：devicePxPerUnit 再大，宽度也被钉住。
+     *
+     * 2026-11-07 起有两道闸：宽度上限 `PDF_MAX_TARGET_PX`(4096)，
+     * 以及**像素预算**上限（按 A4 高宽比反推的宽度）。后者更紧，
+     * 所以极大 ppu 时钉住的是像素预算算出来的那个宽度。
+     */
     let capW = 0;
     for (const ppu of [10, 100, 1e5, 1e9]) capW = Math.max(capW, pdfTargetWidthPx(bgW, ppu));
     pass(
-      capW === PDF_MAX_TARGET_PX,
+      capW <= PDF_MAX_TARGET_PX,
       "封顶生效：极大 devicePxPerUnit → 恒为 " + capW + " ≤ PDF_MAX_TARGET_PX(" + PDF_MAX_TARGET_PX + ")"
     );
+    /*
+     * 像素预算：单张位图 ≤ PDF_BITMAP_MAX_PIXELS，且「两张」不超 bgBitmaps 预算。
+     * 这是 INK-155 地板方案的副作用（地板让位图永远超采样，高倍时单张会很大）：
+     * 平板 dpr=2 放大到 2.8 倍会顶到 4096 宽 → 4096×5793×4 ≈ 90.5MB/张，
+     * 两张 181MB > 160MB，LRU 会一边渲一边淘汰（等于每次翻页都重渲）。
+     */
+    {
+      const hRatio = 1123 / 794;
+      const capPx = capW * Math.round(capW * hRatio);
+      pass(
+        capPx <= PDF_BITMAP_MAX_PIXELS,
+        "像素预算：封顶位图 " +
+          capW +
+          "×" +
+          Math.round(capW * hRatio) +
+          " = " +
+          (capPx / 1e6).toFixed(2) +
+          "M px ≤ PDF_BITMAP_MAX_PIXELS(" +
+          PDF_BITMAP_MAX_PIXELS / 1e6 +
+          "M)"
+      );
+      const twoBitmapsMB = (2 * capPx * 4) / 1048576;
+      pass(
+        twoBitmapsMB <= 160,
+        "像素预算：两张封顶位图共 " +
+          twoBitmapsMB.toFixed(0) +
+          "MB ≤ bgBitmaps 预算 160MB（MIN_MOUNTED=2 不会一边渲一边淘汰）"
+      );
+      // 地板档（fit 缩放）必须**不受**这道预算影响，否则会退回「缩小就糊」
+      const floorW2 = pdfTargetWidthPx(bgW, 1.0);
+      pass(
+        floorW2 >= Math.round(bgW * 2.0) - 1,
+        "像素预算不影响地板档：fit 缩放下目标宽 " +
+          floorW2 +
+          " 仍 ≥ 地板 " +
+          Math.round(bgW * 2.0)
+      );
+    }
 
     // 真的渲染一张地板位图，按实际像素数核对 16M 红线
     const floorW = pdfTargetWidthPx(bgW, 0.5); // 0.5 < 地板 → 必然落到地板

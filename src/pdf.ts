@@ -107,6 +107,25 @@ export const PDF_FLOOR_PPU = 2.0;
 export const PDF_MAX_TARGET_PX = 4096;
 
 /**
+ * A4 页面的高宽比（1123 / 794）。用来把「目标宽度」换算成「像素总数」。
+ *
+ * 底图总是按比例铺在纸面上（`fitBackground`），所以宽定下来高也就定了。
+ */
+export const PDF_PAGE_ASPECT = 1123 / 794;
+
+/**
+ * 单张 PDF 底图位图的像素数上限。
+ *
+ * 取值依据：`bgBitmaps` 预算 160MB，`MIN_MOUNTED = 2`（同时至少两张），
+ * 留一点余量给「正在渲的那张 + 刚淘汰还没回收的」→ 每张最多吃一半：
+ *   160MB / 2 = 80MB = 20.97M px
+ * 按 A4 高宽比反推目标宽 ≈ sqrt(20.97M / 1.414) ≈ **3850px**
+ * 实测单张约 3850×5444×4 ≈ 80MB，两张 160MB 正好卡线。
+ * 再保守一点取 17M px（单张约 65MB，两张 130MB，留 30MB 余量）。
+ */
+export const PDF_BITMAP_MAX_PIXELS = 17_000_000;
+
+/**
  * 算 PDF 底图的目标位图宽度（设备像素）。
  *
  * 纯函数：只吃「底图在页面坐标系里多宽」和「现在每页面单位多少设备像素」，
@@ -123,11 +142,38 @@ export const PDF_MAX_TARGET_PX = 4096;
  * 地板量纲选「设备像素 / 页面单位」而不是「设备像素 / CSS 像素 × dpr」：
  * 后者在 dpr=1 的桌面端会退化成一个跟 dpr 无关的固定像素数——而桌面端的
  * 糊是一样的，必须同样被地板挡住。
+ *
+ * **为什么还要吃一个「像素预算」上限**（2026-11-07 补）：
+ * 只有 `PDF_MAX_TARGET_PX`(4096) 这个宽度封顶是不够的 —— 位图是**按比例**
+ * 缩放的（A4 高宽比 1123/794 ≈ 1.414），宽 4096 时高就是 5793，
+ * 单张 = 4096×5793×4 ≈ **90.5MB**。平板 dpr=2 放大到 2.8 倍就会顶到 4096，
+ * 而 `MIN_MOUNTED = 2` 意味着同时至少两张 → **181MB**，超出
+ * `bgBitmaps` 的 160MB 预算，LRU 会一边渲一边淘汰（等于每次翻页都重渲）。
+ * 所以这里再按「单张最多占预算的 1/2」夹一道：宽 ≤ sqrt(预算/2 ÷ 高宽比)，
+ * 换算到 A4 就是 ≈ 3340px（单张 ≈ 60MB，两张 120MB，留 40MB 余量）。
+ *
+ * @param maxPixels 单张位图的像素数上限（默认按「两张吃满 160MB」反推）
  */
-export function pdfTargetWidthPx(bgWidth: number, devicePxPerUnit: number): number {
+export function pdfTargetWidthPx(
+  bgWidth: number,
+  devicePxPerUnit: number,
+  maxPixels: number = PDF_BITMAP_MAX_PIXELS
+): number {
   const ppu = Math.max(devicePxPerUnit || 0, PDF_FLOOR_PPU);
   const w = Math.max(bgWidth || 0, 1);
-  return Math.min(Math.round(w * ppu), PDF_MAX_TARGET_PX);
+  let target = Math.min(Math.round(w * ppu), PDF_MAX_TARGET_PX);
+  /*
+   * 按像素预算再夹一道。位图高度按「页面高宽比」估：底图占页面宽 bgWidth，
+   * 高就是 bgWidth × (页高/页宽)。换算成目标宽：
+   *   px = target × (target × ratio) ≤ maxPixels
+   *   ⇒ target ≤ sqrt(maxPixels / ratio)
+   */
+  if (Number.isFinite(maxPixels) && maxPixels > 0) {
+    const ratio = Math.max(0.1, PDF_PAGE_ASPECT);
+    const capByPixels = Math.floor(Math.sqrt(maxPixels / ratio));
+    if (target > capByPixels) target = capByPixels;
+  }
+  return Math.max(1, target);
 }
 
 /**
