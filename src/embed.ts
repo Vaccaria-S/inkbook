@@ -129,14 +129,28 @@ export function parseEmbedSrc(src: string): EmbedTarget {
     }
   }
 
-  // 子路径（页码）在 `#` 之后
-  const hash = rest.indexOf("#");
-  if (hash >= 0) {
-    const sub = rest.slice(hash + 1).trim();
-    rest = rest.slice(0, hash).trim();
-    if (/^\d+$/.test(sub)) {
-      const n = Number(sub);
-      if (Number.isFinite(n) && n >= 1) page = Math.floor(n);
+  /*
+   * 子路径（页码）在 `#` 之后。
+   *
+   * **不能见 `#` 就切**：文件名本身可能带 `#`（`C#笔记.inkbook`）。
+   * 以前按第一个 `#` 切，`C#笔记.inkbook` 被切成「C」+「笔记.inkbook」，
+   * 查不到文件，整块嵌入退化成占位符（INK-170）。
+   *
+   * 判据是「`#` 前面那段是不是一个**完整的文件名**」：
+   *   · `本子.inkbook#abc` → 前面是 `.inkbook` 结尾的文件名 → `#` 是子路径；
+   *   · `C#笔记.inkbook`   → 前面只是「C」，不是文件名 → `#` 属于文件名。
+   * 取最后一个 `#`，这样 `C#笔记.inkbook#3` 也能正确切成「文件名 + 第 3 页」。
+   */
+  const hash = rest.lastIndexOf("#");
+  if (hash > 0) {
+    const head = rest.slice(0, hash).trim();
+    if (/\.inkbook$/i.test(head)) {
+      const sub = rest.slice(hash + 1).trim();
+      rest = head;
+      if (/^\d+$/.test(sub)) {
+        const n = Number(sub);
+        if (Number.isFinite(n) && n >= 1) page = Math.floor(n);
+      }
     }
   }
 

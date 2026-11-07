@@ -1159,6 +1159,9 @@
   flex-wrap: nowrap;
   gap: 4px;
   margin: 0;
+  /* 行高由 30px 的字号框决定；不写 center 时 align-items 默认 stretch，
+   * 色点会跟着纵向拉伸（正圆 → 椭圆）。显式居中，尺寸只认自己的宽高。 */
+  align-items: center;
 }
 
 /* border-box：16px 就是最终可点尺寸，不随宿主 box-sizing 变化 */
@@ -1169,16 +1172,41 @@
 }
 
 /*
- * 平板：色点保持 22px 触摸目标（INK-154 定的，手指要按得准，不许缩）。
+ * 平板：色点 20px（INK-166，触摸目标底线 ≥20px）。
  *
- * 真正该收窄的是**字号框**：原来 42px 宽、30px 高，在平板那行里显得
- * 跟两枚步进按钮加起来一样宽，视觉上「占了一整行」。
- * 收到 34px 后整行 = 34 + 2×14 + 8×22 + 10×4 = 278px，
- * 平板侧栏内容区 ~323px（340 侧栏减 padding）→ 余 45px ✓
+ * 真机「椭圆 + 有几个颜色在屏幕外」的**真因不是尺寸**，而是宿主样式：
+ * Obsidian 的 app.css 有
+ *   .is-tablet button:not(.clickable-icon) { padding: 4px 20px }
+ * 优先级 (0,2,1) 高于 `.mb-tcolor { padding: 0 }` (0,1,0) ——
+ * 22px 的色点被 20px 左右 padding 撑成 **42×22 的横椭圆**，
+ * 步进按钮同样被撑成 42×24。8 个点 + 两枚步进整行 494px，
+ * 窄视口（内容区 249px）只看得见前 3 个。
+ * 下面用 (0,4,1) 的选择器把 padding 压回 0（见 .mb-side 那条）。
+ *
+ * 压回 padding 后整行仍有 34 + 2×14 + 8×22 + 10×4 = 278px，
+ * 窄视口内容区 249px（288 侧栏 - 边框 - 滚动条 - padding）→ 溢出 29px。
+ * 色点 22→20、gap 4→2：34 + 28 + 160 + 10×2 = **242px** ✓ 留 7px。
+ * 常态（301px）更宽裕。
  */
 .mb-root.is-tablet .mb-text-tools .mb-tcolor {
-  width: 22px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
+}
+
+/* 平板色点更密：20px 点 + 2px 缝，8 个点 + 字号框 + 两枚步进才塞得下窄视口 */
+.mb-root.is-tablet .mb-text-tools .mb-tcolor-row {
+  gap: 2px;
+}
+
+/*
+ * 把宿主给平板按钮加的 padding 压回去（(0,4,1) > (0,2,1)）。
+ *
+ * 只修侧栏里的色点 / 步进：它们靠固定 width×height + border-box 定义
+ * 可点尺寸，多出来的 padding 会把正圆撑成横椭圆、把整行推出侧栏。
+ */
+.mb-root.is-tablet .mb-side button.mb-tcolor,
+.mb-root.is-tablet .mb-side button.mb-size-step {
+  padding: 0;
 }
 
 .mb-root.is-tablet .mb-text-tools .mb-font-sel {

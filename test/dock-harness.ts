@@ -2087,14 +2087,87 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
         }
       }
 
-      // 平板：色点放大到 ≥22px 触摸目标（CSS 用 .mb-root.is-tablet 区分）
+      // 平板：色点 20px 触摸目标（INK-166 的底线；CSS 用 .mb-root.is-tablet 区分）
       root.classList.add("is-tablet");
       await sleep(30);
       const tabletDot = dyn.querySelector(".mb-tcolor") as HTMLElement;
       pass(
-        tabletDot.getBoundingClientRect().width >= 22,
-        "平板色点 ≥22px 可点（" + tabletDot.getBoundingClientRect().width + "px）"
+        tabletDot.getBoundingClientRect().width >= 20,
+        "平板色点 ≥20px 可点（" + tabletDot.getBoundingClientRect().width + "px）"
       );
+
+      /*
+       * INK-166：平板上色点被拉成横椭圆 + 有几个跑到屏幕外。
+       *
+       * 真机真因不在我们的尺寸，而在宿主 app.css：
+       *   .is-tablet button:not(.clickable-icon) { padding: 4px 20px }
+       * 优先级 (0,2,1) 压过 `.mb-tcolor { padding: 0 }` (0,1,0) ——
+       * 22px 的色点被撑成 **42×22 横椭圆**（步进按钮同样 42×24），
+       * 8 个点 + 两枚步进整行 494px；窄视口内容区 249px，
+       * 只看得见前 3 个色点（用户：「有几个颜色在屏幕外边」）。
+       *
+       * 静态 harness 不加载 Obsidian 的 app.css，所以原来复现不出来。
+       * 这里**注入这条宿主规则再量**：既复现了真机，也保证以后
+       * padding 重置被谁覆盖回去时，这几条断言会红。
+       */
+      {
+        const hostSim = document.createElement("style");
+        hostSim.textContent = ".is-tablet button:not(.clickable-icon){padding:4px 20px}";
+        document.head.appendChild(hostSim);
+        await sleep(50);
+
+        const measureDots = (label: string) => {
+          const sideBody = view.sideEl.querySelector(".mb-side-body") as HTMLElement;
+          const bRect = sideBody.getBoundingClientRect();
+          const cs = getComputedStyle(sideBody);
+          const contentRight =
+            bRect.left + sideBody.clientLeft + sideBody.clientWidth - parseFloat(cs.paddingRight);
+          const ds = [...dyn.querySelectorAll(".mb-tcolor")] as HTMLElement[];
+          const rects = ds.map((d) => d.getBoundingClientRect());
+          const ellipses = rects.filter((r) => Math.abs(r.width - r.height) > 0.5);
+          const overflow = rects.filter((r) => r.right > contentRight + 0.5);
+          const minSide = Math.min(...rects.map((r) => Math.min(r.width, r.height)));
+          pass(
+            ds.length === 8 && ellipses.length === 0,
+            label +
+              "：8 个色点是正圆不是椭圆（宽高差 ≤0.5px，椭圆 " +
+              ellipses.length +
+              " 个；实测 " +
+              rects.map((r) => r.width.toFixed(1) + "×" + r.height.toFixed(1)).join(" ") +
+              "）"
+          );
+          pass(
+            overflow.length === 0,
+            label +
+              "：8 个色点全在侧栏内容区内（最右 " +
+              Math.max(...rects.map((r) => r.right)).toFixed(1) +
+              " / 内容区右缘 " +
+              contentRight.toFixed(1) +
+              "，溢出 " +
+              overflow.length +
+              " 个）"
+          );
+          pass(
+            minSide >= 20,
+            label + "：色点触摸目标 ≥20px（实测 " + minSide.toFixed(1) + "px）"
+          );
+        };
+
+        // 常态：平板侧栏 min(340, 100vw-24)
+        measureDots("平板常态");
+
+        // 窄视口：100vw-24 = 288px（用户真机窄屏 / 分屏）
+        const sideElT = view.sideEl as HTMLElement;
+        sideElT.style.width = "288px";
+        sideElT.style.flexBasis = "288px";
+        await sleep(80);
+        measureDots("平板窄视口 288px");
+        sideElT.style.width = "";
+        sideElT.style.flexBasis = "";
+
+        hostSim.remove();
+        await sleep(80);
+      }
 
       /*
        * 平板：字号框不许把色点挤出屏幕（INK-160）。

@@ -39,6 +39,7 @@ import {
 } from "./modals";
 import { humanBytes, importPdf, importWord, peekPdf } from "./importer";
 import { ExportCancelledError, exportBookPdf, exportPagePng } from "./export";
+import { refreshEmbedsForPath } from "./embed";
 
 export const VIEW_TYPE = "inkbook-view";
 
@@ -566,6 +567,32 @@ export class InkbookView extends FileView {
   private recoveredCopyName: string | null = null;
   private saving = false;
   private saveAgain = false;
+  /**
+   * 正在跑的那一次写盘。
+   *
+   * `saving` 只是个布尔，`flushSave` 的 `await saveNow()` 在「已经有一次
+   * 保存在写」时以前会立刻返回——切本子时上一本的写盘还在飞，新一本的
+   * 数据就被写进了旧文件（INK-167）。有这条 promise，显式路径才能真正等到写完。
+   */
+  private savePromise: Promise<void> | null = null;
+  /** 上一次写盘的失败原因（null = 上次成功）；切文件时据此判断要不要抢救内容 */
+  private lastSaveError: string | null = null;
+  /**
+   * 这本书的未落盘内容是否已经抢救过。
+   *
+   * `onUnloadFile` 抢救完把 store 清掉、`onClose` 再走一遍时，
+   * `dirty` 还挂着（这是事实：主文件确实没更新），会被再抢救一次，
+   * 每关一次标签就多一份副本。用这个标志保证「一本书只抢救一次」。
+   */
+  private rescued = false;
+  /**
+   * 当前 `store` 里这本书对应的磁盘路径。
+   *
+   * `this.file` 归宿主管（切文件时它先变成新路径，之后才轮到我们读盘），
+   * 而 `store` 还是上一本的——两者错位时**绝不能写盘**，
+   * 否则就是「A 的内容写进 B 的文件」。saveNow 用它做最后一道校验。
+   */
+  private bookPath: string | null = null;
   /** 导出进行中：重复点导出只提示，不并发跑第二份（大本会双倍吃内存） */
   private exporting = false;
   private readOnly = false;
@@ -638,7 +665,9 @@ export class InkbookView extends FileView {
 
   async onClose(): Promise<void> {
     this.syncActivePage();
-    await this.flushSave();
+    const ok = await this.flushSave();
+    // 关窗时写不进去：至少把内容另存出来，别跟着视图一起消失
+    if (!ok) await this.rescueUnsaved(this.lastSaveError || "未知原因");
     // 冲突还没解决就关窗：内存里的内容必须落到磁盘上，不能静默丢
     await this.preserveConflictCopy();
     this.destroyEditor();
@@ -664,6 +693,8 @@ export class InkbookView extends FileView {
   /** 装载一本书（首次读成功、以及从备份恢复时共用） */
   private openBook(book: InkBook, readOnly: boolean): void {
     this.store = new BookStore(book);
+    // 记住这本书属于哪个路径：之后 `view.file` 被宿主换掉也不会写错地方
+    this.bookPath = this.file ? this.file.path : null;
     this.store.onChange = () => this.markDirty();
     this.readOnly = readOnly;
     this.conflict = false;
@@ -672,6 +703,9 @@ export class InkbookView extends FileView {
     // 导致打开另一本书什么都不做就白写一次整本
     this.dirty = false;
     this.saveAgain = false;
+    // 上一本的保存失败 / 抢救记录不能带到新本上，否则一打开就判成「没落盘」去抢救
+    this.lastSaveError = null;
+    this.rescued = false;
     this.recoveredCopyName = null;
     this.savedActivePage = book.activePage || 0;
     this.destroyEditor();
@@ -706,11 +740,14 @@ export class InkbookView extends FileView {
     this.destroyEditor();
     this.loadingEl = null;
     this.store = null;
+    this.bookPath = null;
     this.fp = null;
     this.recoveredCopyName = null;
     this.dirty = false;
     this.metaDirty = false;
     this.conflict = false;
+    this.lastSaveError = null;
+    this.rescued = false;
   }
 
   /**
@@ -743,7 +780,16 @@ export class InkbookView extends FileView {
 
   async onLoadFile(file: TFile): Promise<void> {
     const token = ++this._loadToken;
-    await this.flushSave();
+    /*
+     * 切走之前必须先确认上一本真的落盘了。
+     *
+     * 保存失败时宿主不会给我们「拦住这次切换」的能力（onLoadFile 是它
+     * 直接调的），所以至少要把内存里那份抢救成副本，再继续打开新文件——
+     * 否则 store 一换，没写下的内容就再也找不回来了（INK-169）。
+     */
+    const ok = await this.flushSave();
+    if (token !== this._loadToken) return;
+    if (!ok) await this.rescueUnsaved(this.lastSaveError || "未知原因");
     if (token !== this._loadToken) return;
     this.file = file;
     const ext = (file.extension || "").toLowerCase();
@@ -817,11 +863,13 @@ export class InkbookView extends FileView {
   async onUnloadFile(): Promise<void> {
     // 翻页只算「元数据脏」，不置 dirty —— 否则看一眼就整本写一次盘
     this.syncActivePage();
-    await this.flushSave();
+    const ok = await this.flushSave();
+    if (!ok) await this.rescueUnsaved(this.lastSaveError || "未知原因");
     // 冲突还没解决就切文件：内存里的内容必须落到磁盘上，不能静默丢
     await this.preserveConflictCopy();
     this.destroyEditor();
     this.store = null;
+    this.bookPath = null;
     this.file = null;
     this.fp = null;
     this.conflict = false;
@@ -5100,6 +5148,23 @@ export class InkbookView extends FileView {
     }
     if (this.saving) {
       this.saveAgain = true;
+      /*
+       * 显式路径（切文件 / 关标签页 / Ctrl+S）必须**真的等到写完**。
+       *
+       * 以前这里直接 return，调用方的 `await saveNow()` 立刻返回，
+       * 而上一本的写盘还在飞：`onLoadFile` 紧接着把 file 换成新本子，
+       * 在途的那次写盘读到的却是新的 `this.store.data` —— 新本子的内容
+       * 被写进旧本子的文件（INK-167）。等它写完，切换才真正安全。
+       *
+       * 自动保存（force=false）照旧只排队，不阻塞书写。
+       */
+      if (force && this.savePromise) {
+        try {
+          await this.savePromise;
+        } catch (_) {
+          /* 失败原因由那次保存自己记进 lastSaveError */
+        }
+      }
       return;
     }
     if (!force && this.isInkBusy()) {
@@ -5120,61 +5185,119 @@ export class InkbookView extends FileView {
     this.saveState = "saving";
     this.updateStatus();
     const adapter = this.app.vault.adapter;
-    const path = this.file.path;
+    /*
+     * 这一版要写的东西**必须在第一个 await 之前钉死**。
+     *
+     * `path` 和 `book` 一旦捕获，后面不管用户切到哪一本，
+     * 这次写盘写的都是「属于这个路径的那份内容」——
+     * 以前是 await 之后才去读 `this.store.data` / `this.file.path`，
+     * 切本子的瞬间就变成「B 的数据写进 A 的文件」（INK-167）。
+     * `store` 引用留着只为判断「写完时还是不是同一本」。
+     */
+    /*
+     * 用 `bookPath` 而不是 `this.file.path`：宿主在切文件时可能**先**
+     * 把 `view.file` 换成新文件、再调 `onLoadFile`，那时 store 还是上一本，
+     * 按 `this.file.path` 写就等于把上一本的内容写进新文件。
+     */
+    const path = this.bookPath || this.file.path;
+    const store = this.store;
+    const book = store.data;
+    /*
+     * 指纹也要一起捕获：`this.fp` 会在切本子时被换成新本的，
+     * 拿新本的指纹去比旧文件，会把一次正常保存误判成「外部改动」，
+     * 平白多产出两份冲突副本。
+     */
+    const fp = this.fp;
+    const run = (async () => {
+      try {
+        if (this.editor && this.store === store) {
+          book.activePage = this.editor.getState().pageIndex;
+        }
+
+        // 写之前先看磁盘上的文件有没有被别处改过（同步、别的窗口、外部编辑器）
+        const now = await fingerprint(adapter, path);
+        if (fp && now && (now.mtime !== fp.mtime || now.size !== fp.size)) {
+          await this.saveConflictCopies(adapter, path, book);
+          if (this.store !== store) return;
+          this.conflict = true;
+          this.saveState = "dirty";
+          new Notice(
+            "检测到文件已被外部修改，已另存为两份副本，本次未覆盖原文件。请手动检查后选择保留哪一份。",
+            15000
+          );
+          return;
+        }
+
+        /*
+         * 记下代次再进 writeBook：它一进去就 stringify，之后备份 / tmp 写入
+         * 都在 await——那段时间用户再落的笔**不在这一版 JSON 里**。
+         * 存完对比代次，变了就保留 dirty 并再排一次，不能把「已保存」当终点。
+         */
+        const dirtyEpoch = this.dirtyEpoch;
+        const metaEpoch = this.metaEpoch;
+        await writeBook(adapter, path, book);
+        /*
+         * 主动通知嵌入重画。
+         *
+         * 以前只靠 vault 的 `modify` 事件，但我们是走 `adapter.write` 直接写的，
+         * 这条路径**不保证**触发宿主事件（各平台/版本表现不一致）。
+         * 于是平板上「笔记里嵌的那一页」一直显示旧图，直到别的操作顺手刷新
+         * （INK-170）。这里在写成功后无条件通知一次，不依赖宿主事件。
+         *
+         * 放在 store 校验**之前**：即便用户已经切走，写下去的那份文件也该刷新。
+         */
+        refreshEmbedsForPath(path);
+        /*
+         * 已经切到别的本子：这次写的是上一本，**不能**去改新本的
+         * dirty / fp / 保存状态，否则新本会被误标成「已保存」而漏写。
+         */
+        if (this.store !== store) return;
+        this.lastSaveError = null;
+        if (this.dirtyEpoch === dirtyEpoch) {
+          this.dirty = false;
+          this.saveState = "saved";
+        } else {
+          // 写盘期间又有新改动：这一版写的是旧内容，存完再存一次
+          this.dirty = true;
+          this.saveState = "dirty";
+          this.saveAgain = true;
+        }
+        if (this.metaEpoch === metaEpoch) {
+          this.metaDirty = false;
+          this.savedActivePage = book.activePage;
+        }
+        this.fp = await fingerprint(adapter, path);
+        /*
+         * 本子落盘之后再更新文字索引：索引是派生物，
+         * 万一它写失败，不能反过来把「本子已保存」报成失败。
+         */
+        this.scheduleTextIndex();
+      } catch (e: any) {
+        console.error("[inkbook] 保存失败", e);
+        const msg = e && e.message ? e.message : String(e);
+        /*
+         * 失败原因要留着：切文件时（INK-169）得靠它判断「内存里这份还没落盘」，
+         * 只弹一条 8 秒就消失的 Notice，用户根本没机会看到就已经切走了。
+         */
+        this.lastSaveError = msg;
+        if (this.store === store) {
+          this.saveState = "dirty";
+          new Notice("保存失败：" + msg, 8000);
+        }
+      } finally {
+        this.saving = false;
+        if (this.store === store) this.updateStatus();
+        if (this.saveAgain) {
+          this.saveAgain = false;
+          this.saveDebounce();
+        }
+      }
+    })();
+    this.savePromise = run;
     try {
-      if (this.editor) this.store.data.activePage = this.editor.getState().pageIndex;
-
-      // 写之前先看磁盘上的文件有没有被别处改过（同步、别的窗口、外部编辑器）
-      const now = await fingerprint(adapter, path);
-      if (this.fp && now && (now.mtime !== this.fp.mtime || now.size !== this.fp.size)) {
-        await this.saveConflictCopies(adapter, path);
-        this.conflict = true;
-        this.saveState = "dirty";
-        new Notice(
-          "检测到文件已被外部修改，已另存为两份副本，本次未覆盖原文件。请手动检查后选择保留哪一份。",
-          15000
-        );
-        return;
-      }
-
-      /*
-       * 记下代次再进 writeBook：它一进去就 stringify，之后备份 / tmp 写入
-       * 都在 await——那段时间用户再落的笔**不在这一版 JSON 里**。
-       * 存完对比代次，变了就保留 dirty 并再排一次，不能把「已保存」当终点。
-       */
-      const dirtyEpoch = this.dirtyEpoch;
-      const metaEpoch = this.metaEpoch;
-      await writeBook(adapter, path, this.store.data);
-      if (this.dirtyEpoch === dirtyEpoch) {
-        this.dirty = false;
-        this.saveState = "saved";
-      } else {
-        // 写盘期间又有新改动：这一版写的是旧内容，存完再存一次
-        this.dirty = true;
-        this.saveState = "dirty";
-        this.saveAgain = true;
-      }
-      if (this.metaEpoch === metaEpoch) {
-        this.metaDirty = false;
-        this.savedActivePage = this.store.data.activePage;
-      }
-      this.fp = await fingerprint(adapter, path);
-      /*
-       * 本子落盘之后再更新文字索引：索引是派生物，
-       * 万一它写失败，不能反过来把「本子已保存」报成失败。
-       */
-      this.scheduleTextIndex();
-    } catch (e: any) {
-      console.error("[inkbook] 保存失败", e);
-      this.saveState = "dirty";
-      new Notice("保存失败：" + (e && e.message ? e.message : e), 8000);
+      await run;
     } finally {
-      this.saving = false;
-      this.updateStatus();
-      if (this.saveAgain) {
-        this.saveAgain = false;
-        this.saveDebounce();
-      }
+      if (this.savePromise === run) this.savePromise = null;
     }
   }
 
@@ -5226,7 +5349,9 @@ export class InkbookView extends FileView {
       write: (p: string, d: string) => Promise<void>;
       exists?: (p: string) => Promise<boolean>;
     },
-    path: string
+    path: string,
+    /** 要另存的那本书；不传 = 当前这本（切本子的在途保存必须显式传，否则会存错本） */
+    source?: InkBook
   ): Promise<void> {
     const base = path.replace(/\.inkbook$/i, "");
     const stamp = conflictStamp(new Date());
@@ -5255,7 +5380,7 @@ export class InkbookView extends FileView {
     }
 
     // 内存里的版本
-    const mine = this.store ? this.store.data : null;
+    const mine = source ?? (this.store ? this.store.data : null);
     if (mine) {
       try {
         mine.integrity = bookStats(mine);
@@ -5280,7 +5405,7 @@ export class InkbookView extends FileView {
   private async preserveConflictCopy(): Promise<void> {
     if (!this.conflict || !this.store || !this.file) return;
     if (!this.dirty && !this.metaDirty) return;
-    const base = this.file.path.replace(/\.inkbook$/i, "");
+    const base = (this.bookPath || this.file.path).replace(/\.inkbook$/i, "");
     const mine = this.store.data;
     mine.integrity = bookStats(mine);
     try {
@@ -5297,7 +5422,13 @@ export class InkbookView extends FileView {
     }
   }
 
-  async flushSave(): Promise<void> {
+  /**
+   * 显式落盘（切文件 / 关文件 / 关标签页）。
+   *
+   * @returns 是否真的写成功了。`false` = 内存里还有没落盘的内容，
+   *   调用方必须抢救（见 `rescueUnsaved`），不能当没事发生。
+   */
+  async flushSave(): Promise<boolean> {
     /*
      * 编辑框里没按回车、也没失焦的文字先落库：切文件（onLoadFile /
      * onUnloadFile）、关标签页（onClose）都从这条路过。移动端 textarea
@@ -5305,15 +5436,31 @@ export class InkbookView extends FileView {
      * 提交就会整段丢字。force：等不到 compositionend，组字中只写已上屏部分。
      */
     this.editor?.commitTextEditNow(true);
+    /*
+     * 手还按在纸上就关标签页 → 这一笔只活在 draft 里，从没进过 book。
+     *
+     * 以前只有 visibilitychange / pagehide 会收尾，而关标签页在桌面上
+     * 走的是 onClose（页面并不 hidden），那一笔就这么没了（INK-168）。
+     * finishInkGesture 会 commitDraft 并触发 markDirty，下面的 saveNow 才写得进去。
+     */
+    this.editor?.finishInkGesture();
     this.saveDebounce.cancel();
     /*
      * 显式落盘路径，**不避让书写**：切后台 / 关文件 / 切文件时，
-     * 正在写的那一笔会先由 `finishInkGesture()` 收尾提交（见 visibilitychange
-     * 处理器），这里负责把已提交的内容一条不落地写下去。
-     * 即便 gesture 仍是 "draw"（收尾失败等异常情况），也照样 saveNow——
-     * 已提交的笔迹一条都不能少。
+     * 正在写的那一笔上面已经收尾提交，这里负责把内容一条不落地写下去。
+     *
+     * 循环最多 3 轮：`saveNow` 遇到「已经有一次保存在写」时会先等它写完
+     * 再返回（INK-167），那一版可能还不包含最新改动——必须再存一次才干净。
+     * 有失败就立刻停手，交给 rescueUnsaved 抢救，别在同一个错误上空转。
      */
-    if (this.dirty || this.metaDirty) await this.saveNow();
+    for (let round = 0; round < 3; round++) {
+      if (!this.dirty && !this.metaDirty) break;
+      await this.saveNow();
+      // 写不进去 / 只读 / 冲突：这几种再存多少次都是同一个结果
+      if (this.lastSaveError || this.readOnly || this.conflict) break;
+    }
+    // 循环里那次保存可能又排了一个 850ms 后的自动保存，切文件前没意义
+    this.saveDebounce.cancel();
     /*
      * saveNow 成功时只负责「排一个 1 秒后的索引定时器」，而随后 destroyEditor()
      * 会把它取消。这里等索引真正写完，搜索里才不会缺最后一次保存的内容。
@@ -5324,6 +5471,60 @@ export class InkbookView extends FileView {
      */
     if (this.dirty || this.metaDirty) this.scheduleTextIndex();
     await this.flushTextIndex();
+    /*
+     * 判定「落盘成功」：没有失败记录，且脏标记真的清了。
+     * 注意 conflict 状态本来就不写主文件（已另存两份副本），
+     * 那条路由 preserveConflictCopy 兜底，这里不算失败。
+     */
+    if (this.lastSaveError) return false;
+    if (this.conflict) return true;
+    /*
+     * 只读本上的改动本来就存不下去，而且已经弹过「改动不会保存」。
+     * 这里若算成失败，每切一次文件就抢救出一份副本，越攒越多——
+     * 用户改的到底要不要留，得由他自己决定（提示已经给过了）。
+     */
+    if (this.readOnly) return true;
+    return !this.dirty && !this.metaDirty;
+  }
+
+  /**
+   * 保存失败还要切走时，把内存里这份内容抢救成一份副本。
+   *
+   * 磁盘满 / 无权限 / 文件被占用时，`saveNow` 只能弹一条 8 秒的 Notice；
+   * 用户紧接着切本子，`onUnloadFile` 会把 store 清掉——那半小时的笔记
+   * 就彻底没了（INK-169）。真正拦住切换在 Obsidian 的 API 里做不到
+   * （onLoadFile 是宿主直接调的），所以退一步：**先把内容另存出来**，
+   * 再用一条不会自动消失的提示告诉用户副本在哪。
+   */
+  private async rescueUnsaved(reason: string): Promise<void> {
+    if (!this.store || !this.file) return;
+    if (!this.dirty && !this.metaDirty) return;
+    // 同一本书只抢救一次：切文件时救过，紧接着 onClose 不该再产出一份
+    if (this.rescued) return;
+    this.rescued = true;
+    const mine = this.store.data;
+    mine.integrity = bookStats(mine);
+    const base = (this.bookPath || this.file.path).replace(/\.inkbook$/i, "");
+    try {
+      const adapter = this.app.vault.adapter;
+      const target = await this.uniqueCopyPath(
+        adapter,
+        `${base}.unsaved-${conflictStamp(new Date())}-p${mine.pages.length}.inkbook`
+      );
+      await adapter.write(target, JSON.stringify(mine));
+      const name = target.split("/").pop() || target;
+      new Notice(
+        `保存失败（${reason}），内容已另存为「${name}」。` +
+          `原文件可能不是最新的，请检查这份副本后再继续使用。`,
+        0
+      );
+    } catch (e: any) {
+      console.error("[inkbook] 抢救未保存内容失败", e);
+      new Notice(
+        `保存失败（${reason}），且另存副本也失败：请先别关闭这个标签页。`,
+        0
+      );
+    }
   }
 
   /* ------------------------------- 快捷键 ------------------------------- */

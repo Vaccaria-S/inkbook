@@ -366,13 +366,20 @@ export async function readBook(
 ): Promise<InkBook> {
   if (!(await adapter.exists(path))) throw new Error("文件不存在");
   const text = await adapter.read(path);
+  /*
+   * 提示里要不要提 `.bak`，取决于它**到底在不在**（INK-170）。
+   * 没有备份却让人"试试 .bak"，用户会去翻一个不存在的文件，
+   * 反而以为插件在骗他。这里先探一次，措辞跟着实际情况走。
+   */
+  const hasBackup = await hasBackupFile(adapter, path);
+  const bakHint = hasBackup
+    ? "可以试试同目录下的 .bak 备份。"
+    : "同目录下也没有找到 .bak 备份。";
   let raw: any;
   try {
     raw = JSON.parse(text);
   } catch (_) {
-    throw new CorruptError(
-      "这个 .inkbook 的内容读不完整（不是完整的 JSON）。可以试试同目录下的 .bak 备份。"
-    );
+    throw new CorruptError(`这个 .inkbook 的内容读不完整（不是完整的 JSON）。${bakHint}`);
   }
   const book = parseBook(raw, fallbackTitle);
 
@@ -387,12 +394,23 @@ export async function readBook(
         throw new CorruptError(
           `文件可能不完整：记录 ${expectPages} 页 / ${expectStrokes} 条笔迹，` +
             `实际读到 ${actual.pageCount} 页 / ${actual.strokeCount} 条。` +
-            `可以试试同目录下的 .bak 备份。`
+            bakHint
         );
       }
     }
   }
   return book;
+}
+
+/** 同目录下有没有 `.bak`（探不到就当作没有，提示里不误导用户） */
+async function hasBackupFile(adapter: ReadAdapter, path: string): Promise<boolean> {
+  const exists = adapter?.exists;
+  if (typeof exists !== "function") return false;
+  try {
+    return !!(await exists.call(adapter, path + BACKUP_SUFFIX));
+  } catch (_) {
+    return false;
+  }
 }
 
 /** 尽力删掉临时文件，删不掉也不吭声 */
@@ -466,20 +484,42 @@ export async function writeBook(
     }
   }
 
-  // 2. 原子写：写临时文件 → 改名覆盖
+  /*
+   * 2. 原子写：写临时文件 → 改名覆盖。
+   *
+   * 两段失败要分开处理（INK-170）：
+   *   · `.tmp` **没写成功** → 手上没有完整副本，只能退回直接写正文；
+   *   · `.tmp` 写成了、只是 rename 失败 → 完整的 JSON 还在盘上，
+   *     重试一次 rename；再失败也**不要**先删 tmp 再去直接覆盖正文，
+   *     那样一旦直写半途失败，唯一完整的那份也被自己删了。
+   */
   let atomicDone = false;
+  let tmpComplete = false;
   if (typeof adapter.rename === "function") {
     const tmp = path + TMP_SUFFIX;
     try {
       await adapter.write(tmp, json);
-      await adapter.rename(tmp, path);
-      atomicDone = true;
+      tmpComplete = true;
     } catch (e) {
-      console.warn("[inkbook] 原子写入未成功，改回直接写入", e);
+      console.warn("[inkbook] 写临时文件失败，改回直接写入", e);
       await removeQuietly(adapter, tmp);
     }
+    if (tmpComplete) {
+      try {
+        await adapter.rename(tmp, path);
+        atomicDone = true;
+      } catch (e) {
+        console.warn("[inkbook] 临时文件改名失败，重试一次", e);
+        try {
+          await adapter.rename(tmp, path);
+          atomicDone = true;
+        } catch (e2) {
+          console.warn("[inkbook] 改名仍失败，保留临时文件并直接写正文", e2);
+        }
+      }
+    }
   }
-  // 3. 退路：直接写正文
+  // 3. 退路：直接写正文（tmp 完整时留着它，万一这次直写也失败还能人工救回）
   if (!atomicDone) await adapter.write(path, json);
 }
 

@@ -261,6 +261,21 @@ async function main() {
 
     const t8 = parseEmbedSrc("本子.inkbook|300x200");
     pass(t8.width === 300, "|300x200 只取宽度、不报错 → " + JSON.stringify(t8));
+
+    /*
+     * 文件名里带 `#`（INK-170）：以前见 `#` 就切，`C#笔记.inkbook`
+     * 被切成「C」+「笔记.inkbook」，查不到文件，整块嵌入退化成占位符。
+     */
+    const t9 = parseEmbedSrc("C#笔记.inkbook");
+    pass(
+      t9.linktext === "C#笔记.inkbook" && t9.page === 1,
+      "文件名自带 # 不被当成页码 → " + JSON.stringify(t9)
+    );
+    const t10 = parseEmbedSrc("C#笔记.inkbook#3");
+    pass(
+      t10.linktext === "C#笔记.inkbook" && t10.page === 3,
+      "文件名带 # 且真的指定了页码 → " + JSON.stringify(t10)
+    );
   }
 
   /* ========================= 2. DOM 侧读取 ========================= */

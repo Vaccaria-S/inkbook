@@ -86,21 +86,48 @@ function externalEdit(path: string, text: any) {
   mt.set(path, bumpMt());
 }
 
+/**
+ * 写盘故障注入：返回真则该路径的 write 抛错（模拟磁盘满 / 无权限）。
+ *
+ * 用来验证「保存失败还要切本子」这条路会不会把内存里的内容丢掉（INK-169）。
+ * 按路径注入而不是一刀切：主文件写失败、抢救副本仍要能写成功，
+ * 否则测不出「内容被救下来了」这件事。
+ */
+let writeFailFor: ((p: string) => boolean) | null = null;
+/** rename 故障注入：返回真则这次改名失败（模拟 Windows 上文件被占用） */
+let renameFailFor: ((o: string, n: string) => boolean) | null = null;
+/** 写盘人为延迟（毫秒），用来制造「保存还在飞」的窗口（INK-167） */
+let writeDelayMs = 0;
+/**
+ * 取指纹的人为延迟（毫秒）。
+ *
+ * saveNow 是「先 await 指纹、再读 store.data」的顺序，切本子恰好落在这段
+ * await 里就会串写。要稳定复现这个窗口，只能把指纹这一步拖慢。
+ */
+let statDelayMs = 0;
+
 const adapter = {
-  stat: async (p: string) =>
-    files.has(p) ? { mtime: mt.get(p)!, size: blen(files.get(p)) } : null,
+  stat: async (p: string) => {
+    if (statDelayMs > 0) await sleep(statDelayMs);
+    return files.has(p) ? { mtime: mt.get(p)!, size: blen(files.get(p)) } : null;
+  },
   exists: async (p: string) => files.has(p),
   read: async (p: string) => {
     if (!files.has(p)) throw new Error("ENOENT " + p);
     return files.get(p);
   },
   write: async (p: string, d: any) => {
+    if (writeDelayMs > 0) await sleep(writeDelayMs);
+    if (writeFailFor && writeFailFor(p)) throw new Error("ENOSPC: no space left on device");
     files.set(p, d);
     mt.set(p, bumpMt());
     calls.push({ kind: "write", path: p, bytes: blen(d), t: performance.now() - T0 });
   },
   rename: async (o: string, n: string) => {
     if (!files.has(o)) throw new Error("ENOENT " + o);
+    // 原子写的落点同样受故障注入影响，否则「磁盘满」会被 rename 悄悄绕过
+    if (writeFailFor && writeFailFor(n)) throw new Error("ENOSPC: no space left on device");
+    if (renameFailFor && renameFailFor(o, n)) throw new Error("EBUSY: resource busy or locked");
     files.set(n, files.get(o));
     files.delete(o);
     mt.delete(o);
@@ -379,13 +406,13 @@ async function C8() {
   v.containerEl.remove();
 }
 
-/** 在纸面上真实落一笔（走 pointer 事件，和用户手写同一条路径） */
-function drawOnPage(v: any, pageIdx = 0): boolean {
+/** 取当前页的 pointer 事件构造器（落笔 / 半笔都从这里走同一条真实路径） */
+function pagePointer(v: any, pageIdx = 0): ((type: string, x: number, y: number, buttons: number) => PointerEvent) | null {
   const pageEl = v.contentEl.querySelectorAll(".mb-page")[pageIdx] as HTMLElement;
-  if (!pageEl) return false;
+  if (!pageEl) return null;
   const r = pageEl.getBoundingClientRect();
   const k = r.width / 794 || 1;
-  const pe = (type: string, x: number, y: number, buttons: number) =>
+  return (type, x, y, buttons) =>
     new PointerEvent(type, {
       bubbles: true,
       cancelable: true,
@@ -399,9 +426,31 @@ function drawOnPage(v: any, pageIdx = 0): boolean {
       clientY: r.top + y * k,
       pressure: type === "pointerup" ? 0 : 0.55,
     } as any);
+}
+
+/** 在纸面上真实落一笔（走 pointer 事件，和用户手写同一条路径） */
+function drawOnPage(v: any, pageIdx = 0): boolean {
+  const pe = pagePointer(v, pageIdx);
+  const pageEl = v.contentEl.querySelectorAll(".mb-page")[pageIdx] as HTMLElement;
+  if (!pe || !pageEl) return false;
   pageEl.dispatchEvent(pe("pointerdown", 100, 200, 1));
   for (let i = 1; i <= 12; i++) pageEl.dispatchEvent(pe("pointermove", 100 + i * 12, 200 + i * 3, 1));
   pageEl.dispatchEvent(pe("pointerup", 244, 236, 0));
+  return true;
+}
+
+/**
+ * 只按下、不抬起：模拟「手还按在纸上」的那一笔。
+ *
+ * INK-168 的场景就是用户笔尖还没离纸就关了标签页——
+ * 这一笔只在 editor 的 draft 里，从没进过 book。
+ */
+function pressOnPage(v: any, pageIdx = 0): boolean {
+  const pe = pagePointer(v, pageIdx);
+  const pageEl = v.contentEl.querySelectorAll(".mb-page")[pageIdx] as HTMLElement;
+  if (!pe || !pageEl) return false;
+  pageEl.dispatchEvent(pe("pointerdown", 120, 220, 1));
+  for (let i = 1; i <= 8; i++) pageEl.dispatchEvent(pe("pointermove", 120 + i * 10, 220 + i * 4, 1));
   return true;
 }
 
@@ -1417,6 +1466,245 @@ async function K() {
   v4.containerEl.remove();
 }
 
+/**
+ * L：保存还在飞的时候切本子（INK-167）。
+ *
+ * 真实触发条件很窄但一定会撞上：写完一两秒内马上开另一本。旧实现里
+ * `saveNow` 是「先 await 指纹 → 再读 this.store.data」，切本子恰好落在
+ * 这个 await 里，于是**新本的内容被写进了旧本的文件**；同时
+ * `flushSave` 的 `await saveNow()` 因为 `saving` 直接返回，等于没等。
+ *
+ * 这里把指纹那一步拖慢 120ms 稳定造出窗口，然后断言：
+ *   · A 的文件里是 A 的内容（含刚加的那一笔）
+ *   · B 的文件一个字节没动
+ *   · 切换后真的打开了 B
+ */
+async function L167() {
+  const pa = "L167-A.inkbook";
+  const pb = "L167-B.inkbook";
+  const aText = JSON.stringify(mkBook("L167-A本", 3, 2));
+  const bText = JSON.stringify(mkBook("L167-B本", 5, 3));
+  seed(pa, aText);
+  seed(pb, bText);
+
+  const v = await openView();
+  await v.onLoadFile(tf(pa));
+  await sleep(400);
+  const before = v.store.strokeCount;
+
+  v.store.addStroke(mkStroke(777), 0); // dirty
+  statDelayMs = 120; // 让「取指纹」这一步慢下来，制造在途窗口
+  const inFlight = v.saveNow(); // 故意不 await：模拟自动保存正在写
+  await sleep(20); // 确保它已经进到 fingerprint 的 await 里
+  await v.onLoadFile(tf(pb)); // 用户在保存没写完时切了本子
+  statDelayMs = 0;
+  await inFlight;
+  await sleep(300);
+
+  let aSaved: any = null;
+  let aErr = "";
+  try {
+    aSaved = JSON.parse(files.get(pa));
+  } catch (e: any) {
+    aErr = String(e?.message || e);
+  }
+  let bSaved: any = null;
+  try {
+    bSaved = JSON.parse(files.get(pb));
+  } catch (_) {}
+
+  pass(
+    !!aSaved && aSaved.title === "L167-A本" && aSaved.pages.length === 3,
+    "L167① A 的文件里仍是 A 的内容：title=" + JSON.stringify(aSaved?.title) +
+      "，页数=" + aSaved?.pages?.length + "（期望 L167-A本 / 3）；解析错误=" + JSON.stringify(aErr)
+  );
+  pass(
+    !!aSaved && countStrokes(aSaved) === before + 1,
+    "L167② 切本前那一笔写进了 A：笔迹=" + (aSaved ? countStrokes(aSaved) : -1) +
+      "（期望 " + (before + 1) + "）"
+  );
+  pass(
+    files.get(pb) === bText,
+    "L167③ B 的文件一个字节没动=" + (files.get(pb) === bText) +
+      "（页数 " + bSaved?.pages?.length + "）"
+  );
+  pass(
+    !!v.store && v.store.pageCount === 5,
+    "L167④ 切换后打开的是 B：页数=" + (v.store?.pageCount ?? "-") + "（期望 5）"
+  );
+  await v.onClose();
+  v.containerEl.remove();
+}
+
+/**
+ * M：手还按在纸上就关标签页（INK-168）。
+ *
+ * 这一笔只活在 editor 的 draft 里，从没进过 book。以前只有
+ * visibilitychange / pagehide 会收尾，而桌面关标签页走的是 onClose
+ * （页面并不 hidden），于是那一笔就没了。
+ */
+async function M168() {
+  const p = "M168.inkbook";
+  const text = JSON.stringify(mkBook("M168本", 2, 1));
+  seed(p, text);
+  const v = await openView();
+  await v.onLoadFile(tf(p));
+  await sleep(500);
+
+  const before = v.store.strokeCount;
+  const pressed = pressOnPage(v);
+  await sleep(120);
+  const busy = v.editor ? v.editor.isInkBusy() : false;
+  // 基线：这一笔此刻**还没**进 book（正是要验证的「只在 draft 里」）
+  const mid = v.store.strokeCount;
+
+  await v.onClose(); // 手还没抬就关标签页
+
+  let saved: any = null;
+  try {
+    saved = JSON.parse(files.get(p));
+  } catch (_) {}
+  pass(
+    pressed && busy && mid === before,
+    "M168① 复现前提：按下未抬笔=" + pressed + "，isInkBusy=" + busy +
+      "，此刻 book 里笔迹 " + mid + "（期望仍为 " + before + "）"
+  );
+  pass(
+    !!saved && countStrokes(saved) === before + 1,
+    "M168② 关标签页前把半笔收尾写进磁盘：落盘笔迹=" +
+      (saved ? countStrokes(saved) : -1) + "（期望 " + (before + 1) + "）"
+  );
+  v.containerEl.remove();
+}
+
+/**
+ * N：保存失败（磁盘满 / 无权限）之后又切本子（INK-169）。
+ *
+ * 宿主不允许我们拦住 onLoadFile，所以退一步：必须把内存里那份
+ * 另存成 `.unsaved-` 副本，并用**不会自动消失**的提示告诉用户。
+ * 否则 store 一换，半小时的笔记就彻底没了。
+ */
+async function N169() {
+  const pa = "N169-A.inkbook";
+  const pb = "N169-B.inkbook";
+  seed(pa, JSON.stringify(mkBook("N169-A本", 2, 1)));
+  seed(pb, JSON.stringify(mkBook("N169-B本", 4, 2)));
+
+  const v = await openView();
+  await v.onLoadFile(tf(pa));
+  await sleep(400);
+  const before = v.store.strokeCount;
+  v.store.addStroke(mkStroke(888), 0);
+  v.store.addStroke(mkStroke(889), 0);
+  await sleep(100);
+
+  const n0 = notices.length;
+  // 只让 A 的主文件 / 备份 / 临时文件写不进去；抢救副本必须还能写
+  writeFailFor = (p) => p === pa || p === pa + ".bak" || p === pa + ".tmp";
+  await v.onLoadFile(tf(pb));
+  writeFailFor = null;
+  await sleep(400);
+
+  const caseNotices = notices.slice(n0);
+  const failNotice = caseNotices.find((n) => n.includes("保存失败")) || "";
+  const rescueNotice = caseNotices.find((n) => n.includes("另存为")) || "";
+  const rescued = keys().filter((k) => /^N169-A\.unsaved-\d{8}-\d{4}-p\d+\.inkbook$/.test(k));
+  let rescuedStrokes = -1;
+  try {
+    rescuedStrokes = countStrokes(JSON.parse(files.get(rescued[0])));
+  } catch (_) {}
+
+  pass(failNotice.length > 0, "N169① 保存失败有明确提示=" + (failNotice.length > 0) +
+    "；文案=" + JSON.stringify(failNotice.slice(0, 60)));
+  pass(
+    rescued.length >= 1 && rescuedStrokes === before + 2,
+    "N169② 切本前把没落盘的内容抢救成副本=" + (rescued[0] || "无") +
+      "；笔迹=" + rescuedStrokes + "（期望 " + (before + 2) + "）"
+  );
+  pass(
+    rescueNotice.length > 0,
+    "N169③ 提示里说明了副本名=" + (rescueNotice.length > 0) +
+      "；文案=" + JSON.stringify(rescueNotice.slice(0, 70))
+  );
+  pass(
+    !!v.store && v.store.pageCount === 4,
+    "N169④ 仍然能切到 B（没把用户卡死）：页数=" + (v.store?.pageCount ?? "-")
+  );
+  await v.onClose();
+  v.containerEl.remove();
+}
+
+/**
+ * O：写盘回退不毁掉唯一完整副本 + 没备份时别让人去找 .bak（INK-170）。
+ *
+ * 旧实现：rename 失败 → 先 `removeQuietly(tmp)` 再直接覆盖正文。
+ * 于是「tmp 已经完整写好、只是改名被占用」这种情况，唯一完整的 JSON
+ * 被自己删了，接着直写正文又可能失败，用户两头落空。
+ */
+async function O170() {
+  const p = "O170.inkbook";
+  const text = JSON.stringify(mkBook("O170本", 2, 1));
+  seed(p, text);
+  const v = await openView();
+  await v.onLoadFile(tf(p));
+  await sleep(400);
+
+  // 落一笔 → 保存时让 rename 一直失败（tmp 会写好）
+  v.store.addStroke(mkStroke(4242), 0);
+  renameFailFor = (_o, n) => n === p;
+  await v.saveNow();
+  renameFailFor = null;
+  await sleep(100);
+
+  const tmpPath = p + ".tmp";
+  const tmpOk = files.has(tmpPath);
+  let tmpStrokes = -1;
+  try {
+    tmpStrokes = countStrokes(JSON.parse(files.get(tmpPath)));
+  } catch (_) {}
+  pass(
+    tmpOk && tmpStrokes === countStrokes(JSON.parse(text)) + 1,
+    "O170① rename 失败时保留完整的 .tmp=" + tmpOk + "；其中笔迹=" + tmpStrokes +
+      "（期望 " + (countStrokes(JSON.parse(text)) + 1) + "）"
+  );
+  pass(
+    countStrokes(JSON.parse(files.get(p))) === tmpStrokes,
+    "O170② 正文仍然写成功（回退直写）"
+  );
+  await v.onClose();
+  v.containerEl.remove();
+
+  // 坏文件 + 没有 .bak：提示不能说「试试 .bak」
+  const bad = "O170-bad.inkbook";
+  seed(bad, "{ 这不是 JSON");
+  const v2 = await openView();
+  await v2.onLoadFile(tf(bad));
+  await sleep(400);
+  const html = (v2.editorHost?.textContent || "").replace(/\s+/g, " ");
+  pass(
+    html.includes("没有找到 .bak"),
+    "O170③ 没有备份时提示如实说「没有找到 .bak」=" + html.includes("没有找到 .bak") +
+      "；文案=" + JSON.stringify(html.slice(0, 90))
+  );
+  v2.containerEl.remove();
+
+  // 坏文件 + 有 .bak：仍然提示可以试 .bak
+  const bad2 = "O170-bad2.inkbook";
+  seed(bad2, "{ 这不是 JSON");
+  seed(bad2 + ".bak", JSON.stringify(mkBook("O170备份", 2, 1)));
+  const v3 = await openView();
+  const n3Start = notices.length;
+  await v3.onLoadFile(tf(bad2));
+  await sleep(400);
+  // 只看**这个用例这一段**的 Notice：上面几个用例也弹过「已从备份恢复」
+  const n3 = notices.slice(n3Start).join(" ");
+  pass(
+    n3.includes("已从备份恢复") && n3.includes("O170-bad2.recovered-"),
+    "O170④ 有备份时走恢复并另存副本：Notice=" + JSON.stringify(n3.slice(0, 100))
+  );
+  v3.containerEl.remove();
+}
+
 const CASES: Array<[string, () => Promise<void>]> = [
   ["A1+A2", A12],
   ["A3", A3],
@@ -1436,6 +1724,10 @@ const CASES: Array<[string, () => Promise<void>]> = [
   ["J 页序重排", J],
   ["K 本子目录", K],
   ["F14", F14],
+  ["L167 保存中切本子", L167],
+  ["M168 按着笔关标签页", M168],
+  ["N169 保存失败切本子", N169],
+  ["O170 写盘回退/备份提示", O170],
 ];
 
 async function main() {
