@@ -9,7 +9,7 @@
  *   2. 纯手写页：仍然走位图，内容不丢；
  *   3. 笔迹/手写文字是透明叠加层，不会把原文糊死（导出页仍能抽到文字）。
  */
-import { BookEditor } from "../src/editor";
+import { BookEditor, setBackgroundWaitTimeoutForTest } from "../src/editor";
 import { BookStore } from "../src/store";
 import { createBook, createPage, type Stroke } from "../src/types";
 import {
@@ -1083,6 +1083,54 @@ async function main() {
       !!rawErr && /ENOSPC/.test(String(rawErr?.message)),
       "导出链路把系统原始错误抛给界面层映射（ENOSPC 未被吞掉）"
     );
+  }
+
+  /* -------------------- 导出等底图不能挂死（INK-181） -------------------- */
+  {
+    /*
+     * `waitBackgrounds` 里 `new Image()` 的 onload/onerror 都不来时，
+     * 老实现会让 `Promise.all` 永不返回 → 整个导出卡死，取消也无效
+     * （取消检查在页循环里，这里还没进循环）。
+     *
+     * 用「永不 load 的假 Image」复现：把 window.Image 换成一个
+     * 只存 src、不触发任何回调的构造器，再把超时压到 80ms。
+     */
+    const RealImage = (window as any).Image;
+    let fakeCreated = 0;
+    (window as any).Image = class {
+      onload: any = null;
+      onerror: any = null;
+      set src(_v: string) {
+        fakeCreated += 1;
+        // 故意什么都不做：永远不 load、也不 error
+      }
+    };
+    setBackgroundWaitTimeoutForTest(80);
+    try {
+      // 造一页只有静态底图（没有 pdf）的页面
+      const p = editor.store.data.pages[0];
+      p.background = {
+        src: "永不加载.png",
+        sourceName: "卡住的底图",
+        sourcePage: 1,
+        x: 0,
+        y: 0,
+        width: 794,
+        height: 1123,
+        kind: "word",
+      };
+      const t0 = performance.now();
+      await editor.waitBackgrounds([0], 2);
+      const ms = performance.now() - t0;
+      pass(
+        fakeCreated > 0 && ms < 3000,
+        "INK-181 底图永不加载时 waitBackgrounds 超时返回（" +
+          ms.toFixed(0) + "ms，假 Image " + fakeCreated + " 个），导出不会卡死"
+      );
+    } finally {
+      (window as any).Image = RealImage;
+      setBackgroundWaitTimeoutForTest(10_000);
+    }
   }
 
   log("");

@@ -307,6 +307,25 @@ const MAX_EXPORT_PX = 4096;
 const THUMB_SHOT_BUDGET = 8 * 1024 * 1024;
 const THUMB_SHOT_MAX = 80;
 
+/**
+ * 导出前等静态底图（Word 转出的 PNG 等）的上限。
+ *
+ * 和 embed.ts 的 `EMBED_IO_TIMEOUT_MS` 同一档：10 秒足够慢盘读一张图，
+ * 又短到用户不会以为「导出卡死了」。超时按「取不到」处理，导出继续。
+ */
+const BACKGROUND_WAIT_TIMEOUT_MS = 10_000;
+
+/**
+ * 测试用：压短导出底图等待超时。
+ *
+ * 和 embed.ts 的 `setEmbedIoTimeoutForTest` 同一套做法——10 秒的路径
+ * 在自动化测试里等不起，但「卡住不返回」恰恰是最需要断言的行为。
+ */
+let bgWaitTimeoutMs = BACKGROUND_WAIT_TIMEOUT_MS;
+export function setBackgroundWaitTimeoutForTest(ms: number): void {
+  bgWaitTimeoutMs = Number.isFinite(ms) && ms > 0 ? ms : BACKGROUND_WAIT_TIMEOUT_MS;
+}
+
 /** 缩略图快照的 key：页 id + 目标像素尺寸（尺寸变了要重画一份） */
 function thumbShotKey(pageId: string, w: number, h: number): string {
   return `${pageId}@${w}x${h}`;
@@ -5682,13 +5701,39 @@ export class BookEditor {
       if (!src) continue;
       if (this.bgImages.has(src)) continue;
       pending.push(
+        /*
+         * **必须带超时**（INK-181）。
+         *
+         * 这里等的是导出前的底图，`img.onload` / `onerror` 一个都不来
+         * （同步盘卡住、资源被删但 URL 还挂着、宿主拦截了资源加载）时
+         * 这个 Promise 永不 resolve → `Promise.all` 永不返回 →
+         * **整个导出卡死**，用户看到进度条停在「准备导出」不动，
+         * 连取消都没用（取消检查在页循环里，这里还没进循环）。
+         *
+         * 与 embed.ts 的 `withTimeout` 同一思路：超时当「取不到」处理
+         * （resolve 而非 reject），导出照常继续，这一页底图画灰块。
+         * 宁可导出一份缺底图的 PDF，也不能让用户卡在那里没法收场。
+         */
         new Promise<void>((resolve) => {
           const img = new Image();
-          img.onload = () => {
-            this.bgImages.set(src, img);
+          let settled = false;
+          const done = () => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
             resolve();
           };
-          img.onerror = () => resolve();
+          const timer = window.setTimeout(() => {
+            if (settled) return;
+            console.warn("[inkbook] 导出等待底图超时，这一页按无底图导出", src);
+            done();
+          }, bgWaitTimeoutMs);
+          img.onload = () => {
+            if (settled) return;
+            this.bgImages.set(src, img);
+            done();
+          };
+          img.onerror = () => done();
           img.src = this.resolveAssetUrl(src);
         })
       );
@@ -5733,6 +5778,16 @@ export class BookEditor {
     this.thumbQueue.length = 0;
     this.thumbQueued.clear();
     this.bgImages.clear();
+    /*
+     * `bgTarget` 记的是「每页想要多清晰」，只增不减。
+     * 它虽然是实例字段（editor 每次 mountEditor 都重建，能跟着 GC），
+     * 但这里其他所有 bg* 容器都清了、独独漏掉它，属于不对称——
+     * 将来谁把它改成模块级就会变成真泄漏。顺手清掉，成本为零。
+     */
+    this.bgTarget.clear();
+    this.bgRendering.clear();
+    this.bgDirty.clear();
+    this.bgLoading.clear();
     for (const p of this.pdfDocs.values()) {
       void p.then((doc) => doc?.destroy?.()).catch(() => {});
     }
