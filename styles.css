@@ -1209,6 +1209,64 @@
   padding: 0;
 }
 
+/* ---------------- INK-171：宿主平板按钮 padding 的高优先级重置 ----------------
+ *
+ * Obsidian 的 app.css 里有一条：
+ *   .is-tablet button:not(.clickable-icon) { padding: 4px 20px }   (0,2,1)
+ * 它比这些控件自己的 padding 声明 (0,1,0) / (0,2,0) 都高，平板真机上：
+ *   · 16/22/24px 的文字色点被左右各 20px 撑成**横椭圆**；
+ *   · 纸面样式条按钮上下各多 4px → 高度被撑高 8px；
+ *   · 顶栏「当前笔」chip 从 30 高变 38；
+ *   · 「添加一页」原本 9px 22px 的设计值被改成 4px 20px。
+ * 下面用 (0,3,x) / (0,4,x) 的选择器把设计值重新声明一遍。
+ * 只改 padding / box-sizing，**不动**各变体的 min-width / height。
+ */
+
+/* 纸面文字样式条的色点：固定 22/24px，必须还是正圆 */
+.mb-root.is-tablet button.mb-tb-dot {
+  box-sizing: border-box;
+  padding: 0;
+}
+
+/* 文字样式条按钮：保留两个变体各自的横向 padding，竖直 0（别把高度撑高）。
+ * .mb-texteditbar 同时带 .mb-textbar，所以后者写在后、赢在源顺序。 */
+.mb-root.is-tablet .mb-textbar button.mb-tb-btn {
+  box-sizing: border-box;
+  padding: 0 6px;
+}
+.mb-root.is-tablet .mb-texteditbar button.mb-tb-btn {
+  box-sizing: border-box;
+  padding: 0 3px;
+}
+
+/* 新建样式条的 −/＋ 字号步进 */
+.mb-root.is-tablet .mb-texteditbar button.mb-tb-sizestep {
+  box-sizing: border-box;
+  padding: 0 3px;
+}
+
+/*
+ * 顶栏「当前笔」chip 在 containerEl 上（不在 .mb-root 内），
+ * 基础 padding 0 6、平板 0 9。用 [class] 把特异性抬到 (0,3,0)，
+ * 才压得过宿主的 (0,2,1)；平板那条写在后，赢在源顺序。
+ */
+.mb-toprow .mb-pen-chip[class],
+.mb-topbar .mb-pen-chip[class] {
+  box-sizing: border-box;
+  padding: 0 6px;
+}
+.mb-tablet .mb-toprow .mb-pen-chip,
+.mb-tablet .mb-topbar .mb-pen-chip {
+  box-sizing: border-box;
+  padding: 0 9px;
+}
+
+/* 纸面底部「添加一页」：保住自己的 9px 22px 设计值 */
+.mb-root.is-tablet button.mb-add-page {
+  box-sizing: border-box;
+  padding: 9px 22px;
+}
+
 .mb-root.is-tablet .mb-text-tools .mb-font-sel {
   height: 30px;
   font-size: 12.5px;

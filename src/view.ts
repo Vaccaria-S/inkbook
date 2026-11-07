@@ -596,6 +596,14 @@ export class InkbookView extends FileView {
   /** 导出进行中：重复点导出只提示，不并发跑第二份（大本会双倍吃内存） */
   private exporting = false;
   private readOnly = false;
+  /**
+   * 只读的原因：
+   *   · duplicate —— 同一本已在另一个标签页打开（INK-172，避免两边互相覆盖）
+   *   · recovered —— 正文读不出来，只读打开的是 .bak 备份
+   *
+   * 只影响提示措辞（warnReadOnly），不参与写盘判定——那个看 `readOnly`。
+   */
+  private readOnlyReason: "duplicate" | "recovered" | null = null;
   private saveState: "saved" | "dirty" | "saving" = "saved";
   /** 打开中的占位（见 showLoading）；没有占位时是 null */
   private loadingEl: HTMLElement | null = null;
@@ -691,12 +699,17 @@ export class InkbookView extends FileView {
   }
 
   /** 装载一本书（首次读成功、以及从备份恢复时共用） */
-  private openBook(book: InkBook, readOnly: boolean): void {
+  private openBook(
+    book: InkBook,
+    readOnly: boolean,
+    readOnlyReason: "duplicate" | "recovered" | null = readOnly ? "recovered" : null
+  ): void {
     this.store = new BookStore(book);
     // 记住这本书属于哪个路径：之后 `view.file` 被宿主换掉也不会写错地方
     this.bookPath = this.file ? this.file.path : null;
     this.store.onChange = () => this.markDirty();
     this.readOnly = readOnly;
+    this.readOnlyReason = readOnly ? readOnlyReason : null;
     this.conflict = false;
     this.metaDirty = false;
     // dirty 必须一起复位：上一本书留下的"未保存"标记会跟着新文件走，
@@ -748,6 +761,7 @@ export class InkbookView extends FileView {
     this.conflict = false;
     this.lastSaveError = null;
     this.rescued = false;
+    this.readOnlyReason = null;
   }
 
   /**
@@ -778,6 +792,32 @@ export class InkbookView extends FileView {
     }
   }
 
+  /**
+   * 同一本手写本是否已经在**另一个**标签页（leaf）里打开。
+   *
+   * 为什么放在 view 层而不是只靠 main.openBookAt：文件浏览器里
+   * Ctrl/Cmd+点击「在新标签页打开」、拖到分栏等宿主路径根本不经过
+   * openBookAt，只能在这里兜底。
+   *
+   * **每次 onLoadFile 现算，不能缓存**：用户关掉另一个标签页后再打开
+   * 本页，应该恢复可写；缓存会把只读态永久粘住。
+   * `getLeavesOfType` 在测试桩 / 极老宿主里可能缺失或抛错，一律当作
+   * 「没有别的标签页」——检测失败不能影响打开文件。
+   */
+  private hasBookOpenInOtherLeaf(path: string): boolean {
+    try {
+      const leaves = this.app.workspace.getLeavesOfType?.(VIEW_TYPE) || [];
+      return leaves.some((leaf: any) => {
+        if (!leaf || leaf === (this as any).leaf) return false;
+        const view: any = leaf.view;
+        if (!view || view === this) return false;
+        return !!view.file && String(view.file.path) === path;
+      });
+    } catch (_) {
+      return false;
+    }
+  }
+
   async onLoadFile(file: TFile): Promise<void> {
     const token = ++this._loadToken;
     /*
@@ -791,6 +831,17 @@ export class InkbookView extends FileView {
     if (token !== this._loadToken) return;
     if (!ok) await this.rescueUnsaved(this.lastSaveError || "未知原因");
     if (token !== this._loadToken) return;
+    /*
+     * 同一本已在别的标签页打开 → 这里只读打开（INK-172）。
+     *
+     * 两个 InkbookView 各持一份 store、各自自动保存：后保存的一方会先
+     * 触发指纹冲突，转成 -disk-/-mine- 副本并停止写原文件——内容不丢，
+     * 但用户会卡在「怎么保存都不生效」。只读是更早、更清楚的拦截。
+     *
+     * 必须在每次 onLoadFile 现算（见 hasBookOpenInOtherLeaf）：关掉
+     * 另一个标签页后重新打开本页，要能恢复正常可写。
+     */
+    const duplicateTab = this.hasBookOpenInOtherLeaf(file.path);
     this.file = file;
     const ext = (file.extension || "").toLowerCase();
     if (ext !== "inkbook") {
@@ -811,7 +862,13 @@ export class InkbookView extends FileView {
     try {
       const book = await readBook(adapter, file.path, file.basename);
       if (token !== this._loadToken) return;
-      this.openBook(book, false);
+      this.openBook(book, duplicateTab, duplicateTab ? "duplicate" : null);
+      if (duplicateTab) {
+        new Notice(
+          "这本手写本已在另一个标签页打开。为避免两个标签页互相覆盖，这里以只读方式打开；关掉另一个标签页后重新打开本页即可编辑。",
+          12000
+        );
+      }
       this.fp = await fingerprint(adapter, file.path);
     } catch (e: any) {
       console.error("[inkbook] 读取失败", e);
@@ -2040,9 +2097,12 @@ export class InkbookView extends FileView {
      *   · 其它只读路径（原文件打不开）→ 别许诺"另存为"，
      *     插件没有这个功能，只能让用户自己复制 .bak
      */
-    const msg = this.recoveredCopyName
-      ? "这是只读状态（从备份恢复或原文件不可写），改动不会保存。已另存为 recovered 副本，请改用那份。"
-      : "这是只读状态（从备份恢复或原文件不可写），改动不会保存。要接着写，请把同目录的 .bak 复制一份并改名。";
+    const msg =
+      this.readOnlyReason === "duplicate"
+        ? "这本手写本已在另一个标签页打开，这里只读，改动不会保存。要编辑，请先关掉另一个标签页，再重新打开本页。"
+        : this.recoveredCopyName
+          ? "这是只读状态（从备份恢复或原文件不可写），改动不会保存。已另存为 recovered 副本，请改用那份。"
+          : "这是只读状态（从备份恢复或原文件不可写），改动不会保存。要接着写，请把同目录的 .bak 复制一份并改名。";
     new Notice(msg, 8000);
   }
 

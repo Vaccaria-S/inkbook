@@ -304,13 +304,15 @@ export default class InkbookPlugin extends Plugin {
      * 同一本已经在**别的叶子**开着：切过去，别再开第二份 store。
      *
      * 两个 view 各持一份 store、各自保存，正常的保存会变成一对
-     * `-disk-` / `-mine-` 冲突副本——内容不丢，但用户会困惑。
+     * `-disk-` / `-mine-` 冲突副本——内容不丢，但用户会困惑，而且
+     * 后保存的一方会卡在「怎么保存都不生效」。
      *
      * 用 reveal 而不是禁止：既延续「已在这本就只翻页」的既有语义，
-     * 也保住了 newTab「两页对照」的用法（那种情况是用户明确要的，
-     * 只提示一句，不改变行为）。
+     * 也保住了 newTab「两页对照」的用法。
      *
-     * 边界：文件浏览器里手动「在新标签页打开」仍会双开——那是用户明确操作，不拦。
+     * 边界：文件浏览器里手动「在新标签页打开」/ 拖分栏不经过这里；
+     * 那条路交给 view.ts 的 onLoadFile 兜底——检测到同本双开时**只读**
+     * 打开第二个标签（INK-172），不会产生两份可写 store。
      */
     const sameBook = (
       this.app.workspace.getLeavesOfType?.(VIEW_TYPE) || []
@@ -340,8 +342,13 @@ export default class InkbookPlugin extends Plugin {
         }
         // 落到下面的 getLeaf(false).openFile 兜底
       } else {
+        /*
+         * 用户明确要新标签（Ctrl/Cmd+点击、中键）。仍按他的意思开，
+         * 但新视图的 onLoadFile 会检测到同本已开并**只读**打开；
+         * 先把预期说清楚，别等用户写了半天才发现存不进去。
+         */
         new Notice(
-          "这本已在另一个标签页打开：两个标签同时编辑会各存各的，可能产生冲突副本。",
+          "这本已在另一个标签页打开：新标签页将以只读方式打开，避免两边互相覆盖。",
           8000
         );
       }

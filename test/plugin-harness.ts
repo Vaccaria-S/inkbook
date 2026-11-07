@@ -1,4 +1,5 @@
 import InkbookPlugin from "../src/main";
+import { InkbookView } from "../src/view";
 import { TFile } from "obsidian";
 
 const lines: string[] = [];
@@ -215,6 +216,104 @@ async function main() {
       );
 
       abstractFile = null;
+      inkbookLeaves = [];
+    }
+
+    /* ---- INK-172：同一本在另一个标签页 → 第二个标签只读，关掉后恢复可写 ---- */
+    {
+      const bookFile: any = new TFile();
+      bookFile.path = "笔记/几何.inkbook";
+      bookFile.name = "几何.inkbook";
+      bookFile.basename = "几何";
+      bookFile.extension = "inkbook";
+      const bookJson = JSON.stringify({
+        version: 2,
+        kind: "inkbook",
+        title: "几何",
+        width: 794,
+        height: 1123,
+        activePage: 0,
+        pages: [
+          {
+            id: "p1",
+            template: "grid",
+            paper: "white",
+            layers: [{ id: "l1", name: "笔迹层", visible: true, opacity: 1, strokes: [] }],
+            activeLayerId: "l1",
+          },
+        ],
+      });
+      const adapter: any = app.vault.adapter;
+      const origExists = adapter.exists;
+      const origRead = adapter.read;
+      const origStat = adapter.stat;
+      adapter.exists = async (p: string) => p === bookFile.path;
+      adapter.read = async (p: string) => (p === bookFile.path ? bookJson : "");
+      adapter.stat = async (p: string) =>
+        p === bookFile.path ? { mtime: 111, size: bookJson.length } : null;
+
+      const makeLeaf = (): any => ({
+        app,
+        view: null,
+        getViewState: () => ({ state: {} }),
+        getEphemeralState: () => ({}),
+      });
+      const leafA: any = makeLeaf();
+      const viewA: any = new InkbookView(leafA, plugin as any);
+      leafA.view = viewA;
+      inkbookLeaves = [];
+      await viewA.onLoadFile(bookFile);
+      log(
+        (viewA.readOnly === false && viewA.editor && viewA.editor.readOnly === false
+          ? "PASS"
+          : "FAIL") + " INK-172 单标签打开可写"
+      );
+
+      const leafB: any = makeLeaf();
+      const viewB: any = new InkbookView(leafB, plugin as any);
+      leafB.view = viewB;
+      inkbookLeaves = [leafA];
+      await viewB.onLoadFile(bookFile);
+      log(
+        (viewB.readOnly === true && viewB.editor && viewB.editor.readOnly === true
+          ? "PASS"
+          : "FAIL") +
+          " INK-172 同一本已在另一标签 → 第二个标签只读打开（不会两份可写 store）"
+      );
+
+      await viewA.onUnloadFile();
+      inkbookLeaves = [leafB];
+      await viewB.onLoadFile(bookFile);
+      log(
+        (viewB.readOnly === false && viewB.editor && viewB.editor.readOnly === false
+          ? "PASS"
+          : "FAIL") +
+          " INK-172 关掉另一标签后重新打开 → 恢复可写（检测每次现算，不缓存）"
+      );
+
+      const leafC: any = makeLeaf();
+      const viewC: any = new InkbookView(leafC, plugin as any);
+      leafC.view = viewC;
+      inkbookLeaves = [];
+      workspace.getLeavesOfType = () => {
+        throw new Error("stub");
+      };
+      await viewC.onLoadFile(bookFile);
+      log(
+        (viewC.readOnly === false ? "PASS" : "FAIL") +
+          " INK-172 getLeavesOfType 缺失/抛错 → 按可写打开，不影响打开文件"
+      );
+
+      workspace.getLeavesOfType = () => inkbookLeaves;
+      adapter.exists = origExists;
+      adapter.read = origRead;
+      adapter.stat = origStat;
+      await viewA.onClose();
+      await viewB.onClose();
+      await viewC.onClose();
+      viewA.containerEl.remove();
+      viewB.containerEl.remove();
+      viewC.containerEl.remove();
       inkbookLeaves = [];
     }
 

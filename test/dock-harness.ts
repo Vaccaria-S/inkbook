@@ -2333,6 +2333,147 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
     }
   }
 
+  /* ============ 12.5 平板宿主按钮 padding（INK-171） ============ */
+  /*
+   * 宿主 app.css 的
+   *   .is-tablet button:not(.clickable-icon) { padding: 4px 20px }   (0,2,1)
+   * 会压过我们这些控件自己的 padding 声明，真机上表现为：
+   *   · 纸面样式条的色点从正圆变成横椭圆；
+   *   · 样式条按钮 / 顶栏「当前笔」chip 被撑高 8px；
+   *   · 「添加一页」的 9px 22px 设计值被改成 4px 20px。
+   * 这里注入同一条宿主规则，在「平板 + 宿主样式」同时成立时量真实 rect。
+   */
+  {
+    const hostSim2 = document.createElement("style");
+    hostSim2.textContent = ".is-tablet button:not(.clickable-icon){padding:4px 20px}";
+    document.head.appendChild(hostSim2);
+    // 真机上 Obsidian 把 is-tablet 挂在 body 上，containerEl 也带 mb-tablet；
+    // harness 里 root 被挪出了 containerEl，所以把两个类挂到共同祖先 host 上模拟。
+    host.classList.add("is-tablet");
+    view.editor!.setTool("pen");
+    await sleep(120);
+
+    const chip = headerEl.querySelector(".mb-pen-chip") as HTMLElement | null;
+    const chipBase = chip ? getComputedStyle(chip) : null;
+    const chipBaseRect = chip ? chip.getBoundingClientRect() : null;
+    pass(
+      !!chip &&
+        !!chipBaseRect &&
+        Math.abs(chipBaseRect.height - 30) <= 0.5 &&
+        chipBase!.paddingLeft === "6px",
+      "宿主 padding 下顶栏当前笔 chip 保持基础尺寸 30px / padding 6（实测 " +
+        (chipBaseRect ? chipBaseRect.height.toFixed(1) : "缺失") +
+        "px / " +
+        (chipBase ? chipBase.paddingLeft : "缺失") +
+        "）"
+    );
+
+    // 平板档：chip 放大到 34px、padding 9px（现有 .mb-tablet 规则），不是被撑到 42
+    host.classList.add("mb-tablet");
+    await sleep(80);
+    const chipTab = chip ? getComputedStyle(chip) : null;
+    const chipTabRect = chip ? chip.getBoundingClientRect() : null;
+    pass(
+      !!chipTabRect &&
+        Math.abs(chipTabRect.height - 34) <= 0.5 &&
+        chipTab!.paddingLeft === "9px",
+      "平板档顶栏当前笔 chip 保持设计尺寸 34px / padding 9（实测 " +
+        (chipTabRect ? chipTabRect.height.toFixed(1) : "缺失") +
+        "px / " +
+        (chipTab ? chipTab.paddingLeft : "缺失") +
+        "）"
+    );
+
+    // 造出「新建文字」的样式条（.mb-texteditbar 只在新建时出现）
+    view.editor!.setTool("text");
+    root.classList.add("is-tablet");
+    await sleep(100);
+    const pageEl = root.querySelector(".mb-page") as HTMLElement;
+    const pr = pageEl.getBoundingClientRect();
+    const pe = (type: string, buttons: number) =>
+      pageEl.dispatchEvent(
+        new PointerEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          pointerId: 91,
+          pointerType: "mouse",
+          isPrimary: true,
+          button: 0,
+          buttons,
+          clientX: pr.left + 60,
+          clientY: pr.top + 80,
+        })
+      );
+    pe("pointerdown", 1);
+    pe("pointerup", 0);
+    await sleep(180);
+
+    const editBar = root.querySelector(".mb-texteditbar") as HTMLElement | null;
+    pass(!!editBar, "文字工具点空白后出现新建样式条 .mb-texteditbar");
+    if (editBar) {
+      const ebDots = [...editBar.querySelectorAll(".mb-tb-dot")] as HTMLElement[];
+      const ebDotsRects = ebDots.map((d) => d.getBoundingClientRect());
+      const ellipses = ebDotsRects.filter((r) => Math.abs(r.width - r.height) > 0.5);
+      pass(
+        ebDots.length === 6 && ellipses.length === 0,
+        "宿主 padding 下纸面样式条色点仍是正圆（" +
+          ebDots.length +
+          " 个，椭圆 " +
+          ellipses.length +
+          " 个；实测 " +
+          ebDotsRects.map((r) => r.width.toFixed(1) + "×" + r.height.toFixed(1)).join(" ") +
+          "）"
+      );
+
+      const ebBtn = editBar.querySelector(".mb-tb-btn") as HTMLElement | null;
+      const ebBtnRect = ebBtn ? ebBtn.getBoundingClientRect() : null;
+      const ebBtnCS = ebBtn ? getComputedStyle(ebBtn) : null;
+      pass(
+        !!ebBtnRect &&
+          Math.abs(ebBtnRect.height - 28) <= 0.5 &&
+          ebBtnCS!.paddingLeft === "3px" &&
+          ebBtnCS!.paddingTop === "0px",
+        "宿主 padding 下样式条按钮高度保持 28px、padding 0 3（实测 " +
+          (ebBtnRect ? ebBtnRect.height.toFixed(1) : "缺失") +
+          "px / " +
+          (ebBtnCS ? ebBtnCS.paddingTop + " " + ebBtnCS.paddingLeft : "缺失") +
+          "）"
+      );
+
+      const ebStep = editBar.querySelector(".mb-tb-sizestep") as HTMLElement | null;
+      const ebStepRect = ebStep ? ebStep.getBoundingClientRect() : null;
+      const ebStepCS = ebStep ? getComputedStyle(ebStep) : null;
+      pass(
+        !!ebStepRect &&
+          Math.abs(ebStepRect.height - 28) <= 0.5 &&
+          ebStepRect.width >= 26 &&
+          ebStepCS!.paddingLeft === "3px" &&
+          ebStepCS!.paddingTop === "0px",
+        "宿主 padding 下样式条 −/＋ 步进高度保持 28px、宽 ≥26px（实测 " +
+          (ebStepRect ? ebStepRect.width.toFixed(1) + "×" + ebStepRect.height.toFixed(1) : "缺失") +
+          "）"
+      );
+    }
+
+    // 「添加一页」：自己的 9px 22px 设计值不能被宿主改成 4px 20px
+    const addPage = root.querySelector(".mb-add-page") as HTMLElement | null;
+    const addCS = addPage ? getComputedStyle(addPage) : null;
+    pass(
+      !!addCS && addCS.paddingTop === "9px" && addCS.paddingLeft === "22px",
+      "宿主 padding 下「添加一页」保持 9px 22px 设计值（实测 " +
+        (addCS ? addCS.paddingTop + " " + addCS.paddingLeft : "缺失") +
+        "）"
+    );
+
+    // 收尾：丢掉这次空输入、还原类与注入样式，别污染后面的用例
+    view.editor!.commitTextEditNow();
+    view.editor!.setTool("pen");
+    root.classList.remove("is-tablet");
+    host.classList.remove("is-tablet", "mb-tablet");
+    hostSim2.remove();
+    await sleep(120);
+  }
+
   /* ============ 13. 搜索 / 链接跳转后的落点提示 ============ */
   /*
    * 全局搜索只给插件文件路径，拿不到命中行号和搜索词，无法高亮具体文字。
