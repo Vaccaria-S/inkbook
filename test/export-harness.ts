@@ -1133,6 +1133,46 @@ async function main() {
     }
   }
 
+  /* -------------------- 导出等 PDF 渲染也不能挂死（INK-182） -------------------- */
+  {
+    /*
+     * 上一轮只给静态底图加了超时，**PDF 渲染那条漏了**：
+     * `renderPdfPage` 里 `getPage` / `task.promise` / `createImageBitmap`
+     * 任何一步卡住（损坏 PDF、worker 挂掉、显存不足），`await` 永不返回
+     * → 整次导出卡死，取消也无效。同一个 bug 的两半。
+     *
+     * 这里把 `openPdfDoc` 换成一个永不 resolve 的 Promise，验证
+     * `waitBackgrounds` 会在超时后返回（而不是挂死）。
+     */
+    setBackgroundWaitTimeoutForTest(80);
+    const origOpen = (editor as any).openPdfDoc.bind(editor);
+    (editor as any).openPdfDoc = () => new Promise(() => {}); // 永不 resolve
+    try {
+      const p = editor.store.data.pages[0];
+      p.background = {
+        pdf: { path: "卡住的.pdf", page: 1 },
+        sourceName: "卡住的 PDF",
+        sourcePage: 1,
+        x: 0,
+        y: 0,
+        width: 794,
+        height: 1123,
+        kind: "pdf",
+      };
+      const t0 = performance.now();
+      await editor.waitBackgrounds([0], 2);
+      const ms = performance.now() - t0;
+      pass(
+        ms < 3000,
+        "INK-182 PDF 渲染永不返回时 waitBackgrounds 超时返回（" +
+          ms.toFixed(0) + "ms），导出不会卡死"
+      );
+    } finally {
+      (editor as any).openPdfDoc = origOpen;
+      setBackgroundWaitTimeoutForTest(10_000);
+    }
+  }
+
   log("");
   log(failures === 0 ? "ALL PASS" : failures + " FAILED");
   document.title = "DONE";

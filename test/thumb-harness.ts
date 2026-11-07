@@ -307,6 +307,62 @@ async function main() {
     cv.remove();
   }
 
+  /* -------------------- PDF 底图渲染完要通知缩略图补画（INK-183） -------------------- */
+  {
+    /*
+     * 缺口：`requestPdfThumb` 开头有 `if (bgBitmaps.getEntry(key)) return;`
+     * ——主视图正在渲染这一页时缓存里还没图，缩略图请求被直接跳过，
+     * 而它第一次画完就 unobserve 了、不会自己重试。结果主视图正常、
+     * 侧栏那几页永远停在灰底。
+     *
+     * 静态底图那条路径（`loadBackground`）早就有 onThumbNeedsRedraw 补画，
+     * PDF 这条漏了。这里验证 markBgDirty 现在也会回调。
+     */
+    const book2 = createBook("缩略图补画", "grid", "white");
+    /*
+     * `createBook` 自带第 1 页，所以这里**只补 2 页**凑成 3 页；
+     * 然后给全部 3 页都挂同一个 PDF 底图（主视图那页也要算进去）。
+     */
+    while (book2.pages.length < 3) book2.pages.push(createPage("grid", "white"));
+    for (const p of book2.pages) {
+      p.background = {
+        pdf: { path: "补画.pdf", page: 1 },
+        sourceName: "补画",
+        sourcePage: 1,
+        x: 0,
+        y: 0,
+        width: 794,
+        height: 1123,
+        kind: "pdf",
+      } as any;
+    }
+    const store2 = new BookStore(book2);
+    const [host2, cleanup2] = makeHost();
+    const asked: number[] = [];
+    const editor2 = new BookEditor(host2, store2, {
+      smoothing: 0.5,
+      onThumbNeedsRedraw: (i: number) => asked.push(i),
+    });
+    try {
+      asked.length = 0;
+      // 直接触发「某页 PDF 渲染完成」的回调
+      (editor2 as any).markBgDirty("补画.pdf", 1);
+      pass(
+        asked.length === 3 && asked.every((i) => i >= 0 && i < 3),
+        "INK-183 PDF 底图渲染完会通知所有引用它的页补画缩略图（通知 " +
+          asked.length + " 页：" + JSON.stringify(asked) + "）"
+      );
+
+      // 不相关的 PDF 不该被通知
+      asked.length = 0;
+      (editor2 as any).markBgDirty("别的.pdf", 9);
+      pass(asked.length === 0, "INK-183 无关 PDF 不误通知缩略图（" + asked.length + " 页）");
+    } finally {
+      editor2.destroy();
+      cleanup2();
+    }
+  }
+
   log("");
   log(failures === 0 ? "ALL PASS" : failures + " FAILED");
   document.title = "DONE";

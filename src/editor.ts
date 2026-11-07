@@ -326,6 +326,21 @@ export function setBackgroundWaitTimeoutForTest(ms: number): void {
   bgWaitTimeoutMs = Number.isFinite(ms) && ms > 0 ? ms : BACKGROUND_WAIT_TIMEOUT_MS;
 }
 
+/**
+ * 给一个 Promise 加超时上限，超时 reject。
+ *
+ * 和 `embed.ts` 里那个同名函数是同一套思路（那边是私有的，不跨模块共享，
+ * 避免为一个十行的工具函数制造依赖）。**超时后原 Promise 仍在跑**，
+ * 只是我们不再等它——导出场景要的就是「不卡住」，剩下的交给它自己收尾。
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer = 0;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = window.setTimeout(() => reject(new Error(label + " 超时")), ms);
+  });
+  return Promise.race([p, timeout]).finally(() => window.clearTimeout(timer)) as Promise<T>;
+}
+
 /** 缩略图快照的 key：页 id + 目标像素尺寸（尺寸变了要重画一份） */
 function thumbShotKey(pageId: string, w: number, h: number): string {
   return `${pageId}@${w}x${h}`;
@@ -3022,6 +3037,24 @@ export class BookEditor {
         }
       });
     }
+    /*
+     * 侧栏缩略图也要补一次（INK-183）。
+     *
+     * 主视图的 PDF 底图渲染好了，但缩略图那边可能**早就放弃了**：
+     * `requestPdfThumb` 开头有 `if (this.bgBitmaps.getEntry(key)) return;`
+     * ——主视图正在渲染这一页时缓存里还没有图，缩略图请求被直接跳过，
+     * 而且它不会自己重试（第一次画完就 unobserve 了）。结果就是
+     * 主视图显示正常、侧栏那几页永远停在灰底。
+     *
+     * 静态底图（`loadBackground`）那条路径早就有这个补画回调，PDF 这条漏了。
+     */
+    const thumbCb = this.opts.onThumbNeedsRedraw;
+    if (thumbCb) {
+      for (let i = 0; i < this.store.data.pages.length; i += 1) {
+        const bg = this.store.data.pages[i]?.background;
+        if (bg?.pdf && bg.pdf.path === pdfPath && bg.pdf.page === pageNo) thumbCb(i);
+      }
+    }
   }
 
   /** 异步加载底图，加载完重画所在页 */
@@ -5672,8 +5705,26 @@ export class BookEditor {
         pending.push(
           (async () => {
             try {
-              const doc = await this.openPdfDoc(bg.pdf!.path);
-              const rendered = await renderPdfPage(doc, bg.pdf!.page, target);
+              /*
+               * PDF 这条路径**也要超时**（INK-182）。
+               *
+               * 上一轮只给静态底图（`new Image()`）加了超时，PDF 渲染这条
+               * 漏了——`renderPdfPage` 里 `doc.getPage` / `task.promise` /
+               * `createImageBitmap` 任何一步卡住（损坏的 PDF、pdf.js worker
+               * 挂掉、显存不足），`await` 就永远不返回 → 整次导出卡死，
+               * 取消按钮也无效（取消检查在页循环里，这里还没进循环）。
+               * 同一个 bug 的两半，必须一起补。
+               */
+              const doc = await withTimeout(
+                this.openPdfDoc(bg.pdf!.path),
+                bgWaitTimeoutMs,
+                "打开 PDF"
+              );
+              const rendered = await withTimeout(
+                renderPdfPage(doc, bg.pdf!.page, target),
+                bgWaitTimeoutMs,
+                "渲染 PDF 页"
+              );
               const cached = this.bgBitmaps.set(key, rendered.bitmap, rendered.bitmap.width);
               /*
                * 没进缓存（单张超预算）→ 这张图谁都不持有，必须在这里释放，
