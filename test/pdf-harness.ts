@@ -360,6 +360,38 @@ async function main() {
     cache.clear();
   }
 
+  /*
+   * 单张超预算时 set() 返回 false 且**不销毁**这张位图（2026-11-07 修）。
+   *
+   * 老实现直接 `bitmap.close()` 再 return，但注释写着「仍然返回给调用方
+   * 使用」—— 矛盾。实际出事场景：调用方 set 之后紧接着 markBgDirty 重画，
+   * 拿到的就是一张已销毁的 ImageBitmap。现在改成不 close、返回 false，
+   * 由调用方负责用完释放。
+   */
+  {
+    const tiny = new BitmapCache({ budget: 64 }); // 64 字节，任何位图都超
+    const big = await renderPdfPage(doc, 1, 200); // 200 宽 → 远超 64 字节
+    const ok = tiny.set("big", big.bitmap);
+    pass(!ok, "超预算时 set() 返回 false（不进缓存）");
+    // 关键：位图仍然可用（没被 close）
+    let alive = false;
+    try {
+      const c = document.createElement("canvas");
+      c.width = 4;
+      c.height = 4;
+      const ctx = c.getContext("2d")!;
+      ctx.drawImage(big.bitmap, 0, 0, 4, 4);
+      alive = true;
+    } catch (_) {
+      alive = false;
+    }
+    pass(alive, "超预算时位图没被销毁（调用方还能用，自己负责 close）");
+    try {
+      big.bitmap.close();
+    } catch (_) {}
+    pass(tiny.size === 0, "超预算的位图没有进缓存（size=" + tiny.size + "）");
+  }
+
   /* -------------------- 大文档不会一次性全渲染 -------------------- */
   {
     // 关键性能性质：渲染 N 页的耗时应该远小于"渲染所有页再缓存"

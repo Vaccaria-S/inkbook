@@ -2837,8 +2837,20 @@ export class BookEditor {
           // 已经够清晰了 → 收工
           if (have > 0 && need <= have * 1.15) break;
           const rendered = await renderPdfPage(doc, pageNo, Math.max(need, 64));
-          this.bgBitmaps.set(key, rendered.bitmap, rendered.bitmap.width);
+          const cached = this.bgBitmaps.set(key, rendered.bitmap, rendered.bitmap.width);
           this.markBgDirty(pdfPath, pageNo);
+          /*
+           * 没进缓存（单张就超预算）→ 立刻收工，别再循环。
+           *
+           * 否则：这一轮渲完没缓存 → markBgDirty 重画 → drawPdfBackground
+           * 拿不到图 → 又请求渲染 → 又超预算 → 无限重渲，CPU 打满。
+           * 位图本身已经画到屏幕上了（markBgDirty 用的是刚渲染的这张），
+           * 只是留不住 —— 那就不留。
+           */
+          if (!cached) {
+            console.warn("[inkbook] PDF 位图超出缓存预算，本页不缓存", key, rendered.bitmap.width);
+            break;
+          }
           // 渲染期间目标又变高 → 继续渲染更清晰的
           if ((this.bgTarget.get(key) ?? 0) <= rendered.bitmap.width * 1.15) break;
         }
@@ -5355,7 +5367,16 @@ export class BookEditor {
           const nowHave = this.thumbBitmaps.getEntry(job.key)?.width ?? 0;
           if (nowHave >= job.want * 0.8 || this.bgBitmaps.getEntry(job.key)) return;
           const rendered = await renderPdfPage(doc, job.pageNo, job.want);
-          this.thumbBitmaps.set(job.key, rendered.bitmap, rendered.bitmap.width);
+          const cached = this.thumbBitmaps.set(job.key, rendered.bitmap, rendered.bitmap.width);
+          if (!cached) {
+            // 单张超缩略图缓存预算（正常不会，尺寸夹在 96~384）：释放，不重试
+            try {
+              rendered.bitmap.close();
+            } catch (_) {
+              /* 已关闭就算了 */
+            }
+            return;
+          }
           this.notifyThumb(job.pdfPath, job.pageNo);
         } catch (e) {
           console.warn("[inkbook] 缩略图 PDF 底图渲染失败", e);
@@ -5519,7 +5540,20 @@ export class BookEditor {
             try {
               const doc = await this.openPdfDoc(bg.pdf!.path);
               const rendered = await renderPdfPage(doc, bg.pdf!.page, target);
-              this.bgBitmaps.set(key, rendered.bitmap, rendered.bitmap.width);
+              const cached = this.bgBitmaps.set(key, rendered.bitmap, rendered.bitmap.width);
+              /*
+               * 没进缓存（单张超预算）→ 这张图谁都不持有，必须在这里释放，
+               * 否则一张 90MB 的 ImageBitmap 泄漏。导出只用 canvas 画，
+               * 不需要它留在缓存里。
+               */
+              if (!cached) {
+                try {
+                  rendered.bitmap.close();
+                } catch (_) {
+                  /* 已关闭就算了 */
+                }
+                return;
+              }
               this.markBgDirty(bg.pdf!.path, bg.pdf!.page);
             } catch (e) {
               console.error("[inkbook] 导出等待 PDF 渲染失败", e);

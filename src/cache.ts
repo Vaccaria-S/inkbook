@@ -80,9 +80,19 @@ export class BitmapCache {
 
   /**
    * 放一张位图。
-   * 如果它本身就超过预算，就不缓存（但仍然返回给调用方使用）。
+   *
+   * 如果它本身就超过预算，就**不进缓存**，返回 false。
+   *
+   * **注意：超预算时不会 close 这张 bitmap**（2026-11-07 修）。
+   * 老实现直接 `bitmap.close()` 再 return，但注释写着「仍然返回给调用方
+   * 使用」—— 两者矛盾，而且实际会出事：调用方 `set()` 之后紧接着
+   * `markBgDirty` 重画，画的时候如果还能拿到这张图，就是一张已销毁的
+   * ImageBitmap。现在改成不 close，**由调用方负责用完释放**，
+   * 返回值告诉它「没进缓存，你自己管」。
+   *
+   * @returns 是否真的进了缓存
    */
-  set(key: string, bitmap: ImageBitmap, width?: number): void {
+  set(key: string, bitmap: ImageBitmap, width?: number): boolean {
     const existing = this.map.get(key);
     if (existing) {
       this.bytes -= existing.bytes;
@@ -91,9 +101,8 @@ export class BitmapCache {
     }
     const bytes = bitmap.width * bitmap.height * 4;
     if (bytes > this.budget) {
-      // 单张就超预算：直接还回去，不进缓存
-      bitmap.close();
-      return;
+      // 单张就超预算：不进缓存。不 close —— 调用方可能还要用这张图
+      return false;
     }
     this.map.set(key, {
       bitmap,
@@ -103,6 +112,7 @@ export class BitmapCache {
     });
     this.bytes += bytes;
     this.evict();
+    return true;
   }
 
   /** 淘汰到预算以内 */
