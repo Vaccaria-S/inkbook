@@ -2224,6 +2224,40 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       "形状面板也有颜色点（" + root.querySelectorAll(".mb-tcolor").length + " 个）"
     );
     pass(!!root.querySelector(".mb-range"), "形状面板仍有粗细滑杆");
+
+    /*
+     * 滑杆跨入口同步（2026-11-07 修的真回归）：
+     * 加了「结构签名」之后，签名不变就不再重建 DOM —— 于是所有靠
+     * 重建时才刷的显示值都必须就地补刷，否则会停在旧值。
+     * 这里从**笔盒**（buildSide 的静态按钮）改粗细，然后看 `.mb-dyn`
+     * 里的滑杆与数值标签是否跟着变。
+     */
+    {
+      view.editor!.setTool("pen");
+      await sleep(80);
+      const dynEl2 = root.querySelector(".mb-sec-dyn .mb-dyn") as HTMLElement | null;
+      const rangeEl = dynEl2?.querySelector(".mb-range") as HTMLInputElement | null;
+      const lblEl = dynEl2?.querySelector(".mb-size-lbl") as HTMLElement | null;
+      pass(!!rangeEl && !!lblEl, "钢笔工具区有粗细滑杆与数值标签");
+      if (rangeEl && lblEl) {
+        // 模拟「笔盒点粗」：直接走 editor 的 setter（会 emitState）
+        const PEN_SIZES_LOCAL = [1.6, 2.8, 4.6]; // 与 types.ts 的 PEN_SIZES 一致
+        view.editor!.setPenSize(PEN_SIZES_LOCAL[2]);
+        await sleep(200);
+        pass(
+          Math.abs(Number(rangeEl.value) - PEN_SIZES_LOCAL[2]) < 0.11,
+          "外部改钢笔粗细后滑杆跟着刷新（滑杆 " +
+            rangeEl.value +
+            "，期望 " +
+            PEN_SIZES_LOCAL[2] +
+            "）"
+        );
+        pass(
+          lblEl.textContent === String(Math.round(PEN_SIZES_LOCAL[2] * 10) / 10),
+          "外部改钢笔粗细后数值标签跟着刷新（" + lblEl.textContent + "）"
+        );
+      }
+    }
   }
 
   /* ============ 13. 搜索 / 链接跳转后的落点提示 ============ */

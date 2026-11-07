@@ -3703,6 +3703,12 @@ export class BookEditor {
     // 样式条与输入框同生共死：提交、Esc、翻页重建都不能留下孤儿节点
     this.textEditBarEl?.remove();
     this.textEditBarEl = null;
+    /*
+     * 样式条上的步进按钮也一起停手：DOM 已移除，按住中的 pointerup
+     * 等不到，timer 会继续对已关闭的编辑框步进直到用户松手。
+     */
+    for (const stop of this.stepBtnStoppers) stop();
+    this.stepBtnStoppers = [];
     const ed = this.textEdit;
     if (!ed) return;
     /*

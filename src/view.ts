@@ -921,6 +921,9 @@ export class InkbookView extends FileView {
     // 步进按钮的连调 timer：侧栏 DOM 已拆，不停会一直往已销毁的编辑器上写
     for (const stop of this.dynStepStoppers) stop();
     this.dynStepStoppers = [];
+    // dynEl 已随 sideEl.empty() 脱离文档：清掉引用与签名，别留悬空指针
+    this.dynEl = null as any;
+    this.dynToolsSig = "";
     // 拖拽态要收干净：ghost / 指示线挂在 document.body 上，不随侧栏一起走
     this.cancelThumbDrag();
     this.cancelThumbPress();
@@ -1963,45 +1966,98 @@ export class InkbookView extends FileView {
   /**
    * 工具区的「结构签名」：只有它变了才需要重建 DOM。
    *
-   * 刻意**不含 `textSize` 的数值、也不含「是否命中四档」** ——
-   * 两者都是 `syncDynamicValues` 能就地刷新的东西（四档高亮、
-   * 数字框显示值、is-custom 描边都是 class/属性，不涉及结构）。
-   * 放进签名会这样翻车（实测）：按住「＋」从 20 起连调，20 不是四档之一
-   * → 签名从 `preset` 跳到 `custom` → 重建 → 按住中的按钮被换掉 →
-   * timer 被停 → 连调只走一步。
+   * 判据是「这个东西变了会不会改变 DOM 的**结构/节点集合**」。
+   * 只是改 class、属性、value 的（四档高亮、数字框值、is-custom 描边、
+   * 字体下拉 selected、色点 is-active、滑杆 value）都**不进签名**，
+   * 由 `syncDynamicValues` 就地刷 —— 这样按住步进连调时 DOM 不被换掉，
+   * 连调不会断（这是实测踩出来的：20→21 时「是否命中四档」翻转，
+   * 签名跟着变 → 重建 → 按钮被换 → timer 被停 → 连调只走一步）。
    *
-   * 签名只放**真的会改变 DOM 结构**的量：工具种类、字体、颜色、
-   * 橡皮模式、形状种类。
+   * 真正进签名的只有**节点集合会变**的量：
+   *   · 工具种类（不同工具的控件完全不同）
+   *   · 橡皮模式（整笔/局部只是高亮，可 sync，但这里留着更保险）
+   *   · 形状种类（按钮文字会变，sync 里也能刷，这里留着保险）
    */
   private dynToolsSignature(s: any): string {
     if (!this.editor) return "";
     if (s.tool === "eraser") return `eraser|${this.editor.eraserMode}`;
-    if (s.tool === "text") return `text|${s.textFont}|${s.textColor}`;
-    if (s.tool === "shape") return `shape|${(s as any).shapeKind ?? ""}|${s.penColor}`;
-    return `${s.tool}|${s.penColor}`;
+    if (s.tool === "text") return "text";
+    if (s.tool === "shape") return `shape|${(s as any).shapeKind ?? ""}`;
+    return String(s.tool);
   }
 
   /**
    * 结构没变时就地刷新数值（不碰 DOM、不动监听）。
    *
-   * 目前只有文字工具区需要：字号连调时四档高亮、输入框显示值、
-   * is-custom 描边要跟着变，但 DOM 结构不用动。
+   * 为什么需要它：加了「结构签名」之后，签名相同就不再重建 DOM，
+   * 于是**所有靠重建时才刷的显示值都必须在里补刷**，否则会停在旧值。
+   * 已覆盖三类：
+   *   · 文字工具：四档高亮、数字框值、is-custom 描边、字体下拉、色点高亮
+   *   · 钢笔/荧光笔：粗细滑杆与数值标签（笔盒点「细/中/粗」走这条）
+   *   · 橡皮：整笔/局部高亮、大小滑杆
    */
   private syncDynamicValues(s: any): void {
     const el = this.dynEl;
     if (!el || !this.editor) return;
-    if (s.tool !== "text") return;
-    const size = Math.round(s.textSize);
-    for (const b of Array.from(el.querySelectorAll<HTMLElement>(".mb-seg-btn"))) {
-      const n = Number(b.textContent);
-      b.classList.toggle("is-active", n === size);
+
+    if (s.tool === "text") {
+      const size = Math.round(s.textSize);
+      for (const b of Array.from(el.querySelectorAll<HTMLElement>(".mb-seg-btn"))) {
+        const n = Number(b.textContent);
+        b.classList.toggle("is-active", n === size);
+      }
+      const sizeIn = el.querySelector<HTMLInputElement>(".mb-size-in");
+      if (sizeIn && document.activeElement !== sizeIn) {
+        // 用户正在这个框里打字时不要覆盖（会把光标位置冲掉）
+        sizeIn.value = String(size);
+      }
+      sizeIn?.classList.toggle("is-custom", ![14, 18, 24, 32].includes(size));
+      // 字体下拉：`selected` 只是 option 属性，改它不涉及结构，就地刷
+      const fs2 = el.querySelector<HTMLSelectElement>(".mb-font-sel");
+      if (fs2 && fs2.value !== s.textFont) fs2.value = s.textFont;
+      // 文字色点高亮
+      const tc = (s.textColor || "").toLowerCase();
+      for (const d of Array.from(el.querySelectorAll<HTMLElement>(".mb-tcolor"))) {
+        if (!d.style.background) continue;
+        d.classList.toggle("is-active", this.colorMatches(d.title, tc));
+      }
+      return;
     }
-    const sizeIn = el.querySelector<HTMLInputElement>(".mb-size-in");
-    if (sizeIn && document.activeElement !== sizeIn) {
-      // 用户正在这个框里打字时不要覆盖（会把光标位置冲掉）
-      sizeIn.value = String(size);
+
+    if (s.tool === "eraser") {
+      for (const b of Array.from(el.querySelectorAll<HTMLElement>(".mb-seg-btn"))) {
+        b.classList.toggle("is-active", b.textContent === (this.editor.eraserMode === "whole" ? "整笔" : "局部"));
+      }
+      this.syncRange(el, this.editor.eraserSize);
+      return;
     }
-    sizeIn?.classList.toggle("is-custom", ![14, 18, 24, 32].includes(size));
+
+    // 钢笔 / 荧光笔 / 形状：粗细滑杆 + 数值标签（形状没有滑杆，syncRange 会 no-op）
+    const hl = s.tool === "highlighter";
+    this.syncRange(el, hl ? s.highlighterSize : s.penSize);
+    // 形状色点高亮（形状区有自己的色点行，按 penColor）
+    if (s.tool === "shape") {
+      const pc = (s.penColor || "").toLowerCase();
+      for (const d of Array.from(el.querySelectorAll<HTMLElement>(".mb-tcolor"))) {
+        d.classList.toggle("is-active", this.colorMatches(d.title, pc));
+      }
+    }
+  }
+
+  /** 把 `.mb-range` 与其数值标签刷成当前值（没有滑杆就什么都不做） */
+  private syncRange(el: HTMLElement, value: number): void {
+    const range = el.querySelector<HTMLInputElement>(".mb-range");
+    if (!range) return;
+    const v = Math.round(value * 10) / 10;
+    // 正在拖这根滑杆时不要回写（会把拖动位置跳掉）
+    if (document.activeElement !== range) range.value = String(v);
+    const lbl = el.querySelector<HTMLElement>(".mb-size-lbl");
+    if (lbl) lbl.setText(String(v));
+  }
+
+  /** 色点的 title 存的是十六进制色值；比较时统一小写 */
+  private colorMatches(title: string | null | undefined, lower: string): boolean {
+    return !!title && title.toLowerCase() === lower;
   }
 
   private renderDynamicTools(): void {
