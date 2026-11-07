@@ -5451,6 +5451,32 @@ export class BookEditor {
   }
 
   /**
+   * 导出结束后把「超出阅读所需」的 PDF 位图从缓存里丢掉。
+   *
+   * 为什么需要（2026-11-07 补）：导出会按 `pdfExportWidth`（最长边 4096）
+   * 渲染，单张可达 **90.5MB**（4096×5793×4）。这些巨型位图塞进
+   * `bgBitmaps`（预算 160MB）后只放得下 1.8 张，把正常阅读用的 1588 位图
+   * 全挤出去 —— 用户导出完回到阅读，每翻一页都要重渲。
+   *
+   * 这里遍历缓存，凡是**比当前阅读目标还宽 1.25 倍以上**的都删掉，
+   * 让 LRU 回到「够读就行」的状态。阅读目标由 `pdfTargetWidth` 现算，
+   * 所以缩放过的用户也能保住他那档需要的那张。
+   */
+  pruneOversizedBackgrounds(): void {
+    const pages = this.store.data.pages;
+    for (const page of pages) {
+      const bg = page.background;
+      if (!bg?.pdf) continue;
+      const key = `${bg.pdf.path}#${bg.pdf.page}`;
+      const entry = this.bgBitmaps.getEntry(key);
+      if (!entry) continue;
+      const need = this.pdfTargetWidth(bg);
+      // 只删明显超标的（1.25 倍以内留着，免得缩放一点点就重渲）
+      if (entry.width > need * 1.25) this.bgBitmaps.delete(key);
+    }
+  }
+
+  /**
    * 底图是否都已加载完（导出前需要）。
    *
    * PDF 页是按需渲染的，所以这里要**主动等它渲染完**——

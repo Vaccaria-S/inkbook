@@ -215,6 +215,36 @@ async function main() {
   const bytes = written.get(outPath);
   pass(!!bytes && bytes.length > 10000, "导出了 " + (bytes?.length ?? 0) + " 字节（" + ms.toFixed(0) + "ms）");
 
+  /*
+   * 导出完要把「超出阅读所需」的大位图还给缓存（2026-11-07 补）。
+   * 导出按 pdfExportWidth（最长边 4096）渲染，单张可达 90MB，
+   * 塞进 bgBitmaps(160MB) 只放得下 1.8 张，会把阅读用的 1588 位图全挤出去。
+   * pruneOversizedBackgrounds 会把比当前阅读目标宽 1.25 倍以上的删掉。
+   */
+  {
+    const cache = (editor as any).bgBitmaps as {
+      getEntry(k: string): { width: number } | undefined;
+      size: number;
+    };
+    const pages = editor.store.data.pages;
+    let oversized = 0;
+    let total = 0;
+    for (const p of pages) {
+      const bg = p.background;
+      if (!bg?.pdf) continue;
+      const key = `${bg.pdf.path}#${bg.pdf.page}`;
+      const e = cache.getEntry(key);
+      if (!e) continue;
+      total += 1;
+      const need = (editor as any).pdfTargetWidth(bg) as number;
+      if (e.width > need * 1.25) oversized += 1;
+    }
+    pass(
+      oversized === 0,
+      "导出后没有超标位图残留（缓存里 " + total + " 张，超标 " + oversized + " 张）"
+    );
+  }
+
   /* -------------------- 用 pdf.js 读回来验原文 -------------------- */
   const pdfjs = initPdfjs();
   const doc = await pdfjs.getDocument({ data: bytes!.slice() }).promise;

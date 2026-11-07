@@ -479,6 +479,19 @@ export async function exportBookPdf(
   }
   await writeExportFile(vault, folder + name, bytes, signal);
 
+  /*
+   * 导出用的大位图要还给缓存（2026-11-07）：
+   * 导出按 pdfExportWidth（最长边 4096）渲染，单张可达 90MB，
+   * 塞进 bgBitmaps(160MB) 只放得下 1.8 张，会把阅读用的 1588 位图全挤出去。
+   * 导出完把明显超标的删掉，让 LRU 回到「够读就行」。
+   * 放在写完文件之后：即便用户取消，也希望能清掉；这里失败不影响导出结果。
+   */
+  try {
+    editor.pruneOversizedBackgrounds();
+  } catch (_) {
+    /* 清理失败不影响导出成功 */
+  }
+
   const notes: string[] = [];
   if (vectorPages) notes.push(`${vectorPages} 页保留了 PDF 原文，可选中可搜索`);
   if (textPages) notes.push(`${textPages} 页的批注文字可选中`);
