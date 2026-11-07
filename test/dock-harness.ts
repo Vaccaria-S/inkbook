@@ -2003,6 +2003,67 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
         "字号 / 字体 / 色点都带 data-mb-text-style（编辑框开着时点它们不提交）"
       );
 
+      /* ---- 侧栏字号步进：按住连调不能断（2026-11-07 修的真回归） ---- */
+      /*
+       * 侧栏每按一次步进都会 `setTextSize → emitState → updateUI →
+       * renderDynamicTools`。旧实现每次都 `empty()` 重建 `.mb-dyn`，
+       * 按钮 DOM 被换掉、旧按钮的 pointerup 永远等不到 → 连调只走一步。
+       * 现在按「结构签名」判定：字号数值变化不进签名，走就地刷新，
+       * 所以按钮节点能活过整个按住过程。
+       */
+      {
+        const plus = dyn.querySelector(".mb-size-step-add") as HTMLElement | null;
+        const minus = dyn.querySelector(".mb-size-step-sub") as HTMLElement | null;
+        pass(
+          !!plus && !!minus,
+          "侧栏有色点行最左的 −/＋ 步进按钮"
+        );
+        if (plus && minus) {
+          // 先归到一个干净起点
+          view.editor!.setTextSize(20);
+          await sleep(120);
+          const stepNodeBefore = dyn.querySelector(".mb-size-step-add") as HTMLElement;
+          const peStep = (t: string, id: number) =>
+            stepNodeBefore.dispatchEvent(
+              new PointerEvent(t, {
+                bubbles: true,
+                cancelable: true,
+                button: 0,
+                buttons: t === "pointerup" ? 0 : 1,
+                pointerId: id,
+                pointerType: "touch",
+                isPrimary: true,
+              })
+            );
+          // 按住不放：pointerdown 后等 700ms（够走 1 + 约 3 个连调步）
+          peStep("pointerdown", 401);
+          await sleep(700);
+          const held = view.editor!.textSize;
+          pass(
+            held >= 23,
+            "侧栏按住「＋」700ms 连续加：20 → " +
+              held +
+              "（应 ≥23，即至少走了 3 步）"
+          );
+          /*
+           * 关键：按住期间**按钮节点没有被重建**（对象身份不变）。
+           * 这是连调能持续的根因 —— 节点一换，pointerup 就等不到了。
+           */
+          pass(
+            (dyn.querySelector(".mb-size-step-add") as HTMLElement) === stepNodeBefore,
+            "按住期间步进按钮节点没被重建（DOM 身份不变，连调不断）"
+          );
+          peStep("pointerup", 401);
+          await sleep(200);
+          const settled = view.editor!.textSize;
+          await sleep(400);
+          pass(
+            view.editor!.textSize === settled,
+            "松手后连调停住：停在 " + settled + "（400ms 后没有再变）"
+          );
+        }
+      }
+
       // 平板：色点放大到 ≥22px 触摸目标（CSS 用 .mb-root.is-tablet 区分）
       root.classList.add("is-tablet");
       await sleep(30);

@@ -211,6 +211,19 @@ export class InkbookView extends FileView {
   private paperHost!: HTMLElement;
   private sideEl!: HTMLElement;
   private dynEl!: HTMLElement;
+  /**
+   * 侧栏「−/＋」步进按钮的停手句柄。
+   *
+   * `renderDynamicTools` 每次都会整体重建 `.mb-dyn`（`setTextSize` 也会
+   * 触发重建），旧按钮的 pointerup 等不到 → 按住中的 timer 会一路跑到底。
+   * 重建前调用这些句柄把旧的停掉。
+   */
+  private dynStepStoppers: Array<() => void> = [];
+  /**
+   * 上次建工具区用的结构签名。相同则只刷数值、不重建 DOM ——
+   * 这样按住字号步进连调时，按钮不会被换掉、连调不会断。
+   */
+  private dynToolsSig = "";
   private pageLbl!: HTMLElement;
   /** 顶栏那一行：7 支笔 + 保存/侧栏/仅阅读，全部挤在标题栏同一行 */
   private topRowEl: HTMLElement | null = null;
@@ -905,6 +918,9 @@ export class InkbookView extends FileView {
     this.sbThumbTop = 0;
     this.sideEl?.empty();
     this.toolButtons.clear();
+    // 步进按钮的连调 timer：侧栏 DOM 已拆，不停会一直往已销毁的编辑器上写
+    for (const stop of this.dynStepStoppers) stop();
+    this.dynStepStoppers = [];
     // 拖拽态要收干净：ghost / 指示线挂在 document.body 上，不随侧栏一起走
     this.cancelThumbDrag();
     this.cancelThumbPress();
@@ -1944,6 +1960,50 @@ export class InkbookView extends FileView {
     });
   }
 
+  /**
+   * 工具区的「结构签名」：只有它变了才需要重建 DOM。
+   *
+   * 刻意**不含 `textSize` 的数值、也不含「是否命中四档」** ——
+   * 两者都是 `syncDynamicValues` 能就地刷新的东西（四档高亮、
+   * 数字框显示值、is-custom 描边都是 class/属性，不涉及结构）。
+   * 放进签名会这样翻车（实测）：按住「＋」从 20 起连调，20 不是四档之一
+   * → 签名从 `preset` 跳到 `custom` → 重建 → 按住中的按钮被换掉 →
+   * timer 被停 → 连调只走一步。
+   *
+   * 签名只放**真的会改变 DOM 结构**的量：工具种类、字体、颜色、
+   * 橡皮模式、形状种类。
+   */
+  private dynToolsSignature(s: any): string {
+    if (!this.editor) return "";
+    if (s.tool === "eraser") return `eraser|${this.editor.eraserMode}`;
+    if (s.tool === "text") return `text|${s.textFont}|${s.textColor}`;
+    if (s.tool === "shape") return `shape|${(s as any).shapeKind ?? ""}|${s.penColor}`;
+    return `${s.tool}|${s.penColor}`;
+  }
+
+  /**
+   * 结构没变时就地刷新数值（不碰 DOM、不动监听）。
+   *
+   * 目前只有文字工具区需要：字号连调时四档高亮、输入框显示值、
+   * is-custom 描边要跟着变，但 DOM 结构不用动。
+   */
+  private syncDynamicValues(s: any): void {
+    const el = this.dynEl;
+    if (!el || !this.editor) return;
+    if (s.tool !== "text") return;
+    const size = Math.round(s.textSize);
+    for (const b of Array.from(el.querySelectorAll<HTMLElement>(".mb-seg-btn"))) {
+      const n = Number(b.textContent);
+      b.classList.toggle("is-active", n === size);
+    }
+    const sizeIn = el.querySelector<HTMLInputElement>(".mb-size-in");
+    if (sizeIn && document.activeElement !== sizeIn) {
+      // 用户正在这个框里打字时不要覆盖（会把光标位置冲掉）
+      sizeIn.value = String(size);
+    }
+    sizeIn?.classList.toggle("is-custom", ![14, 18, 24, 32].includes(size));
+  }
+
   private renderDynamicTools(): void {
     if (!this.editor) return;
     const s = this.editor.getState();
@@ -1953,6 +2013,30 @@ export class InkbookView extends FileView {
       if (!sec) return;
       this.dynEl = sec.createDiv("mb-dyn");
     }
+    /*
+     * **结构没变就只刷新数值，不重建 DOM**（2026-11-07 修）。
+     *
+     * 原来每次 `updateUI` 都 `empty()` 重建整块：按住「−/＋」连调时
+     * `setTextSize → emitState → updateUI → 这里重建`，按钮 DOM 被换掉、
+     * 旧按钮的 pointerup 永远等不到 → 连调只会走一步（真回归）。
+     *
+     * 现在按「工具 + 关键结构量」做签名：签名相同 → 走 `syncDynamicValues`
+     * 就地刷数值（不碰 DOM、不动事件监听），按住连调可以一直跑下去；
+     * 签名不同（切工具、四档高亮变化、字体/颜色变化等）才重建。
+     */
+    const sig = this.dynToolsSignature(s);
+    if (this.dynEl.childElementCount > 0 && sig === this.dynToolsSig) {
+      this.syncDynamicValues(s);
+      return;
+    }
+    this.dynToolsSig = sig;
+    /*
+     * 真要重建了：先停掉旧步进按钮的连调 timer。
+     * 按钮 DOM 马上被移除，按住中的 pointerup 等不到，不停的话 timer
+     * 会一路按到底（− 按到 8、＋ 按到 96）。
+     */
+    for (const stop of this.dynStepStoppers) stop();
+    this.dynStepStoppers = [];
     this.dynEl.empty();
 
     if (s.tool === "eraser") {
@@ -2105,10 +2189,17 @@ export class InkbookView extends FileView {
         });
         step.textContent = d < 0 ? "−" : "＋";
         step.title = d < 0 ? "字号 −1（按住连减）" : "字号 +1（按住连加）";
-        bindHoldStepBtn(step, () => {
-          // 每步走 editor 内的 clamp（8~96），不绕过 setTextSize
-          this.editor?.stepTextSize(d);
-        });
+        /*
+         * 侧栏这一步不进 stepBtnStoppers：`renderDynamicTools` 每次重建时
+         * 整块 `.mb-dyn` 会被换掉，旧按钮的 pointerup 等不到，
+         * 所以停手句柄要**在重建前**调用（见 renderDynamicTools 开头）。
+         */
+        this.dynStepStoppers.push(
+          bindHoldStepBtn(step, () => {
+            // 每步走 editor 内的 clamp（8~96），不绕过 setTextSize
+            this.editor?.stepTextSize(d);
+          })
+        );
       }
       for (const c of PEN_COLORS) {
         const dot = crow.createEl("button", {
@@ -2619,6 +2710,8 @@ export class InkbookView extends FileView {
      */
     const dynSec = body.createDiv("mb-sec mb-sec-dyn");
     this.dynEl = dynSec.createDiv("mb-dyn");
+    // 新建的空节点：签名要清掉，否则会误判「结构没变」而跳过首建
+    this.dynToolsSig = "";
 
     /* ---------------------------- 输入方式 ---------------------------- */
     const inputSec = body.createDiv("mb-sec");

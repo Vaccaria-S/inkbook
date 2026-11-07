@@ -727,6 +727,34 @@ async function main() {
           "连按「＋」3 次：字号正好 +3（" + before3 + " → " + ed.textSize + "，没有叠加速度）"
         );
       }
+      /*
+       * 样式条重建时必须停掉按住中的 timer（2026-11-07 修）：
+       * syncTextEditBar 每次重建都会换掉步进按钮 DOM，按住中的 pointerup
+       * 等不到 → timer 会一路按到底。这里按住「＋」不放，中途强制重建
+       * 样式条（改字号会触发 updateTextEditBar，但这里直接调 setTextSize
+       * 走完整重建路径），然后验字号不再继续涨。
+       */
+      {
+        csizeIn.value = "50";
+        csizeIn.dispatchEvent(new Event("input", { bubbles: true }));
+        await sleep(30);
+        holdStep(plusBtn!, 320);
+        await sleep(60); // 走第一步
+        // 强制重建样式条（等价于别处触发 syncTextEditBar）
+        (ed as any).syncTextEditBar?.();
+        const atRebuild = ed.textSize;
+        await sleep(700); // 超过连调的两个周期
+        pass(
+          ed.textSize === atRebuild,
+          "样式条重建后连调 timer 已停：重建时 " +
+            atRebuild +
+            " → 700ms 后 " +
+            ed.textSize +
+            "（不再继续涨）"
+        );
+        releaseStep(320);
+        await sleep(100);
+      }
       // 输入框带着 data-mb-text-style：编辑框开着时点它不能把框提交掉
       csizeIn.dispatchEvent(
         new PointerEvent("pointerdown", { bubbles: true, cancelable: true, pointerId: 93 })

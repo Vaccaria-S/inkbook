@@ -411,10 +411,12 @@ const SIZE_STEP_REPEAT_MS = 100;
  * @param btn   目标按钮
  * @param onStep 每步动作（调用方只负责「走一档」，clamp 由内部完成）
  */
-export function bindHoldStepBtn(btn: HTMLElement, onStep: () => void): void {
+export function bindHoldStepBtn(btn: HTMLElement, onStep: () => void): () => void {
   let timer: number | null = null;
   /** 是否正处在一轮按住（防止重复 pointerdown 叠加多套监听与多个 timer） */
   let holding = false;
+  /** 编辑器销毁后要彻底停手（否则 timer 会继续往已销毁的对象上写） */
+  let disposed = false;
 
   function stop(): void {
     if (timer !== null) {
@@ -438,6 +440,7 @@ export function bindHoldStepBtn(btn: HTMLElement, onStep: () => void): void {
   }
 
   const repeat = (): void => {
+    if (disposed) return;
     onStep();
     timer = window.setTimeout(repeat, SIZE_STEP_REPEAT_MS);
   };
@@ -459,6 +462,7 @@ export function bindHoldStepBtn(btn: HTMLElement, onStep: () => void): void {
     e.stopPropagation();
     /* 只认主指针：鼠标右键留给浏览器菜单 */
     if (e.pointerType === "mouse" && e.button !== 0) return;
+    if (disposed) return;
     // 上一轮还没收尾（例如 pointerup 丢在窗口外）：先收干净再重新开始
     if (holding) stop();
     holding = true;
@@ -470,6 +474,18 @@ export function bindHoldStepBtn(btn: HTMLElement, onStep: () => void): void {
     document.addEventListener("pointercancel", onCancel);
     window.addEventListener("blur", onWinBlur);
   });
+
+  /*
+   * 返回「彻底停手」句柄：编辑器 destroy 时调它。
+   *
+   * 为什么必须显式停：手指按着步进按钮的同时切文件 / 关标签页，
+   * 编辑器被销毁，但 pointerup 可能永远等不到（DOM 已拆）→
+   * timer 会一路按到底，反复对已销毁的编辑器调 setTextSize。
+   */
+  return () => {
+    disposed = true;
+    stop();
+  };
 }
 
 export class BookEditor {
@@ -579,6 +595,14 @@ export class BookEditor {
    * 只挂一份，编辑框关闭时随 commitTextEdit 一起移除。
    */
   private textEditBarEl: HTMLElement | null = null;
+  /**
+   * 样式条上「−/＋」步进按钮的停手句柄。
+   *
+   * 每次 `syncTextEditBar` 重建样式条都会新建一对，旧的在重建前调用。
+   * `destroy()` 时全部调用，否则手指按着步进按钮切文件，timer 会继续
+   * 往已销毁的编辑器上写（pointerup 可能永远等不到）。
+   */
+  private stepBtnStoppers: Array<() => void> = [];
   private pointerId: number | null = null;
   private draft: Stroke | null = null;
   private draftRec: PageRec | null = null;
@@ -1512,6 +1536,12 @@ export class BookEditor {
   private syncTextEditBar(): void {
     this.textEditBarEl?.remove();
     this.textEditBarEl = null;
+    /*
+     * 旧样式条上的步进按钮要停手：DOM 马上被移除，按住中的 pointerup
+     * 再也等不到，timer 会一路跑到底。重建前先把旧的全部停掉。
+     */
+    for (const stop of this.stepBtnStoppers) stop();
+    this.stepBtnStoppers = [];
     const ed = this.textEdit;
     // 只给"新建"用：改已有文字的框自带 .mb-textbar，不重复
     if (!ed || ed.id || !ed.rec.mounted) return;
@@ -1571,14 +1601,17 @@ export class BookEditor {
       step.title = d < 0 ? "字号 −1（按住连减）" : "字号 +1（按住连加）";
       // 编辑框开着时点它不能把框提交掉（blur 判定靠这个标记）
       step.dataset.mbTextStyle = "1";
-      bindHoldStepBtn(step, () => {
-        // setTextSize → applyTextEditStyle：实时预览 + 高亮同步
-        this.stepTextSize(d);
-        // updateTextEditBar 不敢覆盖正在输入的框；既然按了步进按钮，
-        // 说明这一格的输入已结束，主动把显示值同步成新值
-        const bi = bar.querySelector<HTMLInputElement>(".mb-tb-sizein");
-        if (bi) bi.value = String(this.textSize);
-      });
+      // 收集停手句柄：编辑器销毁时要能把按住中的 timer 停掉
+      this.stepBtnStoppers.push(
+        bindHoldStepBtn(step, () => {
+          // setTextSize → applyTextEditStyle：实时预览 + 高亮同步
+          this.stepTextSize(d);
+          // updateTextEditBar 不敢覆盖正在输入的框；既然按了步进按钮，
+          // 说明这一格的输入已结束，主动把显示值同步成新值
+          const bi = bar.querySelector<HTMLInputElement>(".mb-tb-sizein");
+          if (bi) bi.value = String(this.textSize);
+        })
+      );
       bar.appendChild(step);
     }
 
@@ -5470,6 +5503,13 @@ export class BookEditor {
      */
     this.commitTextEditNow(true);
     this.stopFling();
+    /*
+     * 停掉步进按钮的连调 timer：手指还按着按钮时切文件 / 关标签页，
+     * DOM 已拆、pointerup 可能永远等不到，不停的话 timer 会一路按到底，
+     * 反复对已销毁的编辑器调 setTextSize。
+     */
+    for (const stop of this.stepBtnStoppers) stop();
+    this.stepBtnStoppers = [];
     this.destroyed = true;
     this.uninstallEdgeSwipeGuard();
     window.removeEventListener("pointerup", this.globalUp, true);
