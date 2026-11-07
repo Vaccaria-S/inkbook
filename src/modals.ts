@@ -514,8 +514,18 @@ export class ImportRangeModal extends Modal {
       new Notice("结束页不能小于起始页", 2500);
       return;
     }
-    this.close();
+    /*
+     * **先 onDone 再 close**（2026-11-07 修）。
+     *
+     * 反过来的话，调用方若靠覆盖 `onClose` 判定「用户取消」，
+     * `close()` 会同步触发 onClose → 先被判成取消，随后的 onDone 被吞，
+     * 用户点「确认」毫无反应。导入范围弹窗正好踩了这个坑。
+     *
+     * 先回调再关窗也符合直觉：调用方拿到结果时弹窗还开着，
+     * 想接着弹下一个框（比如导入进度）不会闪一下空白。
+     */
     this.onDone(this.from, this.to);
+    this.close();
   }
 
   /** 与其他 Modal 保持一致：关闭时清空，避免复用实例时残留两套 UI */

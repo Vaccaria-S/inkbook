@@ -940,8 +940,8 @@ async function main() {
      */
     {
       const pdfFile = { path: "/test/sample.pdf", name: "sample.pdf", basename: "sample" } as any;
-      const imported = await importPdf(mockApp, pdfFile, mockFile.path, 1);
-      pass(imported.pages.length === 1, "导入 PDF：只取第 1 页（pageLimit=1）");
+      const imported = await importPdf(mockApp, pdfFile, mockFile.path, { from: 1, to: 1 });
+      pass(imported.pages.length === 1, "导入 PDF：只取第 1 页（range 1..1）");
       const pdfTexts = (imported.pages[0].texts || []).filter(
         (t) => t.source === "pdf" && (t.text || "").trim()
       );
@@ -949,6 +949,50 @@ async function main() {
         pdfTexts.length > 0,
         "导入 PDF：第 1 页抽出 " + pdfTexts.length + " 条 PDF 文字"
       );
+
+      /*
+       * 页码范围导入（2026-11-07 加 INK-163）：
+       * sample.pdf 有 20 页，导 2..4 应当正好 3 页，且底图页码是真实的
+       * PDF 页码（2/3/4），不是从 1 重新编号 —— 否则翻到那页会显示错内容。
+       */
+      {
+        const mid = await importPdf(mockApp, pdfFile, mockFile.path, { from: 2, to: 4 });
+        pass(
+          mid.pages.length === 3,
+          "范围导入 2..4：正好 3 页（实际 " + mid.pages.length + "）"
+        );
+        const pgNos = mid.pages.map((p) => p.background?.pdf?.page ?? -1);
+        pass(
+          pgNos.join(",") === "2,3,4",
+          "范围导入保留真实 PDF 页码（" + pgNos.join(",") + "，期望 2,3,4）"
+        );
+        // 越界范围要被夹住而不是抛错
+        let clamped = 0;
+        try {
+          const over = await importPdf(mockApp, pdfFile, mockFile.path, {
+            from: 19,
+            to: 999,
+          });
+          clamped = over.pages.length;
+        } catch (_) {
+          clamped = -1;
+        }
+        pass(clamped === 2, "范围导入越界被夹到末页（19..999 → 2 页，实际 " + clamped + "）");
+        /*
+         * 起止颠倒 → 明确报错，**不静默导整本**（2026-11-07 改）：
+         * 用户只想要 3 页却因为写反了拿到 300 页，比报个错难收拾。
+         */
+        let revThrew = "";
+        try {
+          await importPdf(mockApp, pdfFile, mockFile.path, { from: 5, to: 2 });
+        } catch (e: any) {
+          revThrew = String(e?.message || e);
+        }
+        pass(
+          revThrew.includes("页码范围不合法"),
+          "范围导入起止颠倒 → 明确报错而不是静默导整本（" + revThrew + "）"
+        );
+      }
 
       const importedBook = createBook("数学", "grid", "white");
       importedBook.pages = imported.pages;
@@ -1024,7 +1068,7 @@ async function main() {
       const e2eApp = { vault } as any;
 
       const pdfFile = { path: "/test/sample.pdf", name: "sample.pdf", basename: "sample" } as any;
-      const imported = await importPdf(e2eApp, pdfFile, mockFile.path, 1);
+      const imported = await importPdf(e2eApp, pdfFile, mockFile.path, { from: 1, to: 1 });
       const pdfTexts = (imported.pages[0].texts || []).filter(
         (t) => t.source === "pdf" && (t.text || "").trim()
       );

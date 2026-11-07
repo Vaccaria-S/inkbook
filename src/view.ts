@@ -37,7 +37,7 @@ import {
   ImportSourceModal,
   ImportRangeModal,
 } from "./modals";
-import { importPdf, importWord } from "./importer";
+import { humanBytes, importPdf, importWord, peekPdf } from "./importer";
 import { ExportCancelledError, exportBookPdf, exportPagePng } from "./export";
 
 export const VIEW_TYPE = "inkbook-view";
@@ -100,6 +100,15 @@ const TOOLS_NEED_SIDE = new Set<ToolId>(["text", "eraser", "shape"]);
  */
 const PAGE_GRID_OVERSCAN_ROWS = 2;
 const PAGE_GRID_FULL_ROWS = 24;
+
+/**
+ * 导入 PDF 时，页数超过这个值才弹「选页码范围」。
+ *
+ * 小文档（≤20 页）弹一次范围选择纯属打断，直接整本导入更顺手；
+ * 大文档（教材、扫描件）往往有几百页，全导进来本子会变得很长，
+ * 而用户通常只想要前几十页。
+ */
+const IMPORT_RANGE_THRESHOLD = 20;
 /**
  * 滚出窗口的缩略图条目回收池上限。
  *
@@ -180,6 +189,54 @@ function conflictStamp(d: Date): string {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(
     d.getMinutes()
   )}`;
+}
+
+/**
+ * 把导入时的异常翻译成用户能看懂的话（2026-11-07 修 INK-164）。
+ *
+ * pdf.js 抛的是英文原文，直接弹给用户就是
+ * 「导入失败：No password given」/「Invalid PDF structure」——
+ * 用户不知道该怎么办。这里按关键词映射成中文，认不出来的保留原文
+ * （总比吞掉好，至少能贴给我排查）。
+ */
+function describeImportError(e: any): string {
+  const raw = String((e && e.message) || e || "").trim();
+  const low = raw.toLowerCase();
+  if (!raw) return "未知错误";
+  // 加密 / 需要密码
+  if (
+    low.includes("password") ||
+    low.includes("encrypted") ||
+    (e && e.name === "PasswordException")
+  ) {
+    return "这个 PDF 有密码，墨本打不开。请先用其他工具去掉密码再导入。";
+  }
+  // 结构损坏 / 不是 PDF
+  if (
+    low.includes("invalid pdf") ||
+    low.includes("invalidpdf") ||
+    low.includes("structure") ||
+    (e && e.name === "InvalidPDFException")
+  ) {
+    return "文件损坏或不是有效的 PDF。";
+  }
+  // 缺少 PDF 头（常见于改了扩展名的文件）
+  if (low.includes("missing pdf") || low.includes("missingpdf")) {
+    return "这不是 PDF 文件（可能只是改了扩展名）。";
+  }
+  // 读取失败（文件被移动 / 权限 / 同步中）
+  if (
+    low.includes("unexpected server response") ||
+    low.includes("failed to fetch") ||
+    low.includes("network") ||
+    low.includes("not found") ||
+    low.includes("enoent") ||
+    low.includes("no such file")
+  ) {
+    return "读不到这个文件。确认它还在库里、没有正在同步，然后重试。";
+  }
+  // 认不出来就保留原文（中文原样，英文也留着便于贴给我排查）
+  return raw;
 }
 
 export interface InkbookPluginLike {
@@ -2410,36 +2467,126 @@ export class InkbookView extends FileView {
   }
 
   /**
-   * 导入流程：选源文档 → 选页码范围 → 导入 → 插入。
+   * 选源文档之后、真正导入之前：问一下页码范围。
    *
-   * PDF 是按需渲染的，所以导入只是建立页码映射——瞬时完成。
-   * 真正的渲染推迟到翻到那一页时，不会卡住界面。
+   * **只在 PDF 页数多的时候问**（2026-11-07 加 INK-163）：
+   * 小文档（≤ 20 页）弹一次「选范围」纯属打断，直接整本导入。
+   * 大文档才给选择 —— 300 页的 PDF 全导进来，本子会变得很长，
+   * 而用户往往只想要前几十页。
+   *
+   * 页数要先打开 PDF 才知道（pdf.js 只读目录，很快），所以这里
+   * 先 `peekPdf` 读页数（顺带拿到已打开的 doc 复用），再决定弹不弹。
    */
   private async runImport(kind: "pdf" | "word", file: TFile): Promise<void> {
-    if (!this.store || !this.file) return;
     /*
-     * 记下「开始导入时的本子」（2026-11-07 修）：
-     * 抽 300 页文字要几十秒，这期间用户完全可能切到另一个本子。
-     * 老代码 await 之后直接用 `this.store` / `this.file` —— 那已经是
-     * **新本子**了，于是几百页被插进新本子并落盘（新本还没加载完时
-     * this.store 为 null，直接抛错）。两本都遭殃。
+     * 在**最开始**就把「目标本子」记下来（2026-11-07 修）。
+     * 后面要 await 读页数、等用户选范围 —— 这期间用户可能切本子。
+     * 如果等到 doImport 才记，切本子后捕获到的就是新本子，
+     * 于是几百页被导进新本（或者新本还没加载完、this.store 为 null 直接抛错）。
      */
     const startFile = this.file;
     const startStore = this.store;
+    if (!startFile || !startStore) return;
+    let range: { from: number; to: number } | undefined;
+    /*
+     * 只打开一次 PDF：`peekPdf` 返回已打开的 doc，直接交给 `doImport`
+     * 复用 —— 几十 MB 的 PDF 没必要为了「读页数」再读一遍。
+     */
+    let preopened: any = null;
+    if (kind === "pdf") {
+      const peeked = await peekPdf(this.app, file);
+      preopened = peeked.doc;
+      const total = peeked.total;
+      if (total > IMPORT_RANGE_THRESHOLD) {
+        /*
+         * 等用户选范围。
+         *
+         * 取消判定的写法要小心：真实 Obsidian 的 `Modal.close()` 会
+         * **同步**调用 `onClose()`。所以用「确认标志」而不是靠时序 ——
+         * `onDone` 先跑（`finish()` 已改成先回调再 close），
+         * `onClose` 时若没确认过才当取消。
+         *
+         * （`test/dist-harness.ts` 的 Modal.close 不调 onClose，
+         * 自动测试测不出这类时序问题，所以这里逻辑要自己站得住。）
+         */
+        let confirmed = false;
+        const picked = await new Promise<{ from: number; to: number } | null>((resolve) => {
+          let settled = false;
+          const done = (v: { from: number; to: number } | null) => {
+            if (settled) return;
+            settled = true;
+            resolve(v);
+          };
+          const modal = new ImportRangeModal(this.app, "pdf", total, (from, to) => {
+            confirmed = true;
+            done({ from, to });
+          });
+          const origClose = modal.onClose.bind(modal);
+          modal.onClose = () => {
+            origClose();
+            if (!confirmed) done(null); // 没确认就关窗 = 用户取消
+          };
+          modal.open();
+        });
+        if (!picked) {
+          // 用户取消：把已经打开的 doc 释放掉，别让它挂着
+          try {
+            await preopened?.destroy();
+          } catch (_) {
+            /* 释放失败无所谓 */
+          }
+          return;
+        }
+        range = picked;
+      }
+    }
+    await this.doImport(kind, file, range, preopened, startFile, startStore);
+  }
+
+  /**
+   * 真正干活的那一段（`runImport` 选完范围后调）。
+   */
+  private async doImport(
+    kind: "pdf" | "word",
+    file: TFile,
+    range: { from: number; to: number } | undefined,
+    /** `peekPdf` 已打开的文档：复用，不再读第二遍（本函数负责释放） */
+    preopened: any,
+    /** 开始导入时的本子（由 `runImport` 在 await 之前捕获） */
+    startFile: TFile,
+    startStore: BookStore
+  ): Promise<void> {
+    if (!startStore || !startFile) return;
     const notice = new Notice(
       kind === "pdf" ? "正在读取 PDF…" : "正在解析 Word…",
       0
     );
     try {
       const bookPath = startFile.path;
+      /*
+       * 进度分两个阶段显示（2026-11-07 修 INK-165）：
+       *   · loading —— pdf.js 在读文件，数字是**字节**，显示成 MB；
+       *   · pages   —— 在建页抽文字，数字是**页数**。
+       * 老代码把两者都当页数，于是出现「正在读取 PDF：52428800/69500000 页」。
+       */
+      const onProg = (phase: "loading" | "pages", done: number, total: number) => {
+        if (phase === "loading") {
+          notice.setMessage(
+            total > 0
+              ? `正在读取 PDF：${humanBytes(done)} / ${humanBytes(total)}`
+              : `正在读取 PDF：${humanBytes(done)}`
+          );
+        } else if (total > 0) {
+          notice.setMessage(`正在处理第 ${done}/${total} 页…`);
+        } else {
+          // 总数未知（Word 是流式分页）：只报已完成多少，别显示「N/N」装成满了
+          notice.setMessage(`已生成 ${done} 页…`);
+        }
+      };
       const result =
         kind === "pdf"
-          ? await importPdf(this.app, file, bookPath, 0, (done, total) => {
-              notice.setMessage(`正在读取 PDF：${done}/${total} 页`);
-            })
-          : await importWord(this.app, file, bookPath, (done, total) => {
-              notice.setMessage(`正在生成页面：${done}/${total} 页`);
-            });
+          ? await importPdf(this.app, file, bookPath, range, onProg, true, preopened)
+          : await importWord(this.app, file, bookPath, onProg);
 
       /*
        * 导入期间用户切了本子 / 关了本子 → 丢弃这次结果，别插进别的本子。
@@ -2487,7 +2634,7 @@ export class InkbookView extends FileView {
       setTimeout(() => notice.hide(), 2500);
     } catch (e: any) {
       notice.hide();
-      new Notice("导入失败：" + (e && e.message ? e.message : e), 8000);
+      new Notice("导入失败：" + describeImportError(e), 8000);
       console.error("[inkbook] 导入失败", e);
     }
   }
