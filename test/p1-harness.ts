@@ -10,6 +10,12 @@
  */
 import { InkbookView } from "../src/view";
 import { createBook, createPage, DEFAULT_SETTINGS, type InkBook, type Stroke } from "../src/types";
+import {
+  isIndexPageFileName,
+  isLegacyIndexPageName,
+  removeTextIndex,
+  writeTextIndex,
+} from "../src/indexer";
 
 const lines: string[] = [];
 const out = document.getElementById("out")!;
@@ -1954,6 +1960,208 @@ async function P173() {
   v6.containerEl.remove();
 }
 
+/* ==================== INK-176：文字索引四条修复 ==================== */
+
+/**
+ * 独立的内存 vault 桩：所有写/删/列表都记在 Map 里。
+ * 故意做成可配置的（list / rmdir / 故障注入），四条修复都要靠它造边界。
+ */
+function makeIndexVault(opts: { withList?: boolean; unregistered?: boolean } = {}) {
+  const disk = new Map<string, string>();
+  const table = new Map<string, any>();
+  const rmdirCalls: string[] = [];
+  const withList = opts.withList !== false;
+  const mk = (p: string, text: string) => {
+    disk.set(p, text);
+    table.set(p, { path: p, extension: p.split(".").pop() });
+  };
+  const adapter: any = {
+    // 目录只要有子文件就算存在（真实适配器语义；桩里没有单独的目录条目）
+    exists: async (p: string) =>
+      disk.has(p) || Array.from(disk.keys()).some((k) => k.startsWith(p + "/")),
+    read: async (p: string) => disk.get(p) ?? "",
+    write: async (p: string, d: string) => void disk.set(p, d),
+    mkdir: async (p: string) => void table.set(p, { path: p, type: "folder" }),
+    remove: async (p: string) => {
+      disk.delete(p);
+      table.delete(p);
+    },
+    rmdir: async (p: string, recursive: boolean) => {
+      rmdirCalls.push(p + (recursive ? " (recursive)" : ""));
+      for (const k of Array.from(disk.keys())) if (k.startsWith(p + "/")) disk.delete(k);
+      table.delete(p);
+    },
+    list: withList
+      ? async (p: string) => ({
+          files: Array.from(disk.keys()).filter((k) => k.startsWith(p + "/")),
+          folders: [],
+        })
+      : undefined,
+  };
+  if (!withList) delete adapter.list;
+  const vault: any = {
+    adapter,
+    getAbstractFileByPath: (p: string) => table.get(p) || null,
+    createFolder: async (p: string) => {
+      // 故障态：目录在磁盘上已存在，createFolder 抛「已存在」且不补登记
+      if (opts.unregistered) throw new Error("Folder already exists.");
+      table.set(p, { path: p, type: "folder" });
+      return table.get(p);
+    },
+    create: async (p: string, d: string) => {
+      mk(p, d);
+      return table.get(p);
+    },
+    modify: async (f: any, d: string) => void disk.set(f.path, d),
+    delete: async (f: any) => {
+      disk.delete(f.path);
+      table.delete(f.path);
+    },
+  };
+  return { disk, table, adapter, vault, rmdirCalls, mk, app: { vault } as any };
+}
+
+function indexBook(texts: string[]): InkBook {
+  const b = createBook("索引修复", "blank", "white");
+  b.pages = texts.map((t) => {
+    const p = createPage("blank", "white");
+    p.texts = t ? [{ id: "t", source: "user", x: 10, y: 20, size: 14, text: t } as any] : [];
+    return p;
+  });
+  return b;
+}
+const idxFile = (p: string) =>
+  ({ path: p, basename: p.split("/").pop()!.replace(/\.inkbook$/i, ""), parent: { path: "" } } as any);
+
+/** S1：改名竞态 —— remove 必须排在旧 key 的单飞链尾部 */
+async function S1() {
+  const v = makeIndexVault();
+  const f = idxFile("旧名.inkbook");
+  const book = indexBook(["旧内容"]);
+  /*
+   * 造出「旧链上还有一轮在途写入」：新文件走的是 vault.create，
+   * 所以把闸门挂在那儿（挂 adapter.write 会拦不到，测试变成假绿）。
+   */
+  const origCreate = v.vault.create;
+  const origDelete = v.vault.delete;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  let writesDone = 0;
+  let removeStartedAfterWrites = false;
+  v.vault.create = async (p: string, d: string) => {
+    await gate; // 在途窗口：这一轮已经进了链、但还没写第一个索引页
+    const r = await origCreate(p, d);
+    writesDone += 1;
+    return r;
+  };
+  // 索引页已登记进文件表，removeIndexFile 走的是 vault.delete
+  v.vault.delete = async (f: any) => {
+    removeStartedAfterWrites = writesDone > 0;
+    return origDelete(f);
+  };
+  const writing = writeTextIndex(v.app, f, book, { notify: false });
+  // 在途写入还没结束时「改名」：remove 必须排在旧链的尾部
+  const fNew = idxFile("新名.inkbook");
+  const removing = removeTextIndex(v.app, fNew, "旧名.inkbook");
+  release();
+  await writing;
+  await removing;
+  const oldDir = "旧名.墨本索引/";
+  const left = Array.from(v.disk.keys()).filter((k) => k.startsWith(oldDir));
+  pass(writesDone > 0, "S1 改名竞态：在途写入确实跑完了（" + writesDone + " 次）");
+  pass(
+    removeStartedAfterWrites,
+    "S1 改名竞态：删除发生在在途写入完成之后（排队生效，没抢跑）"
+  );
+  pass(
+    left.length === 0,
+    "S1 改名竞态：旧目录的索引页被删干净，不会被在途写入重建（残留 " + left.length + " 个）"
+  );
+  pass(
+    !v.disk.has("旧名.墨本文字.md"),
+    "S1 改名竞态：旧版单文件索引也一并清掉"
+  );
+}
+
+/** S2：rmdir 前先 list 校验，目录里有外来文件就不敢删 */
+async function S2() {
+  // 造「磁盘上有目录，但文件表里没有」的故障态（createFolder 会抛已存在）
+  const v = makeIndexVault({ unregistered: true });
+  const dir = "外来文件.墨本索引";
+  v.disk.set(dir, ""); // adapter.exists(dir) 要为真
+  v.disk.set(dir + "/外来文件 · 第 1 页.md", "# 索引页");
+  v.disk.set(dir + "/我的笔记.md", "用户自己放的内容，不能删");
+  const before = notices.length;
+  const ok = await writeTextIndex(v.app, idxFile("外来文件.inkbook"), indexBook(["字"]), { notify: false });
+  pass(
+    v.disk.has(dir + "/我的笔记.md"),
+    "S2 rmdir 校验：目录里有不认识的文件时，用户文件没被删"
+  );
+  pass(v.rmdirCalls.length === 0, "S2 rmdir 校验：这种情况根本没调 rmdir（递归删除）");
+  pass(notices.length > before, "S2 rmdir 校验：明确弹了提示，没有静默跳过");
+
+  // 对照组：全是我们的命名 → 允许递归删掉重建
+  const v2 = makeIndexVault({ unregistered: true });
+  const dir2 = "纯索引.墨本索引";
+  v2.disk.set(dir2, "");
+  v2.disk.set(dir2 + "/纯索引 · 第 1 页.md", "# 索引页");
+  v2.disk.set(dir2 + "/第 2 页.md", "# 旧命名索引页");
+  await writeTextIndex(v2.app, idxFile("纯索引.inkbook"), indexBook(["字"]), { notify: false });
+  pass(v2.rmdirCalls.length === 1, "S2 对照组：全是索引命名时照常 rmdir 重建");
+  pass(isIndexPageFileName("纯索引 · 第 9 页.md"), "S2 命名识别：新命名算我们的索引文件");
+  pass(isIndexPageFileName("第 3 页.md"), "S2 命名识别：旧命名也算我们的索引文件");
+  pass(!isIndexPageFileName("我的笔记.md"), "S2 命名识别：外来文件不算");
+  pass(isLegacyIndexPageName("第 3 页.md"), "S2 命名识别：isLegacyIndexPageName 与判据一致");
+}
+
+/** S3：缺 adapter.list 时按页码逐个探测删除 */
+async function S3() {
+  const v = makeIndexVault({ withList: false });
+  const f = idxFile("无list.inkbook");
+  const dir = "无list.墨本索引";
+  // 3 页 → 只留 1 页有字，旧的 2/3 页索引必须被探测删掉
+  const r1 = await writeTextIndex(v.app, f, indexBook(["甲", "乙", "丙"]), { notify: false });
+  pass(r1.ok && r1.pages === 3, "S3 无 list：3 页都能写出索引");
+  const r2 = await writeTextIndex(v.app, f, indexBook(["甲", "", ""]), { notify: false });
+  pass(r2.ok && r2.pages === 1, "S3 无 list：第 2/3 页文字清空后只剩 1 个索引");
+  pass(
+    !v.disk.has(dir + "/无list · 第 2 页.md") && !v.disk.has(dir + "/无list · 第 3 页.md"),
+    "S3 无 list：被清空的第 2/3 页旧索引页确实删掉了（全局搜索不会命中旧字）"
+  );
+  pass(v.disk.has(dir + "/无list · 第 1 页.md"), "S3 无 list：仍有文字的第 1 页没被误删");
+  // 旧命名残留也要能探测删掉（页码在本子页数范围内）
+  v.disk.set(dir + "/第 3 页.md", "# 旧命名残留");
+  await writeTextIndex(v.app, f, indexBook(["甲"]), { notify: false });
+  pass(!v.disk.has(dir + "/第 3 页.md"), "S3 无 list：旧命名残留页也被探测删掉");
+}
+
+/** S4：失败 Notice 节流按归一化 key，多本/多页失败不刷屏 */
+async function S4() {
+  const v = makeIndexVault();
+  const before = notices.length;
+  // 三本不同的本子、同样的 ENOSPC：文案各不相同（含本子名），但只该弹一次
+  const bad = (name: string) => {
+    // 两条写入路径都堵死：create 失败会退回 adapter.write，必须也抛才能走到失败 Notice
+    v.vault.create = async () => {
+      throw new Error("ENOSPC: no space left on device");
+    };
+    v.adapter.write = async () => {
+      throw new Error("ENOSPC: no space left on device");
+    };
+    return writeTextIndex(v.app, idxFile(name + ".inkbook"), indexBook(["字"]));
+  };
+  const r1 = await bad("甲本");
+  const r2 = await bad("乙本");
+  const r3 = await bad("丙本");
+  const emitted = notices.slice(before).filter((n) => n.includes("文字索引生成失败"));
+  pass(!r1.ok && !r2.ok && !r3.ok, "S4 节流：三本索引都失败了");
+  pass(emitted.length === 1, "S4 节流：同类错误（不同本子名）60 秒内只弹 1 条（实际 " + emitted.length + " 条）");
+  pass(
+    emitted[0]?.includes("甲本") && emitted[0]?.includes("ENOSPC"),
+    "S4 节流：提示里仍保留本子名与原始错误，便于排查"
+  );
+}
+
 const CASES: Array<[string, () => Promise<void>]> = [
   ["A1+A2", A12],
   ["A3", A3],
@@ -1980,6 +2188,10 @@ const CASES: Array<[string, () => Promise<void>]> = [
   ["P173 缩放/滚动恢复", P173],
   ["Q174 改名后写新路径", Q174],
   ["R174 抢救标记不吞第二次", R174],
+  ["S1 改名竞态 remove 入链", S1],
+  ["S2 rmdir 递归删校验", S2],
+  ["S3 无 list 探测删旧页", S3],
+  ["S4 索引失败 Notice 节流", S4],
 ];
 
 async function main() {

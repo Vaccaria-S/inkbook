@@ -236,6 +236,16 @@ export default class InkbookPlugin extends Plugin {
         if (oldPath && isBook(f)) {
           void (async () => {
             try {
+              /*
+               * 必须 await，且必须传 oldPath（INK-176）。
+               *
+               * removeTextIndex 内部会排到 `oldPath` 那条单飞链的**尾部**：
+               * 改名时旧本子可能还有一轮 writeTextIndexNow 在半途，它写的正是
+               * 旧目录。删得太早，那轮写完会把旧目录的 md 重建回来，之后再无
+               * 事件清理 → 搜索结果残留旧本子名、点开报「找不到这本手写本」。
+               * 排队 + await 保证「旧链的活全干完 → 删干净 → 再建新索引」。
+               * 别把这里的 await 改成 void，也别省掉 oldPath。
+               */
               await removeTextIndex(this.app, f, oldPath);
               /*
                * **立刻重建新索引**（2026-11-07 补）。

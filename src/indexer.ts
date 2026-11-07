@@ -47,6 +47,20 @@ export function isLegacyIndexPageName(name: string): boolean {
   return LEGACY_PAGE_FILE_RE.test(name);
 }
 
+/**
+ * 这个名字是不是**我们生成的**索引文件（新旧两种命名都算）。
+ *
+ * ensureDir 要「删掉未登记的旧目录重建」时用它逐项核对：
+ * `adapter.rmdir(dir, true)` 会递归删掉整目录，判据不能只是目录名后缀——
+ * 用户可能往 `.墨本索引/` 里放过自己的笔记。任何一个不认识的文件都要
+ * 让整次递归删除作罢（INK-176）。
+ *
+ * 导出来给测试直接断言，避免「识别逻辑」和「删除判据」各写一份而漂移。
+ */
+export function isIndexPageFileName(name: string): boolean {
+  return PAGE_FILE_RE.test(name) || LEGACY_PAGE_FILE_RE.test(name);
+}
+
 /** 单页最多索引这么多字符（约 200 行中文），超出截断 */
 const MAX_PAGE_CHARS = 12000;
 
@@ -214,8 +228,10 @@ function hasFileTable(vault: VaultLike | undefined): vault is VaultLike {
  * 但 Obsidian 的 `Vault.addChild` 找不到父目录，文件不会挂进 `vault.getFiles()`
  * 那棵树——全局搜索永远 0 结果，而且不报任何错。
  *
- * 索引全是派生数据，所以这里直接删掉未登记的旧目录，再用 `createFolder`
- * 建一个会被登记的。删不掉才退回裸建（最终校验会把它报出来）。
+ * 索引全是派生数据，所以这里删掉未登记的旧目录，再用 `createFolder`
+ * 建一个会被登记的。但**只删确认过的索引目录**：`rmdir(dir, true)` 是递归删，
+ * 目录里若有用户自己的文件，绝不能跟着一起没。删不掉/不敢删就退回裸建
+ * 并给用户一条提示（最终校验也会把「进不了文件表」报出来）。
  */
 async function ensureDir(vault: VaultLike, adapter: AdapterLike, dir: string): Promise<void> {
   if (hasFileTable(vault)) {
@@ -235,18 +251,41 @@ async function ensureDir(vault: VaultLike, adapter: AdapterLike, dir: string): P
       /*
        * 走到这里：目录在磁盘上，文件表里却没有。createFolder 对已存在目录
        * 只会失败、不会补登记，必须把旧目录删掉重建。
+       *
+       * ### 递归删除前的三项校验（INK-176）
+       *
+       * 老实现只判 `dir.endsWith(".墨本索引")` 就 `rmdir(dir, true)`：
+       * 目录是用户可写的位置，里面若被放过自己的笔记/图片，会被静默一并删掉。
+       *   1. 目录名后缀 + 非空前缀（防误把根目录当索引目录）；
+       *   2. `list(dir)` 必须拿得到，且没有子文件夹；
+       *   3. 每个文件的名字都必须是我们的索引命名（新旧两版）。
+       * 任何一条不满足就不删，退回裸建，并明确告诉用户「搜索可能搜不到」。
        */
       if (
         typeof adapter.rmdir === "function" &&
+        typeof adapter.list === "function" &&
         dir.length > INDEX_DIR_SUFFIX.length &&
         dir.endsWith(INDEX_DIR_SUFFIX)
       ) {
         try {
           if (await adapter.exists(dir)) {
-            await adapter.rmdir(dir, true);
-            await vault.createFolder(dir);
-            await new Promise((r) => setTimeout(r, 0));
-            if (vault.getAbstractFileByPath(dir)) return;
+            const listed = await adapter.list(dir);
+            const names = (listed?.files || []).map((p) => p.split("/").pop() || "");
+            const folders = listed?.folders || [];
+            const unknown = names.filter((n) => !isIndexPageFileName(n));
+            if (folders.length === 0 && unknown.length === 0) {
+              await adapter.rmdir(dir, true);
+              await vault.createFolder(dir);
+              await new Promise((r) => setTimeout(r, 0));
+              if (vault.getAbstractFileByPath(dir)) return;
+            } else {
+              // 不敢删：别静默，让用户知道搜索可能受影响
+              notifyIndexIssue(
+                `unknown-dir|${dir}`,
+                `索引目录「${dir}」里有不是墨本生成的文件（${unknown.slice(0, 3).join("、") || "子文件夹"}），` +
+                  `墨本没有动它；全局搜索可能搜不到这本本子的文字。`
+              );
+            }
           }
         } catch (_) {
           /* 修不好就退回下面的裸建；最终校验会把"进不了文件表"报给用户 */
@@ -385,29 +424,57 @@ async function removeIndexFile(
 }
 
 /**
- * 索引失败时给用户看的提示。
+ * 文字索引相关的提示（失败、可疑目录）。
  *
  * 为什么不能只 console.warn：真机上没人看控制台，索引写不出来时用户
  * 看到的只是「全局搜索永远搜不到本子里的文字」。
  *
  * 为什么不能报成「保存失败」：索引是派生物，本子已经正常落盘。
- * 自动保存会反复触发索引失败，同一句原因 60 秒内只提示一次，避免刷屏。
+ * 自动保存会反复触发索引失败，同一类原因 60 秒内只提示一次，避免刷屏。
+ *
+ * ### 节流不能拿整条文案当 key（INK-176）
+ *
+ * 老写法比对整个 msg，而 msg 里含本子名、阶段、页码、具体路径：
+ * 多本同时失败、或每次失败的页码不一样时，每条 msg 都不同 → 60s 节流
+ * 完全失效，自动保存每 10s 弹一条 10s Notice，把屏幕刷满。
+ * 改成调用方传一个**归一化 key**（如 `write|ENOSPC`、`unknown-dir|路径`），
+ * 文案里仍然保留细节供展示。
  */
-let lastFailureNoticeAt = 0;
-let lastFailureNoticeText = "";
+const INDEX_NOTICE_WINDOW_MS = 60_000;
+const lastIndexNoticeAt = new Map<string, number>();
 
-function notifyTextIndexFailure(reason: string): void {
-  const msg = `文字索引生成失败：${reason}；全局搜索可能搜不到本子里的文字（本子本身不受影响）。`;
+function notifyIndexIssue(key: string, msg: string): void {
   const now = Date.now();
-  if (msg === lastFailureNoticeText && now - lastFailureNoticeAt < 60_000) return;
-  lastFailureNoticeAt = now;
-  lastFailureNoticeText = msg;
+  const last = lastIndexNoticeAt.get(key) ?? 0;
+  if (now - last < INDEX_NOTICE_WINDOW_MS) return;
+  lastIndexNoticeAt.set(key, now);
+  // Map 只存有限的几类 key，顺手清掉过期的，别随错误种类无限增长
+  for (const [k, at] of lastIndexNoticeAt) {
+    if (now - at >= INDEX_NOTICE_WINDOW_MS) lastIndexNoticeAt.delete(k);
+  }
   try {
     new Notice(msg, 10000);
   } catch (_) {
     // 极少数测试桩没有 Notice：至少把原因留在控制台
     console.warn("[inkbook] " + msg);
   }
+}
+
+/** 失败原因归一化：同类错误（不同本子 / 不同页码）共用一个节流 key */
+function indexFailureKey(e: unknown): string {
+  const raw = describeError(e).toLowerCase();
+  if (raw.includes("enospc") || raw.includes("no space") || raw.includes("quota")) return "disk-full";
+  if (raw.includes("eacces") || raw.includes("eperm") || raw.includes("permission")) return "denied";
+  if (raw.includes("enoent") || raw.includes("not found") || raw.includes("no such file")) return "missing";
+  if (raw.includes("文件表")) return "not-registered";
+  return raw.slice(0, 80) || "unknown";
+}
+
+function notifyTextIndexFailure(reason: string, key: string): void {
+  notifyIndexIssue(
+    `write|${key}`,
+    `文字索引生成失败：${reason}；全局搜索可能搜不到本子里的文字（本子本身不受影响）。`
+  );
 }
 
 function describeError(e: unknown): string {
@@ -465,6 +532,27 @@ export interface TextIndexResult {
 const indexWriteChain = new Map<string, Promise<unknown>>();
 
 /**
+ * 把一个任务排到某本本子的链尾，返回它的结果。
+ *
+ * 写索引与**删索引**都必须走这里（INK-176）：改名时 `removeTextIndex`
+ * 若不排队，旧 key 上还在半途的 `writeTextIndexNow` 会在删除之后把旧目录
+ * 的 md 重建回来，之后再没有事件清理 → 搜索里残留旧本子名、点开报
+ * 「找不到这本手写本」。排到同一条链上，删除就必然发生在那轮写完之后。
+ *
+ * 链尾跑完清掉自己，避免 Map 随本子数量无限增长；前一轮失败也照样往下跑。
+ */
+function enqueueIndexTask<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const prev = indexWriteChain.get(key) ?? Promise.resolve();
+  const run = prev.then(task, task);
+  const tail = run.catch(() => undefined);
+  indexWriteChain.set(key, tail);
+  void tail.then(() => {
+    if (indexWriteChain.get(key) === tail) indexWriteChain.delete(key);
+  });
+  return run;
+}
+
+/**
  * 写索引：有文字的页各写一个文件，清掉多余的旧页与旧版单文件。
  *
  * **永不抛异常**：索引是附属品，不能因为它坏了就把「保存成功」报成失败。
@@ -480,19 +568,7 @@ export function writeTextIndex(
   opts: { notify?: boolean } = {}
 ): Promise<TextIndexResult> {
   const key = file.path || file.basename || "?";
-  const prev = indexWriteChain.get(key) ?? Promise.resolve();
-  // 无论前一轮成功失败都接着往下跑（失败不该卡死后续索引）
-  const run = prev.then(
-    () => writeTextIndexNow(app, file, book, opts),
-    () => writeTextIndexNow(app, file, book, opts)
-  );
-  const tail = run.catch(() => undefined);
-  indexWriteChain.set(key, tail);
-  // 链尾跑完就清掉，避免 Map 随本子数量无限增长
-  void tail.then(() => {
-    if (indexWriteChain.get(key) === tail) indexWriteChain.delete(key);
-  });
-  return run;
+  return enqueueIndexTask(key, () => writeTextIndexNow(app, file, book, opts));
 }
 
 /** 真正干活的那一轮（由 `writeTextIndex` 串行调度） */
@@ -540,6 +616,31 @@ async function writeTextIndexNow(
         if (!PAGE_FILE_RE.test(name)) continue;
         if (!wanted.has(p)) await removeIndexFile(vault, adapter, p);
       }
+    } else {
+      /*
+       * 没有 `adapter.list`（测试桩 / 某些移动适配器）：老实现整段清理被跳过，
+       * 某页文字清空或删页后旧索引页永远留着 → 全局搜索命中已删掉的文字。
+       * 逐个 exists 探测 1..上界，把不在 wanted 里的（含旧命名）删掉。
+       * 上界 = max(当前页数, wanted 里最大页码, 上次页数 + 余量)：
+       * 本子从 100 页缩到 3 页时，没有 list 就无法知道曾经有多少页，
+       * 多探一段余量（最多 32 页）能覆盖常见的「删了几页」，成本可控。
+       * 极端残留（比如从 857 页缩到 3 页）仍需要走有 list 的适配器或重建索引命令。
+       */
+      let maxPage = book.pages.length;
+      for (const p of wanted) {
+        const m = p.match(/第 (\d+) 页\.md$/);
+        if (m) maxPage = Math.max(maxPage, Number(m[1]) || 0);
+      }
+      maxPage += 32; // 余量覆盖「删了几页」；再高的残留只能靠有 list 的适配器或重建索引命令
+      for (let pageNo = 1; pageNo <= maxPage; pageNo += 1) {
+        stage = `清理旧索引（探测第 ${pageNo} 页）`;
+        const candidates = [indexPagePath(file, pageNo), `${dir}/第 ${pageNo} 页.md`];
+        for (const p of candidates) {
+          if (wanted.has(p)) continue;
+          if (await adapter.exists(p)) await removeIndexFile(vault, adapter, p);
+        }
+      }
+      stage = "清理旧索引";
     }
 
     // 旧方案留下的一本一个大 md：迁移时删掉，免得搜索结果里出现两份
@@ -556,7 +657,8 @@ async function writeTextIndexNow(
     const reason = `${stage}时失败：${describeError(e)}`;
     console.warn("[inkbook] 写文字索引失败（不影响本子保存）", e);
     if (opts.notify !== false) {
-      notifyTextIndexFailure(`${file.basename || "未命名"}（${reason}）`);
+      // 文案带本子名/阶段/页码方便排查，但节流 key 只按错误类型算，避免刷屏
+      notifyTextIndexFailure(`${file.basename || "未命名"}（${reason}）`, indexFailureKey(e));
     }
     return { ok: false, pages: wanted.size, error: reason };
   }
@@ -570,32 +672,45 @@ async function writeTextIndexNow(
  * 于是搜索结果里留着旧本子名，点开报「找不到这本手写本」。
  * 所以 rename 必须把 oldPath 传进来，按旧路径算目录。
  */
-export async function removeTextIndex(
+export function removeTextIndex(
   app: App,
   file: TFile,
   oldPath?: string
 ): Promise<void> {
-  const vault = app.vault as unknown as VaultLike;
-  const adapter = (vault.adapter || (app.vault.adapter as unknown as AdapterLike));
-  try {
-    // 用一个「路径伪装成 TFile」的对象复用 dirOf/baseOf/indexDirFor
-    const target = oldPath
-      ? ({
-          path: oldPath,
-          basename: oldPath.split("/").pop()!.replace(/\.inkbook$/i, ""),
-          parent: { path: oldPath.includes("/") ? oldPath.slice(0, oldPath.lastIndexOf("/")) : "/" },
-        } as unknown as TFile)
-      : file;
-    const legacy = legacyIndexPath(target);
-    if (await adapter.exists(legacy)) {
-      await removeIndexFile(vault, adapter, legacy);
+  /*
+   * 排到**旧路径那条链**的尾部。
+   *
+   * 为什么是 oldPath 的 key：在途的 `writeTextIndexNow` 是按改名前的
+   * `file.path` 入链的，它写的也是旧目录。排在新 key 上等于没排，删除
+   * 仍会先于那轮写入完成，随后旧目录又被重建回来。
+   * 选排队而不是「作废旧链」：作废拿不到在途任务的句柄，只能靠标志位
+   * 让它自己中途退出，写一半的目录还是得清；排队则天然保证「先写完、
+   * 再全删」，语义最简单也最稳。
+   */
+  const key = oldPath || file.path || file.basename || "?";
+  return enqueueIndexTask(key, async () => {
+    const vault = app.vault as unknown as VaultLike;
+    const adapter = (vault.adapter || (app.vault.adapter as unknown as AdapterLike));
+    try {
+      // 用一个「路径伪装成 TFile」的对象复用 dirOf/baseOf/indexDirFor
+      const target = oldPath
+        ? ({
+            path: oldPath,
+            basename: oldPath.split("/").pop()!.replace(/\.inkbook$/i, ""),
+            parent: { path: oldPath.includes("/") ? oldPath.slice(0, oldPath.lastIndexOf("/")) : "/" },
+          } as unknown as TFile)
+        : file;
+      const legacy = legacyIndexPath(target);
+      if (await adapter.exists(legacy)) {
+        await removeIndexFile(vault, adapter, legacy);
+      }
+      const dir = indexDirFor(target);
+      if (typeof adapter.list !== "function") return;
+      if (!(await adapter.exists(dir))) return;
+      const listed = await adapter.list(dir);
+      for (const p of listed?.files || []) await removeIndexFile(vault, adapter, p);
+    } catch (_) {
+      /* 派生数据，删不掉不算错 */
     }
-    const dir = indexDirFor(target);
-    if (typeof adapter.list !== "function") return;
-    if (!(await adapter.exists(dir))) return;
-    const listed = await adapter.list(dir);
-    for (const p of listed?.files || []) await removeIndexFile(vault, adapter, p);
-  } catch (_) {
-    /* 派生数据，删不掉不算错 */
-  }
+  });
 }

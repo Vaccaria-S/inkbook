@@ -240,6 +240,55 @@ function describeImportError(e: any): string {
   return raw;
 }
 
+/**
+ * 把导出时的异常翻译成用户能看懂的话（INK-176）。
+ *
+ * 导出写盘走的是 adapter，抛的是 Node/系统原文：
+ * 「ENOSPC: no space left on device」/「EACCES: permission denied」——
+ * 直接弹到平板上用户完全不知道该怎么办。这里照 describeImportError
+ * 的样子按关键词映射，认不出来保留原文（便于贴回来排查）。
+ *
+ * 注意：ExportCancelledError 由 runExport 提前单独处理，不进这里。
+ *
+ * 导出给测试用：映射规则必须能被直接断言，而不是靠真机撞上 ENOSPC 才发现。
+ */
+export function describeExportError(e: any): string {
+  const raw = String((e && e.message) || e || "").trim();
+  const low = raw.toLowerCase();
+  if (!raw) return "未知错误";
+  // 空间不足（Node 的 ENOSPC / 浏览器的配额错误）
+  if (
+    low.includes("enospc") ||
+    low.includes("no space") ||
+    low.includes("quota") ||
+    low.includes("out of memory") ||
+    low.includes("storage full")
+  ) {
+    return "磁盘空间不足，导出的 PDF 没能写进去。清理一些空间后重试。";
+  }
+  // 权限 / 文件被占用
+  if (
+    low.includes("eacces") ||
+    low.includes("eperm") ||
+    low.includes("permission") ||
+    low.includes("denied") ||
+    low.includes("not allowed")
+  ) {
+    return "没有写入权限。换个保存位置，或检查这个文件夹的权限。";
+  }
+  // 目标文件 / 目录不存在（被移动、同步中、原 PDF 被删）
+  if (
+    low.includes("enoent") ||
+    low.includes("not found") ||
+    low.includes("no such file") ||
+    low.includes("does not exist")
+  ) {
+    return "找不到目标文件或文件夹。确认它还在库里、没有正在同步，然后重试。";
+  }
+  // 认不出来就保留原文
+  return raw;
+}
+
 export interface InkbookPluginLike {
   settings: InkbookSettings;
   saveSettings(): Promise<void>;
@@ -2962,6 +3011,18 @@ export class InkbookView extends FileView {
       const setMessage = this.attachExportProgress(notice, controller);
       await exportBookPdf(this.app.vault, this.editor, this.file, scale, range, {
         signal: controller.signal,
+        /*
+         * 页范围被夹取 / 起止颠倒时别静默：老实现回落整本，进度 Notice 却还
+         * 写着「第 9–2 页」，用户以为只导几页结果跑了 857 页。
+         * 回调发生在开跑前，进度文案随后会覆盖它，所以这里另弹一条独立 Notice。
+         */
+        onRangeAdjusted: (norm) => {
+          new Notice(
+            `页码范围无效，已改为整本（第 1–${norm.total} 页）。` +
+              `实际导出第 ${norm.from}–${norm.to} 页。`,
+            6000
+          );
+        },
         onProgress: (done, total, phase) => {
           if (phase === "saving") {
             setMessage(`正在生成 PDF（${total} 页）…`);
@@ -2978,7 +3039,7 @@ export class InkbookView extends FileView {
       if (e instanceof ExportCancelledError) {
         new Notice("已取消导出，没有写入文件。", 4000);
       } else {
-        new Notice("导出失败：" + (e && e.message ? e.message : e || "未知错误"), 8000);
+        new Notice("导出失败：" + describeExportError(e), 8000);
         console.error("[inkbook] 导出失败", e);
       }
     } finally {

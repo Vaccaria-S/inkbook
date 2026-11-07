@@ -15,9 +15,12 @@ import { createBook, createPage, type Stroke } from "../src/types";
 import {
   ExportCancelledError,
   exportBookPdf,
+  normalizeExportRange,
   pageHasUserText,
+  type ExportRangeResult,
 } from "../src/export";
 import { chineseFontBytes } from "../src/fontasset";
+import { describeExportError } from "../src/view";
 import {
   PDFArray,
   PDFDict,
@@ -174,16 +177,22 @@ async function main() {
   const removed: string[] = [];
   /** 写 .tmp 时的钩子：取消用例用它模拟「写到一半用户点取消」 */
   let onTmpWrite: ((path: string) => void) | null = null;
+  /** 故障注入：让指定路径的 writeBinary 抛错（模拟 ENOSPC / 权限不足） */
+  let writeFailFor: ((p: string) => boolean) | null = null;
+  /** 故障注入：让 rename 抛错（模拟 Windows 文件被占用 / 适配器不支持） */
+  let renameFails = false;
   const adapter = {
     exists: async (p: string) => written.has(p),
     read: async () => "",
     readBinary: async (p: string) => files.get(p) ?? new ArrayBuffer(0),
     write: async () => {},
     writeBinary: async (p: string, buf: ArrayBuffer) => {
+      if (writeFailFor && writeFailFor(p)) throw new Error("ENOSPC: no space left on device");
       written.set(p, new Uint8Array(buf));
       if (p.endsWith(".tmp") && onTmpWrite) onTmpWrite(p);
     },
     rename: async (from: string, to: string) => {
+      if (renameFails) throw new Error("EBUSY: resource busy or locked");
       const data = written.get(from);
       if (!data) throw new Error("rename 源文件不存在：" + from);
       written.delete(from);
@@ -896,6 +905,184 @@ async function main() {
     pass(!pageHasUserText(pBlank), "Notice 计数：空 texts 的页不算");
     pass(!pageHasUserText(pSpaces), "Notice 计数：只有空白字符的批注不算");
     pass(!pageHasUserText(undefined), "Notice 计数：缺页数据不抛错、不算");
+  }
+
+  /* -------------------- INK-176：页范围归一化（穷举边界） -------------------- */
+  {
+    const cases: Array<[number, { from: number; to: number } | undefined | null, ExportRangeResult]> = [
+      [4, undefined, { from: 1, to: 4, total: 4, adjusted: false }],
+      [4, { from: 2, to: 3 }, { from: 2, to: 3, total: 4, adjusted: false }],
+      // 起止颠倒：回落整本，且必须报 adjusted
+      [4, { from: 9, to: 2 }, { from: 1, to: 4, total: 4, adjusted: true }],
+      [4, { from: 3, to: 1 }, { from: 1, to: 4, total: 4, adjusted: true }],
+      // 越界夹取：也要报 adjusted，别让 Notice 还写着 9–99
+      [4, { from: 0, to: 99 }, { from: 1, to: 4, total: 4, adjusted: true }],
+      [4, { from: 2, to: 99 }, { from: 2, to: 4, total: 4, adjusted: true }],
+      // 非整数 / NaN / 非有限值
+      [4, { from: NaN, to: 3 }, { from: 1, to: 4, total: 4, adjusted: true }],
+      [4, { from: 2.7, to: 3 }, { from: 2, to: 3, total: 4, adjusted: true }],
+      [4, { from: Infinity, to: 2 }, { from: 1, to: 4, total: 4, adjusted: true }],
+      // 空本子
+      [0, { from: 1, to: 1 }, { from: 1, to: 0, total: 0, adjusted: true }],
+    ];
+    let allOk = true;
+    for (const [total, range, want] of cases) {
+      const got = normalizeExportRange(total, range);
+      const ok =
+        got.from === want.from &&
+        got.to === want.to &&
+        got.total === want.total &&
+        got.adjusted === want.adjusted;
+      if (!ok) {
+        allOk = false;
+        log("  range 不符 total=" + total + " range=" + JSON.stringify(range) + " got=" + JSON.stringify(got));
+      }
+    }
+    pass(allOk, "页范围归一化：10 组边界全部符合（起止颠倒/越界/NaN/小数/空本）");
+
+    // 非法范围确实通过回调报出来，界面层才不会静默导整本
+    const adjustments: ExportRangeResult[] = [];
+    await exportBookPdf(vault, editor, file, 1, { from: 9, to: 2 }, {
+      onRangeAdjusted: (r) => adjustments.push(r),
+    });
+    pass(
+      adjustments.length === 1 && adjustments[0].adjusted && adjustments[0].total === 4,
+      "非法页范围导出：回调明确报告「已改为整本」（共 " + adjustments[0]?.total + " 页）"
+    );
+    const okAdjustments: ExportRangeResult[] = [];
+    await exportBookPdf(vault, editor, file, 1, { from: 2, to: 3 }, {
+      onRangeAdjusted: (r) => okAdjustments.push(r),
+    });
+    pass(okAdjustments.length === 0, "合法页范围导出：不误报范围无效");
+  }
+
+  /* -------------------- INK-176：兜底写盘不留半截文件 -------------------- */
+  {
+    // 场景 1：rename 不可用 → 直接写正式名，写失败必须把半截文件删掉
+    renameFails = true;
+    writeFailFor = (p) => !p.endsWith(".tmp"); // 只让正式文件那次写失败
+    let err: any = null;
+    try {
+      await exportBookPdf(vault, editor, file, 1);
+    } catch (e) {
+      err = e;
+    } finally {
+      renameFails = false;
+      writeFailFor = null;
+    }
+    pass(!!err && /ENOSPC/.test(String(err?.message)), "rename 失败 + 正式写盘 ENOSPC：抛错");
+    // 模拟「写了一半才失败」：writeBinary 先把半截字节放进去再抛
+    let halfPath = "";
+    renameFails = true;
+    writeFailFor = (p) => {
+      if (p.endsWith(".tmp")) return false;
+      halfPath = p;
+      written.set(p, new Uint8Array([0x25, 0x50, 0x44, 0x46])); // "%PDF" 半截
+      return true;
+    };
+    try {
+      await exportBookPdf(vault, editor, file, 1);
+    } catch (_) {
+      /* 预期抛错 */
+    } finally {
+      renameFails = false;
+      writeFailFor = null;
+    }
+    pass(!!halfPath && !written.has(halfPath), "写盘失败：半截 .pdf 被删掉（不留打不开的文件）");
+    pass(
+      !Array.from(written.keys()).some((k) => k.endsWith(".tmp")),
+      "写盘失败：.tmp 也被清掉"
+    );
+
+    // 场景 2：rename 失败但写成功 → 产物完整、且 .tmp 不残留
+    renameFails = true;
+    let fallbackPath = "";
+    try {
+      fallbackPath = await exportBookPdf(vault, editor, file, 1);
+    } finally {
+      renameFails = false;
+    }
+    const fbBytes = written.get(fallbackPath);
+    pass(!!fbBytes && fbBytes.length > 10000, "rename 失败回落裸写：产物完整（" + (fbBytes?.length ?? 0) + " 字节）");
+    pass(
+      !Array.from(written.keys()).some((k) => k.endsWith(".tmp")),
+      "rename 失败回落裸写：.tmp 被清掉"
+    );
+
+    // 场景 3：完全没有 rename 的适配器，也要先写 .tmp 再写正式名
+    const noRenameVault = { adapter: { ...adapter, rename: undefined } } as any;
+    const renamesBefore = renamed.length;
+    const nrPath = await exportBookPdf(noRenameVault, editor, file, 1);
+    pass(!!written.get(nrPath), "无 rename 适配器：导出仍成功落盘");
+    pass(
+      renamed.length === renamesBefore && !written.has(nrPath + ".tmp"),
+      "无 rename 适配器：没调 rename，且 .tmp 已清理"
+    );
+  }
+
+  /* -------------------- INK-176：取消检查覆盖长 await 段 -------------------- */
+  {
+    // 在 .tmp 写好、准备 rename 时取消（模拟长段 await 期间点取消）
+    const controller = new AbortController();
+    let seenTmp = "";
+    onTmpWrite = (p) => {
+      seenTmp = p;
+      controller.abort();
+    };
+    let err: any = null;
+    let path: string | null = null;
+    try {
+      path = await exportBookPdf(vault, editor, file, 1, { from: 2, to: 3 }, {
+        signal: controller.signal,
+      });
+    } catch (e) {
+      err = e;
+    } finally {
+      onTmpWrite = null;
+    }
+    pass(err instanceof ExportCancelledError, "写 .tmp 期间取消：抛 ExportCancelledError");
+    pass(path === null, "写 .tmp 期间取消：不返回文件名");
+    pass(!!seenTmp && !written.has(seenTmp.replace(/\.tmp$/, "")), "写 .tmp 期间取消：正式文件不存在");
+  }
+
+  /* -------------------- INK-176：错误文案中文化 -------------------- */
+  {
+    const map: Array<[any, string]> = [
+      [new Error("ENOSPC: no space left on device"), "磁盘空间不足"],
+      [new Error("QuotaExceededError: storage full"), "磁盘空间不足"],
+      [new Error("EACCES: permission denied"), "没有写入权限"],
+      [new Error("EPERM: operation not permitted"), "没有写入权限"],
+      [new Error("ENOENT: no such file or directory"), "找不到目标文件或文件夹"],
+      [new Error("File not found"), "找不到目标文件或文件夹"],
+    ];
+    let allOk = true;
+    for (const [e, want] of map) {
+      const got = describeExportError(e);
+      if (!got.includes(want)) {
+        allOk = false;
+        log("  映射不符 " + e.message + " → " + got);
+      }
+    }
+    pass(allOk, "导出错误中文化：ENOSPC/quota/EACCES/EPERM/ENOENT 全部映射成可操作中文");
+    pass(
+      describeExportError(new Error("pdf-lib: WinAnsi cannot encode")) === "pdf-lib: WinAnsi cannot encode",
+      "导出错误中文化：认不出来时保留原文（便于贴回来排查）"
+    );
+    pass(describeExportError(null) === "未知错误", "导出错误中文化：空错误有兜底文案");
+    // 导出链路本身不能吞掉原始错误，否则界面层拿不到可映射的原因
+    let rawErr: any = null;
+    writeFailFor = (p) => p.endsWith(".tmp");
+    try {
+      await exportBookPdf(vault, editor, file, 1);
+    } catch (e) {
+      rawErr = e;
+    } finally {
+      writeFailFor = null;
+    }
+    pass(
+      !!rawErr && /ENOSPC/.test(String(rawErr?.message)),
+      "导出链路把系统原始错误抛给界面层映射（ENOSPC 未被吞掉）"
+    );
   }
 
   log("");

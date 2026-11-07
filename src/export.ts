@@ -46,6 +46,59 @@ export interface ExportBookOptions {
    * `total` 是本次导出的总页数（指定页范围时就是范围内的页数）。
    */
   onProgress?: (done: number, total: number, phase: ExportPhase) => void;
+  /**
+   * 用户填的页范围非法（起止颠倒 / 越界 / 非整数）被夹取或回落整本时回调。
+   * 界面层据此明确告诉用户「已改为整本」，别静默导完 857 页。
+   */
+  onRangeAdjusted?: (range: ExportRangeResult) => void;
+}
+
+/**
+ * 夹取页范围后的结果。`adjusted` 表示与用户输入不一致（界面层要提示）。
+ */
+export interface ExportRangeResult {
+  /** 1 起的闭区间起点 */
+  from: number;
+  /** 1 起的闭区间终点 */
+  to: number;
+  /** 总页数 */
+  total: number;
+  /** 用户输入被夹取 / 回落过 */
+  adjusted: boolean;
+}
+
+/**
+ * 夹取导出页范围：非法一律回落整本。
+ *
+ * 抽成纯函数是为了界面层（进度 Notice 的文案）和导出主体用**同一把尺子**，
+ * 否则「Notice 写第 9–2 页、实际导 1–857 页」这种自相矛盾的提示会一直漂移。
+ * 也是为了能在 export-harness.ts 里直接穷举边界，而不是靠肉眼挑几个例子。
+ */
+export function normalizeExportRange(
+  total: number,
+  range?: { from: number; to: number } | null
+): ExportRangeResult {
+  const n = Number.isFinite(total) ? Math.max(0, Math.floor(total)) : 0;
+  if (!range) return { from: 1, to: n, total: n, adjusted: false };
+  /*
+   * 空本子（total = 0）单独处理：下面那套夹取是 `max(1, min(n, x))`，
+   * n=0 时 `min(0, x)` 得 0、再被 `max(1, …)` 顶回 1，于是返回
+   * 「第 1–1 页 / 共 0 页」——to 比 total 还大，自相矛盾。
+   * 空本子就该是空范围（from=1, to=0），且用户填了范围要报 adjusted。
+   */
+  if (n === 0) return { from: 1, to: 0, total: 0, adjusted: true };
+  const rawFrom = Number(range.from);
+  const rawTo = Number(range.to);
+  // 填了范围但根本不是数字：当「没填」处理，并明确告诉用户已回落整本
+  if (!Number.isFinite(rawFrom) || !Number.isFinite(rawTo)) {
+    return { from: 1, to: n, total: n, adjusted: true };
+  }
+  const a = Math.max(1, Math.min(n, Math.floor(rawFrom)));
+  const b = Math.max(1, Math.min(n, Math.floor(rawTo)));
+  // 起止颠倒：保持老行为，回落整本（不要猜用户想反着导）
+  if (a > b) return { from: 1, to: n, total: n, adjusted: true };
+  if (a !== rawFrom || b !== rawTo) return { from: a, to: b, total: n, adjusted: true };
+  return { from: a, to: b, total: n, adjusted: false };
 }
 
 function throwIfCancelled(signal?: AbortSignal): void {
@@ -93,30 +146,56 @@ async function writeExportFile(
   const whole =
     bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength;
   const buffer = (whole ? bytes.buffer : bytes.slice().buffer) as ArrayBuffer;
+
+  /*
+   * 无论走不走 rename，**先写 `.tmp`**。
+   *
+   * 老写法在 rename 不可用/失败时直接 `writeBinary(path, buffer)`：写失败
+   * （ENOSPC 最常见）会在正式文件名留下一个打不开的半截 PDF；而且取消
+   * 检查在 :116 之后就没了，用户点了取消文件照样写出去、还弹「已导出」。
+   * 现在所有路径都先落 .tmp、检查取消、再决定 rename 还是复制，失败一律清干净。
+   */
+  const tmp = path + ".tmp";
+  try {
+    await adapter.writeBinary(tmp, buffer);
+  } catch (e) {
+    await removeQuietly(adapter, tmp);
+    throw e;
+  }
+  // 写 .tmp 期间用户点了取消：正式文件一个字节都不写
+  if (signal?.aborted) {
+    await removeQuietly(adapter, tmp);
+    throw new ExportCancelledError();
+  }
   if (typeof adapter.rename === "function") {
-    const tmp = path + ".tmp";
-    try {
-      await adapter.writeBinary(tmp, buffer);
-    } catch (e) {
-      await removeQuietly(adapter, tmp);
-      throw e;
-    }
-    // 写 .tmp 期间用户点了取消：正式文件一个字节都不写
-    if (signal?.aborted) {
-      await removeQuietly(adapter, tmp);
-      throw new ExportCancelledError();
-    }
     try {
       await adapter.rename(tmp, path);
       return;
     } catch (e) {
-      // rename 不是所有适配器都可靠；清掉临时文件、确认没被取消后退回直接写
+      // rename 不是所有适配器都可靠；清掉临时文件、确认没被取消后走下面的裸写
       await removeQuietly(adapter, tmp);
       console.warn("[inkbook] 导出文件原子改名失败，改回直接写入", e);
       throwIfCancelled(signal);
     }
   }
-  await adapter.writeBinary(path, buffer);
+  /*
+   * 没有 rename（或 rename 失败）：只能直接写正式文件。
+   * 写失败必须把半截文件删掉，别让用户看到一个打不开的 PDF。
+   */
+  throwIfCancelled(signal);
+  try {
+    await adapter.writeBinary(path, buffer);
+  } catch (e) {
+    await removeQuietly(adapter, path);
+    throw e;
+  } finally {
+    await removeQuietly(adapter, tmp);
+    // 写正式文件期间点了取消：这份文件不该留下，也不该报「已导出」
+    if (signal?.aborted) {
+      await removeQuietly(adapter, path);
+      throw new ExportCancelledError();
+    }
+  }
 }
 
 export async function exportPagePng(
@@ -300,19 +379,15 @@ async function exportBookPdfImpl(
   range?: { from: number; to: number },
   opts: ExportBookOptions = {}
 ): Promise<string> {
-  const { signal, onProgress } = opts;
-  const state = editor.getState();
-  const total = state.pageCount;
-  let from = 1;
-  let to = total;
-  if (range && Number.isFinite(range.from) && Number.isFinite(range.to)) {
-    const a = Math.max(1, Math.min(total, Math.floor(range.from)));
-    const b = Math.max(1, Math.min(total, Math.floor(range.to)));
-    if (a <= b) {
-      from = a;
-      to = b;
-    }
-  }
+  const { signal, onProgress, onRangeAdjusted } = opts;
+  const total = editor.getState().pageCount;
+  const norm = normalizeExportRange(total, range);
+  const { from, to } = norm;
+  /*
+   * 夹取后和用户输入不一致就明确报一声：老实现静默回落整本，但进度
+   * Notice 还写「准备导出第 9–2 页」，用户以为只导几页结果跑了 857 页。
+   */
+  if (norm.adjusted) onRangeAdjusted?.(norm);
   const isPartial = from > 1 || to < total;
   const indices = Array.from({ length: to - from + 1 }, (_, k) => from - 1 + k);
   const count = indices.length;
@@ -377,6 +452,8 @@ async function exportBookPdfImpl(
       console.warn("[inkbook] 嵌入中文字体失败，批注将按图片导出", e);
       zhFont = null;
     }
+    // 放在 try 外面：嵌字体是大 await，期间可能已经取消，别被上面的 catch 吞掉
+    throwIfCancelled(signal);
   }
 
   /**
@@ -422,7 +499,9 @@ async function exportBookPdfImpl(
      */
     if (pdfRef) {
       if (!srcDocs.has(pdfRef.path)) {
+        throwIfCancelled(signal);
         const bytes = await editor.readPdfBytes(pdfRef.path);
+        throwIfCancelled(signal);
         let loaded: PDFDocument | null = null;
         if (bytes) {
           try {
@@ -434,13 +513,17 @@ async function exportBookPdfImpl(
             console.warn("[inkbook] 原 PDF 解析失败，这几页退回位图", pdfRef.path, e);
           }
         }
+        // 别放在上面的 try 里：ExportCancelledError 会被 catch 当成解析失败吞掉
+        throwIfCancelled(signal);
         srcDocs.set(pdfRef.path, loaded);
       }
       const src = srcDocs.get(pdfRef.path);
       const bg = page.background;
       if (src && bg && pdfRef.page >= 1 && pdfRef.page <= src.getPageCount()) {
         try {
+          throwIfCancelled(signal);
           const [copied] = await doc.copyPages(src, [pdfRef.page - 1]);
+          throwIfCancelled(signal);
           /*
            * 旋转过的页（扫描件常见 /Rotate 90）不能用这条路径：
            * Form XObject 不带 /Rotate，画上去会横过来。宁可退回位图也不错页。
@@ -459,6 +542,7 @@ async function exportBookPdfImpl(
             });
             const overlay = editor.exportOverlayCanvas(i, scale, canvasWithText);
             const png = await doc.embedPng(overlay.toDataURL("image/png"));
+            throwIfCancelled(signal);
             out.drawImage(png, { x: 0, y: 0, width: A4_W, height: A4_H });
             if (vectorText && zhFont) {
               drawUserTextsPdf(out, page, zhFont, pageH);
@@ -488,6 +572,7 @@ async function exportBookPdfImpl(
       throwIfCancelled(signal);
       const canvas = editor.exportPageCanvas(i, scale, canvasWithText);
       const png = await doc.embedPng(canvas.toDataURL("image/png"));
+      throwIfCancelled(signal);
       const out = doc.addPage([A4_W, A4_H]);
       out.drawImage(png, { x: 0, y: 0, width: A4_W, height: A4_H });
       if (vectorText && zhFont) {
