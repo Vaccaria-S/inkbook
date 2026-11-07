@@ -155,12 +155,13 @@ export class BookStore {
    *
    * 不用方向判断，也不用生成"反向操作"，逻辑简单不易错。
    */
-  private pushHistory(before: HistoryEntry, after: HistoryEntry): void {
+  private pushHistory(before: HistoryEntry, after: HistoryEntry, keepRedo = false): void {
     // 增量操作自己记录前后状态，不需要挂起的快照
     this.pendingBefore = null;
     this.undoStack.push({ before, after });
     if (this.undoStack.length > MAX_HISTORY) this.undoStack.shift();
-    this.redoStack.length = 0;
+    // 新操作会让「重做」失效；但 undo/redo 的补结算不算新操作（见 settleHistory）
+    if (!keepRedo) this.redoStack.length = 0;
   }
 
   /**
@@ -181,8 +182,13 @@ export class BookStore {
     this.pendingBefore = entry;
   }
 
-  /** 操作完成，补上 after 状态 */
-  private settleHistory(): void {
+  /**
+   * 操作完成，补上 after 状态。
+   *
+   * @param keepRedo undo/redo 开头补结算时传 true：**不要清空 redoStack**。
+   *   那段历史是「上一步被撤销、等着重做」的，跟这次补结算无关。
+   */
+  private settleHistory(keepRedo = false): void {
     // 正在结算/应用历史时不要再结算，避免递归
     if (this.settling) return;
     if (!this.pendingBefore) return;
@@ -206,7 +212,7 @@ export class BookStore {
                 pageIndex: before.pageIndex,
                 data: JSON.stringify(this.data.pages[this.pageIndexOf(before)]),
               };
-      this.pushHistory(before, after);
+      this.pushHistory(before, after, keepRedo);
     } finally {
       this.settling = false;
     }
@@ -243,23 +249,6 @@ export class BookStore {
     return this.redoStack.length > 0;
   }
 
-  private currentEntry(): HistoryEntry {
-    const page = this.page;
-    return {
-      kind: "page",
-      pageId: page.id,
-      pageIndex: this.data.activePage,
-      data: JSON.stringify(page),
-    };
-  }
-
-  private currentBookEntry(): HistoryEntry {
-    return {
-      kind: "book",
-      data: JSON.stringify({ pages: this.data.pages, activePage: this.data.activePage }),
-    };
-  }
-
   /**
    * 找出条目对应的页下标（只看有 pageId 的条目）
    */
@@ -276,8 +265,8 @@ export class BookStore {
   }
 
   undo(): boolean {
-    // 先把挂起的快照结算掉，否则最后一次操作撤不掉
-    this.settleHistory();
+    // 先把挂起的快照结算掉，否则最后一次操作撤不掉（保留 redo 栈，见 settleHistory）
+    this.settleHistory(true);
     const pair = this.undoStack.pop();
     if (!pair) return false;
     // 回到操作前
@@ -288,7 +277,8 @@ export class BookStore {
   }
 
   redo(): boolean {
-    this.settleHistory();
+    // 补结算挂起快照，但**不能清 redoStack** —— 否则下面 pop 拿到 undefined
+    this.settleHistory(true);
     const pair = this.redoStack.pop();
     if (!pair) return false;
     // 回到操作后

@@ -199,7 +199,7 @@ export class InkbookSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("在墨本里屏蔽「命令面板」")
       .setDesc(
-        "开启后，在墨本笔记里命令面板打不开（快捷键 Ctrl/Cmd+P 同样拦下）。平板下拉手势、误触都算——拖右侧滑条时弹出的就是它。离开墨本文件即恢复。"
+        "开启后，在墨本笔记里平板下拉手势、误触都不会弹出命令面板——拖右侧滑条时弹出的就是它。键盘 Ctrl/Cmd+P 仍然可用（不连键盘一起拦）。离开墨本文件即恢复。"
       )
       .addToggle((t) =>
         t

@@ -205,6 +205,28 @@ async function main() {
   editor.redo();
   pass(store.strokeCount === 1, "重做后 1 条");
 
+  /*
+   * 有挂起快照时 redo 仍要生效（2026-11-07 修）：
+   * 老实现 redo() 开头 `settleHistory()` → `pushHistory()` 会清空 redoStack，
+   * 紧接着 `redoStack.pop()` 拿到 undefined → 首次重做直接返回 false。
+   * 这里人为挂一个 pendingBefore，再验 redo 仍能重做。
+   */
+  {
+    editor.undo();
+    await sleep(40);
+    pass(store.strokeCount === 0, "挂起快照测试：先撤销到 0 条");
+    // 人为制造「挂起的快照」（真实场景：snapshotPage 之后、touch 之前）
+    (store as any).snapshotPage(store.data.activePage);
+    const ok = store.redo();
+    await sleep(40);
+    pass(ok && store.strokeCount === 1, "有挂起快照时 redo 仍生效（不会误清 redoStack）");
+    // 清理人为挂起的快照，别污染后续断言
+    (store as any).pendingBefore = null;
+    (store as any).settleHistory?.(true);
+    (store as any).undoStack.length = 0;
+    (store as any).redoStack.length = 0;
+  }
+
   /* 荧光笔 */
   editor.setTool("highlighter");
   await draw([

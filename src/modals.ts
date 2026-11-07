@@ -418,6 +418,15 @@ export class ImportSourceModal extends Modal {
     if (n < 1024 * 1024) return (n / 1024).toFixed(0) + " KB";
     return (n / 1024 / 1024).toFixed(1) + " MB";
   }
+
+  /*
+   * 与其他 Modal 保持一致（2026-11-07 补）：不 empty 的话，复用同一个实例
+   * 再 open 会在旧内容后面追加第二套 UI，`listEl` 还指向旧节点。
+   * 现在每处都是 new 一个实例，所以没暴露；补上这行才一致。
+   */
+  onClose(): void {
+    this.contentEl.empty();
+  }
 }
 
 /**
@@ -507,5 +516,10 @@ export class ImportRangeModal extends Modal {
     }
     this.close();
     this.onDone(this.from, this.to);
+  }
+
+  /** 与其他 Modal 保持一致：关闭时清空，避免复用实例时残留两套 UI */
+  onClose(): void {
+    this.contentEl.empty();
   }
 }

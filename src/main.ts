@@ -301,14 +301,31 @@ export default class InkbookPlugin extends Plugin {
     });
     if (sameBook) {
       if (!newTab) {
-        void this.app.workspace.revealLeaf?.(sameBook);
-        (sameBook.view as InkbookView).gotoPageFromLink(page);
-        return;
+        /*
+         * revealLeaf 失败不能连翻页一起丢（2026-11-07 修）：
+         * 老写法 `void revealLeaf?.(...)` 在 API 缺失 / 抛错 / reject 时
+         * 只是静默 —— 标签没切过去，用户以为「点了没反应」。
+         * 这里显式 await + catch，失败就退回「新开一个 leaf 打开」的兜底。
+         */
+        let revealed = false;
+        try {
+          const r: any = this.app.workspace.revealLeaf?.(sameBook);
+          if (r && typeof r.then === "function") await r;
+          revealed = true;
+        } catch (e) {
+          console.warn("[inkbook] revealLeaf 失败，退回新开标签", e);
+        }
+        if (revealed) {
+          (sameBook.view as InkbookView).gotoPageFromLink(page);
+          return;
+        }
+        // 落到下面的 getLeaf(false).openFile 兜底
+      } else {
+        new Notice(
+          "这本已在另一个标签页打开：两个标签同时编辑会各存各的，可能产生冲突副本。",
+          8000
+        );
       }
-      new Notice(
-        "这本已在另一个标签页打开：两个标签同时编辑会各存各的，可能产生冲突副本。",
-        8000
-      );
     }
     const leaf = newTab
       ? this.app.workspace.getLeaf("tab")

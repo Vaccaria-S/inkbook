@@ -4350,13 +4350,14 @@ export class BookEditor {
       const dx = p[0] - m.startX;
       const dy = p[1] - m.startY;
       if (!m.moved && Math.hypot(dx, dy) < 3) return;
+      // 先判 target 再 snapshot（理由同 resizeText：别留悬挂的 pendingBefore）
+      const target = this.store.data.pages[m.rec.index]?.texts?.find((t) => t.id === m.id);
+      if (!target) return;
       if (!m.moved) {
         // 第一次真正拖动才记历史：点一下（没动）不该产生一条撤销
         this.store.snapshotPage(m.rec.index);
         m.moved = true;
       }
-      const target = this.store.data.pages[m.rec.index]?.texts?.find((t) => t.id === m.id);
-      if (!target) return;
       /*
        * 拖动后的落点同样要过一遍排版夹取：拖到纸边时不光横向会顶出去，
        * 拖到页底时折行后的下面几行也会整行掉出纸外。
@@ -4387,12 +4388,17 @@ export class BookEditor {
       const p = this.pointFromEvent(e, m.rec);
       const dx = p[0] - m.startX;
       if (!m.moved && Math.abs(dx) < 3) return;
+      /*
+       * 先判 target 再 snapshot（2026-11-07 修）：反过来的话，文字已经不存在
+       * 时 snapshotPage 已经挂上 pendingBefore，然后 return —— 这个挂起的
+       * 快照会被下一次 touch() 结算成「上一条的 after」，污染撤销历史。
+       */
+      const target = this.store.data.pages[m.rec.index]?.texts?.find((t) => t.id === m.id);
+      if (!target) return;
       if (!m.moved) {
         this.store.snapshotPage(m.rec.index);
         m.moved = true;
       }
-      const target = this.store.data.pages[m.rec.index]?.texts?.find((t) => t.id === m.id);
-      if (!target) return;
       // 上限用排版后的 x 现算：拖到纸右缘时不能把每行右端推出纸外（INK-116）
       const l = this.textLayout(target);
       const avail = availableTextWidth(this.store.data.width, l.x);
