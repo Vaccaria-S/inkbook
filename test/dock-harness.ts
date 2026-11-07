@@ -725,6 +725,29 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       "滚回顶部后多余条目被回收（" + bottom + " → " + back + "）"
     );
 
+    /*
+     * 从回收池复用条目时，`dataset.pageId` 必须与当前页序一致
+     * （2026-11-07 补）：条目按页号进池、按页号复用，历史上页序不变时
+     * 恰好一致；但拖拽的 click 守卫是**按 pageId 比对**的，
+     * 页序变过就会对不上。这里滚一遍再滚回来，逐条核对 pageId。
+     */
+    {
+      const pages = view.store!.data.pages;
+      const mismatched: string[] = [];
+      for (const el of Array.from(listEl.querySelectorAll(".mb-thumb:not(.mb-thumb-add)"))) {
+        const idx = Number((el as HTMLElement).dataset.page);
+        const pid = (el as HTMLElement).dataset.pageId;
+        const real = pages[idx]?.id ?? "";
+        if (pid !== real) mismatched.push(`#${idx}: ${pid}≠${real}`);
+      }
+      pass(
+        mismatched.length === 0,
+        "复用池条目后 dataset.pageId 与当前页序一致（" +
+          (mismatched.length ? mismatched.slice(0, 3).join(";") : "全部一致") +
+          "）"
+      );
+    }
+
     // 还原成原来的 3 页，后面的断言仍按原书
     sideBody.scrollTop = 0;
     view.store!.data.pages = origPages;

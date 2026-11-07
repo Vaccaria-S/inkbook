@@ -3436,7 +3436,16 @@ export class InkbookView extends FileView {
           if (pooled) {
             this.thumbItemPool.delete(i);
             item = pooled;
-            // 躺在池里的这段时间当前页可能变了；把高亮和长按标记刷正
+            /*
+             * 躺在池里的这段时间，当前页、页序都可能变过；把状态刷正。
+             *
+             * `dataset.pageId` **必须重写**：条目按页号复用时它还是旧值。
+             * 池本身按 index 存，页序不变时两者恰好一致，所以历史上没暴露；
+             * 但拖拽的 click 守卫（`thumbDragClickGuardId`）是**按 pageId
+             * 比对**的，一旦哪天页序变后走了复用路径，就会对不上、误挡或漏挡。
+             * 顺手写一行，比靠「调用方保证页序不变」更稳。
+             */
+            item.dataset.pageId = this.store?.data.pages[i]?.id ?? "";
             item.classList.toggle("is-active", i === current);
             delete item.dataset.longPressAt;
             const cv = item.querySelector(".mb-thumb-canvas") as HTMLCanvasElement | null;
