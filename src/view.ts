@@ -1000,12 +1000,31 @@ export class InkbookView extends FileView {
      * 另一个标签页后重新打开本页，要能恢复正常可写。
      */
     const duplicateTab = this.hasBookOpenInOtherLeaf(file.path);
-    this.file = file;
     const ext = (file.extension || "").toLowerCase();
     if (ext !== "inkbook") {
+      /*
+       * **绝不能把非 .inkbook 的文件留在 `this.file` 上**（INK-184）。
+       *
+       * 老代码先 `this.file = file` 再判扩展名，于是打开一个 .pdf
+       * （用户导出后点开成品、或宿主把导出的文件塞进同一个标签页）时，
+       * `this.file` 变成了那个 .pdf，而 `bookPath` 可能已被
+       * `onUnloadFile` 清成 null —— 下一次 `saveNow` 的
+       * `this.bookPath || this.file.path` 就取到了 **.pdf 路径**，
+       * 把整本 .inkbook 的 JSON 写进导出的 PDF 文件里。
+       *
+       * 真实现场（2026-11-07）：`未命名笔记 3-手写本.pdf` 内容变成了
+       * `{"version":2,...}`，用户「导出的 PDF 打不开」；
+       * 真正的 PDF 被挤进了 `.pdf.bak`（7MB，完好）。
+       *
+       * 所以这里把 file / bookPath 一起清干净，让这个视图回到「没打开
+       * 任何本子」的状态——它本来也显示不出这个文件。
+       */
+      this.file = null;
+      this.bookPath = null;
       this.showError(`墨本只处理 .inkbook 文件，${file.name} 打不开。`);
       return;
     }
+    this.file = file;
     const adapter = this.app.vault.adapter;
     /*
      * 先立占位再读盘。
@@ -5499,6 +5518,24 @@ export class InkbookView extends FileView {
      * 按 `this.file.path` 写就等于把上一本的内容写进新文件。
      */
     const path = this.bookPath || this.file.path;
+    /*
+     * 最后一道防线：**只往 .inkbook 写**（INK-184）。
+     *
+     * 上面已经保证 `this.file` 不会留成 .pdf，但保存链路是数据安全里
+     * 最不能靠「上游应该做对了」的地方——一旦路径不是 .inkbook，
+     * 写下去就是把整本 JSON 灌进用户的 PDF/图片/别的笔记里，
+     * 而且**原文件当场被毁**（真实现场：导出的 7MB PDF 被换成 128KB JSON）。
+     * 宁可这次不存（dirty 还挂着，下次切本子会走 rescueUnsaved 另存副本），
+     * 也不能写错地方。
+     */
+    if (!/\.inkbook$/i.test(path)) {
+      console.error("[inkbook] 拒绝往非 .inkbook 路径写盘：", path);
+      this.saving = false;
+      this.saveState = "dirty";
+      this.updateStatus();
+      this.lastSaveError = `目标路径不是 .inkbook（${path}）`;
+      return;
+    }
     const store = this.store;
     const book = store.data;
     /*

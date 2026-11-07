@@ -45,6 +45,33 @@ const pass = (ok: boolean, label: string) => {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const PDF_URL = "/test/sample.pdf";
+/** Word 底图的假资源路径（adapter.getResourcePath 会把它映射成 blob URL） */
+const WORD_BG_URL = ".inkbook-assets/word-p1.png";
+
+/**
+ * 造一张「像 Word 转出来的」底图 PNG。
+ *
+ * 真实样本是 7 页各约 1.1MB 的 A4 PNG。这里不需要那么大，但必须：
+ *   · 是**合法 PNG**（`embedPng` 会解析 IHDR / IDAT）；
+ *   · 尺寸与 A4 成比例（导出时按 bg.width/height 铺满纸面）；
+ *   · 有实际内容（纯白图看不出「底图丢了」）。
+ */
+async function makeWordBackgroundPng(): Promise<Blob> {
+  const canvas = document.createElement("canvas");
+  canvas.width = 794;
+  canvas.height = 1123;
+  const ctx = canvas.getContext("2d")!;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  // 几行「正文」横条，模拟 Word 文字块
+  ctx.fillStyle = "#333333";
+  for (let i = 0; i < 24; i++) {
+    ctx.fillRect(80, 120 + i * 34, 620 - (i % 4) * 60, 10);
+  }
+  ctx.fillStyle = "#1A5276";
+  ctx.fillRect(80, 60, 400, 26); // 「标题」
+  return await new Promise<Blob>((resolve) => canvas.toBlob((b) => resolve(b!), "image/png"));
+}
 
 function makeHost(): [HTMLElement, () => void] {
   const root = document.createElement("div");
@@ -169,6 +196,33 @@ async function main() {
   ];
   book.pages.push(p4);
 
+  /*
+   * 第 5 页：**Word 底图页**（静态 PNG 底图）。
+   *
+   * 之前这个套件只造了 PDF 底图页和纯手写页，Word 底图这条路径
+   * **从来没被测过**——而用户报「以 Word 文档为底图的笔记导出 PDF 后
+   * 打不开」正是这条。区别在于：PDF 页走矢量 copyPages（不碰位图），
+   * 纯手写页没有底图；只有 Word 页会真的把一张 PNG 画进画布再编码成
+   * PDF 图片对象，这条路径的每一步都可能出错。
+   */
+  const WORD_PNG = await makeWordBackgroundPng();
+  // 真机上 getResourcePath 返回的是资源 URL；这里用 blob URL 等价替代，
+  // 让 `new Image()` 真的能加载（否则测不出底图有没有画进去）
+  const wordBgBlobUrl = URL.createObjectURL(WORD_PNG);
+  const p5 = createPage("blank", "white");
+  p5.background = {
+    src: WORD_BG_URL,
+    sourceName: "620b43f95dfd73298b276ff434623660.docx",
+    sourcePage: 1,
+    x: 0,
+    y: 0,
+    width: 794,
+    height: 1123,
+    kind: "word",
+  } as any;
+  p5.layers[0].strokes.push(makeStroke());
+  book.pages.push(p5);
+
   /* -------------------- vault 桩 -------------------- */
   const written = new Map<string, Uint8Array>();
   const files = new Map<string, ArrayBuffer>();
@@ -182,6 +236,14 @@ async function main() {
   /** 故障注入：让 rename 抛错（模拟 Windows 文件被占用 / 适配器不支持） */
   let renameFails = false;
   const adapter = {
+    /*
+     * `getResourcePath` 必须有：真机上 `editor.resolveAssetUrl` 靠它把
+     * 库内相对路径（`.inkbook-assets/xxx.png`）变成能喂给 `new Image()`
+     * 的 URL。桩里没有这个方法时，图片**永远加载不出来**——
+     * 导出测试就看不见 Word 底图这条路径的真实行为（这正是
+     * 「Word 底图导出」一直没被测出来的原因）。
+     */
+    getResourcePath: (p: string) => (p === WORD_BG_URL ? wordBgBlobUrl : p),
     exists: async (p: string) => written.has(p),
     read: async () => "",
     readBinary: async (p: string) => files.get(p) ?? new ArrayBuffer(0),
@@ -257,7 +319,51 @@ async function main() {
   /* -------------------- 用 pdf.js 读回来验原文 -------------------- */
   const pdfjs = initPdfjs();
   const doc = await pdfjs.getDocument({ data: bytes!.slice() }).promise;
-  pass(doc.numPages === 4, "导出的 PDF 有 " + doc.numPages + " 页");
+  pass(doc.numPages === 5, "导出的 PDF 有 " + doc.numPages + " 页");
+
+  /* -------------------- Word 底图页真的画进去了（INK-184） -------------------- */
+  {
+    /*
+     * 用户报：「以 Word 文档为底图的笔记导出 PDF 后打不开」。
+     * 这条路径以前**完全没有测试覆盖**——套件里只有 PDF 底图页和纯手写页。
+     *
+     * 这里验两件事：
+     *   1. 第 5 页（Word 底图页）在导出的 PDF 里**能被 pdf.js 正常渲染**
+     *      （打不开的 PDF 会在这里就抛）；
+     *   2. 那一页渲染出来的像素**不是纯白**——证明底图真的画进去了，
+     *      而不是「PDF 合法但内容是空白」。
+     */
+    let renderErr = "";
+    let darkPx = -1;
+    try {
+      const wp = await doc.getPage(5);
+      const vp = wp.getViewport({ scale: 0.35 });
+      const cv = document.createElement("canvas");
+      cv.width = Math.ceil(vp.width);
+      cv.height = Math.ceil(vp.height);
+      const c2 = cv.getContext("2d")!;
+      c2.fillStyle = "#fff";
+      c2.fillRect(0, 0, cv.width, cv.height);
+      await wp.render({ canvasContext: c2, viewport: vp, background: "#ffffff" }).promise;
+      const d = c2.getImageData(0, 0, cv.width, cv.height).data;
+      let n = 0;
+      for (let k = 0; k < d.length; k += 4) {
+        // 底图里的「正文条」是深灰 #333，纯白页不会命中
+        if (d[k] < 200 && d[k + 1] < 200 && d[k + 2] < 200) n += 1;
+      }
+      darkPx = n;
+    } catch (e: any) {
+      renderErr = String(e?.message || e);
+    }
+    pass(
+      renderErr === "",
+      "INK-184 Word 底图页能被 pdf.js 正常渲染（错误：" + JSON.stringify(renderErr.slice(0, 80)) + "）"
+    );
+    pass(
+      darkPx > 200,
+      "INK-184 Word 底图真的画进了导出页（深色像素 " + darkPx + "，纯白页会是 0）"
+    );
+  }
 
   /* -------------------- 指定页范围导出（INK-133） -------------------- */
   {
@@ -285,7 +391,7 @@ async function main() {
     const fallbackPath = await exportBookPdf(vault, editor, file, 2, { from: 9, to: 2 });
     const fb = written.get(fallbackPath);
     const fdoc = await pdfjs.getDocument({ data: fb!.slice() }).promise;
-    pass(fdoc.numPages === 4, "非法页范围：回落整本（" + fdoc.numPages + " 页）");
+    pass(fdoc.numPages === 5, "非法页范围：回落整本（" + fdoc.numPages + " 页）");
     await fdoc.destroy();
   }
 
@@ -298,17 +404,17 @@ async function main() {
     pass(progress.length >= 2, "导出过程有进度回调（" + progress.length + " 次）");
     const first = progress[0];
     pass(
-      !!first && first.done === 0 && first.total === 4 && first.phase === "page",
-      "进度从 0/4 开始（" + (first ? `${first.phase} ${first.done}/${first.total}` : "无") + "）"
+      !!first && first.done === 0 && first.total === 5 && first.phase === "page",
+      "进度从 0/5 开始（" + (first ? `${first.phase} ${first.done}/${first.total}` : "无") + "）"
     );
     const pageSteps = progress.filter((p) => p.phase === "page" && p.done > 0).map((p) => p.done);
     pass(
-      pageSteps.length === 4 && pageSteps.every((d, i) => d === i + 1),
-      "进度逐页递增到 4/4（" + pageSteps.join(",") + "）"
+      pageSteps.length === 5 && pageSteps.every((d, i) => d === i + 1),
+      "进度逐页递增到 5/5（" + pageSteps.join(",") + "）"
     );
     const last = progress[progress.length - 1];
     pass(
-      !!last && last.phase === "saving" && last.done === 4,
+      !!last && last.phase === "saving" && last.done === 5,
       "逐页完成后进入写文件阶段（" + (last ? `${last.phase} ${last.done}/${last.total}` : "无") + "）"
     );
     pass(written.has(progressPath), "带进度回调的导出正常落盘");
@@ -946,7 +1052,7 @@ async function main() {
       onRangeAdjusted: (r) => adjustments.push(r),
     });
     pass(
-      adjustments.length === 1 && adjustments[0].adjusted && adjustments[0].total === 4,
+      adjustments.length === 1 && adjustments[0].adjusted && adjustments[0].total === 5,
       "非法页范围导出：回调明确报告「已改为整本」（共 " + adjustments[0]?.total + " 页）"
     );
     const okAdjustments: ExportRangeResult[] = [];

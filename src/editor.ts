@@ -1885,7 +1885,15 @@ export class BookEditor {
       if (rec) this.onLeave(e as PointerEvent, rec);
     });
     this.docEl.addEventListener("contextmenu", (e) => {
-      if (this.tool !== "hand") e.preventDefault();
+      /*
+       * **一律拦掉系统菜单**（2026-11-07）。
+       *
+       * 老条件是 `tool !== "hand"` —— 抓手工具下放行菜单。但现在右键
+       * 也是平移手势，鼠标用户按住右键拖动时若弹菜单，拖动直接中断。
+       * 纸面上没有需要浏览器原生菜单的东西（文字编辑有自己的属性条），
+       * 所以无条件拦。
+       */
+      e.preventDefault();
     });
   }
 
@@ -4249,7 +4257,15 @@ export class BookEditor {
   }
 
   private onDown(e: PointerEvent, rec: PageRec): void {
-    if (e.pointerType === "mouse" && e.button !== 0 && e.button !== 1) return;
+    /*
+     * 鼠标只处理左键(0) / 中键(1) / **右键(2)**。
+     *
+     * 右键 = 平移（2026-11-07 用户要求：放大后用右键拖界面）。
+     * 其他键（侧键 3/4 等）仍然忽略。
+     */
+    if (e.pointerType === "mouse" && e.button !== 0 && e.button !== 1 && e.button !== 2) {
+      return;
+    }
 
     /*
      * 新的按下立刻打断惯性。
@@ -4272,6 +4288,28 @@ export class BookEditor {
     if (role === "pan") {
       // 单指：默认滚动页面（touch-action 已放开）
       if (this.arbiter.touchCountNow >= 2) return;
+      /*
+       * **鼠标右键：直接平移，不参与任何「点一下做点什么」的分支**。
+       *
+       * 下面几个分支（文字工具弹输入框、选择工具选中）都是为「手指/左键
+       * 点一下」设计的。右键按下的语义只有一个：拖动画面。放它进去会出现
+       * 「右键拖动画布，结果在文字工具下弹出一个输入框」这种怪事。
+       */
+      if (e.pointerType === "mouse" && e.button === 2) {
+        this.gesture = "pan";
+        this.pointerId = e.pointerId;
+        this.pan = {
+          x: e.clientX,
+          y: e.clientY,
+          left: this.scrollEl.scrollLeft,
+          top: this.scrollEl.scrollTop,
+        };
+        try {
+          rec.pageEl.setPointerCapture?.(e.pointerId);
+        } catch (_) {}
+        e.preventDefault();
+        return;
+      }
       /*
        * 文字工具例外：平板上用手指点一下就该出输入框，
        * 不然"添加文字"在平板上等于不能用（手指只会滚动）。
@@ -4412,7 +4450,19 @@ export class BookEditor {
       return;
     }
 
-    if (this.tool === "hand" || (e.pointerType === "mouse" && e.button === 1)) {
+    /*
+     * 抓手 / 中键 / **右键** 都走平移。
+     *
+     * 右键拖动（2026-11-07 用户要求）：放大后纸比屏幕大，靠滚动条拖很别扭；
+     * 鼠标用户习惯「按住右键拖画布」。中键早就是这个行为，右键补上即可。
+     *
+     * 配套：`contextmenu` 必须无条件 preventDefault（见 DOM 绑定处），
+     * 否则右键一按就弹系统菜单，拖动根本开始不了。
+     */
+    if (
+      this.tool === "hand" ||
+      (e.pointerType === "mouse" && (e.button === 1 || e.button === 2))
+    ) {
       this.gesture = "pan";
       this.pointerId = e.pointerId;
       this.pan = {

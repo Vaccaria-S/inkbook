@@ -2463,6 +2463,92 @@ async function U2() {
   pass(got3 === "A,B,C", "U2 正常 positions 不受影响（实际 " + got3 + "）");
 }
 
+/**
+ * V：打开非 .inkbook 文件**绝不能**把本子内容写到那个文件里（INK-184）。
+ *
+ * 真实现场（2026-11-07）：用户导出 PDF 后点开成品，宿主用那个 .pdf 调
+ * `onLoadFile`。老代码先 `this.file = pdf` 再判扩展名 → 返回时 `this.file`
+ * 还是那个 .pdf，而 `bookPath` 已被 `onUnloadFile` 清成 null →
+ * 下一次 `saveNow` 取 `this.bookPath || this.file.path` 拿到 **.pdf 路径**，
+ * 把整本 JSON 写了进去。结果：导出的 7MB PDF 变成 128KB 的 JSON，
+ * 用户「PDF 打不开」；真正的 PDF 被挤进 `.pdf.bak`。
+ */
+async function V184() {
+  const p = "V184.inkbook";
+  const pdfPath = "V184-手写本.pdf";
+  seed(p, JSON.stringify(mkBook("V184本", 3, 2)));
+  const pdfContent = "%PDF-1.7\n假 PDF 内容\n%%EOF";
+  seed(pdfPath, pdfContent);
+
+  const v = await openView();
+  await v.onLoadFile(tf(p));
+  await sleep(400);
+  const before = v.store.strokeCount;
+  v.store.addStroke(mkStroke(1841), 0);
+
+  // 模拟「导出后点开成品」：宿主先卸载，再用 .pdf 调 onLoadFile
+  await v.onUnloadFile();
+  await v.onLoadFile(tf(pdfPath));
+  await sleep(300);
+
+  // 这时视图里不该还挂着那个 pdf
+  pass(
+    v.file === null,
+    "V184① 打开非 .inkbook 后不把该文件留在 this.file 上（file=" +
+      (v.file ? v.file.path : "null") + "）"
+  );
+
+  // 落一笔 + 触发保存：绝不能写到 pdf 上
+  if (v.store) v.store.addStroke(mkStroke(1842), 0);
+  await v.saveNow();
+  await sleep(200);
+
+  pass(
+    files.get(pdfPath) === pdfContent,
+    "V184② 导出的 PDF 内容一字未变（" + (files.get(pdfPath) === pdfContent ? "完好" : "被覆盖！") + "）"
+  );
+
+  // 重新打开真正的本子，数据还在
+  await v.onLoadFile(tf(p));
+  await sleep(400);
+  pass(
+    !!v.store && v.store.strokeCount === before + 1,
+    "V184③ 重新打开本子内容完好（笔迹 " + (v.store ? v.store.strokeCount : -1) +
+      "，期望 " + (before + 1) + "）"
+  );
+  await v.onClose();
+  v.containerEl.remove();
+}
+
+/**
+ * W：`saveNow` 自身拒绝往非 .inkbook 路径写（INK-184 第二道防线）。
+ */
+async function W184() {
+  const p = "W184.inkbook";
+  seed(p, JSON.stringify(mkBook("W184本", 2, 1)));
+  const v = await openView();
+  await v.onLoadFile(tf(p));
+  await sleep(400);
+
+  const t0 = calls.length;
+  // 直接把 bookPath 和 file 都改成 pdf，模拟上游漏改的最坏情况
+  (v as any).bookPath = "W184.pdf";
+  (v as any).file = tf("W184.pdf");
+  v.store.addStroke(mkStroke(1843), 0);
+  await v.saveNow();
+  await sleep(150);
+
+  const wrotePdf = since(t0).some(
+    (c) => c.path === "W184.pdf" || c.newPath === "W184.pdf"
+  );
+  pass(!wrotePdf, "W184 saveNow 拒绝往非 .inkbook 路径写盘（写 pdf=" + wrotePdf + "）");
+  pass(
+    files.get(p) !== undefined,
+    "W184 原 .inkbook 文件仍在（未被误删）"
+  );
+  v.containerEl.remove();
+}
+
 const CASES: Array<[string, () => Promise<void>]> = [
   ["A1+A2", A12],
   ["A3", A3],
@@ -2495,6 +2581,8 @@ const CASES: Array<[string, () => Promise<void>]> = [
   ["S4 索引失败 Notice 节流", S4],
   ["U1 撤销不写错页", U1],
   ["U2 positions 非法值", U2],
+  ["V184 打开非 inkbook 不写错文件", V184],
+  ["W184 saveNow 拒绝非 inkbook 路径", W184],
   ["T1 设置数值校验", T1],
   ["T2 外部设置变更", T2],
   ["T3 存档防 NaN", T3],

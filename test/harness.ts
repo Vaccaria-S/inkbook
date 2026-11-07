@@ -199,6 +199,74 @@ async function main() {
     await sleep(220);
   }
 
+  /*
+   * 放大后**右键拖动**画面（2026-11-07 用户要求）。
+   *
+   * 放大后纸比屏幕大，靠滚动条拖很别扭；鼠标用户习惯「按住右键拖画布」。
+   * 中键早就是这个行为（`button === 1`），右键补齐。
+   *
+   * 三个要点：
+   *   1. 右键按下要真的滚（scrollTop 变化）；
+   *   2. 右键**不能落笔**（笔迹数不变）；
+   *   3. `contextmenu` 要被拦掉（否则系统菜单一弹，拖动就中断）。
+   */
+  {
+    const zPrev = editor.getState().zoom;
+    editor.setZoom(2.8);
+    await sleep(250);
+    const sc = (editor as any).scrollEl as HTMLElement;
+    const topOriginal = sc.scrollTop;
+    sc.scrollTop = 400;
+    await sleep(60);
+    const topBefore = sc.scrollTop;
+    const n0 = store.strokeCount;
+
+    const r3 = pageEl().getBoundingClientRect();
+    const right = (type: string, dy: number, buttons: number) =>
+      pageEl().dispatchEvent(
+        new PointerEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          pointerId: 77,
+          pointerType: "mouse",
+          isPrimary: true,
+          button: 2, // 右键
+          buttons,
+          clientX: r3.left + 300,
+          clientY: r3.top + 300 + dy,
+          pressure: 0,
+        })
+      );
+    right("pointerdown", 0, 2);
+    for (let i = 1; i <= 10; i++) {
+      right("pointermove", -i * 10, 2); // 往上拖 → 内容下移 → scrollTop 减小
+      await sleep(4);
+    }
+    right("pointerup", -100, 0);
+    await sleep(80);
+
+    /*
+     * 向上拖（clientY 减小）→ 纸跟手上移 → scrollTop **变大**。
+     * 这是「抓住纸往上拽」的直觉，和中键/手指拖动一致。
+     */
+    pass(
+      sc.scrollTop > topBefore + 40,
+      "右键拖动会滚动画面（scrollTop " + topBefore + " → " + Math.round(sc.scrollTop) + "）"
+    );
+    pass(store.strokeCount === n0, "右键拖动不落笔（笔迹 " + n0 + " → " + store.strokeCount + "）");
+
+    // contextmenu 必须被拦掉
+    const cm = new MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2 });
+    pageEl().dispatchEvent(cm);
+    pass(cm.defaultPrevented, "右键菜单被拦掉（defaultPrevented=" + cm.defaultPrevented + "）");
+
+    editor.setZoom(zPrev);
+    await sleep(200);
+    // 恢复滚动位置：后面的荧光笔/擦除用例依赖页面停在原处
+    sc.scrollTop = topOriginal;
+    await sleep(120);
+  }
+
   /* 撤销 / 重做 */
   editor.undo();
   pass(store.strokeCount === 0, "撤销后 0 条");
