@@ -44,7 +44,7 @@ const PAGES = [
   ["touch.html", 17, "touch-run.mjs"],
   ["swipe.html", 7, "swipe-run.mjs"],
   ["qa-wrap.html", 242],
-  ["embed.html", 114],
+  ["embed.html", 119],
   ["qa-embed2.html", 115],
   ["qa-embed3.html", 16],
   ["qa-embed4.html", 122],

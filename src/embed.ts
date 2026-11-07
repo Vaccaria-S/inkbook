@@ -381,7 +381,18 @@ function getPdfDoc(path: string): Promise<PdfDoc> {
   while (pdfDocs.size > MAX_PDF_DOCS) {
     const oldest = pdfDocs.keys().next().value;
     if (oldest === undefined) break;
+    const evicted = pdfDocs.get(oldest);
     pdfDocs.delete(oldest);
+    /*
+     * 淘汰必须 destroy：PDFDocumentProxy 背后挂着 worker 和解析出来的
+     * 字体/页面结构，只 delete Map 条目这些资源会活到进程结束。
+     * destroy 是异步的，失败也只影响内存回收，绝不能反过来影响渲染主流程。
+     */
+    if (evicted) {
+      void evicted.then((doc) => doc?.destroy?.()).catch(() => {
+        /* 已经失败 / 已销毁的文档没有句柄要释放 */
+      });
+    }
   }
   return p;
 }
@@ -416,17 +427,40 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise
   }
 }
 
+/**
+ * 嵌入 IO（读本子 / 加载底图）的上限，与 PDF 底图同一档 10 秒。
+ *
+ * 没有上限的话，同步盘卡住、资源被删但 URL 还挂着时 Promise 可能永远
+ * 不 settle：paintEmbed 卡在 await → state.rendering 永远是 true →
+ * 这块嵌入永久停在占位，之后每次保存的刷新请求也全被 `if (rendering)`
+ * 吞掉。超时后走 reject，由 paintEmbed 的 catch 复位并保留错误占位。
+ */
+const EMBED_IO_TIMEOUT_MS = 10_000;
+let embedIoTimeoutMs = EMBED_IO_TIMEOUT_MS;
+
+/** 仅测试用：把 IO 超时压短，否则要等 10 秒才看得到结果 */
+export function setEmbedIoTimeoutForTest(ms: number): void {
+  embedIoTimeoutMs = Number.isFinite(ms) && ms > 0 ? ms : EMBED_IO_TIMEOUT_MS;
+}
+
 function loadImage(url: string): Promise<HTMLImageElement | null> {
-  return new Promise((resolve) => {
+  const loaded = new Promise<HTMLImageElement | null>((resolve) => {
     try {
       const img = new Image();
       img.onload = () => resolve(img);
+      // 404 / 格式坏：这是「确定读不到」，resolve(null) 走浅灰底图，
+      // 笔迹和批注照常显示（与 PDF 底图取不到时的处理一致）
       img.onerror = () => resolve(null);
       img.src = url;
     } catch (_) {
       resolve(null);
     }
   });
+  /*
+   * 超时则 reject（而不是 null）：「根本没回来」与「确定 404」不同，
+   * 交给 paintEmbed 的 catch 保留错误占位，rendering 也能复位。
+   */
+  return withTimeout(loaded, embedIoTimeoutMs, "底图加载");
 }
 
 /** 底图取不到时的浅灰块：证明「这页有底图，只是没画出来」，不是空白页 */
@@ -737,8 +771,12 @@ export function getEmbedBook(app: EmbedApp | null, file: EmbedFile): Promise<Ink
   const adapter = (app ?? embedApp)?.vault?.adapter;
   if (!adapter) return Promise.reject(new Error("拿不到 vault.adapter，无法读取手写本"));
 
-  const p = readBook(adapter, file.path, file.basename).catch((e) => {
-    // 读失败不缓存：文件可能正在同步/恢复，下次嵌入再试
+  const p = withTimeout(
+    readBook(adapter, file.path, file.basename),
+    embedIoTimeoutMs,
+    "读取手写本"
+  ).catch((e) => {
+    // 读失败 / 超时都不缓存：文件可能正在同步，下次嵌入还能再试
     bookCache.delete(key);
     throw e;
   });
@@ -752,9 +790,19 @@ export function getEmbedBook(app: EmbedApp | null, file: EmbedFile): Promise<Ink
 }
 
 /**
- * 清缓存。
+ * 清掉一本（或全部）的嵌入缓存。
  *
- * @param path 只清这一本（modify / rename / delete 时用）；不传则全清
+ * **这里刻意不做「同 mtime = 重复信号」的去重**（2026-11-07 试过，已撤）。
+ * 判据不成立：同一版内容确实会有两条刷新信号（vault modify + saveNow
+ * 主动通知），但**真实的第二次修改**同样可能 mtime 不变——同秒内写两次、
+ * 同步盘回写、外部工具保留 mtime 都会这样。两者在时间上无法区分，
+ * 按 mtime 吞信号会把「渲染期间又保存了一次」「滚回视口要补画」这些
+ * **必须重画**的场景一起吞掉（qa-embed4 的 4c / 4c2 当场抓到）。
+ *
+ * 代价只是慢盘下偶尔重画两次（一次 drawImage），远小于「该更新的块
+ * 停在旧图」。1.5s 去抖窗口已经把同一批 modify 合并掉了，实际重复很少。
+ *
+ * @param path 只清这一本；不传则全清
  */
 export function invalidateEmbedCache(path?: string): void {
   if (!path) {
@@ -1087,10 +1135,25 @@ async function paintEmbed(state: EmbedState, force = false): Promise<void> {
     state.stale = false;
   } catch (e) {
     console.warn("[inkbook] 嵌入：这一页渲染失败（占位保留，点开可以试试）", state.file.path, e);
-    if (state.placeholder) {
-      state.placeholder.classList.add("mb-embed-ph-err");
-      state.placeholder.textContent = "这本手写本暂时读不出来（点开可以试试）";
+    /*
+     * 重画失败时占位可能已经不在了（上一次成功后就置 null），旧 canvas
+     * 还留在 DOM 里 = 用户看到的是一张**过期内容**，比"读不出来"更误导。
+     * 摘掉旧 canvas，重新挂一个错误占位，宁可显示错误也不要显示旧图。
+     */
+    const old = state.container.querySelector(".mb-embed-canvas");
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+    state.container.classList.remove("mb-embed-loaded");
+    let ph = state.placeholder;
+    if (!ph || !ph.parentNode) {
+      ph = makePlaceholder(state.file?.basename || state.file?.path || "手写本", state.page, false);
+      state.container.appendChild(ph);
+      state.placeholder = ph;
     }
+    ph.classList.add("mb-embed-ph-err");
+    ph.textContent = "这本手写本暂时读不出来（点开可以试试）";
+    // 容器里已经没有 canvas：让下一次 paintEmbed（哪怕非 force）重试
+    state.rendered = false;
+    state.stale = false;
   } finally {
     state.rendering = false;
     if (state.repaintQueued) {

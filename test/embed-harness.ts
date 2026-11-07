@@ -19,6 +19,7 @@ import {
   embedCacheStats,
   embedDisplayWidth,
   embedDpr,
+  getEmbedBook,
   invalidateEmbedCache,
   isInkbookEmbed,
   parseEmbedSrc,
@@ -29,6 +30,7 @@ import {
   renderEmbedForFile,
   renderEmbedPage,
   setEmbedContext,
+  setEmbedIoTimeoutForTest,
   type EmbedFile,
   type EmbedHost,
 } from "../src/embed";
@@ -896,6 +898,56 @@ async function main() {
     invalidateEmbedCache();
   }
 
+  /* ============ 5e. 重画失败：旧图必须摘掉、改显示错误占位 ============ */
+  {
+    const failHost = document.createElement("div");
+    failHost.style.cssText =
+      "position:fixed;left:220px;top:320px;width:240px;display:block;z-index:5";
+    document.body.appendChild(failHost);
+    const failNode = document.createElement("div");
+    failNode.className = "internal-embed";
+    failNode.setAttribute("src", "另一本.inkbook");
+    failNode.style.cssText = "display:block;width:110px";
+    failHost.appendChild(failNode);
+    callbacks[0](failHost, ctx);
+
+    const firstCanvas = await waitFor(() => !!failNode.querySelector(".mb-embed-canvas"));
+    pass(firstCanvas, "失败重画夹具：先成功画出一张 canvas");
+
+    /*
+     * 让这本书的读取失败（模拟同步把文件截断），mtime 前进触发 force 重画。
+     * 关键断言：上一轮成功后 placeholder 已经是 null，失败时若不重建占位，
+     * 用户会继续看到那张**过期**的 canvas。
+     */
+    const originalRead = app.vault.adapter.read;
+    (app.vault.adapter as any).read = async (p: string) => {
+      if (p === "另一本.inkbook") return '{ "kind": "inkbook", "pages": [';
+      return originalRead(p);
+    };
+    meta["另一本.inkbook"].stat.mtime += 1;
+    invalidateEmbedCache("另一本.inkbook");
+    refreshEmbedsForPath("另一本.inkbook");
+
+    const failed = await waitFor(() => {
+      const el = failNode.querySelector(".mb-embed");
+      return !!el && !el.querySelector(".mb-embed-canvas") && !!el.querySelector(".mb-embed-ph-err");
+    }, 4000);
+    const failText = (failNode.textContent || "").trim();
+    pass(
+      failed && failText.indexOf("读不出来") >= 0,
+      "重画失败：旧 canvas 已摘掉并显示错误占位（占位=" + JSON.stringify(failText.slice(0, 40)) + "）"
+    );
+
+    // 收尾：恢复读取再画一次，别把失败状态留给后面的用例
+    (app.vault.adapter as any).read = originalRead;
+    meta["另一本.inkbook"].stat.mtime += 1;
+    invalidateEmbedCache("另一本.inkbook");
+    refreshEmbedsForPath("另一本.inkbook");
+    await waitFor(() => !!failNode.querySelector(".mb-embed-canvas"), 3000);
+    failHost.remove();
+    invalidateEmbedCache();
+  }
+
   /* ============ 5d. 越界角标 hover 覆盖（N1）+ 缺变量宿主的边框（R3） ============ */
   {
     const norm = (sel: string) => sel.replace(/\s+/g, " ").trim();
@@ -1216,6 +1268,95 @@ async function main() {
       !err2 && !!c2 && px2[0] > 200 && px2[0] < 252,
       "PDF 底图读不出来 → 浅灰占位、笔迹照常（中心像素 " + px2.join(",") + "）"
     );
+  }
+
+  /* ============ 6. IO 超时：不能永久把渲染卡在 await ============ */
+  {
+    invalidateEmbedCache();
+
+    /*
+     * 6a. adapter.read 永不 settle（同步盘卡住 / 资源被删但句柄还挂着）。
+     * 没有超时的话 renderEmbedForFile 永远不返回，paintEmbed 的
+     * state.rendering 永远是 true，这块嵌入永久停在占位。
+     */
+    const hangFile: EmbedFile = {
+      path: "超时本.inkbook",
+      basename: "超时本",
+      extension: "inkbook",
+      stat: { mtime: 1 },
+    } as any;
+    const hangApp: any = {
+      vault: {
+        adapter: {
+          exists: async () => true,
+          read: () => new Promise<string>(() => {}),
+          stat: async () => ({ mtime: 1, size: 1 }),
+        },
+      },
+    };
+    setEmbedIoTimeoutForTest(30);
+    const t0 = performance.now();
+    let bookRejected = false;
+    try {
+      await getEmbedBook(hangApp, hangFile);
+    } catch (_) {
+      bookRejected = true;
+    }
+    const bookMs = Math.round(performance.now() - t0);
+    pass(
+      bookRejected && bookMs < 1000,
+      "getEmbedBook 的 read 卡死会超时 reject（" + bookMs + "ms），不会永久挂起"
+    );
+    pass(
+      embedCacheStats().books === 0,
+      "超时的书不留在缓存里（books=" + embedCacheStats().books + "），下次还能重试"
+    );
+
+    /*
+     * 6b. Image 既不来 onload 也不来 onerror（资源 URL 挂着不动）。
+     * 超时必须 reject 到 paintEmbed 的 catch，rendering 才能复位。
+     */
+    const RealImage = window.Image;
+    class HangingImage {
+      onload: any = null;
+      onerror: any = null;
+      set src(_v: string) {
+        /* 故意什么都不触发 */
+      }
+      get naturalWidth(): number {
+        return 0;
+      }
+    }
+    (window as any).Image = HangingImage;
+    try {
+      const b = createBook("底图超时本", "blank", "white");
+      b.pages[0].background = {
+        src: "卡住的底图.png",
+        sourceName: "卡住的底图.png",
+        sourcePage: 1,
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 100,
+        kind: "word",
+      };
+      setEmbedIoTimeoutForTest(30);
+      const t1 = performance.now();
+      let imgRejected = false;
+      try {
+        await renderEmbedPage(b, 0, 200);
+      } catch (_) {
+        imgRejected = true;
+      }
+      const imgMs = Math.round(performance.now() - t1);
+      pass(
+        imgRejected && imgMs < 1000,
+        "loadImage 卡死会超时 reject（" + imgMs + "ms），paintEmbed 能复位并保留占位"
+      );
+    } finally {
+      (window as any).Image = RealImage;
+      setEmbedIoTimeoutForTest(10000);
+    }
   }
 
   disposeEmbeds();
