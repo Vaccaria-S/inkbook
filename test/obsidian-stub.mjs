@@ -327,8 +327,10 @@ export class Plugin {
     (window.__protocolHandlers = window.__protocolHandlers || {})[action] = handler;
   }
   async loadData() {
-    return {};
+    return this.__data || {};
   }
-  async saveData() {}
+  async saveData(d) {
+    this.__data = d;
+  }
 }
 

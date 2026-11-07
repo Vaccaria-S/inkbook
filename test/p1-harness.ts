@@ -8,7 +8,9 @@
  *   · adapter 提供 stat（mtime + size），否则 view 的冲突检测整条链路是关的
  *   · 外部改动 = 直接改 files 表 + 把 mtime 往前推（模拟 Obsidian Sync）
  */
+import InkbookPlugin from "../src/main";
 import { InkbookView } from "../src/view";
+import { normalizeBook } from "../src/storage";
 import { createBook, createPage, DEFAULT_SETTINGS, type InkBook, type Stroke } from "../src/types";
 import {
   isIndexPageFileName,
@@ -577,6 +579,208 @@ async function C10() {
   pass(threw === "", "C10① 打开未抛异常 threw=" + JSON.stringify(threw));
   pass(html.includes("打不开"), "C10① 显示「打不开」=" + html.includes("打不开") + "；文案=" + JSON.stringify(html.slice(0, 80)));
   pass(files.get(p) === cut, "C10② 主文件字节未被改写=" + (files.get(p) === cut) + "；写调用=" + totalCalls(t0));
+  v.containerEl.remove();
+}
+
+/* ============================================================================
+ * INK-179 / INK-180：设置数值校验 + 存档防 NaN
+ *
+ * 复现路径：data.json 被同步工具/手工编辑写进 null、"abc" 或越界值 →
+ * loadSettings 的 Object.assign 原样盖掉默认值 → shapePressure(0.5, NaN)
+ * 返回 NaN → pressureFor 把 NaN 写进 stroke.points → normalizePoints 只查
+ * `typeof === "number"`（NaN 也是 number）直接放行 → 存档永久污染。
+ * 下面四条分别守住这四层，任何一层单独被改回去都会红。
+ * ========================================================================== */
+
+/** 造一个只带 loadData/saveData 的宿主，专测 loadSettings / 外部变更 */
+function makeSettingsHost(data: any): any {
+  const pluginApp: any = {
+    vault: {
+      adapter: { exists: async () => false, read: async () => "", write: async () => {} },
+      getFiles: () => [],
+      getAbstractFileByPath: () => null,
+      on: () => ({}),
+    },
+    workspace: {
+      on: () => ({}),
+      getLeavesOfType: () => [],
+      getActiveFile: () => null,
+      getActiveViewOfType: () => null,
+      getLeaf: () => ({ openFile: async () => {} }),
+      onLayoutReady: () => {},
+    },
+  };
+  const p: any = new InkbookPlugin(pluginApp, { id: "inkbook", name: "墨本", version: "0", dir: "" });
+  // 直接给宿主塞 data，再走真实 loadData（stub 的 Plugin.loadData 读 __data）
+  p.__data = data;
+  return p;
+}
+
+/** T1：脏 data.json 的数值字段必须回落/夹取，未知字段保留 */
+async function T1() {
+  const p = makeSettingsHost({
+    pressure: null,
+    smoothing: "abc",
+    defaultPenSize: NaN,
+    defaultHighlighterSize: 9999,
+    futureSetting: "keep-me",
+  });
+  await p.loadSettings();
+  pass(
+    p.settings.pressure === DEFAULT_SETTINGS.pressure,
+    "T1 pressure=null 回落默认 " + DEFAULT_SETTINGS.pressure + "（实际 " + p.settings.pressure + "）"
+  );
+  pass(
+    p.settings.smoothing === DEFAULT_SETTINGS.smoothing,
+    "T1 smoothing=\"abc\" 回落默认 " + DEFAULT_SETTINGS.smoothing + "（实际 " + p.settings.smoothing + "）"
+  );
+  pass(
+    p.settings.defaultPenSize === DEFAULT_SETTINGS.defaultPenSize,
+    "T1 defaultPenSize=NaN 回落默认（实际 " + p.settings.defaultPenSize + "）"
+  );
+  pass(
+    p.settings.defaultHighlighterSize === 40,
+    "T1 越界 9999 夹到上界 40（实际 " + p.settings.defaultHighlighterSize + "）"
+  );
+  pass(
+    (p.settings as any).futureSetting === "keep-me",
+    "T1 未知字段保留（不激进删除，留给未来版本/别的插件）"
+  );
+
+  const p2 = makeSettingsHost({ pressure: 0.01, smoothing: -3, defaultPenSize: 0 });
+  await p2.loadSettings();
+  pass(
+    p2.settings.pressure === 0.3 &&
+      p2.settings.smoothing === 0 &&
+      p2.settings.defaultPenSize === DEFAULT_SETTINGS.defaultPenSize,
+    "T1 越下界夹到边界；粗细=0 按非法回落默认（" +
+      [p2.settings.pressure, p2.settings.smoothing, p2.settings.defaultPenSize].join("/") +
+      "）"
+  );
+}
+
+/** T2：onExternalSettingsChange 要重读盘并刷新已打开的视图 */
+async function T2() {
+  const p = makeSettingsHost({ pressure: 1 });
+  await p.loadSettings();
+  let synced = 0;
+  let cancelled = 0;
+  p.app.workspace.getLeavesOfType = () => [
+    {
+      view: {
+        syncSettings: () => synced++,
+        cancelPendingSaves: () => cancelled++,
+      },
+    },
+  ] as any;
+  // 模拟另一台设备 / 另一个窗口改了 data.json
+  p.__data = { pressure: 0.6, smoothing: 0.9, lastPenColor: "#2E8B57" };
+  await p.onExternalSettingsChange();
+  pass(
+    p.settings.pressure === 0.6 && p.settings.lastPenColor === "#2E8B57",
+    "T2 外部变更被读进内存（pressure=" + p.settings.pressure + "，色=" + p.settings.lastPenColor + "）"
+  );
+  pass(synced === 1, "T2 refreshViews 调了已打开视图的 syncSettings（" + synced + " 次）");
+
+  // 关掉自动保存再刷新：pendings 要被收回
+  p.__data = { autosave: false };
+  await p.onExternalSettingsChange();
+  pass(
+    cancelled === 1,
+    "T2 关自动保存时取消已排队的落盘（cancelPendingSaves " + cancelled + " 次）"
+  );
+}
+
+/** T3：normalizePoints 是最后一道防线，NaN / Infinity 的点不许进存档 */
+async function T3() {
+  const raw: any = {
+    version: 2,
+    kind: "inkbook",
+    title: "NaN本",
+    pages: [
+      {
+        id: "p",
+        template: "grid",
+        paper: "white",
+        layers: [
+          {
+            id: "l",
+            name: "笔迹层",
+            visible: true,
+            opacity: 1,
+            activeLayerId: "l",
+            strokes: [
+              {
+                id: "s",
+                tool: "pen",
+                color: "#1A1A1A",
+                size: 2.8,
+                opacity: 1,
+                points: [
+                  [10, 20, 0.5],
+                  [30, 40, NaN], // 压力 NaN：typeof 是 number，旧实现放行
+                  [Infinity, 50, 0.7], // 坐标 Infinity
+                  [60, 70, 0.8],
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+  const book = normalizeBook(raw, "fallback");
+  const pts = book.pages[0].layers[0].strokes[0].points;
+  pass(
+    pts.every((q) => Number.isFinite(q[0]) && Number.isFinite(q[1]) && Number.isFinite(q[2])),
+    "T3 normalizeBook 后所有点坐标/压力都是有限数（" + JSON.stringify(pts) + "）"
+  );
+  pass(
+    pts.length === 3 && pts[1][2] === 0.5,
+    "T3 压力 NaN 补中性 0.5、坐标 Infinity 丢点（剩 " + pts.length + " 点）"
+  );
+}
+
+/** T4：syncSettings 对运行时注入的脏值兜底 + 关自动保存后 pending 不落盘 */
+async function T4() {
+  const p = "T4.inkbook";
+  seed(p, JSON.stringify(mkBook("T4本", 1, 0)));
+  const v: any = await openView();
+  await v.onLoadFile(tf(p));
+  await sleep(300);
+  plugin.settings.pressure = NaN;
+  plugin.settings.smoothing = -5;
+  plugin.settings.defaultPenSize = 0;
+  plugin.settings.defaultHighlighterSize = NaN;
+  v.syncSettings();
+  const opts = (v.editor as any).opts;
+  pass(
+    Number.isFinite(opts.pressure) && opts.pressure === 1 && opts.smoothing === 0,
+    "T4 syncSettings 把 NaN/负平滑夹回合法区间（pressure=" + opts.pressure + " smoothing=" + opts.smoothing + "）"
+  );
+  pass(
+    v.editor.penSize === 2.8 && v.editor.highlighterSize === 24,
+    "T4 syncSettings 的粗细兜底与 mountEditor 一致（" +
+      v.editor.penSize + "/" + v.editor.highlighterSize + "）"
+  );
+
+  // 关自动保存：已排队的定时器到点也不许写盘
+  plugin.settings.autosave = false;
+  const t0 = calls.length;
+  v.markDirty();
+  // 模拟「已经排上但用户在这之后才关掉自动保存」的定时器：手动排一次
+  v.saveDebounce();
+  v.cancelPendingSaves();
+  // 不取消也会落盘的那两条路径（10s 兜底、抬笔补排）同样不许再排
+  v.armInkDeferRetry(0);
+  v.onInkGestureEnd();
+  await sleep(1100);
+  pass(
+    totalCalls(t0) === 0,
+    "T4 关自动保存后 pending/兜底/抬笔补排都不落盘（写调用=" + totalCalls(t0) + "）"
+  );
+  pass(v.dirty === true, "T4 取消定时器不吞 dirty，显式保存仍能写下去");
+  plugin.settings.autosave = true;
   v.containerEl.remove();
 }
 
@@ -2162,6 +2366,103 @@ async function S4() {
   );
 }
 
+/* ==================== INK-178：撤销/重做两条加固 ==================== */
+
+/**
+ * U1：目标页已不存在时，撤销**不能**把内容写到别的页上。
+ *
+ * 老实现 `pageIndexOf` 找不到 pageId 就退回 `entry.pageIndex`（当时的下标），
+ * 页被删/挪之后它指向的是**另一页**——撤销会把 A 页的内容写到 B 页上。
+ * 正常 LIFO 顺序走不到，但历史被裁（MAX_HISTORY）或将来引入非线性历史
+ * 就会撞上。现在改成返回 -1，apply 直接跳过这一步。
+ */
+async function U1() {
+  const { BookStore } = await import("../src/store");
+  const { createBook, createPage } = await import("../src/types");
+  const book = createBook("撤销加固", "grid", "white");
+  while (book.pages.length < 3) book.pages.push(createPage("grid", "white"));
+  const store: any = new BookStore(book);
+
+  const targetId = book.pages[2].id;
+  const beforeText = book.pages[2].texts;
+  // 手工造一条「指向已删页」的 page 历史
+  book.pages.splice(2, 1); // 第 3 页没了
+  const ghostEntry = {
+    kind: "page" as const,
+    pageId: targetId,
+    pageIndex: 2, // 老实现会用它兜底 → 指向现在的第 3 页（越界夹到第 2 页）
+    data: JSON.stringify({ ...createPage("grid", "white"), id: targetId, texts: beforeText }),
+  };
+  const snapshotB = JSON.stringify(book.pages[1]);
+  store.undoStack.push({ before: ghostEntry, after: ghostEntry });
+  const ok = store.undo();
+
+  pass(
+    JSON.stringify(book.pages[1]) === snapshotB,
+    "U1 目标页已删：撤销不把内容写到相邻页上（第 2 页未被改动）"
+  );
+  pass(
+    book.pages.every((p: any) => p && p.id),
+    "U1 目标页已删：页数组里没有 null/undefined 空洞（页数 " + book.pages.length + "）"
+  );
+  pass(
+    ok === true && book.activePage >= 0 && book.activePage < book.pages.length,
+    "U1 目标页已删：activePage 仍在合法范围内（" + book.activePage + "/" + book.pages.length + "）"
+  );
+}
+
+/**
+ * U2：positions 里的非法值（负数 / NaN）按「追加到末尾」处理，不乱序。
+ *
+ * 老注释写「-1 = 追加到末尾」，但实现会把它 sort 到最前 → `B,C,A`。
+ * 现在 apply 侧统一把非法值当 Infinity（追加）。
+ */
+async function U2() {
+  const { BookStore } = await import("../src/store");
+  const { createBook, createPage } = await import("../src/types");
+  const book = createBook("positions 加固", "grid", "white");
+  const page = book.pages[0];
+  const store: any = new BookStore(book);
+
+  const mk = (id: string): any => ({
+    id,
+    tool: "pen",
+    color: "#000",
+    size: 2.8,
+    opacity: 1,
+    points: [[0, 0, 0.5]],
+  });
+  const A = mk("A"), B = mk("B"), C = mk("C");
+  page.layers[0].strokes = [];
+
+  const entry = (strokes: any[], positions: number[]) => ({
+    kind: "layer" as const,
+    pageId: page.id,
+    pageIndex: 0,
+    layerId: page.layers[0].id,
+    strokes,
+    positions,
+  });
+
+  // 全 -1：老实现给 B,C,A，现在应该按原顺序 A,B,C
+  store.apply(entry([A, B, C], [-1, -1, -1]));
+  const got1 = page.layers[0].strokes.map((s: any) => s.id).join(",");
+  pass(got1 === "A,B,C", "U2 positions 全 -1 按追加处理（实际 " + got1 + "，期望 A,B,C）");
+
+  // NaN 混在中间
+  store.apply(entry([A, B, C], [0, NaN, 1]));
+  const got2 = page.layers[0].strokes.map((s: any) => s.id).join(",");
+  pass(
+    got2 === "A,C,B",
+    "U2 positions 含 NaN 当追加（实际 " + got2 + "，期望 A,C,B：A 在 0、C 在 1、B 追加）"
+  );
+
+  // 正常顺序仍然是 A,B,C
+  store.apply(entry([A, B, C], [0, 1, 2]));
+  const got3 = page.layers[0].strokes.map((s: any) => s.id).join(",");
+  pass(got3 === "A,B,C", "U2 正常 positions 不受影响（实际 " + got3 + "）");
+}
+
 const CASES: Array<[string, () => Promise<void>]> = [
   ["A1+A2", A12],
   ["A3", A3],
@@ -2192,6 +2493,12 @@ const CASES: Array<[string, () => Promise<void>]> = [
   ["S2 rmdir 递归删校验", S2],
   ["S3 无 list 探测删旧页", S3],
   ["S4 索引失败 Notice 节流", S4],
+  ["U1 撤销不写错页", U1],
+  ["U2 positions 非法值", U2],
+  ["T1 设置数值校验", T1],
+  ["T2 外部设置变更", T2],
+  ["T3 存档防 NaN", T3],
+  ["T4 syncSettings 与自动保存", T4],
 ];
 
 async function main() {

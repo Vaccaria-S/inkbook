@@ -56,7 +56,14 @@ export type HistoryEntry =
       layerId: string;
       /** 该层应有的全部笔迹 */
       strokes: Stroke[];
-      /** 每条笔迹在层内的位置（-1 = 追加到末尾） */
+      /**
+       * 每条笔迹在层内的位置（`positions[i]` 对应 `strokes[i]`）。
+       *
+       * 生成方（`layerEntry`）恒给 `[0,1,2,…]`。老注释写「-1 = 追加到末尾」
+       * 但实现从来没兑现：`-1` 会被 `sort` 排到最前，得到 `B,C,A` 乱序
+       * （INK-178 审查实测）。现在 apply 侧把**非法值（负数/NaN）统一按
+       * 「追加到末尾」处理**，注释与实现一致。
+       */
       positions?: number[];
     }
   /**
@@ -196,8 +203,8 @@ export class BookStore {
     try {
       const before = this.pendingBefore;
       this.pendingBefore = null;
-      // after = 现在的状态（和 before 同类型）
-      const after: HistoryEntry =
+      // after = 现在的状态（和 before 同类型）；null = 页没了，这条历史作废
+      const after: HistoryEntry | null =
         before.kind === "book"
           ? {
               kind: "book",
@@ -206,12 +213,25 @@ export class BookStore {
             }
           : before.kind === "outline"
             ? { kind: "outline", outlines: this.outlineSnapshot() }
-            : {
-                kind: "page",
-                pageId: before.pageId,
-                pageIndex: before.pageIndex,
-                data: JSON.stringify(this.data.pages[this.pageIndexOf(before)]),
-              };
+            : (() => {
+                /*
+                 * 页已经不在了（结算前被删）：这条历史没有意义，
+                 * 直接丢掉，别推一条 data 为 undefined 的坏条目进去。
+                 * 见 pageIndexOf 的说明（INK-178）。
+                 */
+                const at = this.pageIndexOf(before);
+                if (at < 0) return null;
+                return {
+                  kind: "page" as const,
+                  pageId: before.pageId,
+                  pageIndex: before.pageIndex,
+                  data: JSON.stringify(this.data.pages[at]),
+                };
+              })();
+      if (!after) {
+        // 页没了：这次补结算不产生历史（before 也一并丢弃）
+        return;
+      }
       this.pushHistory(before, after, keepRedo);
     } finally {
       this.settling = false;
@@ -250,13 +270,21 @@ export class BookStore {
   }
 
   /**
-   * 找出条目对应的页下标（只看有 pageId 的条目）
+   * 找出条目对应的页下标（只看有 pageId 的条目）。
+   *
+   * **找不到就返回 -1，绝不退回 `entry.pageIndex`**（INK-178 审查）。
+   *
+   * 老实现找不到 pageId 时按「历史里记的下标」兜底，问题在于：
+   * 那个下标是**当时**的位置，页被删/挪之后它指向的是**另一页**。
+   * 正常 LIFO 顺序下走不到（撤销删页会先把页恢复回来），但只要历史被
+   * 外部因素打乱（`MAX_HISTORY` 把中间的删页记录裁掉、或将来引入
+   * 非线性的历史操作），就会把 A 页的文字/笔迹**写到 B 页上**。
+   * 宁可不撤这一步（调用方按 -1 跳过），也不能悄悄改坏另一页。
    */
   private pageIndexOf(
     entry: Exclude<HistoryEntry, { kind: "book" } | { kind: "order" } | { kind: "outline" }>
   ): number {
-    const found = this.data.pages.findIndex((p) => p.id === entry.pageId);
-    return found >= 0 ? found : Math.min(entry.pageIndex, this.data.pages.length - 1);
+    return this.data.pages.findIndex((p) => p.id === entry.pageId);
   }
 
   /** 找到某页里指定 id 的图层 */
@@ -351,30 +379,45 @@ export class BookStore {
       if (page) {
         const layer = this.findLayer(page, entry.layerId) ?? activeLayer(page);
         /*
-         * 位置还原要小心：positions 是"这条笔迹在原列表里的下标"。
+         * 位置还原：positions 是"这条笔迹在原列表里的下标"。
          * 如果原列表是 [A,B,C]，只保留 [A,C]，那么 C 应该落在下标 1
          * 而不是 2——因为 B 已经没了。
          *
          * 稳妥做法：先按 positions 排序，再依次找"下一个空位"。
          * 这样无论中间删了几条，顺序都正确。
+         *
+         * 非法 positions（负数 / NaN / 越界）一律当成「追加到末尾」：
+         * 老注释说的「-1 = 追加末尾」就是在这里兑现的（INK-178）。
          */
         const ordered = entry.strokes
-          .map((stroke, i) => ({ stroke, pos: entry.positions?.[i] ?? i }))
+          .map((stroke, i) => {
+            const raw = entry.positions?.[i] ?? i;
+            return { stroke, pos: Number.isFinite(raw) && raw >= 0 ? raw : Infinity };
+          })
           .sort((a, b) => a.pos - b.pos);
         const next: Stroke[] = [];
         for (const o of ordered) {
           // 放进第一个 >= pos 的位置；不够就追加
           let target = o.pos;
-          if (target > next.length) target = next.length;
+          if (!Number.isFinite(target) || target > next.length) target = next.length;
           next.splice(target, 0, o.stroke);
         }
         layer.strokes = next;
         this.data.activePage = at;
       }
     } else {
-      const page = JSON.parse(entry.data) as Page;
+      /*
+       * 目标页已经不在（被删且历史被裁）：**跳过这一步**，不猜位置。
+       * `this.data.pages[-1] = page` 会在数组上挂一个 "-1" 属性，
+       * 既不生效也不报错，而 activePage 会被设成 -1 → 界面显示空白页。
+       * 见 pageIndexOf 的说明（INK-178）。
+       */
       const at = this.pageIndexOf(entry);
-      this.data.pages[at] = page;
+      if (at < 0) {
+        this.touch();
+        return;
+      }
+      this.data.pages[at] = JSON.parse(entry.data) as Page;
       this.data.activePage = at;
     }
     this.touch();

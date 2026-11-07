@@ -227,6 +227,67 @@ async function main() {
     pass(zoomNormalization(NaN) === 1, "缩放归一化：非法 zoom 回落 1");
   }
 
+  /* -------------------- 手感参数边界（INK-179 / INK-180） --------------------
+   *
+   * `Math.max(0.1, NaN) === NaN`：旧实现只做了下限兜底，sensitivity 一旦
+   * 是 NaN（脏 data.json、同步工具写进来的 null），整条压感链路会把 NaN
+   * 传回 stroke.points 并写进存档，永久污染这一笔。下面锁住四层防线里
+   * 纯函数与运行时入口这两层。
+   * ------------------------------------------------------------------------ */
+  {
+    const nanP = shapePressure(0.5, NaN);
+    pass(
+      Number.isFinite(nanP) && Math.abs(nanP - shapePressure(0.5, 1)) < 1e-12,
+      "shapePressure：sensitivity=NaN 回落默认 1，绝不返回 NaN（得到 " + nanP + "）"
+    );
+    pass(
+      Number.isFinite(shapePressure(0.5, Infinity)) &&
+        Number.isFinite(shapePressure(0.5, -Infinity)),
+      "shapePressure：sensitivity=±Infinity 也不返回 NaN"
+    );
+    pass(
+      Number.isFinite(shapePressure(NaN, 1)),
+      "shapePressure：原始压力 NaN 本身也按中性 0.5 兜住"
+    );
+  }
+  {
+    const { host, editor, store } = makeAbHost();
+    editor.setPressure(NaN);
+    editor.setSmoothing(NaN);
+    const opts = (editor as any).opts;
+    pass(
+      opts.pressure === 1 && opts.smoothing === 0.55,
+      "setPressure/setSmoothing：NaN 回落默认（" + opts.pressure + "/" + opts.smoothing + "）"
+    );
+    editor.setPressure(99);
+    editor.setSmoothing(-3);
+    pass(
+      opts.pressure === 1.5 && opts.smoothing === 0,
+      "setPressure/setSmoothing：越界值夹到面板区间（" + opts.pressure + "/" + opts.smoothing + "）"
+    );
+    // 构造时直接传进来的脏 opts（不经过 setter）也不能把 NaN 写进笔迹
+    const badHost = document.createElement("div");
+    badHost.className = "mb-host";
+    host.parentElement!.appendChild(badHost);
+    const badStore = new BookStore(createBook("脏手感", "blank", "white"));
+    const badEditor = new BookEditor(badHost, badStore, {
+      pressure: NaN,
+      smoothing: NaN,
+      onState: () => {},
+      onChange: () => {},
+      onPageChange: () => {},
+    });
+    (badEditor as any).pressureFor({ pointerType: "pen", pressure: 0.5 } as any, 1, 16);
+    pass(
+      Number.isFinite((badEditor as any).lastPressure) && (badEditor as any).lastPressure > 0,
+      "构造时脏 opts 也兜住：pressureFor 不产出 NaN（" + (badEditor as any).lastPressure + "）"
+    );
+    badEditor.destroy();
+    editor.destroy();
+    store.page.layers[0].strokes.length = 0;
+    document.querySelectorAll(".mb-root").forEach((el) => el.remove());
+  }
+
   /* -------------------- 桌面端渲染超采样（INK-162） --------------------
    *
    * 用户报「用电脑写的时候边缘不够丝滑」。根因（实测 5 seed × 2 笔画 ×

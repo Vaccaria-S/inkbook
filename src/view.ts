@@ -293,6 +293,23 @@ export interface InkbookPluginLike {
   settings: InkbookSettings;
   saveSettings(): Promise<void>;
   refreshViews(): void;
+  /** 关掉自动保存时收回已经排队的落盘（main.ts 实现；测试桩可不给） */
+  cancelPendingSaves?: () => void;
+}
+
+/**
+ * 手感 / 粗细字段的合法区间，与设置页滑杆的 setLimits、侧栏粗细
+ * range 的 min/max 一致。syncSettings 是运行时入口，拿到的值未必经过
+ * loadSettings 校验（别的窗口同步、手工改 data.json、测试桩注入），
+ * 所以在这里再兜一次，避免非法值直接落到 editor 上。
+ */
+function finiteSetting(v: number | undefined, fallback: number, min: number, max: number): number {
+  if (!Number.isFinite(v)) return fallback;
+  const n = v as number;
+  // 粗细类字段的下界 > 0：0 / 负数没有「笔尖」语义（旧代码用 `|| 默认值`
+  // 兜的正是这个），按非法值回落，不要夹成 min 后画出一条几乎看不见的线。
+  if (min > 0 && n <= 0) return fallback;
+  return Math.max(min, Math.min(max, n));
 }
 
 export class InkbookView extends FileView {
@@ -1083,8 +1100,8 @@ export class InkbookView extends FileView {
     this.editor = new BookEditor(this.paperHost, this.store, {
       app: this.app,
       penOnly: this.plugin.settings.penOnly,
-      pressure: this.plugin.settings.pressure,
-      smoothing: this.plugin.settings.smoothing,
+      pressure: finiteSetting(this.plugin.settings.pressure, 1, 0.3, 1.5),
+      smoothing: finiteSetting(this.plugin.settings.smoothing, 0.55, 0, 1),
       prediction: this.plugin.settings.prediction,
       edgeSwipeBlock: this.plugin.settings.blockEdgeSwipe !== false,
       straighten: this.plugin.settings.straightLine === true,
@@ -1110,9 +1127,14 @@ export class InkbookView extends FileView {
       },
     });
     this.editor.penColor = this.plugin.settings.lastPenColor || "#1A1A1A";
-    this.editor.penSize = this.plugin.settings.defaultPenSize || 2.8;
+    this.editor.penSize = finiteSetting(this.plugin.settings.defaultPenSize, 2.8, 1, 8);
     this.editor.highlighterColor = this.plugin.settings.lastHighlighterColor || "#F6E05E";
-    this.editor.highlighterSize = this.plugin.settings.defaultHighlighterSize || 24;
+    this.editor.highlighterSize = finiteSetting(
+      this.plugin.settings.defaultHighlighterSize,
+      24,
+      4,
+      40
+    );
     // 「允许手指书写」以前只活在编辑器实例上，每次打开都回默认 false；
     // 现在从 settings 恢复（侧栏开关 / 设置页都会写回这里）。
     this.editor.touchDraw = this.plugin.settings.touchDraw === true;
@@ -3290,13 +3312,17 @@ export class InkbookView extends FileView {
       }
       if (this.plugin.settings.penOnly) {
         this.plugin.settings.penOnly = false;
-        void this.plugin.saveSettings();
         this.editor?.setPenOnly(false);
         undone.push("已关闭「只认触控笔」");
       }
       this.editor?.setTouchDraw(true);
       // 写回 settings：以前只在编辑器实例上置位，重启就复位了
       this.plugin.settings.touchDraw = true;
+      /*
+       * 两个字段一起写盘，只调一次 saveSettings。
+       * saveData 是整份 settings 全量覆盖，连写两次时两次之间另一个
+       * 窗口刚保存的改动会被第二次用同一份旧快照抹掉（INK-179）。
+       */
       void this.plugin.saveSettings();
       this.updateUI();
       new Notice(
@@ -5188,6 +5214,13 @@ export class InkbookView extends FileView {
    * markDirty() 绝不拦截（它还驱动 thumbDebounce，拦了缩略图会停更）。
    */
   private runAutoSave(): void {
+    /*
+     * 关掉「自动保存」只挡住了 markDirty 的排程，可已经在飞的定时器
+     * （850ms 尾沿 / 10s 上限 / 抬笔补排 / saveNow 的 saveAgain 补排）
+     * 到点仍会走这里落盘，用户看到的就是「明明了自动保存还是存了」。
+     * 这一道门是所有自动路径的共同出口，挡在这里才不会漏。
+     */
+    if (!this.plugin.settings.autosave) return;
     void this.saveNow(false);
   }
 
@@ -5203,12 +5236,15 @@ export class InkbookView extends FileView {
    * （INK-129）。上限的时间戳和兜底定时器要一直留到真正存成功为止。
    */
   private onInkGestureEnd(): void {
+    // 关掉自动保存后，抬笔也不能再把自动落盘排回来
     if (this.dirty && this.plugin.settings.autosave) this.saveDebounce();
   }
 
   /** 硬上限到点后来敲门：不 busy 了就正常存，还 busy 就让 saveNow 强制存 */
   private armInkDeferRetry(delayMs: number): void {
     this.cancelInkDeferRetry();
+    // 用户中途关掉自动保存时，10s 硬上限这条兜底也不能再敲门
+    if (!this.plugin.settings.autosave) return;
     this.inkDeferRetry = window.setTimeout(() => {
       this.inkDeferRetry = 0;
       if (!this.dirty && !this.metaDirty) return;
@@ -5219,6 +5255,18 @@ export class InkbookView extends FileView {
   private cancelInkDeferRetry(): void {
     if (this.inkDeferRetry) window.clearTimeout(this.inkDeferRetry);
     this.inkDeferRetry = 0;
+  }
+
+  /**
+   * 设置页关掉「自动保存」时调用：把已经排上但还没到点的自动落盘收回。
+   *
+   * 只清定时器、不动 dirty 状态：用户关掉自动保存不代表这一笔不要了，
+   * 显式保存（Ctrl+S / 顶栏按钮 / 切文件时的 flushSave）仍要能写下去。
+   */
+  cancelPendingSaves(): void {
+    this.saveDebounce.cancel();
+    this.cancelInkDeferRetry();
+    this.inkDeferAt = 0;
   }
 
   /**
@@ -5564,7 +5612,8 @@ export class InkbookView extends FileView {
         if (this.store === store) this.updateStatus();
         if (this.saveAgain) {
           this.saveAgain = false;
-          this.saveDebounce();
+          // 关掉自动保存后不再补排；这一笔仍留在 dirty，显式保存/flush 会写掉
+          if (this.plugin.settings.autosave) this.saveDebounce();
         }
       }
     })();
@@ -5916,16 +5965,23 @@ export class InkbookView extends FileView {
     // 设置页现在也能改「允许手指书写」：同步到已打开的视图，
     // 不能让设置页里改完、当前笔记还是老样子。
     this.editor.setTouchDraw(this.plugin.settings.touchDraw === true);
-    this.editor.setPressure(this.plugin.settings.pressure);
-    this.editor.setSmoothing(this.plugin.settings.smoothing ?? 0.55);
+    this.editor.setPressure(finiteSetting(this.plugin.settings.pressure, 1, 0.3, 1.5));
+    this.editor.setSmoothing(finiteSetting(this.plugin.settings.smoothing, 0.55, 0, 1));
     this.editor.setPrediction(this.plugin.settings.prediction !== false);
     this.editor.setEdgeSwipeBlock(this.plugin.settings.blockEdgeSwipe !== false);
     this.editor.setStraighten(this.plugin.settings.straightLine === true);
-    this.editor.penSize = this.plugin.settings.defaultPenSize;
+    // 与 mountEditor 一致地兜底：0 / NaN / null 会让笔尖宽度变成非法值，
+    // 落笔线条消失、Path2D 也会拿到 NaN。别让「改了别的设置」顺手弄坏笔。
+    this.editor.penSize = finiteSetting(this.plugin.settings.defaultPenSize, 2.8, 1, 8);
     // 设置页里的「上次用的笔色 / 荧光色 / 荧光粗细」改完立即生效
     this.editor.penColor = this.plugin.settings.lastPenColor || "#1A1A1A";
     this.editor.highlighterColor = this.plugin.settings.lastHighlighterColor || "#F6E05E";
-    this.editor.highlighterSize = this.plugin.settings.defaultHighlighterSize || 24;
+    this.editor.highlighterSize = finiteSetting(
+      this.plugin.settings.defaultHighlighterSize,
+      24,
+      4,
+      40
+    );
     this.updateUI();
   }
 }

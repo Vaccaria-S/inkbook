@@ -147,8 +147,14 @@ export async function fingerprint(
  * 我们自己写的、旧版本写的都长这样。所以先走一趟只读校验：
  *   · 全部合规 → 原样把数组交回去，零分配（`raw` 在这次调用返回后就是垃圾，
  *     复用它没有任何别名风险）
- *   · 只要有一个不合规 → 整体走慢路径逐点重建，**语义与旧实现完全一致**
- *     （长度 < 2 的丢掉，缺压力值补 0.5，字符串数字用 Number 转）
+ *   · 只要有一个不合规 → 整体走慢路径逐点重建（长度 < 2 的丢掉，缺压力值
+ *     补 0.5，字符串数字用 Number 转）
+ *
+ * 合规判据必须是 `Number.isFinite` 而不是 `typeof === "number"`：
+ * NaN / Infinity 的 typeof 也是 "number"，只查类型会原样放行。
+ * 手感参数一旦被脏 data.json 写坏，NaN 会顺着 pressureFor → points
+ * 流进来；这一层是**存档前的最后一道防线**，漏了就永久写坏这一笔
+ * （INK-179）。非法坐标/压力按中性值兜底，不让脏值再写回磁盘。
  *
  * 为什么不"洗几个就复用几个"：半洗半留会让「哪些点被规范化过」变得不可预测，
  * 将来排查"某个点为什么是字符串"会变成噩梦。要么全快，要么全慢。
@@ -161,17 +167,30 @@ function normalizePoints(list: any[]): Pt[] {
       clean = false;
       break;
     }
-    if (typeof q[0] !== "number" || typeof q[1] !== "number" || typeof q[2] !== "number") {
+    if (
+      !Number.isFinite(q[0]) ||
+      !Number.isFinite(q[1]) ||
+      !Number.isFinite(q[2])
+    ) {
       clean = false;
       break;
     }
   }
   if (clean) return list as Pt[];
 
+  const finite = (v: any, fallback: number): number => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
   const out: Pt[] = [];
   for (const q of list) {
     if (!Array.isArray(q) || q.length < 2) continue;
-    out.push([Number(q[0]), Number(q[1]), Number(q[2] ?? 0.5)]);
+    // 坐标非法时不能瞎补 0（会把点吸到左上角）——直接丢这个点最安全；
+    // 压力非法补 0.5（中性力度），与旧路径「缺压力值补 0.5」语义一致。
+    const x = Number(q[0]);
+    const y = Number(q[1]);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    out.push([x, y, finite(q[2] ?? 0.5, 0.5)]);
   }
   return out;
 }

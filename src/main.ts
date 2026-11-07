@@ -13,6 +13,18 @@ import {
   type EmbedHost,
 } from "./embed";
 
+/**
+ * 手感 / 粗细数值字段的合法区间：与设置页滑杆的 setLimits、
+ * 侧栏粗细 range 的 min/max 一致。取 UI 的真实范围而不是更宽的兜底——
+ * 超出这个范围的值在面板上根本显示不出来，留着只会继续误导用户。
+ */
+const NUMERIC_SETTING_RANGES: Array<[keyof InkbookSettings, number, number]> = [
+  ["pressure", 0.3, 1.5],
+  ["smoothing", 0, 1],
+  ["defaultPenSize", 1, 8],
+  ["defaultHighlighterSize", 4, 40],
+];
+
 class BookPickerModal extends FuzzySuggestModal<TFile> {
   private choose: (file: TFile) => void;
 
@@ -591,17 +603,58 @@ export default class InkbookPlugin extends Plugin {
      * 免得下次保存又写回去、让后来的人以为它有用。
      */
     delete data.toolPanel;
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+    const settings = Object.assign({}, DEFAULT_SETTINGS, data) as InkbookSettings;
+    /*
+     * 数值字段必须自己校验，不能只靠面板滑杆的 setLimits。
+     * data.json 会被同步工具 / 手工编辑 / 别的版本写进 null、"abc"、
+     * NaN（JSON 里通常是 null）甚至越界值；`Object.assign` 会把它们
+     * 原样盖掉默认值。NaN 一旦流到 shapePressure → pressureFor →
+     * stroke.points 就会被写进 .inkbook，存档永久污染（INK-179）。
+     * 非法一律回落 DEFAULT_SETTINGS 的对应项，合法但越界的夹到边界。
+     */
+    for (const [key, min, max] of NUMERIC_SETTING_RANGES) {
+      const v = (settings as any)[key];
+      const fallback = (DEFAULT_SETTINGS as any)[key];
+      // 粗细类字段下界 > 0：0 / 负数按非法值回落默认，别夹出一个画不出的笔尖
+      (settings as any)[key] = !Number.isFinite(v) || (min > 0 && v <= 0)
+        ? fallback
+        : Math.max(min, Math.min(max, v));
+    }
+    this.settings = settings;
   }
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
   }
 
+  /**
+   * 另一窗口 / 另一台设备改了 data.json 时由宿主调用（Sync、iCloud、
+   * Obsidian 多窗口都是这条路）。
+   *
+   * 不实现这个钩子的话，本窗口内存里的 settings 会一直停留在启动时的
+   * 旧快照；用户下一次点任何控件（选笔色、切侧栏、新建本子都调
+   * saveSettings）都会用这份旧快照全量覆盖别人刚写的值 —— 真机表现就是
+   * 「改了设置、重启就没了 / 两台设备互相覆盖」。这里重新读盘并让已经
+   * 打开的编辑器立刻跟上。
+   *
+   * 不做「写前读盘再按字段合并」：那份逻辑分不清「本窗口刚删掉的旧字段」
+   * 和「别的窗口刚加的新字段」，反而会把 toolPanel 这类已废弃的键又捞回来；
+   * 而且读-改-写之间仍有竞态窗口。交给宿主的外部变更通知是更干净的解法：
+   * 谁最后写盘谁生效，另一方随后被通知并刷新内存，不会静默回滚用户操作。
+   */
+  async onExternalSettingsChange(): Promise<void> {
+    await this.loadSettings();
+    this.refreshViews();
+  }
+
   refreshViews(): void {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
       const v = leaf.view as any;
       if (v && typeof v.syncSettings === "function") v.syncSettings();
+      // 关「自动保存」时，已经排队的那次落盘不能等定时器到点再写
+      if (!this.settings.autosave && typeof v?.cancelPendingSaves === "function") {
+        v.cancelPendingSaves();
+      }
     }
   }
 }

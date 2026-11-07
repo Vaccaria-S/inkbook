@@ -297,6 +297,11 @@ export class InkbookSettingTab extends PluginSettingTab {
         t.setValue(this.plugin.settings.autosave).onChange(async (v) => {
           this.plugin.settings.autosave = v;
           await this.plugin.saveSettings();
+          /*
+           * 关掉后 refreshViews 会取消各视图已经排队的自动保存；
+           * 打开时也让视图跟上，避免别的窗口同步来的设置与内存不一致。
+           */
+          this.plugin.refreshViews();
         })
       );
   }

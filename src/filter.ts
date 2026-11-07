@@ -121,8 +121,15 @@ export function shapePressure(raw: number, sensitivity = 1, gamma = 0.72): numbe
   if (!Number.isFinite(raw)) return 0.5;
   let p = Math.max(0, Math.min(1, raw));
 
-  // 灵敏度：围绕 0.5 做对比拉伸
-  const s = Math.max(0.1, sensitivity);
+  /*
+   * 灵敏度：围绕 0.5 做对比拉伸。
+   *
+   * 必须先判 isFinite：Math.max(0.1, NaN) 是 NaN（不是 0.1），
+   * 一旦 sensitivity 是 NaN/Infinity，下面所有运算都会把 NaN 传回
+   * pressureFor → stroke.points → 存档（INK-179）。这是最后一层纯函数
+   * 防线，非法值按默认灵敏度 1 处理，绝不把脏值往下游传。
+   */
+  const s = Number.isFinite(sensitivity) ? Math.max(0.1, sensitivity) : 1;
   p = Math.max(0, Math.min(1, 0.5 + (p - 0.5) * s));
 
   // 提底噪

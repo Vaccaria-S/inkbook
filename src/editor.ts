@@ -1148,12 +1148,19 @@ export class BookEditor {
     this.emitState();
   }
 
+  /*
+   * 二次夹取：settings 的 loadSettings 已经校验过一轮，但 setPressure /
+   * setSmoothing 是运行时入口（syncSettings、测试 harness、未来新调用方
+   * 都可能直接传值）。非法值一旦落到 opts 上，pressureFor 会把它一路带进
+   * stroke.points 写盘；平滑为负还会让 1€ 的 minCutoff 变 21、beta 变负，
+   * alpha 成负数导致坐标发散。所以这里拒绝 NaN/Infinity 并夹到面板区间。
+   */
   setPressure(v: number): void {
-    this.opts.pressure = v;
+    this.opts.pressure = Number.isFinite(v) ? clamp(v, 0.3, 1.5) : 1;
   }
 
   setSmoothing(v: number): void {
-    this.opts.smoothing = v;
+    this.opts.smoothing = Number.isFinite(v) ? clamp(v, 0, 1) : 0.55;
   }
 
   setPrediction(on: boolean): void {
@@ -3939,7 +3946,9 @@ export class BookEditor {
   /** 原始坐标 → 滤波后坐标。手抖没了，线条才干净。 */
   private filteredPoint(e: PointerEvent, rec: PageRec): Pt {
     const raw = this.pointFromEvent(e, rec);
-    const smooth = this.opts.smoothing ?? 0.55;
+    const rawSmooth = this.opts.smoothing ?? 0.55;
+    // 构造时直接传进来的 opts 也要兜住（不经过 setSmoothing 的那条路）
+    const smooth = Number.isFinite(rawSmooth) ? clamp(rawSmooth, 0, 1) : 0.55;
     if (smooth <= 0.02) return raw;
     // 平滑强度映射到 1€ 滤波器的 minCutoff：越强越稳
     const minCutoff = 0.6 + (1 - smooth) * 3.4;
@@ -3977,7 +3986,8 @@ export class BookEditor {
     }
 
     // 压感曲线整形：让轻到中等压力的区分度更高，重按趋于饱和
-    const sens = this.opts.pressure ?? 1;
+    const rawSens = this.opts.pressure ?? 1;
+    const sens = Number.isFinite(rawSens) ? clamp(rawSens, 0.3, 1.5) : 1;
     raw = shapePressure(raw, sens);
 
     // 速度—粗细联动：快笔收窄，避免飞白成一团
