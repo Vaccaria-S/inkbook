@@ -340,6 +340,30 @@ async function main() {
       progress[progress.length - 1] === 1 && progress.indexOf(2) < 0,
       "取消发生在第 1 页之后（进度停在 " + progress[progress.length - 1] + "/4）"
     );
+    /*
+     * 取消路径也要清掉超标位图（2026-11-07 补）。
+     * 用户点取消往往正是因为本子太大、导出太慢 —— 那时缓存里恰恰
+     * 已经堆了一批 90MB 的导出位图。清理放在 exportBookPdf 的 finally 里。
+     */
+    {
+      const cache = (editor as any).bgBitmaps as {
+        getEntry(k: string): { width: number } | undefined;
+      };
+      let oversized = 0;
+      for (const p of editor.store.data.pages) {
+        const bg = p.background;
+        if (!bg?.pdf) continue;
+        const key = `${bg.pdf.path}#${bg.pdf.page}`;
+        const e = cache.getEntry(key);
+        if (!e) continue;
+        const need = (editor as any).pdfTargetWidth(bg) as number;
+        if (e.width > need * 1.25) oversized += 1;
+      }
+      pass(
+        oversized === 0,
+        "取消导出后也没有超标位图残留（超标 " + oversized + " 张）"
+      );
+    }
   }
 
   /* -------------------- 写 .tmp 时取消：清干净，不留半个 PDF -------------------- */

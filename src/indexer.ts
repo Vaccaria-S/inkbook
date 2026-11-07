@@ -450,12 +450,53 @@ export interface TextIndexResult {
 }
 
 /**
+ * 每个本子的「正在写索引」链（单飞）。
+ *
+ * 为什么必须有（2026-11-07 补）：`writeTextIndex` 有四个调用点，其中
+ * `view.ts:4750` 是 `void writeTextIndex(...)` 异步启动、`view.ts:4775`
+ * 在 flush 时 `await` 又启一轮。两轮并发时：
+ *   前一轮在「清理旧索引」阶段按**它当时的 wanted** 删文件，
+ *   而后一轮可能刚写完几个新页 —— 这些新页不在前一轮的 wanted 里，
+ *   于是被删掉，接着前一轮的 `verify` 报「索引失败」、全局搜索缺页。
+ *
+ * 同一本子的写索引必须串行：后来的请求排在链尾，等前一轮结束再跑。
+ * 用 `file.path` 做键（改名后路径会变，自然分成两条链，不会互相串）。
+ */
+const indexWriteChain = new Map<string, Promise<unknown>>();
+
+/**
  * 写索引：有文字的页各写一个文件，清掉多余的旧页与旧版单文件。
  *
  * **永不抛异常**：索引是附属品，不能因为它坏了就把「保存成功」报成失败。
  * 失败时返回 `ok:false` 并弹一个用户可见的 Notice（同一原因会节流）。
+ *
+ * 同一个本子的调用会**串行排队**（见 `indexWriteChain`），避免两轮互相
+ * 删掉对方刚写的页。
  */
-export async function writeTextIndex(
+export function writeTextIndex(
+  app: App,
+  file: TFile,
+  book: InkBook,
+  opts: { notify?: boolean } = {}
+): Promise<TextIndexResult> {
+  const key = file.path || file.basename || "?";
+  const prev = indexWriteChain.get(key) ?? Promise.resolve();
+  // 无论前一轮成功失败都接着往下跑（失败不该卡死后续索引）
+  const run = prev.then(
+    () => writeTextIndexNow(app, file, book, opts),
+    () => writeTextIndexNow(app, file, book, opts)
+  );
+  const tail = run.catch(() => undefined);
+  indexWriteChain.set(key, tail);
+  // 链尾跑完就清掉，避免 Map 随本子数量无限增长
+  void tail.then(() => {
+    if (indexWriteChain.get(key) === tail) indexWriteChain.delete(key);
+  });
+  return run;
+}
+
+/** 真正干活的那一轮（由 `writeTextIndex` 串行调度） */
+async function writeTextIndexNow(
   app: App,
   file: TFile,
   book: InkBook,

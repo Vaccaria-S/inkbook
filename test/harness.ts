@@ -887,6 +887,31 @@ async function main() {
     );
 
     /*
+     * 并发写索引必须串行（2026-11-07 补）：
+     * writeTextIndex 有 `void` 异步启动的调用点，两轮并发时前一轮在
+     * 「清理旧索引」阶段按它当时的 wanted 删文件，会删掉后一轮刚写的新页，
+     * 随后 verify 报「索引失败」、全局搜索缺页。
+     * 这里同时发起两轮，两轮都必须成功、且最终索引页齐全。
+     */
+    {
+      // 恢复第 2 页有文字，确保 wanted 里有两页
+      bk.pages[1].texts = [{ id: "t2", source: "user", x: 60, y: 60, text: "第二页的字", size: 18 }];
+      const [r1, r2] = await Promise.all([
+        writeTextIndex(mockApp, mockFile, bk),
+        writeTextIndex(mockApp, mockFile, bk),
+      ]);
+      pass(
+        r1.ok && r2.ok,
+        "并发两轮写索引都成功（r1=" + r1.ok + " r2=" + r2.ok + "，pages " + r1.pages + "/" + r2.pages + "）"
+      );
+      pass(
+        fsMap.has("笔记/数学.墨本索引/数学 · 第 1 页.md") &&
+          fsMap.has("笔记/数学.墨本索引/数学 · 第 2 页.md"),
+        "并发两轮之后两页索引都在（没被对方清理阶段删掉）"
+      );
+    }
+
+    /*
      * 导入 PDF 的端到端索引：
      *   真实 sample.pdf（第 1 页）→ importPdf 抽文字 → 组装成书 → writeTextIndex
      * 断言抽出来的每一条 PDF 原文都进入了索引 md，且文件名带本子名。

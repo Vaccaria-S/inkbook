@@ -261,6 +261,36 @@ export async function exportBookPdf(
   range?: { from: number; to: number },
   opts: ExportBookOptions = {}
 ): Promise<string> {
+  /*
+   * 无论成功、失败还是**被取消**，都要把导出用的大位图还给缓存。
+   *
+   * 导出按 pdfExportWidth（最长边 4096）渲染，单张可达 4096×5793×4 ≈ 90MB；
+   * 塞进 bgBitmaps(160MB) 只放得下 1.8 张，会把阅读用的 1588 位图全挤出去。
+   * 取消路径同样要清 —— 用户点「取消」往往正是因为本子太大、导出太慢，
+   * 那时缓存里恰恰已经堆了一批超大位图。
+   *
+   * 清理失败不影响导出结果，所以单独 catch。
+   */
+  try {
+    return await exportBookPdfImpl(vault, editor, file, scale, range, opts);
+  } finally {
+    try {
+      editor.pruneOversizedBackgrounds();
+    } catch (_) {
+      /* 清理失败不影响导出结论 */
+    }
+  }
+}
+
+/** 导出主体（`exportBookPdf` 的包装只负责 finally 清理） */
+async function exportBookPdfImpl(
+  vault: Vault,
+  editor: BookEditor,
+  file: TFile,
+  scale = 2,
+  range?: { from: number; to: number },
+  opts: ExportBookOptions = {}
+): Promise<string> {
   const { signal, onProgress } = opts;
   const state = editor.getState();
   const total = state.pageCount;
@@ -478,19 +508,6 @@ export async function exportBookPdf(
     name = `${base}-手写本${suffix} ${++n}.pdf`;
   }
   await writeExportFile(vault, folder + name, bytes, signal);
-
-  /*
-   * 导出用的大位图要还给缓存（2026-11-07）：
-   * 导出按 pdfExportWidth（最长边 4096）渲染，单张可达 90MB，
-   * 塞进 bgBitmaps(160MB) 只放得下 1.8 张，会把阅读用的 1588 位图全挤出去。
-   * 导出完把明显超标的删掉，让 LRU 回到「够读就行」。
-   * 放在写完文件之后：即便用户取消，也希望能清掉；这里失败不影响导出结果。
-   */
-  try {
-    editor.pruneOversizedBackgrounds();
-  } catch (_) {
-    /* 清理失败不影响导出成功 */
-  }
 
   const notes: string[] = [];
   if (vectorPages) notes.push(`${vectorPages} 页保留了 PDF 原文，可选中可搜索`);

@@ -4165,6 +4165,25 @@ export class BookEditor {
       // fingerDraws 为真：不 return，继续走下面共用的落笔流程
     }
 
+    /*
+     * 笔落时如果已经有一个「手指/掌根」起的 pan 在跑，**无条件收掉它再落笔**。
+     *
+     * 真机高频场景：手掌先贴到屏幕上（触屏把它判成 touch → 走 pan 滚动），
+     * 紧接着笔尖落下。老代码在下面这行 `gesture !== "none"` 直接 return，
+     * 于是**第一笔根本写不进去**，页面反而被掌根滚走 —— 用户感觉是
+     * 「偶尔写不上字，纸还自己动」。
+     *
+     * 收掉 pan 的写法照 `beginPinch`：清 pointerId 与 pan 状态、把 gesture
+     * 复位。笔才是真正要写的那根，掌根只是误触，所以笔有更高优先级。
+     * 只收 "pan"：其他手势（pinch / draw / erase）不该被笔打断。
+     */
+    if (e.pointerType === "pen" && this.gesture === "pan") {
+      this.stopFling();
+      this.gesture = "none";
+      this.pointerId = null;
+      this.pan = null;
+    }
+
     if (this.gesture !== "none") return;
 
     /*
