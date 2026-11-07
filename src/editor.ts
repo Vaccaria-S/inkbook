@@ -617,6 +617,15 @@ export class BookEditor {
   private pan: { x: number; y: number; left: number; top: number } | null = null;
 
   /**
+   * 待恢复的滚动位置（页面像素，来自上次保存的 scrollTop）。
+   *
+   * 不能立刻写进 scrollEl：构造函数末尾排了一帧 rAF，里面会
+   * goToPage(activePage)，把滚动位置拉到当前页顶部。必须等那一帧跑完
+   * 再落，否则用户重开本子永远回到页首（INK-173）。
+   */
+  private pendingScrollTop: number | null = null;
+
+  /**
    * 惯性滚动的状态。
    *
    * 为什么自己做而不靠浏览器：实测 pointercancel = 0，
@@ -1922,6 +1931,17 @@ export class BookEditor {
     for (const rec of this.recs) {
       if (rec.mounted) this.resizeRec(rec);
     }
+    /*
+     * 尺寸就绪后补落待恢复的滚动位置。
+     *
+     * 编辑器可能在隐藏的标签页 / 折叠面板里创建，那一刻 clientHeight=0，
+     * restoreViewState 的 rAF 落不下去（见 applyPendingScrollTop）。
+     * 等第一次真实的 applyLayout（容器可见后由 ResizeObserver 触发）
+     * 再补一次，用户看到的才是上次的位置。
+     */
+    if (this.pendingScrollTop != null && this.scrollEl.clientHeight > 0) {
+      requestAnimationFrame(() => this.applyPendingScrollTop());
+    }
     this.emitState();
   }
 
@@ -1952,6 +1972,85 @@ export class BookEditor {
     this.fitMode = true;
     this.applyLayout();
     this.refreshCurrentAfterZoom();
+  }
+
+  /**
+   * 恢复上次保存的视图状态（缩放 + 页内滚动位置）。
+   *
+   * 为什么不能由调用方直接写 `zoom` / `scrollEl.scrollTop`：
+   *   1. 构造函数末尾排了一帧 rAF（applyLayout → measurePageMetrics →
+   *      goToPage(activePage)），那次 goToPage 会把滚动位置拉到页顶；
+   *      构造后直接写 scrollTop 会被它盖掉。
+   *   2. fit 的 zoom 要等容器有尺寸后才算得准，早写没有意义。
+   *
+   * 所以 zoom 立即落（并关掉 fitMode，让构造函数那一帧按它排版；
+   * 字段存在 = 用户显式缩放过，见 types.ts），scrollTop 挂成 pending，
+   * 由构造后的下一帧统一落。
+   */
+  restoreViewState(view: { zoom?: number; scrollTop?: number }): void {
+    if (typeof view.zoom === "number" && Number.isFinite(view.zoom)) {
+      this.fitMode = false;
+      this.zoom = clamp(view.zoom, 0.3, 2.8);
+    }
+    if (
+      typeof view.scrollTop === "number" &&
+      Number.isFinite(view.scrollTop) &&
+      view.scrollTop > 0
+    ) {
+      this.pendingScrollTop = view.scrollTop;
+      requestAnimationFrame(() => this.applyPendingScrollTop());
+    }
+  }
+
+  /**
+   * 把 pending 的 scrollTop 真正落到滚动容器上。
+   *
+   * 必须晚于构造函数的 rAF（它里面 goToPage 会滚到 activePage），
+   * 否则恢复值会被覆盖。落之前重新量一次页高 / 首页偏移：fit 模式下
+   * zoom 刚在上一帧算出来，滚动高度可能和构造时不同。
+   */
+  private applyPendingScrollTop(): void {
+    if (this.destroyed || this.pendingScrollTop == null) return;
+    const target = this.pendingScrollTop;
+    /*
+     * 容器还没完成布局（clientHeight / scrollHeight 为 0）时**保留**
+     * pending，绝不把恢复值落成 0——那等于用户又回到页首，而且下次
+     * 关闭还会把 0 写回文件（被隐藏标签页打开的场景）。
+     * 先自己重试 3 帧；仍没尺寸就等 applyLayout 末尾那一次补落
+     * （容器可见 / ResizeObserver 触发时）。
+     * 不能用「max<=0」判断：内容本来就装得下时 max 也是 0，
+     * 那属于合法地只能停在页首，不该重试。
+     */
+    if (this.scrollEl.clientHeight <= 0 || this.scrollEl.scrollHeight <= 0) {
+      if (this.restoreScrollRetry < 3) {
+        this.restoreScrollRetry += 1;
+        requestAnimationFrame(() => this.applyPendingScrollTop());
+      }
+      return;
+    }
+    this.restoreScrollRetry = 0;
+    this.pendingScrollTop = null;
+    this.measurePageMetrics();
+    const max = Math.max(0, this.scrollEl.scrollHeight - this.scrollEl.clientHeight);
+    this.scrollEl.scrollTop = Math.min(target, max);
+    // 位置可能落在另一页上（窗口尺寸 / fit 比例变了）：页码立刻跟上，
+    // 别等异步 scroll 事件——返回后马上读 getState() 的调用方会拿到旧页码
+    this.updateCurrentFromScroll(true);
+    this.emitState();
+  }
+
+  /** applyPendingScrollTop 的重试计数（见该方法的说明） */
+  private restoreScrollRetry = 0;
+
+  /**
+   * 当前应落盘的滚动位置。
+   *
+   * 恢复值还没落下（容器尺寸没就绪）时返回 pending：否则在隐藏的
+   * 后台标签页里关闭文件，会把「上次保存的位置」当成 0 覆盖掉——
+   * 下次打开就真的回页首了，而且用户完全不知道是这次关闭弄丢的。
+   */
+  getScrollTop(): number {
+    return this.pendingScrollTop ?? this.scrollEl.scrollTop;
   }
 
   /**

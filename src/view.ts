@@ -557,6 +557,13 @@ export class InkbookView extends FileView {
   private fp: FileFingerprint | null = null;
   /** 上次成功写盘时的 activePage，用来看"翻页后到底要不要写一次" */
   private savedActivePage = -1;
+  /**
+   * 上次成功写盘时的视图状态（zoom / scrollTop），用途同 savedActivePage：
+   * 只缩放或只滚动时也要在关文件时落一次，但**不能**每次滚动都写整本。
+   * `savedZoom === undefined` 表示上次落盘时是 fit 模式（字段没写）。
+   */
+  private savedZoom: number | undefined;
+  private savedScrollTop: number | undefined;
   /** 检测到外部改动后置真：此后不再写主文件，等用户自己处理两份副本 */
   private conflict = false;
   /** 只读态的"改动不会保存"提示是否已经弹过（每本书一次，别刷屏） */
@@ -681,6 +688,34 @@ export class InkbookView extends FileView {
     this.destroyEditor();
   }
 
+  /**
+   * 文件被改名 / 移动（宿主只改 file 路径，**不重载视图**）。
+   *
+   * 必须在这里把 `bookPath` 跟上，否则它永远停在旧路径上：
+   * `saveNow` 优先用 `bookPath` 写盘（那是 INK-167 防串写的手段），
+   * 于是改名后每次保存都在**旧路径重新造一个文件**，新名字的文件
+   * 一直停在改名前的版本——用户看到「已保存」，关掉重开就少了后半段
+   * （INK-174 复查发现的回归，`bookPath` 是 INK-167 引入的）。
+   *
+   * 顺序：先把在途保存等完（它捕获的是旧路径、写的是改名前的正确内容，
+   * 不用打断），再换路径、清指纹——新路径的 mtime/size 与旧记录无关，
+   * 不清会把改名后的第一次保存误判成「外部改动」。
+   *
+   * 索引不用管：`main.ts` 的 vault rename 事件负责删旧目录 + 重建。
+   */
+  async onRename(file: TFile): Promise<void> {
+    if (this.savePromise) {
+      try {
+        await this.savePromise;
+      } catch (_) {
+        /* 失败原因已经记进 lastSaveError */
+      }
+    }
+    this.file = file;
+    this.bookPath = file.path;
+    this.fp = null;
+  }
+
   /* ------------------------------- 文件 ------------------------------- */
 
   /**
@@ -696,6 +731,57 @@ export class InkbookView extends FileView {
       this.metaDirty = true;
       this.metaEpoch += 1;
     }
+    /*
+     * 缩放 / 页内滚动位置同样是「打开看一眼就可能变」的元数据：
+     * 只标 metaDirty，等关文件 / 切文件时随下一次写盘落一次，
+     * 绝不在这里排整本保存（和翻页同一套机制，见本方法开头）。
+     *
+     * 比较对象必须是「将要写进文件的形态」——fit 模式下 zoom 根本不落盘，
+     * 所以拿 undefined 去比，不能拿 applyLayout 算出来的 this.zoom 比：
+     * 否则打开一本没手动缩放过的本子、什么都不动直接关，也会白写一次整本。
+     * scrollTop 有滚动取整 / 亚像素抖动，留 2px 容差。
+     */
+    const zoom = this.editor.fitMode ? undefined : this.editor.zoom;
+    // getScrollTop 把「还没落下去的恢复值」也算进来：隐藏标签页 / 折叠面板
+    // 里关闭文件时，不能把待恢复的位置误判成 0 再写回磁盘
+    const rawTop = this.editor.getScrollTop();
+    const scrollTop = rawTop > 0 ? rawTop : undefined;
+    const zoomChanged =
+      zoom === undefined
+        ? this.savedZoom !== undefined
+        : this.savedZoom === undefined || Math.abs(zoom - this.savedZoom) > 1e-6;
+    const topChanged =
+      scrollTop === undefined
+        ? this.savedScrollTop !== undefined
+        : this.savedScrollTop === undefined || Math.abs(scrollTop - this.savedScrollTop) > 2;
+    if (zoomChanged || topChanged) {
+      this.metaDirty = true;
+      this.metaEpoch += 1;
+    }
+  }
+
+  /**
+   * 把编辑器当前的视图状态写进 book（只改内存对象，落盘交给 writeBook）。
+   *
+   * fit 模式下刻意 `delete book.zoom`：fit 的比例是窗口算出来的，
+   * 不是用户的选择，存下来下次会被旧窗口尺寸锁死（平板上转个方向就错位）。
+   * scrollTop 两种模式都存——至少回到上次的位置附近。
+   * 值缺省时删字段而不是写 0/undefined：老文件和停在页首时不产生多余字段。
+   */
+  private captureViewState(book: InkBook): {
+    zoom: number | undefined;
+    scrollTop: number | undefined;
+  } {
+    const ed = this.editor;
+    if (!ed) return { zoom: this.savedZoom, scrollTop: this.savedScrollTop };
+    const zoom = !ed.fitMode && Number.isFinite(ed.zoom) ? ed.zoom : undefined;
+    const rawTop = ed.getScrollTop();
+    const scrollTop = Number.isFinite(rawTop) && rawTop > 0 ? rawTop : undefined;
+    if (zoom === undefined) delete book.zoom;
+    else book.zoom = zoom;
+    if (scrollTop === undefined) delete book.scrollTop;
+    else book.scrollTop = scrollTop;
+    return { zoom, scrollTop };
   }
 
   /** 装载一本书（首次读成功、以及从备份恢复时共用） */
@@ -721,6 +807,10 @@ export class InkbookView extends FileView {
     this.rescued = false;
     this.recoveredCopyName = null;
     this.savedActivePage = book.activePage || 0;
+    // 基线取文件里读到的形态：undefined 的 zoom = 上次是 fit，不能拿
+    // 编辑器算出来的 fit 比例当基线，否则关文件时会误判成"用户缩放过了"
+    this.savedZoom = book.zoom;
+    this.savedScrollTop = book.scrollTop;
     this.destroyEditor();
     /*
      * 装配期（buildUI → buildRail → setReading）会顺手动到 setReading /
@@ -762,6 +852,8 @@ export class InkbookView extends FileView {
     this.lastSaveError = null;
     this.rescued = false;
     this.readOnlyReason = null;
+    this.savedZoom = undefined;
+    this.savedScrollTop = undefined;
   }
 
   /**
@@ -975,6 +1067,18 @@ export class InkbookView extends FileView {
     // 「允许手指书写」以前只活在编辑器实例上，每次打开都回默认 false；
     // 现在从 settings 恢复（侧栏开关 / 设置页都会写回这里）。
     this.editor.touchDraw = this.plugin.settings.touchDraw === true;
+    /*
+     * 恢复上次的缩放与页内滚动位置（INK-173）。
+     *
+     * 必须在编辑器构造之后、第一帧布局之前调用：zoom 会立即生效并关掉
+     * fitMode；scrollTop 由编辑器挂到下一帧，等构造函数里的
+     * goToPage(activePage) 跑完再落，不然会被它拉回页首。
+     * 字段缺省时（老文件）restoreViewState 是空操作，仍走 fit + 页首。
+     */
+    this.editor.restoreViewState({
+      zoom: this.store.data.zoom,
+      scrollTop: this.store.data.scrollTop,
+    });
     this.buildHeaderActions();
     // 标题栏放不下十个按钮时（平板常见），下一帧会把整行搬到自建顶栏条
     this.scheduleTopRowFit();
@@ -997,6 +1101,24 @@ export class InkbookView extends FileView {
         if (hint) this.editor?.locatePage(p);
       });
     }
+
+    /*
+     * 首屏布局稳定后，把「当前视图」记为已保存基线。
+     *
+     * 老文件的 activePage 可能 >0：打开时编辑器会自动滚到那一页，
+     * 但那不是用户的滚动。不更新基线的话，什么都不做直接关文件也会被
+     * syncActivePage 判成「滚动位置变了」，白写一次整本。
+     * 双 rAF：等构造函数的 goToPage、restoreViewState 的滚动恢复、
+     * 以及上面 pendingPage 的跳页都跑完再取。
+     */
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        if (!this.editor || !this.store) return;
+        this.savedZoom = this.editor.fitMode ? undefined : this.editor.zoom;
+        const rawTop = this.editor.getScrollTop();
+        this.savedScrollTop = rawTop > 0 ? rawTop : undefined;
+      })
+    );
 
     this.ensureTextIndexIfMissing();
   }
@@ -4948,6 +5070,14 @@ export class InkbookView extends FileView {
     this.dirty = true;
     this.dirtyEpoch += 1;
     this.saveState = "dirty";
+    /*
+     * 又有新内容要存了 → 上一轮「已经抢救过」的记录作废。
+     *
+     * `rescued` 防的是**同一份**未落盘内容被重复另存（切文件救过之后
+     * onClose 又救一次）。但用户接着写，现在脏的是**新内容**，
+     * 必须允许再救一次，否则下次切走时这部分就没人管了（INK-174 复查）。
+     */
+    this.rescued = false;
     this.updateStatus();
     // 只读态（备份恢复 / 打不开）下的改动一律不会落盘，必须当场说清楚，
     // 否则用户会以为写着写着就存上了
@@ -5295,6 +5425,19 @@ export class InkbookView extends FileView {
          */
         const dirtyEpoch = this.dirtyEpoch;
         const metaEpoch = this.metaEpoch;
+        /*
+         * 视图状态（缩放 / 页内滚动位置）在 stringify 前一刻才写进 book：
+         * 放在第一个 await（指纹 / 冲突检测）之前的话，用户在那段时间里
+         * 缩放或滚动，落盘的仍是旧落点，下次打开「记得的位置」就差一截。
+         *
+         * 只有 store 还是同一本时才从编辑器取值。切本子抢先发生的话，
+         * this.editor 已经是新本子的，读它会把 B 的缩放/滚动写进 A 的文件；
+         * 那种情况保持 book 上已有的字段不动（它们属于 A）。
+         */
+        const view =
+          this.editor && this.store === store
+            ? this.captureViewState(book)
+            : { zoom: book.zoom, scrollTop: book.scrollTop };
         await writeBook(adapter, path, book);
         /*
          * 主动通知嵌入重画。
@@ -5325,8 +5468,19 @@ export class InkbookView extends FileView {
         if (this.metaEpoch === metaEpoch) {
           this.metaDirty = false;
           this.savedActivePage = book.activePage;
+          // 基线跟着这次真正写下去的值走；代次对不上说明期间又变了，
+          // 保持旧基线、让下一次 flush 继续把它们写掉
+          this.savedZoom = view.zoom;
+          this.savedScrollTop = view.scrollTop;
         }
-        this.fp = await fingerprint(adapter, path);
+        const fpAfter = await fingerprint(adapter, path);
+        /*
+         * 取指纹也是 await：期间用户可能已经切走（store 换成新的）。
+         * 不判这一下，旧路径的指纹会赋给新本，下次保存拿它去比新文件
+         * → 误判成「外部改动」，白产两份冲突副本并停写主文件（INK-174）。
+         */
+        if (this.store !== store) return;
+        this.fp = fpAfter;
         /*
          * 本子落盘之后再更新文字索引：索引是派生物，
          * 万一它写失败，不能反过来把「本子已保存」报成失败。
@@ -5490,6 +5644,14 @@ export class InkbookView extends FileView {
    */
   async flushSave(): Promise<boolean> {
     /*
+     * 先把页码 / 缩放 / 滚动位置同步回内存并标记元数据脏。
+     *
+     * onClose / onUnloadFile 各自会调一次 syncActivePage，但切后台
+     * （visibilitychange / pagehide）只走 flushSave——不在入口统一同步的话，
+     * 用户只是缩放了或滚了几屏就切 App，这些位置信息永远不会落盘。
+     */
+    this.syncActivePage();
+    /*
      * 编辑框里没按回车、也没失焦的文字先落库：切文件（onLoadFile /
      * onUnloadFile）、关标签页（onClose）都从这条路过。移动端 textarea
      * 自带的 blur 兜底不可靠（点别处 / 切后台未必触发），不在这里主动
@@ -5522,6 +5684,24 @@ export class InkbookView extends FileView {
     // 循环里那次保存可能又排了一个 850ms 后的自动保存，切文件前没意义
     this.saveDebounce.cancel();
     /*
+     * 3 轮跑完还脏：说明用户在这段时间里一直在写（每轮都写不完）。
+     * 这**不是写盘失败**，只是内容还没追上——但不能当成成功放过去，
+     * 否则那些笔迹就跟着视图一起消失了。标记一下，让调用方去抢救副本，
+     * 提示措辞也要和真正的 IO 失败区分开（INK-174 复查）。
+     *
+     * 只读 / 冲突要排除：这两种情况下 dirty 本来就永远清不掉
+     * （只读不写盘、冲突只出副本），不是"没来得及写完"，
+     * 当成失败会每关一次文件就白抢救一份（H3 用例当场抓到）。
+     */
+    if (
+      !this.lastSaveError &&
+      !this.readOnly &&
+      !this.conflict &&
+      (this.dirty || this.metaDirty)
+    ) {
+      this.lastSaveError = "还有内容没来得及写完";
+    }
+    /*
      * saveNow 成功时只负责「排一个 1 秒后的索引定时器」，而随后 destroyEditor()
      * 会把它取消。这里等索引真正写完，搜索里才不会缺最后一次保存的内容。
      *
@@ -5533,11 +5713,14 @@ export class InkbookView extends FileView {
     await this.flushTextIndex();
     /*
      * 判定「落盘成功」：没有失败记录，且脏标记真的清了。
-     * 注意 conflict 状态本来就不写主文件（已另存两份副本），
-     * 那条路由 preserveConflictCopy 兜底，这里不算失败。
+     *
+     * **先判 conflict 再判 lastSaveError**（INK-174 复查）：早先失败过一次
+     * （比如盘满）之后又转成冲突状态时，主文件确实没写——但那条路由
+     * preserveConflictCopy 兜底另存副本，此时再让调用方去 rescueUnsaved
+     * 会同时产出 conflict 副本和 unsaved 副本两份，提示还会说错原因。
      */
-    if (this.lastSaveError) return false;
     if (this.conflict) return true;
+    if (this.lastSaveError) return false;
     /*
      * 只读本上的改动本来就存不下去，而且已经弹过「改动不会保存」。
      * 这里若算成失败，每切一次文件就抢救出一份副本，越攒越多——
@@ -5559,9 +5742,8 @@ export class InkbookView extends FileView {
   private async rescueUnsaved(reason: string): Promise<void> {
     if (!this.store || !this.file) return;
     if (!this.dirty && !this.metaDirty) return;
-    // 同一本书只抢救一次：切文件时救过，紧接着 onClose 不该再产出一份
+    // 同一份未落盘内容只抢救一次：切文件时救过，紧接着 onClose 不该再产出一份
     if (this.rescued) return;
-    this.rescued = true;
     const mine = this.store.data;
     mine.integrity = bookStats(mine);
     const base = (this.bookPath || this.file.path).replace(/\.inkbook$/i, "");
@@ -5572,6 +5754,14 @@ export class InkbookView extends FileView {
         `${base}.unsaved-${conflictStamp(new Date())}-p${mine.pages.length}.inkbook`
       );
       await adapter.write(target, JSON.stringify(mine));
+      /*
+       * **写成功之后**才置位（INK-174 复查）。
+       *
+       * 以前在写之前就置 true：第一次抢救因为磁盘满失败后，用户继续写、
+       * 再切本子时会被 `rescued` 直接挡掉——真正该救的内容反而没救。
+       * 成功才置位，失败时下次切走还能再试一次。
+       */
+      this.rescued = true;
       const name = target.split("/").pop() || target;
       new Notice(
         `保存失败（${reason}），内容已另存为「${name}」。` +

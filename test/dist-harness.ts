@@ -133,6 +133,8 @@ async function main() {
       async onClose(){}
       async onLoadFile(){}
       async onUnloadFile(){}
+      /* 宿主改名会调它（不重载视图）；插件覆写了 onRename（INK-174） */
+      async onRename(file){ this.file = file; }
     }
     export class Events {}
     export class TAbstractFile {}
@@ -503,6 +505,30 @@ async function main() {
     pass(
       bytes.length > 100_000,
       "产物导出：中文字体确实内联进产物（" + Math.round(bytes.length / 1024) + "KB > 100KB）"
+    );
+  }
+
+  /*
+   * 改名后必须写到新路径（INK-174）。
+   *
+   * 走**压缩产物**：`bookPath` 是 saveNow 写盘时优先用的路径，
+   * 而宿主改名只换 `file.path`、不重载视图。插件不覆写 onRename 的话
+   * bookPath 永远停在旧路径 → 改名后每次保存都在旧路径造文件。
+   * 这里只验「覆写的方法存在且能把 bookPath 跟上」，不重复 p1 的完整往返。
+   */
+  {
+    const before = (view as any).bookPath;
+    const renamed: any = { path: "改名后的本子.inkbook", name: "改名后的本子.inkbook", basename: "改名后的本子", extension: "inkbook" };
+    let threw = "";
+    try {
+      await (view as any).onRename(renamed);
+    } catch (e: any) {
+      threw = String(e?.message || e);
+    }
+    pass(
+      threw === "" && (view as any).bookPath === renamed.path,
+      "产物改名：onRename 不抛异常且 bookPath 跟到新路径（" +
+        before + " → " + (view as any).bookPath + "；异常=" + JSON.stringify(threw.slice(0, 60)) + "）"
     );
   }
 

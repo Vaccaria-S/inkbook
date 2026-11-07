@@ -77,6 +77,15 @@ export class ItemView {
 
 export class FileView extends ItemView {
   async loadFile(file) { this.file = file; await this.onLoadFile(file); }
+  /**
+   * 宿主改名时调这个（**不重载视图**）。
+   *
+   * 桩里必须真的有这个方法：`view.onRename` 是我们覆写的
+   * （INK-174：bookPath 要跟着新路径走），父类没有的话
+   * `super.onRename` 之类的写法会炸；而且没有它，
+   * 测试也无法模拟「宿主改名」这条真实路径。
+   */
+  async onRename(file) { this.file = file; }
   canAcceptExtension() { return true; }
   getState() { return { file: this.file && this.file.path }; }
 }

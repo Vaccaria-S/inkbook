@@ -344,6 +344,23 @@ export function normalizeBook(raw: any, fallbackTitle: string): InkBook {
         .filter((o: any, i: number, arr: any[]) => arr.findIndex((x: any) => x.id === o.id) === i)
     : undefined;
   if (outlines !== undefined && outlines.length > 0) book.outlines = outlines;
+  /*
+   * 视图状态（zoom / scrollTop，不升版本，与 outlines 同批做法）：
+   *   · zoom 只认真正的 number（字符串 "1.5"、null 一律当没写）并夹到
+   *     [0.3, 2.8]。夹取而不是丢弃——「用户手动缩放过」这个信息有价值，
+   *     不该因为一个脏数字就退回 fit；但也不能原样放行：99 倍 zoom 会让
+   *     打开时先按 99 倍排一次版，可能直接把主线程卡死。
+   *   · scrollTop 只留正的有限值；0/负/NaN 当没写（页首是默认行为）。
+   *   · 缺省不写回字段——老文件读出来仍是 undefined，打开时走 fit + 页首。
+   */
+  const zoom = raw?.zoom;
+  if (typeof zoom === "number" && Number.isFinite(zoom)) {
+    book.zoom = Math.max(0.3, Math.min(2.8, zoom));
+  }
+  const scrollTop = raw?.scrollTop;
+  if (typeof scrollTop === "number" && Number.isFinite(scrollTop) && scrollTop > 0) {
+    book.scrollTop = scrollTop;
+  }
   return book;
 }
 

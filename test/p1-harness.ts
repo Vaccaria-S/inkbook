@@ -1705,6 +1705,255 @@ async function O170() {
   v3.containerEl.remove();
 }
 
+/**
+ * Q：改名后必须写到**新路径**（INK-174 复查发现的回归）。
+ *
+ * `bookPath` 是 INK-167 防串写引入的：saveNow 优先用它而不是 this.file.path。
+ * 但宿主改名只改 `file.path`、**不重载视图**，如果 view 不覆写 onRename，
+ * bookPath 就永远停在旧路径上——改名后每次保存都在旧路径重新造一个文件，
+ * 新名字的文件一直停在改名前的版本。用户看到「已保存」，关掉重开少一段。
+ */
+async function Q174() {
+  const oldPath = "Q174-旧名.inkbook";
+  const newPath = "Q174-新名.inkbook";
+  const original = JSON.stringify(mkBook("Q174本", 3, 2));
+  seed(oldPath, original);
+
+  const v = await openView();
+  await v.onLoadFile(tf(oldPath));
+  await sleep(400);
+  const before = v.store.strokeCount;
+
+  // 宿主改名：只换 file 路径，然后调 onRename（不重载视图）
+  const renamed = tf(newPath);
+  files.set(newPath, files.get(oldPath)!);
+  mt.set(newPath, bumpMt());
+  files.delete(oldPath);
+  mt.delete(oldPath);
+  await v.onRename(renamed);
+  await sleep(50);
+
+  // 改名后落一笔 → 必须写进新路径
+  v.store.addStroke(mkStroke(1741), 0);
+  await sleep(1300);
+
+  let newSaved: any = null;
+  try {
+    newSaved = JSON.parse(files.get(newPath));
+  } catch (_) {}
+  pass(
+    !!newSaved && countStrokes(newSaved) === before + 1,
+    "Q174① 改名后保存写到新路径：新文件笔迹=" +
+      (newSaved ? countStrokes(newSaved) : -1) + "（期望 " + (before + 1) + "）"
+  );
+  pass(
+    !files.has(oldPath),
+    "Q174② 没有在旧路径重新造出文件（旧路径存在=" + files.has(oldPath) + "）"
+  );
+
+  await v.onClose();
+  v.containerEl.remove();
+}
+
+/**
+ * R：抢救标记不能吞掉第二次机会（INK-174 复查）。
+ *
+ * 以前 `rescued` 在**写之前**就置位：第一次抢救因为磁盘满失败后，
+ * 用户继续写、再切本子时会被直接挡掉——真正该救的内容反而没救。
+ * 现在改成「写成功才置位」，且新改动会把标记复位。
+ */
+async function R174() {
+  const pa = "R174-A.inkbook";
+  const pb = "R174-B.inkbook";
+  seed(pa, JSON.stringify(mkBook("R174-A本", 2, 1)));
+  seed(pb, JSON.stringify(mkBook("R174-B本", 3, 1)));
+
+  const v = await openView();
+  await v.onLoadFile(tf(pa));
+  await sleep(400);
+  v.store.addStroke(mkStroke(1742), 0);
+  await sleep(100);
+
+  // 第一次：主文件和抢救副本都写不进去 → 抢救失败，rescued 不该置位
+  writeFailFor = (p) => p.startsWith("R174-A");
+  await v.onUnloadFile();
+  const firstTry = keys().filter((k) => k.includes("R174-A.unsaved-"));
+  writeFailFor = null;
+
+  // 第二次：重新打开 A、写一笔、这次允许抢救 → 必须救得下来
+  await v.onLoadFile(tf(pa));
+  await sleep(400);
+  v.store.addStroke(mkStroke(1743), 0);
+  await sleep(100);
+  writeFailFor = (p) => p === pa || p === pa + ".bak" || p === pa + ".tmp";
+  await v.onUnloadFile();
+  writeFailFor = null;
+
+  const rescued = keys().filter((k) => k.includes("R174-A.unsaved-"));
+  pass(
+    firstTry.length === 0 && rescued.length >= 1,
+    "R174① 第一次抢救失败不置位、第二次仍能救：第一次副本=" + firstTry.length +
+      "（期望 0）；第二次副本=" + rescued.length + "（期望 ≥1）"
+  );
+  v.containerEl.remove();
+}
+
+/**
+ * P：保存并恢复「缩放 + 页内滚动位置」（INK-173）。
+ *
+ * 覆盖四条主线：
+ *   ① 文件里存了 zoom/scrollTop → 重开后真的恢复（不是回到 fit + 页首）
+ *   ② fit 模式不把算出来的比例写成用户 zoom（否则换窗口尺寸会被锁死）
+ *   ③ 非法值：zoom 夹到 [0.3,2.8]，scrollTop 负数/字符串丢弃
+ *   ④ 老文件没有这两个字段 → 正常 fit 打开，且不凭空写回默认字段
+ */
+async function P173() {
+  /* ---------- ① 已有 zoom/scrollTop → 打开即恢复，保存后再重开仍是新值 ---------- */
+  const p = "P173.inkbook";
+  const seeded: any = mkBook("P173本", 4, 1);
+  seeded.zoom = 1.5;
+  seeded.scrollTop = 640;
+  seed(p, JSON.stringify(seeded));
+
+  const v = await openView();
+  await v.onLoadFile(tf(p));
+  await sleep(500);
+  const ed = v.editor;
+  const st = ed.getState();
+  const top = ed.scrollEl.scrollTop;
+  pass(
+    ed.fitMode === false && Math.abs(st.zoom - 1.5) < 1e-6 && Math.abs(top - 640) <= 2,
+    "P173① 打开即恢复：zoom=" + st.zoom.toFixed(3) + "（期望 1.5）；fitMode=" + ed.fitMode +
+      "（期望 false）；scrollTop=" + top.toFixed(1) + "（期望 640）"
+  );
+
+  // 改缩放 + 滚动后落一笔，等自动保存把新视图状态写进去
+  ed.setZoom(2);
+  ed.scrollEl.scrollTop = 900;
+  v.store.addStroke(mkStroke(1731), 0);
+  await sleep(1300);
+  let saved: any = null;
+  try {
+    saved = JSON.parse(files.get(p));
+  } catch (e: any) {
+    log("P173 保存结果解析失败 " + e);
+  }
+  pass(
+    Math.abs((saved?.zoom ?? -1) - 2) < 1e-6 && Math.abs((saved?.scrollTop ?? -1) - 900) <= 2,
+    "P173② 保存写入当前视图状态：zoom=" + saved?.zoom + "（期望 2）；scrollTop=" +
+      saved?.scrollTop + "（期望 ≈900）"
+  );
+  await v.onClose();
+  v.containerEl.remove();
+
+  /* ---------- ② 重开恢复；fit 模式不污染用户 zoom ---------- */
+  const v2 = await openView();
+  await v2.onLoadFile(tf(p));
+  await sleep(500);
+  const reZoom = v2.editor.getState().zoom;
+  const reTop = v2.editor.scrollEl.scrollTop;
+  pass(
+    v2.editor.fitMode === false && Math.abs(reZoom - 2) < 1e-6 && Math.abs(reTop - 900) <= 2,
+    "P173③ 重开后恢复上次的值：zoom=" + reZoom.toFixed(3) + "（期望 2）；scrollTop=" +
+      reTop.toFixed(1) + "（期望 ≈900）"
+  );
+
+  v2.editor.fit();
+  await sleep(100);
+  const fitZoom = v2.editor.getState().zoom;
+  v2.store.addStroke(mkStroke(1732), 0);
+  await sleep(1300);
+  const fitSaved: any = JSON.parse(files.get(p));
+  pass(
+    ("zoom" in fitSaved) === false,
+    "P173④ fit 模式不把算出来的 zoom 写成用户选择：文件 zoom 字段=" +
+      ("zoom" in fitSaved) + "（期望不存在）；本次 fit 比例=" + fitZoom.toFixed(3)
+  );
+  await v2.onClose();
+  v2.containerEl.remove();
+
+  const v3 = await openView();
+  await v3.onLoadFile(tf(p));
+  await sleep(500);
+  pass(
+    v3.editor.fitMode === true,
+    "P173④ 重开时 zoom 字段缺失 → 仍然 fit（fitMode=" + v3.editor.fitMode +
+      "，期望 true；zoom=" + v3.editor.getState().zoom.toFixed(3) + "）"
+  );
+  await v3.onClose();
+  v3.containerEl.remove();
+
+  /* ---------- ③ 非法值：夹取 / 丢弃，且不原样写回 ---------- */
+  const dp = "P173-dirty.inkbook";
+  const dirty: any = mkBook("P173脏本", 3, 0);
+  dirty.zoom = 99;       // 超上限 → 夹到 2.8
+  dirty.scrollTop = -50; // 负数 → 丢弃
+  seed(dp, JSON.stringify(dirty));
+  const v4 = await openView();
+  await v4.onLoadFile(tf(dp));
+  await sleep(500);
+  const dirtyZoom = v4.editor.getState().zoom;
+  const dirtyTop = v4.editor.scrollEl.scrollTop;
+  pass(
+    v4.editor.fitMode === false && Math.abs(dirtyZoom - 2.8) < 1e-6 && dirtyTop === 0,
+    "P173⑤ zoom 99 夹到 2.8、scrollTop -50 丢弃：zoom=" + dirtyZoom.toFixed(3) +
+      "；fitMode=" + v4.editor.fitMode + "；scrollTop=" + dirtyTop.toFixed(1)
+  );
+  // 落一笔让它保存：夹取后的 2.8 是用户显式缩放过，应该写回；脏 scrollTop 不能出现
+  v4.store.addStroke(mkStroke(1733), 0);
+  await sleep(1300);
+  const dirtySaved: any = JSON.parse(files.get(dp));
+  pass(
+    Math.abs((dirtySaved?.zoom ?? -1) - 2.8) < 1e-6 && ("scrollTop" in dirtySaved) === false,
+    "P173⑤ 脏值不原样写回：zoom=" + dirtySaved?.zoom + "（期望 2.8）；scrollTop 字段=" +
+      ("scrollTop" in dirtySaved)
+  );
+  await v4.onClose();
+  v4.containerEl.remove();
+
+  // 字符串形态的脏值（手改文件 / 旧版本遗留）一律当没写
+  const sp = "P173-string.inkbook";
+  const strBook: any = mkBook("P173字符串本", 2, 0);
+  strBook.zoom = "1.5";
+  strBook.scrollTop = "120";
+  seed(sp, JSON.stringify(strBook));
+  const v5 = await openView();
+  await v5.onLoadFile(tf(sp));
+  await sleep(450);
+  pass(
+    v5.editor.fitMode === true && v5.store.data.zoom === undefined && v5.store.data.scrollTop === undefined,
+    "P173⑥ 字符串 zoom/scrollTop 当没写：fitMode=" + v5.editor.fitMode +
+      "；store.zoom=" + v5.store.data.zoom + "；store.scrollTop=" + v5.store.data.scrollTop
+  );
+  await v5.onClose();
+  v5.containerEl.remove();
+
+  /* ---------- ④ 老文件（没有这两个字段）正常打开，且不写出默认字段 ---------- */
+  const op = "P173-old.inkbook";
+  seed(op, JSON.stringify(mkBook("P173老本", 3, 1)));
+  const v6 = await openView();
+  await v6.onLoadFile(tf(op));
+  await sleep(450);
+  pass(
+    v6.store.data.zoom === undefined && v6.store.data.scrollTop === undefined &&
+      v6.editor.fitMode === true && v6.editor.scrollEl.scrollTop === 0,
+    "P173⑦ 老文件正常打开：store.zoom=" + v6.store.data.zoom + "；store.scrollTop=" +
+      v6.store.data.scrollTop + "；fitMode=" + v6.editor.fitMode + "；scrollTop=" +
+      v6.editor.scrollEl.scrollTop
+  );
+  // 不动视图、只落一笔 → 文件里不该凭空多出 zoom / scrollTop 字段
+  v6.store.addStroke(mkStroke(1734), 0);
+  await sleep(1300);
+  const oldSaved: any = JSON.parse(files.get(op));
+  pass(
+    ("zoom" in oldSaved) === false && ("scrollTop" in oldSaved) === false,
+    "P173⑦ 老文件保存后不凭空写默认视图字段：zoom 字段=" + ("zoom" in oldSaved) +
+      "；scrollTop 字段=" + ("scrollTop" in oldSaved)
+  );
+  await v6.onClose();
+  v6.containerEl.remove();
+}
+
 const CASES: Array<[string, () => Promise<void>]> = [
   ["A1+A2", A12],
   ["A3", A3],
@@ -1728,6 +1977,9 @@ const CASES: Array<[string, () => Promise<void>]> = [
   ["M168 按着笔关标签页", M168],
   ["N169 保存失败切本子", N169],
   ["O170 写盘回退/备份提示", O170],
+  ["P173 缩放/滚动恢复", P173],
+  ["Q174 改名后写新路径", Q174],
+  ["R174 抢救标记不吞第二次", R174],
 ];
 
 async function main() {
