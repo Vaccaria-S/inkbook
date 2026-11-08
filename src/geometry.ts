@@ -1,4 +1,6 @@
 import type { Pt, Stroke } from "./types";
+// 路径缓存也要失效：strokePath 按对象身份缓存，原地改点后不失效会画出旧轮廓
+import { invalidateStroke } from "./ink";
 
 export interface Bounds {
   minX: number;
@@ -170,6 +172,17 @@ export function translateStroke(stroke: Stroke, dx: number, dy: number): void {
     p[1] += dy;
   }
   invalidateStrokeBounds(stroke);
+  /*
+   * **路径缓存也要失效**（INK-203）。
+   *
+   * `strokePath` 按对象身份缓存在 `WeakMap` 里，而这里是**原地改坐标**
+   * ——对象还是那个对象，缓存命中就会拿回**旧位置的轮廓**，笔迹画在原地
+   * 不动。包围盒和路径是两套独立的缓存，只失效一个不够。
+   *
+   * 目前这个函数零调用（它是套索选择那一套的一部分，见文件头的说明），
+   * 所以没有实际症状；但将来谁用了它，不修这条就是「拖了笔迹没反应」。
+   */
+  invalidateStroke(stroke);
 }
 
 /**

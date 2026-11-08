@@ -33,7 +33,7 @@ const PAGES = [
   ["dist.html", 30],
   ["plugin.html", 32],
   ["jumptest.html", 11],
-  ["feel.html", 53],
+  ["feel.html", 69],
   ["perf.html", 21],
   ["perf-open.html", 60],
   ["qa-open.html", 49],

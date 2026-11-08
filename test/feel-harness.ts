@@ -577,6 +577,161 @@ async function main() {
       return { dark, minX, minY, maxX, maxY, cols, data, w, h };
     };
 
+    /* -------------------- 离屏像素级轮廓回归（INK-204） --------------------
+     * 使用真实 drawStroke（含颜色/透明度/单点特例）与 strokePath，
+     * 背景保持透明；页面坐标乘 2 模拟平板 dpr=2 的 backing。
+     */
+    {
+      const scale = 2;
+      const W = 240, H = 180;
+      const draw = (s: Stroke, alpha = 1) => {
+        const canvas = document.createElement("canvas");
+        canvas.width = W * scale;
+        canvas.height = H * scale;
+        const ctx = canvas.getContext("2d")!;
+        ctx.scale(scale, scale);
+        drawStroke(ctx, s, alpha);
+        return ctx.getImageData(0, 0, canvas.width, canvas.height);
+      };
+      const at = (image: ImageData, x: number, y: number) => {
+        const px = Math.round(x * scale);
+        const py = Math.round(y * scale);
+        const i = (py * image.width + px) * 4;
+        return Array.from(image.data.slice(i, i + 4));
+      };
+      const bounds = (image: ImageData, threshold = 64) => {
+        let count = 0, minX = image.width, minY = image.height, maxX = -1, maxY = -1;
+        for (let y = 0; y < image.height; y++) {
+          for (let x = 0; x < image.width; x++) {
+            if (image.data[(y * image.width + x) * 4 + 3] < threshold) continue;
+            count++;
+            minX = Math.min(minX, x); minY = Math.min(minY, y);
+            maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+          }
+        }
+        return { count, minX, minY, maxX, maxY };
+      };
+      const hasInkNear = (image: ImageData, x: number, y: number, radius: number) => {
+        const cx = Math.round(x * scale), cy = Math.round(y * scale);
+        const r = Math.ceil(radius * scale);
+        for (let py = Math.max(0, cy - r); py <= Math.min(image.height - 1, cy + r); py++) {
+          for (let px = Math.max(0, cx - r); px <= Math.min(image.width - 1, cx + r); px++) {
+            if (Math.hypot(px - cx, py - cy) > r) continue;
+            if (image.data[(py * image.width + px) * 4 + 3] >= 64) return true;
+          }
+        }
+        return false;
+      };
+
+      // strokePath 的单点轮廓不代表实际单击点：必须验 drawStroke 的真实分支。
+      const dot = draw(mk([[60, 70, 0.7]], 6));
+      const dotBox = bounds(dot);
+      pass(dotBox.count > 30 && at(dot, 60, 70)[3] > 200 &&
+        Math.abs((dotBox.maxX - dotBox.minX) - (dotBox.maxY - dotBox.minY)) <= 3,
+        "单点笔迹：dpr=2 下画出可见圆点（非空白/非细线）");
+
+      const two = draw(mk([[40, 60, 0.7], [170, 60, 0.7]], 8));
+      const twoBox = bounds(two);
+      pass(twoBox.count > 100 && [50, 75, 100, 125, 150, 160].every((x) =>
+        hasInkNear(two, x, 60, 3)) && twoBox.maxY - twoBox.minY < 30 * scale &&
+        twoBox.minY > 40 * scale && twoBox.maxY < 80 * scale,
+        "两点笔迹：首尾间连续水平线，不绕出怪弧");
+
+      // 密集/稀疏采样、急弯及首尾都逐点核对；不能只看 bounding box。
+      const curved: Pt[] = [
+        [30, 110, 0.8], [37, 106, 0.8], [45, 100, 0.8], [57, 93, 0.8],
+        [76, 90, 0.8], [95, 94, 0.8], [112, 105, 0.8], [120, 125, 0.8],
+        [130, 138, 0.8], [151, 141, 0.8], [177, 132, 0.8], [205, 115, 0.8],
+      ];
+      const curveSize = 10;
+      const curve = draw(mk(curved, curveSize));
+      const missed = curved.map((p, i) => hasInkNear(curve, p[0], p[1], curveSize / 2 + 3) ? -1 : i)
+        .filter((i) => i >= 0);
+      pass(bounds(curve).count > 0 && missed.length === 0,
+        "多点轮廓包住全部原始点（容差 size/2+3，遗漏下标 " + missed.join(",") + "）");
+
+      // 用 ballpoint 消除钢笔收尖对宽度的干扰，量长水平线的中间列。
+      const widths = [2, 10].map((size) => {
+        const img = draw({ ...mk([[30, 45, 1], [110, 45, 1], [200, 45, 1]], size), tool: "ballpoint" });
+        const x = 120 * scale;
+        let width = 0;
+        for (let y = 0; y < img.height; y++)
+          if (img.data[(y * img.width + x) * 4 + 3] >= 64) width++;
+        return width;
+      });
+      const widthRatio = widths[1] / widths[0];
+      pass(widths[0] > 0 && widthRatio >= 3.5 && widthRatio <= 6.5,
+        "粗细：size=10/2 的中段墨迹宽度接近 5:1（" + widths.join("/") + " px）");
+
+      const red = mk([[100, 85, 0.8]], 12);
+      red.color = "#E02040";
+      const solid = at(draw(red), 100, 85);
+      const half = at(draw(red, 0.5), 100, 85);
+      pass(solid[0] === 224 && solid[1] === 32 && solid[2] === 64 && solid[3] === 255,
+        "颜色：drawStroke 的单点中心为指定 RGB 且完全不透明");
+      /*
+       * RGB 容差 ±2：半透明落笔时 canvas 会先把颜色与底色做 alpha 合成，
+       * 224 × 0.5 + 255 × 0.5 之类的中间值会取整，实测得到 223。
+       * 差 1~2 是取整误差，不是颜色错了——用 ±2 而不是死等 224。
+       */
+      const near = (a: number, b: number) => Math.abs(a - b) <= 2;
+      pass(
+        near(half[0], 224) && near(half[1], 32) && near(half[2], 64) &&
+          half[3] >= 126 && half[3] <= 129,
+        "alpha：0.5 的单次落笔中心透明度约 128（实测 rgba=" + half.join(",") + "）"
+      );
+      const overlap = document.createElement("canvas");
+      overlap.width = W * scale; overlap.height = H * scale;
+      const overlapCtx = overlap.getContext("2d")!;
+      overlapCtx.scale(scale, scale);
+      drawStroke(overlapCtx, red, 0.5);
+      drawStroke(overlapCtx, red, 0.5);
+      const layered = at(overlapCtx.getImageData(0, 0, overlap.width, overlap.height), 100, 85);
+      pass(layered[3] >= 190 && layered[3] <= 194 && layered[3] > half[3],
+        "alpha：两个半透明落笔叠加为约 0.75，不是覆盖/全不透明");
+
+      const inside = draw(mk([[20, 25, 0.8], [110, 60, 0.8], [210, 150, 0.8]], 8));
+      const insideBox = bounds(inside, 1);
+      pass(insideBox.count > 0 && insideBox.minX > 0 && insideBox.minY > 0 &&
+        insideBox.maxX < inside.width - 1 && insideBox.maxY < inside.height - 1,
+        "页面内笔迹：所有可见墨迹留在画布边界以内（无裁切）");
+
+      const moving = mk([[40, 110, 0.8], [100, 110, 0.8], [160, 110, 0.8]], 8);
+      const oldPath = strokePath(moving);
+      const original = draw(moving);
+      moving.points = [[40, 45, 0.8], [100, 45, 0.8], [160, 45, 0.8]];
+      const cached = draw(moving);
+      pass(strokePath(moving) === oldPath && hasInkNear(cached, 100, 110, 3) &&
+        !hasInkNear(cached, 100, 45, 3) && hasInkNear(original, 100, 110, 3),
+        "缓存：修改笔迹但未失效时，仍绘制原位置旧轮廓");
+      invalidateStroke(moving);
+      const fresh = draw(moving);
+      pass(strokePath(moving) !== oldPath && hasInkNear(fresh, 100, 45, 3) &&
+        !hasInkNear(fresh, 100, 110, 3),
+        "缓存：invalidateStroke 后新位置轮廓生效、旧轮廓消失");
+
+      const dirty: Array<{ label: string; points: Pt[] }> = [
+        { label: "空 points", points: [] },
+        { label: "单点", points: [[90, 80, 0.5]] },
+        { label: "同坐标重复十次", points: Array.from({ length: 10 }, () => [90, 80, 0.5] as Pt) },
+        { label: "NaN 压力", points: [[60, 80, NaN], [90, 80, 0.5], [120, 80, NaN]] },
+        { label: "NaN 坐标", points: [[60, 80, 0.5], [NaN, 80, 0.5], [120, 80, 0.5]] },
+        // 序列化残缺数据：Pt 第三元缺失，运行时表现为 undefined。
+        { label: "压力数组短于点数", points: [[60, 80, 0.5], [90, 80], [120, 80]] as Pt[] },
+      ];
+      for (const c of dirty) {
+        let ok = true;
+        try {
+          const s = mk(c.points, 6);
+          strokePath(s);
+          draw(s);
+        } catch (_) {
+          ok = false;
+        }
+        pass(ok, "脏数据不崩：strokePath + drawStroke（" + c.label + "）");
+      }
+    }
+
     // 1) 闭合缝：画一个首尾相接的圆环笔迹，闭合处不应出现「缝外突然判内」的空洞
     {
       const pts: Pt[] = [];
