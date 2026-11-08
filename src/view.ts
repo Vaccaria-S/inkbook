@@ -1461,6 +1461,17 @@ export class InkbookView extends FileView {
     const visible = !this.reading && this.sideShown;
     this.sideEl?.toggleClass("is-hidden", !visible);
     /*
+     * 平板上侧栏是**绝对定位盖在纸面上**的（见 styles.css 的
+     * `.mb-root.is-tablet .mb-side`）。展开后它压住右侧约 340px：
+     * 800px 竖屏 fit 出来纸宽 736px，被盖掉 42% —— 而纸本来就不宽于
+     * 视口，横向没有可滚空间，用户既看不见也够不着被盖的那部分。
+     *
+     * 给纸面列留出同等宽度的右侧空间（CSS 里靠这个类），fit 就会按
+     * **真正看得见的区域**算缩放，纸整体缩进可见区。
+     * 收起时移除，纸恢复满宽。
+     */
+    this.bodyEl?.toggleClass("mb-side-open", visible);
+    /*
      * 展开侧栏（或退出仅阅读）时补建/补画缩略图。
      * 收起状态下不建页列表、不渲染缩略图：857 页的本子光建 DOM 就要几十毫秒，
      * 更贵的是会立刻用 pdf.js 渲 5 页缩略图，和首屏抢同一份 PDF。

@@ -2828,6 +2828,18 @@
   position: relative;
 }
 
+/*
+ * 平板侧栏展开时，纸面列让出右侧一条（INK-217）。
+ *
+ * 侧栏是绝对定位盖在纸面上的，展开会压掉右侧约 340px；而 fit 出来的纸
+ * 本来就不宽于视口，横向没有可滚空间 —— 被盖的那部分既看不见也够不着。
+ * 这里把编辑区右侧收进同等宽度，让 fit 按**真正可见的区域**算缩放。
+ * 宽度必须与 .mb-root.is-tablet .mb-side 保持一致，改一处要同步另一处。
+ */
+.mb-root.is-tablet .mb-body.mb-side-open .mb-editor {
+  margin-right: min(340px, calc(100vw - 24px));
+}
+
 /* 底部留出空间，别挡住最后一页 */
 .mb-root.is-tablet .mb-scroll {
   padding-bottom: 110px;

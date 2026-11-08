@@ -1701,6 +1701,33 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   );
   pass(new Set(tTops).size === 1, "平板端 8 个工具仍是一行（没有换行）");
 
+  /*
+   * INK-217 侧栏展开时纸面列要让出右侧空间。
+   * 侧栏是绝对定位盖在纸面上的，不让开的话 800px 竖屏会盖掉 42%，
+   * 而纸本来就不宽于视口，横向没有可滚空间 —— 被盖的部分够不着。
+   */
+  {
+    const bodyEl = root.querySelector(".mb-body") as HTMLElement;
+    const editorEl = root.querySelector(".mb-editor") as HTMLElement;
+    const before = editorEl.getBoundingClientRect().width;
+    view.toggleDock();
+    await sleep(250);
+    const openCls = bodyEl.classList.contains("mb-side-open");
+    const after = editorEl.getBoundingClientRect().width;
+    pass(
+      openCls && after < before - 40,
+      "INK-217 平板侧栏展开时纸面列让出右侧空间（" +
+        before.toFixed(0) + " → " + after.toFixed(0) + "；class=" + openCls + "）"
+    );
+    view.toggleDock();
+    await sleep(250);
+    const restored = editorEl.getBoundingClientRect().width;
+    pass(
+      !bodyEl.classList.contains("mb-side-open") && Math.abs(restored - before) < 2,
+      "INK-217 侧栏收起后纸面列恢复满宽（" + restored.toFixed(0) + "）"
+    );
+  }
+
   root.classList.remove("is-tablet");
   headerEl.classList.remove("mb-tablet");
   await sleep(200);
