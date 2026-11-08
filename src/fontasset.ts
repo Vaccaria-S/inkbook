@@ -65,6 +65,3 @@ export function chineseCharacterSet(): Set<number> | null {
     return null;
   }
 }
-
-/** 字体名（写进 PDF 的 BaseFont，仅作展示） */
-export const CHINESE_FONT_NAME = "NotoSansSC-Subset";

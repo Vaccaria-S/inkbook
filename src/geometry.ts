@@ -46,6 +46,23 @@ export function pointInPolygon(x: number, y: number, polygon: Array<[number, num
   return inside;
 }
 
+/*
+ * ============ 套索选择的一套几何工具（当前**未被调用**）============
+ *
+ * `polygonBounds` / `pointInPolygon` / `strokeInPolygon` /
+ * `selectionBounds` / `translateStroke` 是一整套「套索选中笔迹 + 整体
+ * 平移」的完整实现，写于选择工具早期。后来选择工具只做了**文字**选择
+ * （`editor.ts` 的 `handleSelectPointer`），笔迹选择一直没做，这组函数
+ * 就成了零调用。
+ *
+ * 为什么保留而不是删：这是一套**自洽且经过推敲**的算法（点在多边形内、
+ * 笔迹 55% 采样点命中即算选中、包围盒并集、整体平移），删掉以后要做
+ * 笔迹选择就得重写一遍。留着成本只是几百行源码（压缩后几 KB），
+ * 比重新推导便宜。
+ *
+ * 如果确认永远不做笔迹选择，可以整体删除——删之前 grep 确认这五个
+ * 函数确实零调用即可（当前是）。
+ */
 export function polygonBounds(points: Array<[number, number]>): Bounds {
   let minX = Infinity;
   let minY = Infinity;

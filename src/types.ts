@@ -295,7 +295,6 @@ export const PEN_COLORS = [
 
 export const PEN_SIZES = [1.6, 2.8, 4.6];
 export const HIGHLIGHTER_SIZES = [16, 24, 34];
-export const HIGHLIGHTER_OPACITY = 0.32;
 
 export const TEMPLATES: Array<{ id: TemplateId; label: string }> = [
   { id: "blank", label: "空白" },

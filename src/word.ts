@@ -278,14 +278,4 @@ export async function* renderDocxToPages(
   }
 }
 
-/** 快速取 Word 的前 N 段文字（用于预览标题） */
-export function previewText(paras: DocParagraph[], max = 60): string {
-  const t = paras
-    .map((p) => p.text)
-    .filter(Boolean)
-    .join(" ")
-    .slice(0, max);
-  return t;
-}
-
 export type { Pt };

@@ -348,15 +348,3 @@ export class TouchArbiter {
   }
 }
 
-/** 判断两个点是否接近（用于双击检测） */
-export function isDoubleTap(
-  a: { x: number; y: number; t: number },
-  b: { x: number; y: number; t: number } | null,
-  maxDist = 28,
-  maxDelay = 320
-): boolean {
-  if (!b) return false;
-  return (
-    Math.hypot(a.x - b.x, a.y - b.y) <= maxDist && a.t - b.t <= maxDelay
-  );
-}

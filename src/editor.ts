@@ -766,8 +766,6 @@ export class BookEditor {
   private resizeRaf = 0;
   /** 平板手势仲裁：笔 / 手指 / 多指手势 */
   private arbiter: TouchArbiter;
-  /** 当前这一指的角色 */
-  private role: TouchRole = "none";
   /**
    * 允许手指书写（平板没笔时也能写）。
    *
@@ -4507,7 +4505,6 @@ export class BookEditor {
 
     // 手势仲裁：笔优先；笔活动期间的手指视为掌根；双指进入手势
     const role = this.arbiter.down(this.pointerInfo(e));
-    this.role = role;
 
     if (role === "ignore") return;
     if (role === "gesture") {
