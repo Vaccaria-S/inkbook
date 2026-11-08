@@ -369,7 +369,8 @@ export function normalizeBook(raw: any, fallbackTitle: string): InkBook {
    *     [0.3, 2.8]。夹取而不是丢弃——「用户手动缩放过」这个信息有价值，
    *     不该因为一个脏数字就退回 fit；但也不能原样放行：99 倍 zoom 会让
    *     打开时先按 99 倍排一次版，可能直接把主线程卡死。
-   *   · scrollTop 只留正的有限值；0/负/NaN 当没写（页首是默认行为）。
+   *   · scrollTop / scrollLeft 只留正的有限值；0/负/NaN 当没写
+   *     （页首 / 页左边是默认行为）。
    *   · 缺省不写回字段——老文件读出来仍是 undefined，打开时走 fit + 页首。
    */
   const zoom = raw?.zoom;
@@ -379,6 +380,14 @@ export function normalizeBook(raw: any, fallbackTitle: string): InkBook {
   const scrollTop = raw?.scrollTop;
   if (typeof scrollTop === "number" && Number.isFinite(scrollTop) && scrollTop > 0) {
     book.scrollTop = scrollTop;
+  }
+  /*
+   * 水平位置与 scrollTop 同一套校验：只认正的有限数。
+   * 未放大时 scrollLeft 恒为 0，「停在左边」不需要字段表达。
+   */
+  const scrollLeft = raw?.scrollLeft;
+  if (typeof scrollLeft === "number" && Number.isFinite(scrollLeft) && scrollLeft > 0) {
+    book.scrollLeft = scrollLeft;
   }
   return book;
 }

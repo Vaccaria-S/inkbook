@@ -191,6 +191,17 @@ export interface InkBook {
    * 「停在页首」是默认行为，没必要为它占体积。
    */
   scrollTop?: number;
+  /**
+   * 上次关文件时的**水平**页内滚动位置（相对滚动容器的 CSS 像素）。
+   *
+   * 为什么单独存：放大后纸比容器宽，用户会向右滚去看右边的内容；
+   * 以前只记 scrollTop，重开就跳回左边（INK-209）。与 zoom / scrollTop
+   * 同为不升版本新增，老文件没有它 = 停在左边。
+   *
+   * 只有放大到出现横向滚动时才可能有值；未放大时纸是居中的，
+   * scrollLeft 恒为 0，这种情况不写回字段（0 是默认行为）。
+   */
+  scrollLeft?: number;
 }
 
 export interface InkbookSettings {

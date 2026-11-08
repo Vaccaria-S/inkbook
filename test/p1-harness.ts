@@ -2165,13 +2165,14 @@ async function R174() {
 }
 
 /**
- * P：保存并恢复「缩放 + 页内滚动位置」（INK-173）。
+ * P：保存并恢复「缩放 + 页内滚动位置」（INK-173 / INK-209）。
  *
- * 覆盖四条主线：
+ * 覆盖五条主线：
  *   ① 文件里存了 zoom/scrollTop → 重开后真的恢复（不是回到 fit + 页首）
  *   ② fit 模式不把算出来的比例写成用户 zoom（否则换窗口尺寸会被锁死）
- *   ③ 非法值：zoom 夹到 [0.3,2.8]，scrollTop 负数/字符串丢弃
- *   ④ 老文件没有这两个字段 → 正常 fit 打开，且不凭空写回默认字段
+ *   ③ 非法值：zoom 夹到 [0.3,2.8]，scrollTop/scrollLeft 负数/字符串丢弃
+ *   ④ 老文件没有这些字段 → 正常 fit 打开，且不凭空写回默认字段
+ *   ⑤ 水平位置：放大后向右看，重开仍在右边；水平为 0 时不写字段
  */
 async function P173() {
   /* ---------- ① 已有 zoom/scrollTop → 打开即恢复，保存后再重开仍是新值 ---------- */
@@ -2302,22 +2303,108 @@ async function P173() {
   await sleep(450);
   pass(
     v6.store.data.zoom === undefined && v6.store.data.scrollTop === undefined &&
-      v6.editor.fitMode === true && v6.editor.scrollEl.scrollTop === 0,
+      v6.store.data.scrollLeft === undefined &&
+      v6.editor.fitMode === true && v6.editor.scrollEl.scrollTop === 0 &&
+      v6.editor.scrollEl.scrollLeft === 0,
     "P173⑦ 老文件正常打开：store.zoom=" + v6.store.data.zoom + "；store.scrollTop=" +
-      v6.store.data.scrollTop + "；fitMode=" + v6.editor.fitMode + "；scrollTop=" +
-      v6.editor.scrollEl.scrollTop
+      v6.store.data.scrollTop + "；store.scrollLeft=" + v6.store.data.scrollLeft +
+      "；fitMode=" + v6.editor.fitMode + "；scrollTop=" + v6.editor.scrollEl.scrollTop +
+      "；scrollLeft=" + v6.editor.scrollEl.scrollLeft
   );
-  // 不动视图、只落一笔 → 文件里不该凭空多出 zoom / scrollTop 字段
+  // 不动视图、只落一笔 → 文件里不该凭空多出 zoom / scrollTop / scrollLeft 字段
   v6.store.addStroke(mkStroke(1734), 0);
   await sleep(1300);
   const oldSaved: any = JSON.parse(files.get(op));
   pass(
-    ("zoom" in oldSaved) === false && ("scrollTop" in oldSaved) === false,
+    ("zoom" in oldSaved) === false && ("scrollTop" in oldSaved) === false &&
+      ("scrollLeft" in oldSaved) === false,
     "P173⑦ 老文件保存后不凭空写默认视图字段：zoom 字段=" + ("zoom" in oldSaved) +
-      "；scrollTop 字段=" + ("scrollTop" in oldSaved)
+      "；scrollTop 字段=" + ("scrollTop" in oldSaved) +
+      "；scrollLeft 字段=" + ("scrollLeft" in oldSaved)
   );
   await v6.onClose();
   v6.containerEl.remove();
+
+  /* ---------- ⑤ 水平位置（INK-209）：放大后向右看，重开还在右边 ---------- */
+  const hp = "P173-h.inkbook";
+  const hb: any = mkBook("P173水平本", 3, 1);
+  // zoom=2 → 纸宽 794×2=1588，必然超过测试窗口宽度，才有横向滚动可言
+  hb.zoom = 2;
+  hb.scrollTop = 500;
+  hb.scrollLeft = 300;
+  seed(hp, JSON.stringify(hb));
+
+  const vh = await openView();
+  await vh.onLoadFile(tf(hp));
+  await sleep(500);
+  // 恢复值可能被「当前可滚宽度」夹小（缩放变了宽也变），按上限算期望
+  const hMax = Math.max(0, vh.editor.scrollEl.scrollWidth - vh.editor.scrollEl.clientWidth);
+  const hLeft = vh.editor.scrollEl.scrollLeft;
+  pass(
+    hMax > 50 && Math.abs(hLeft - Math.min(300, hMax)) <= 2,
+    "P173⑧ 打开即恢复水平位置：scrollLeft=" + hLeft.toFixed(1) + "（期望 " +
+      Math.min(300, hMax).toFixed(0) + "；可滚上限=" + hMax.toFixed(0) + "）"
+  );
+
+  // 只改横向位置（纵向不动）再落一笔：新的 scrollLeft 必须写进文件
+  const wantLeft = Math.min(120, hMax);
+  vh.editor.scrollEl.scrollLeft = wantLeft;
+  vh.store.addStroke(mkStroke(1735), 0);
+  await sleep(1300);
+  const hSaved: any = JSON.parse(files.get(hp));
+  pass(
+    Math.abs((hSaved?.scrollLeft ?? -1) - wantLeft) <= 2,
+    "P173⑨ 保存写入水平位置：scrollLeft=" + hSaved?.scrollLeft +
+      "（期望 ≈" + wantLeft.toFixed(0) + "）"
+  );
+  await vh.onClose();
+  vh.containerEl.remove();
+
+  const vh2 = await openView();
+  await vh2.onLoadFile(tf(hp));
+  await sleep(500);
+  const hRe = vh2.editor.scrollEl.scrollLeft;
+  pass(
+    hRe > 0 && Math.abs(hRe - wantLeft) <= 2,
+    "P173⑨ 重开后水平位置仍在右边：scrollLeft=" + hRe.toFixed(1) +
+      "（期望 ≈" + wantLeft.toFixed(0) + "）"
+  );
+  await vh2.onClose();
+  vh2.containerEl.remove();
+
+  /*
+   * 水平为 0 时不写字段：这里 zoom=2 已经能横向滚，但用户没动横向，
+   * scrollLeft 仍是 0（纸贴左边是默认）。字段不该凭空产生。
+   */
+  const zp = "P173-leftzero.inkbook";
+  const zb: any = mkBook("P173水平零本", 2, 1);
+  zb.zoom = 2;
+  seed(zp, JSON.stringify(zb));
+  const vz = await openView();
+  await vz.onLoadFile(tf(zp));
+  await sleep(500);
+  vz.store.addStroke(mkStroke(1736), 0);
+  await sleep(1300);
+  const zSaved: any = JSON.parse(files.get(zp));
+  pass(
+    ("scrollLeft" in zSaved) === false,
+    "P173⑩ 水平为 0 时不写字段：scrollLeft 字段=" + ("scrollLeft" in zSaved)
+  );
+  await vz.onClose();
+  vz.containerEl.remove();
+
+  // 非法水平值：负数 / 字符串在 normalizeBook 阶段就当没写（不进内存对象）
+  const negBook: any = mkBook("P173水平脏本", 1, 0);
+  negBook.scrollLeft = -50;
+  const strLeftBook: any = mkBook("P173水平字符串本", 1, 0);
+  strLeftBook.scrollLeft = "300";
+  const negNorm: any = normalizeBook(negBook, "fallback");
+  const strLeftNorm: any = normalizeBook(strLeftBook, "fallback");
+  pass(
+    negNorm.scrollLeft === undefined && strLeftNorm.scrollLeft === undefined,
+    "P173⑪ 非法 scrollLeft 当没写：负数=" + negNorm.scrollLeft +
+      "；字符串=" + strLeftNorm.scrollLeft
+  );
 }
 
 /* ==================== INK-176：文字索引四条修复 ==================== */

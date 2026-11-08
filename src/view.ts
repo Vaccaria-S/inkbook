@@ -325,6 +325,16 @@ export class InkbookView extends FileView {
   file: TFile | null = null;
   store: BookStore | null = null;
   editor: BookEditor | null = null;
+  /**
+   * 允许在没有绑定文件的情况下打开本视图（INK-210）。
+   *
+   * `FileView` 默认 false —— 宿主只允许「打开某个 .inkbook」时创建它。
+   * 但 `onOpen` 里本来就无条件 `renderEmpty()`（画「新建手写本」/
+   * 「导入文档开始」那个空状态），说明代码一直预期「无文件」是可能的；
+   * 缺这一行导致用户**根本开不出一个空的墨本标签页**，
+   * 「导入文档开始」这个入口永远够不着。
+   */
+  allowNoFile = true;
 
   private railReadBtn!: HTMLElement;
   private railSideBtn!: HTMLElement;
@@ -632,12 +642,15 @@ export class InkbookView extends FileView {
   /** 上次成功写盘时的 activePage，用来看"翻页后到底要不要写一次" */
   private savedActivePage = -1;
   /**
-   * 上次成功写盘时的视图状态（zoom / scrollTop），用途同 savedActivePage：
-   * 只缩放或只滚动时也要在关文件时落一次，但**不能**每次滚动都写整本。
+   * 上次成功写盘时的视图状态（zoom / scrollTop / scrollLeft），用途同
+   * savedActivePage：只缩放或只滚动时也要在关文件时落一次，但**不能**
+   * 每次滚动都写整本。
    * `savedZoom === undefined` 表示上次落盘时是 fit 模式（字段没写）。
    */
   private savedZoom: number | undefined;
   private savedScrollTop: number | undefined;
+  /** 水平基线：放大后向右滚过才非 0，见 types.ts 的 scrollLeft */
+  private savedScrollLeft: number | undefined;
   /** 检测到外部改动后置真：此后不再写主文件，等用户自己处理两份副本 */
   private conflict = false;
   /** 只读态的"改动不会保存"提示是否已经弹过（每本书一次，别刷屏） */
@@ -813,13 +826,16 @@ export class InkbookView extends FileView {
      * 比较对象必须是「将要写进文件的形态」——fit 模式下 zoom 根本不落盘，
      * 所以拿 undefined 去比，不能拿 applyLayout 算出来的 this.zoom 比：
      * 否则打开一本没手动缩放过的本子、什么都不动直接关，也会白写一次整本。
-     * scrollTop 有滚动取整 / 亚像素抖动，留 2px 容差。
+     * scrollTop / scrollLeft 有滚动取整 / 亚像素抖动，留 2px 容差。
      */
     const zoom = this.editor.fitMode ? undefined : this.editor.zoom;
-    // getScrollTop 把「还没落下去的恢复值」也算进来：隐藏标签页 / 折叠面板
-    // 里关闭文件时，不能把待恢复的位置误判成 0 再写回磁盘
+    // getScrollTop / getScrollLeft 把「还没落下去的恢复值」也算进来：
+    // 隐藏标签页 / 折叠面板里关闭文件时，不能把待恢复的位置误判成 0
+    // 再写回磁盘
     const rawTop = this.editor.getScrollTop();
     const scrollTop = rawTop > 0 ? rawTop : undefined;
+    const rawLeft = this.editor.getScrollLeft();
+    const scrollLeft = rawLeft > 0 ? rawLeft : undefined;
     const zoomChanged =
       zoom === undefined
         ? this.savedZoom !== undefined
@@ -828,7 +844,14 @@ export class InkbookView extends FileView {
       scrollTop === undefined
         ? this.savedScrollTop !== undefined
         : this.savedScrollTop === undefined || Math.abs(scrollTop - this.savedScrollTop) > 2;
-    if (zoomChanged || topChanged) {
+    // 水平必须单独比较：只向右滚、纵向没动时，不判它就不会标脏，
+    // 关文件时这次水平位移根本不会写进文件（INK-209）
+    const leftChanged =
+      scrollLeft === undefined
+        ? this.savedScrollLeft !== undefined
+        : this.savedScrollLeft === undefined ||
+          Math.abs(scrollLeft - this.savedScrollLeft) > 2;
+    if (zoomChanged || topChanged || leftChanged) {
       this.metaDirty = true;
       this.metaEpoch += 1;
     }
@@ -839,23 +862,36 @@ export class InkbookView extends FileView {
    *
    * fit 模式下刻意 `delete book.zoom`：fit 的比例是窗口算出来的，
    * 不是用户的选择，存下来下次会被旧窗口尺寸锁死（平板上转个方向就错位）。
-   * scrollTop 两种模式都存——至少回到上次的位置附近。
-   * 值缺省时删字段而不是写 0/undefined：老文件和停在页首时不产生多余字段。
+   * scrollTop / scrollLeft 两种模式都存——至少回到上次的位置附近。
+   * 值缺省时删字段而不是写 0/undefined：老文件、停在页首或页左边时
+   * 不产生多余字段。
    */
   private captureViewState(book: InkBook): {
     zoom: number | undefined;
     scrollTop: number | undefined;
+    scrollLeft: number | undefined;
   } {
     const ed = this.editor;
-    if (!ed) return { zoom: this.savedZoom, scrollTop: this.savedScrollTop };
+    if (!ed) {
+      return {
+        zoom: this.savedZoom,
+        scrollTop: this.savedScrollTop,
+        scrollLeft: this.savedScrollLeft,
+      };
+    }
     const zoom = !ed.fitMode && Number.isFinite(ed.zoom) ? ed.zoom : undefined;
     const rawTop = ed.getScrollTop();
     const scrollTop = Number.isFinite(rawTop) && rawTop > 0 ? rawTop : undefined;
+    // 没放大时纸是居中的，scrollLeft 恒为 0 → 不写字段（见 types.ts）
+    const rawLeft = ed.getScrollLeft();
+    const scrollLeft = Number.isFinite(rawLeft) && rawLeft > 0 ? rawLeft : undefined;
     if (zoom === undefined) delete book.zoom;
     else book.zoom = zoom;
     if (scrollTop === undefined) delete book.scrollTop;
     else book.scrollTop = scrollTop;
-    return { zoom, scrollTop };
+    if (scrollLeft === undefined) delete book.scrollLeft;
+    else book.scrollLeft = scrollLeft;
+    return { zoom, scrollTop, scrollLeft };
   }
 
   /** 装载一本书（首次读成功、以及从备份恢复时共用） */
@@ -885,6 +921,7 @@ export class InkbookView extends FileView {
     // 编辑器算出来的 fit 比例当基线，否则关文件时会误判成"用户缩放过了"
     this.savedZoom = book.zoom;
     this.savedScrollTop = book.scrollTop;
+    this.savedScrollLeft = book.scrollLeft;
     this.destroyEditor();
     /*
      * 装配期（buildUI → buildRail → setReading）会顺手动到 setReading /
@@ -928,6 +965,7 @@ export class InkbookView extends FileView {
     this.readOnlyReason = null;
     this.savedZoom = undefined;
     this.savedScrollTop = undefined;
+    this.savedScrollLeft = undefined;
   }
 
   /**
@@ -1180,16 +1218,17 @@ export class InkbookView extends FileView {
     // 现在从 settings 恢复（侧栏开关 / 设置页都会写回这里）。
     this.editor.touchDraw = this.plugin.settings.touchDraw === true;
     /*
-     * 恢复上次的缩放与页内滚动位置（INK-173）。
+     * 恢复上次的缩放与页内滚动位置（INK-173 / INK-209）。
      *
      * 必须在编辑器构造之后、第一帧布局之前调用：zoom 会立即生效并关掉
-     * fitMode；scrollTop 由编辑器挂到下一帧，等构造函数里的
-     * goToPage(activePage) 跑完再落，不然会被它拉回页首。
-     * 字段缺省时（老文件）restoreViewState 是空操作，仍走 fit + 页首。
+     * fitMode；scrollTop / scrollLeft 由编辑器挂到下一帧，等构造函数里的
+     * goToPage(activePage) 跑完、容器量出真实尺寸后再落，不然会被它拉回
+     * 页首 / 页左边。字段缺省时（老文件）restoreViewState 是空操作。
      */
     this.editor.restoreViewState({
       zoom: this.store.data.zoom,
       scrollTop: this.store.data.scrollTop,
+      scrollLeft: this.store.data.scrollLeft,
     });
     this.buildHeaderActions();
     // 标题栏放不下十个按钮时（平板常见），下一帧会把整行搬到自建顶栏条
@@ -1229,6 +1268,8 @@ export class InkbookView extends FileView {
         this.savedZoom = this.editor.fitMode ? undefined : this.editor.zoom;
         const rawTop = this.editor.getScrollTop();
         this.savedScrollTop = rawTop > 0 ? rawTop : undefined;
+        const rawLeft = this.editor.getScrollLeft();
+        this.savedScrollLeft = rawLeft > 0 ? rawLeft : undefined;
       })
     );
 
@@ -5801,7 +5842,7 @@ export class InkbookView extends FileView {
         const view =
           this.editor && this.store === store
             ? this.captureViewState(book)
-            : { zoom: book.zoom, scrollTop: book.scrollTop };
+            : { zoom: book.zoom, scrollTop: book.scrollTop, scrollLeft: book.scrollLeft };
         await writeBook(adapter, path, book);
         /*
          * 主动通知嵌入重画。
@@ -5836,6 +5877,7 @@ export class InkbookView extends FileView {
           // 保持旧基线、让下一次 flush 继续把它们写掉
           this.savedZoom = view.zoom;
           this.savedScrollTop = view.scrollTop;
+          this.savedScrollLeft = view.scrollLeft;
         }
         const fpAfter = await fingerprint(adapter, path);
         /*

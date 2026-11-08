@@ -2494,6 +2494,28 @@
   line-height: 1.6;
 }
 
+/*
+ * 空视图的两个入口（INK-207）：新建 / 导入文档开始。
+ *
+ * 没有这条时两个按钮会贴在一起、在平板上很难点准——它们并排且都是
+ * 默认 inline-block，中间连空隙都没有。
+ * 竖排 + 间距 + 等宽：手指从上往下依次碰到，不会点错。
+ */
+.mb-empty-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: stretch;
+  max-width: 260px;
+  margin: 0 auto;
+}
+
+.mb-empty-actions button {
+  width: 100%;
+  height: 38px;
+  font-size: 13px;
+}
+
 .mb-error {
   margin: auto;
   max-width: 420px;

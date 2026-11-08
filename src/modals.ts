@@ -493,7 +493,20 @@ export class ImportSourceModal extends Modal {
       cls: "mb-file-input",
       attr: { type: "file", accept: this.acceptAttr() },
     });
-    input.style.display = "none";
+    /*
+     * **视觉隐藏，而不是 `display: none`**（INK-210）。
+     *
+     * `display: none` 的 input 在标准 Chromium 里 `.click()` 仍然能弹选择器，
+     * 但部分 WebView（尤其是安卓上的 Capacitor 内核）会直接忽略——
+     * 用户看到的是「点了按钮，什么都没发生」，正是这次报的症状。
+     * 用「零尺寸 + 透明 + 绝对定位」：元素仍在渲染树里、可被程序点击，
+     * 但用户看不见、也不占位。
+     */
+    input.style.position = "absolute";
+    input.style.width = "0";
+    input.style.height = "0";
+    input.style.opacity = "0";
+    input.style.pointerEvents = "none";
     this.fileInput = input;
     this.deviceBtn.onclick = () => {
       if (this.busy) return;

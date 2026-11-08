@@ -696,6 +696,16 @@ export class BookEditor {
   private pendingScrollTop: number | null = null;
 
   /**
+   * 待恢复的**水平**滚动位置，语义与 pendingScrollTop 完全相同。
+   *
+   * 放大到纸比容器宽时才可能出现非 0 的 scrollLeft（没放大时纸居中，
+   * 横向根本没得滚）。单独存一份是因为两者可能只有其一：纵向停在页首、
+   * 横向却在右半边，或者反过来。恢复同样要等构造函数那帧 goToPage
+   * 跑完、容器量出真实 scrollWidth 之后再落，否则会被夹成 0（INK-209）。
+   */
+  private pendingScrollLeft: number | null = null;
+
+  /**
    * 惯性滚动的状态。
    *
    * 为什么自己做而不靠浏览器：实测 pointercancel = 0，
@@ -2073,12 +2083,16 @@ export class BookEditor {
      * 尺寸就绪后补落待恢复的滚动位置。
      *
      * 编辑器可能在隐藏的标签页 / 折叠面板里创建，那一刻 clientHeight=0，
-     * restoreViewState 的 rAF 落不下去（见 applyPendingScrollTop）。
+     * restoreViewState 的 rAF 落不下去（见 applyPendingScroll）。
      * 等第一次真实的 applyLayout（容器可见后由 ResizeObserver 触发）
-     * 再补一次，用户看到的才是上次的位置。
+     * 再补一次，用户看到的才是上次的位置。横向同理：只有水平 pending
+     * 时也要补落，否则「纵向在页首、横向在右半边」的读者永远回左边。
      */
-    if (this.pendingScrollTop != null && this.scrollEl.clientHeight > 0) {
-      requestAnimationFrame(() => this.applyPendingScrollTop());
+    if (
+      (this.pendingScrollTop != null || this.pendingScrollLeft != null) &&
+      this.scrollEl.clientHeight > 0
+    ) {
+      requestAnimationFrame(() => this.applyPendingScroll());
     }
     this.emitState();
   }
@@ -2122,10 +2136,10 @@ export class BookEditor {
    *   2. fit 的 zoom 要等容器有尺寸后才算得准，早写没有意义。
    *
    * 所以 zoom 立即落（并关掉 fitMode，让构造函数那一帧按它排版；
-   * 字段存在 = 用户显式缩放过，见 types.ts），scrollTop 挂成 pending，
-   * 由构造后的下一帧统一落。
+   * 字段存在 = 用户显式缩放过，见 types.ts），纵向 / 横向滚动位置
+   * 挂成 pending，由构造后的下一帧统一落。
    */
-  restoreViewState(view: { zoom?: number; scrollTop?: number }): void {
+  restoreViewState(view: { zoom?: number; scrollTop?: number; scrollLeft?: number }): void {
     if (typeof view.zoom === "number" && Number.isFinite(view.zoom)) {
       this.fitMode = false;
       this.zoom = clamp(view.zoom, 0.3, 2.8);
@@ -2136,48 +2150,78 @@ export class BookEditor {
       view.scrollTop > 0
     ) {
       this.pendingScrollTop = view.scrollTop;
-      requestAnimationFrame(() => this.applyPendingScrollTop());
+    }
+    // 水平只在大缩放、纸比容器宽时才不为 0；0 是默认（纸居中），不必恢复
+    if (
+      typeof view.scrollLeft === "number" &&
+      Number.isFinite(view.scrollLeft) &&
+      view.scrollLeft > 0
+    ) {
+      this.pendingScrollLeft = view.scrollLeft;
+    }
+    if (this.pendingScrollTop != null || this.pendingScrollLeft != null) {
+      requestAnimationFrame(() => this.applyPendingScroll());
     }
   }
 
   /**
-   * 把 pending 的 scrollTop 真正落到滚动容器上。
+   * 把 pending 的纵向 / 横向滚动位置真正落到滚动容器上。
    *
    * 必须晚于构造函数的 rAF（它里面 goToPage 会滚到 activePage），
    * 否则恢复值会被覆盖。落之前重新量一次页高 / 首页偏移：fit 模式下
    * zoom 刚在上一帧算出来，滚动高度可能和构造时不同。
+   *
+   * 纵向和横向分别判就绪、分别落：可能只有其一在 pending（纵向在页首
+   * 但横向在右半边），不能因为另一个是 null 就跳过。
    */
-  private applyPendingScrollTop(): void {
-    if (this.destroyed || this.pendingScrollTop == null) return;
-    const target = this.pendingScrollTop;
+  private applyPendingScroll(): void {
+    if (this.destroyed) return;
+    const topTarget = this.pendingScrollTop;
+    const leftTarget = this.pendingScrollLeft;
+    if (topTarget == null && leftTarget == null) return;
     /*
      * 容器还没完成布局（clientHeight / scrollHeight 为 0）时**保留**
      * pending，绝不把恢复值落成 0——那等于用户又回到页首，而且下次
      * 关闭还会把 0 写回文件（被隐藏标签页打开的场景）。
+     * 水平同理：scrollWidth 还没量出来时 max 会被算成 0，恢复值就被
+     * 覆盖成「贴左边」，所以横向 pending 也要求 clientWidth 就绪。
      * 先自己重试 3 帧；仍没尺寸就等 applyLayout 末尾那一次补落
      * （容器可见 / ResizeObserver 触发时）。
      * 不能用「max<=0」判断：内容本来就装得下时 max 也是 0，
-     * 那属于合法地只能停在页首，不该重试。
+     * 那属于合法地只能停在页首 / 页左边，不该重试。
      */
-    if (this.scrollEl.clientHeight <= 0 || this.scrollEl.scrollHeight <= 0) {
+    const verticalReady =
+      this.scrollEl.clientHeight > 0 && this.scrollEl.scrollHeight > 0;
+    const horizontalReady =
+      leftTarget == null ||
+      (this.scrollEl.clientWidth > 0 && this.scrollEl.scrollWidth > 0);
+    if (!verticalReady || !horizontalReady) {
       if (this.restoreScrollRetry < 3) {
         this.restoreScrollRetry += 1;
-        requestAnimationFrame(() => this.applyPendingScrollTop());
+        requestAnimationFrame(() => this.applyPendingScroll());
       }
       return;
     }
     this.restoreScrollRetry = 0;
     this.pendingScrollTop = null;
+    this.pendingScrollLeft = null;
     this.measurePageMetrics();
-    const max = Math.max(0, this.scrollEl.scrollHeight - this.scrollEl.clientHeight);
-    this.scrollEl.scrollTop = Math.min(target, max);
+    if (topTarget != null) {
+      const maxTop = Math.max(0, this.scrollEl.scrollHeight - this.scrollEl.clientHeight);
+      this.scrollEl.scrollTop = Math.min(topTarget, maxTop);
+    }
+    if (leftTarget != null) {
+      // 缩放变了可滚动宽度也跟着变，夹到当前真正能滚到的最右位置
+      const maxLeft = Math.max(0, this.scrollEl.scrollWidth - this.scrollEl.clientWidth);
+      this.scrollEl.scrollLeft = Math.min(leftTarget, maxLeft);
+    }
     // 位置可能落在另一页上（窗口尺寸 / fit 比例变了）：页码立刻跟上，
     // 别等异步 scroll 事件——返回后马上读 getState() 的调用方会拿到旧页码
     this.updateCurrentFromScroll(true);
     this.emitState();
   }
 
-  /** applyPendingScrollTop 的重试计数（见该方法的说明） */
+  /** applyPendingScroll 的重试计数（见该方法的说明） */
   private restoreScrollRetry = 0;
 
   /**
@@ -2189,6 +2233,17 @@ export class BookEditor {
    */
   getScrollTop(): number {
     return this.pendingScrollTop ?? this.scrollEl.scrollTop;
+  }
+
+  /**
+   * 当前应落盘的**水平**滚动位置，语义与 getScrollTop 完全对称。
+   *
+   * 为什么需要 pending：和纵向一样，在隐藏标签页里关闭文件时容器
+   * 还没恢复布局，直接读 scrollEl.scrollLeft 会得到 0，把上次的
+   * 水平位置抹掉。放大后向右看的那半边内容就这么丢了（INK-209）。
+   */
+  getScrollLeft(): number {
+    return this.pendingScrollLeft ?? this.scrollEl.scrollLeft;
   }
 
   /**
