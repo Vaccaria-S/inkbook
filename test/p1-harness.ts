@@ -18,6 +18,15 @@ import {
   removeTextIndex,
   writeTextIndex,
 } from "../src/indexer";
+/*
+ * 真实用户动线（INK-205）要用到的两条真实链路：
+ *   · 导入 PDF 页 —— 走 importers.ts 的 importPdf，和用户点「导入」同一条；
+ *   · 导出 PDF   —— 走 export.ts 的 exportBookPdf，和用户点「导出」同一条。
+ * 不自己拼假数据结构，避免「测试里能跑、真机上走的是另一条路」。
+ */
+import { importPdf } from "../src/importer";
+import { exportBookPdf } from "../src/export";
+import { initPdfjs } from "../src/pdf";
 
 const lines: string[] = [];
 const out = document.getElementById("out")!;
@@ -69,6 +78,13 @@ const T0 = performance.now();
 const calls: Call[] = [];
 const files = new Map<string, any>();
 const mt = new Map<string, number>();
+/*
+ * 二进制文件（导出的 PDF / 导入用的源 PDF）。
+ *
+ * 和 `files` 分开存：正文 .inkbook 是字符串，用字符串比较能逐字节判断
+ * "主文件有没有被动过"；导出件是 Uint8Array，混在一起会把 blen 算成 0。
+ */
+const binFiles = new Map<string, Uint8Array>();
 /**
  * mtime 必须用**真实时钟**，不能用固定基准值。
  *
@@ -119,11 +135,27 @@ const adapter = {
     if (statDelayMs > 0) await sleep(statDelayMs);
     return files.has(p) ? { mtime: mt.get(p)!, size: blen(files.get(p)) } : null;
   },
-  exists: async (p: string) => files.has(p),
+  exists: async (p: string) => files.has(p) || binFiles.has(p),
   read: async (p: string) => {
     if (!files.has(p)) throw new Error("ENOENT " + p);
     return files.get(p);
   },
+  /*
+   * 二进制读写：导出 PDF 写 `.tmp` → rename，导入/导出回读源 PDF 都走这两个。
+   * 真机上是 Obsidian DataAdapter 的同名方法，桩里对齐语义。
+   */
+  readBinary: async (p: string) => {
+    const data = binFiles.get(p);
+    if (!data) throw new Error("ENOENT " + p);
+    return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+  },
+  writeBinary: async (p: string, buf: ArrayBuffer) => {
+    if (writeDelayMs > 0) await sleep(writeDelayMs);
+    if (writeFailFor && writeFailFor(p)) throw new Error("ENOSPC: no space left on device");
+    binFiles.set(p, new Uint8Array(buf));
+  },
+  /* 导入时 assetUrl 用它把库路径转成可 fetch 的 URL（测试服务根目录在 /） */
+  getResourcePath: (p: string) => (/^[./]/.test(p) ? p : "/" + p),
   write: async (p: string, d: any) => {
     if (writeDelayMs > 0) await sleep(writeDelayMs);
     if (writeFailFor && writeFailFor(p)) throw new Error("ENOSPC: no space left on device");
@@ -132,6 +164,14 @@ const adapter = {
     calls.push({ kind: "write", path: p, bytes: blen(d), t: performance.now() - T0 });
   },
   rename: async (o: string, n: string) => {
+    // 导出 PDF 的原子写：.tmp 在 binFiles 里，别去 files 表找（会误报 ENOENT）
+    if (binFiles.has(o)) {
+      if (writeFailFor && writeFailFor(n)) throw new Error("ENOSPC: no space left on device");
+      if (renameFailFor && renameFailFor(o, n)) throw new Error("EBUSY: resource busy or locked");
+      binFiles.set(n, binFiles.get(o)!);
+      binFiles.delete(o);
+      return;
+    }
     if (!files.has(o)) throw new Error("ENOENT " + o);
     // 原子写的落点同样受故障注入影响，否则「磁盘满」会被 rename 悄悄绕过
     if (writeFailFor && writeFailFor(n)) throw new Error("ENOSPC: no space left on device");
@@ -143,6 +183,7 @@ const adapter = {
     calls.push({ kind: "rename", path: o, newPath: n, bytes: 0, t: performance.now() - T0 });
   },
   remove: async (p: string) => {
+    binFiles.delete(p);
     files.delete(p);
     mt.delete(p);
     calls.push({ kind: "remove", path: p, bytes: 0, t: performance.now() - T0 });
@@ -199,6 +240,14 @@ function totalCalls(from: number): number {
 function keys(): string[] {
   return [...files.keys()];
 }
+/** 解析落盘 JSON；文件不在 / 坏了返回 null（让断言报 FAIL，而不是整条用例抛异常） */
+function parseFile(p: string): any {
+  try {
+    return JSON.parse(files.get(p));
+  } catch (_) {
+    return null;
+  }
+}
 
 /* ------------------------------ 造数工具 ------------------------------ */
 
@@ -240,6 +289,91 @@ function countStrokes(book: any): number {
   let n = 0;
   for (const p of book?.pages || []) for (const l of p?.layers || []) n += (l.strokes || []).length;
   return n;
+}
+
+/** 带固定 id 的笔迹：往返后能逐条核对「是不是同一批」，而不是只数个数 */
+function strokeId(id: string, seedN: number, points = 12): Stroke {
+  const s = mkStroke(seedN, points);
+  s.id = id;
+  return s;
+}
+
+/** 某页（含所有图层）的笔迹 id，按落笔顺序 */
+function strokeIdsOfPage(book: any, index: number): string[] {
+  const ids: string[] = [];
+  for (const l of book?.pages?.[index]?.layers || []) for (const s of l.strokes || []) ids.push(s.id);
+  return ids;
+}
+
+/** 整本所有页的笔迹 id */
+function allStrokeIds(book: any): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < (book?.pages?.length || 0); i++) out.push(...strokeIdsOfPage(book, i));
+  return out;
+}
+
+/**
+ * 像用户一样加一段文字批注：走编辑器的 beginTextEdit / textarea / 回车提交。
+ *
+ * 不直接把对象塞进 page.texts —— 那样测不到编辑器提交时补的
+ * size/color/font/id 和 store.touch，往返断言会变成「自己造的数据自己读」。
+ */
+async function addUserText(
+  v: any,
+  pageIndex: number,
+  x: number,
+  y: number,
+  text: string,
+  opts: { size?: number; font?: string; color?: string } = {}
+): Promise<any> {
+  const ed: any = v.editor;
+  if (!ed) return null;
+  ed.selectText(null);
+  if (typeof opts.size === "number") ed.setTextSize(opts.size);
+  if (typeof opts.font === "string") ed.setTextFont(opts.font);
+  if (typeof opts.color === "string") ed.setTextColor(opts.color);
+  const rec = ed.recs?.[pageIndex];
+  if (!rec) return null;
+  ed.beginTextEdit(rec, x, y);
+  await sleep(80);
+  const pageEl = v.contentEl.querySelectorAll(".mb-page")[pageIndex] as HTMLElement | null;
+  const ta = pageEl?.querySelector(".mb-text-edit") as HTMLTextAreaElement | null;
+  if (!ta) return null;
+  ta.value = text;
+  ta.dispatchEvent(new Event("input", { bubbles: true }));
+  ta.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await sleep(100);
+  return (v.store.data.pages[pageIndex].texts || []).find((t: any) => t.text === text) || null;
+}
+
+/** 用 pdf.js 把导出的 PDF 第 n 页渲染成像素，数深色像素（证明确实有墨） */
+async function countExportedInk(bytes: Uint8Array, pageNo = 1): Promise<{ dark: number; err: string }> {
+  try {
+    const pdfjs = initPdfjs();
+    const doc = await pdfjs.getDocument({ data: bytes.slice() }).promise;
+    const page = await doc.getPage(pageNo);
+    const vp = page.getViewport({ scale: 1 });
+    const cv = document.createElement("canvas");
+    cv.width = Math.ceil(vp.width);
+    cv.height = Math.ceil(vp.height);
+    const ctx = cv.getContext("2d")!;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, cv.width, cv.height);
+    await page.render({ canvasContext: ctx, viewport: vp, background: "#ffffff" }).promise;
+    const d = ctx.getImageData(0, 0, cv.width, cv.height).data;
+    let dark = 0;
+    for (let k = 0; k < d.length; k += 4) {
+      if (d[k] < 200 && d[k + 1] < 200 && d[k + 2] < 200) dark += 1;
+    }
+    try {
+      await doc.destroy();
+    } catch (_) {
+      /* 释放失败不影响断言 */
+    }
+    return { dark, err: "" };
+  } catch (e: any) {
+    return { dark: -1, err: String(e?.message || e) };
+  }
 }
 
 async function openView(): Promise<any> {
@@ -2571,6 +2705,417 @@ async function W184() {
   v.containerEl.remove();
 }
 
+/* ======================================================================
+ * INK-205 · 真实用户动线：把一整次使用从头到尾跑一遍，看数据能不能完整往返。
+ *
+ * 和前面的单点用例互补：这里不挑函数测，而是按用户真正会做的顺序操作
+ * （写 → 存 → 关 → 重开 / 切本子 / 撤销重做 / 导入导出 / 改样式），
+ * 核心判据只有一条：**往返之后内容一条不能少**。
+ * ==================================================================== */
+
+/** 动线 1：新建本子 → 写 20 笔 → 加文字批注 → 改模板 → 保存 → 关闭 → 重开 */
+async function E2E1() {
+  const p = "E2E1-fullpage.inkbook";
+  seed(p, JSON.stringify(mkBook("整页本", 2, 0)));
+  const v = await openView();
+  await v.onLoadFile(tf(p));
+  await sleep(400);
+
+  /*
+   * 前 2 笔走真实 pointer 事件（和手写同一条链路），确认「落笔 → 入 store」
+   * 本身没断；其余 18 笔直接走 store.addStroke（pointerup 最终也是调它），
+   * 避免 20 次 DOM 事件让用例变慢、变脆。
+   */
+  const beforeDraw = v.store.strokeCount;
+  // 两笔之间留一帧：真机上第二笔也是等第一笔抬起来才落下
+  drawOnPage(v, 0);
+  await sleep(80);
+  drawOnPage(v, 0);
+  await sleep(150);
+  const drawn = v.store.strokeCount - beforeDraw;
+  for (let i = drawn; i < 20; i++) {
+    v.store.addStroke(strokeId("F" + (i + 1), i), 0);
+  }
+  const text = await addUserText(v, 0, 140, 320, "整页动线·批注", {
+    size: 18,
+    font: "kai",
+    color: "#D64545",
+  });
+
+  // 换模板：第 2 页改成横线；同时把当前页切到第 2 页（activePage 也要一起往返）
+  v.editor.goToPage(1, false);
+  await sleep(80);
+  v.editor.setTemplate("lined", false);
+  await sleep(80);
+
+  pass(
+    drawn === 2 && v.store.strokeCount === 20,
+    "E2E1① 写满一页：pointer 落笔=" + drawn + " 笔；总笔迹=" + v.store.strokeCount + "（期望 2 + 18 = 20）"
+  );
+  pass(
+    !!text && (v.store.data.pages[0].texts || []).length === 1,
+    "E2E1① 文字批注进内存：条数=" + (v.store.data.pages[0].texts || []).length +
+      "；内容=" + JSON.stringify(text?.text)
+  );
+  pass(
+    v.store.data.pages[1].template === "lined" && v.store.data.pages[0].template === "grid",
+    "E2E1① 模板改到第 2 页：" + v.store.data.pages.map((x: any) => x.template).join(",")
+  );
+
+  await v.saveNow();
+  await sleep(150);
+  const saved = parseFile(p);
+  pass(
+    saved?.integrity?.pageCount === 2 && saved?.integrity?.strokeCount === 20,
+    "E2E1② 落盘 integrity=" + JSON.stringify(saved?.integrity) + "（期望 2 页 / 20 笔）"
+  );
+  pass(
+    saved?.activePage === 1 && saved?.pages?.[1]?.template === "lined",
+    "E2E1② 落盘 activePage=" + JSON.stringify(saved?.activePage) +
+      "；第 2 页模板=" + JSON.stringify(saved?.pages?.[1]?.template)
+  );
+  pass(
+    saved?.pages?.[0]?.texts?.length === 1 && saved.pages[0].texts[0].text === "整页动线·批注",
+    "E2E1② 落盘文字=" + JSON.stringify(saved?.pages?.[0]?.texts?.[0]?.text)
+  );
+
+  await v.onClose();
+  v.containerEl.remove();
+
+  const v2 = await openView();
+  await v2.onLoadFile(tf(p));
+  await sleep(500);
+  pass(
+    v2.store.strokeCount === 20 &&
+      strokeIdsOfPage(v2.store.data, 0).length === 20 &&
+      strokeIdsOfPage(v2.store.data, 1).length === 0,
+    "E2E1③ 重开后笔迹一条不少：总笔迹=" + v2.store.strokeCount +
+      "；第 1 页=" + strokeIdsOfPage(v2.store.data, 0).length +
+      "；第 2 页=" + strokeIdsOfPage(v2.store.data, 1).length
+  );
+  const t2 = (v2.store.data.pages[0].texts || [])[0];
+  pass(
+    !!t2 && t2.text === "整页动线·批注" && t2.size === 18 && t2.font === "kai" && t2.color === "#D64545",
+    "E2E1③ 重开后文字内容/字号/字体/颜色全对：" +
+      JSON.stringify(t2 && { text: t2.text, size: t2.size, font: t2.font, color: t2.color })
+  );
+  pass(
+    v2.store.data.pages[1].template === "lined" && v2.store.data.pages[0].template === "grid",
+    "E2E1③ 重开后模板保持：" + v2.store.data.pages.map((x: any) => x.template).join(",")
+  );
+  pass(
+    v2.store.data.activePage === 1 && v2.editor.getState().pageIndex === 1,
+    "E2E1③ 重开后 activePage=" + v2.store.data.activePage +
+      "；编辑器当前页=" + v2.editor.getState().pageIndex
+  );
+  await v2.onClose();
+  v2.containerEl.remove();
+}
+
+/** 动线 2：A → B → A，每次写完立刻切，验证没有串写 / 丢内容 */
+async function E2E2() {
+  const pa = "E2E2-A.inkbook";
+  const pb = "E2E2-B.inkbook";
+  seed(pa, JSON.stringify(mkBook("多本A", 2, 0)));
+  seed(pb, JSON.stringify(mkBook("多本B", 2, 0)));
+  const v = await openView();
+  await v.onLoadFile(tf(pa));
+  await sleep(350);
+
+  for (let i = 1; i <= 3; i++) v.store.addStroke(strokeId("A" + i, 200 + i), 0);
+  pass(
+    v.store.strokeCount === 3 && v.store.data.title === "多本A",
+    "E2E2① A 写完 3 笔（内存）：笔迹=" + v.store.strokeCount + "；标题=" + v.store.data.title
+  );
+  // 不手动 saveNow：模拟用户「写完马上切本子」，切走必须自己落盘
+  await v.onUnloadFile();
+
+  await v.onLoadFile(tf(pb));
+  await sleep(350);
+  pass(
+    v.store.strokeCount === 0 && v.store.data.title === "多本B",
+    "E2E2② 切到 B：B 自己的笔迹=" + v.store.strokeCount + "（期望 0）；标题=" + v.store.data.title
+  );
+  v.store.addStroke(strokeId("B1", 300), 0);
+  v.store.addStroke(strokeId("B2", 301), 0);
+  pass(v.store.strokeCount === 2, "E2E2② B 写完 2 笔（内存）：笔迹=" + v.store.strokeCount);
+
+  // 写完立刻切回 A：这一次切换会先把 B 落盘
+  await v.onLoadFile(tf(pa));
+  await sleep(350);
+
+  const diskA1 = parseFile(pa);
+  const diskB = parseFile(pb);
+  pass(
+    allStrokeIds(diskA1).join(",") === "A1,A2,A3",
+    "E2E2③ 切走时 A 已落盘：" + JSON.stringify(allStrokeIds(diskA1))
+  );
+  pass(
+    allStrokeIds(diskB).join(",") === "B1,B2",
+    "E2E2③ 切走时 B 已落盘：" + JSON.stringify(allStrokeIds(diskB))
+  );
+  pass(
+    v.store.strokeCount === 3 && v.store.data.title === "多本A",
+    "E2E2④ 切回 A：读到自己的 3 笔=" + v.store.strokeCount + "；标题=" + v.store.data.title
+  );
+
+  v.store.addStroke(strokeId("A4", 204), 0);
+  await v.onUnloadFile();
+  const diskA2 = parseFile(pa);
+  pass(
+    allStrokeIds(diskA2).join(",") === "A1,A2,A3,A4",
+    "E2E2④ A 再来一笔后落盘完整：" + JSON.stringify(allStrokeIds(diskA2))
+  );
+
+  const va = await openView();
+  await va.onLoadFile(tf(pa));
+  await sleep(450);
+  pass(
+    va.store.strokeCount === 4 && va.store.data.title === "多本A",
+    "E2E2⑤ 重开 A：笔迹=" + va.store.strokeCount + "（期望 4）；标题=" + va.store.data.title
+  );
+  await va.onClose();
+  va.containerEl.remove();
+
+  const vb = await openView();
+  await vb.onLoadFile(tf(pb));
+  await sleep(450);
+  pass(
+    vb.store.strokeCount === 2 && vb.store.data.title === "多本B",
+    "E2E2⑤ 重开 B：笔迹=" + vb.store.strokeCount + "（期望 2）；标题=" + vb.store.data.title
+  );
+  const aIds = allStrokeIds(diskA2);
+  const bIds = allStrokeIds(vb.store.data);
+  pass(
+    !bIds.some((id: string) => aIds.includes(id)),
+    "E2E2⑤ 没有串写：B 里不含任何 A 的笔迹（A=" + JSON.stringify(aIds) + "；B=" + JSON.stringify(bIds) + "）"
+  );
+  await vb.onClose();
+  vb.containerEl.remove();
+}
+
+/** 动线 3：写 10 笔 → 撤销 5 次 → 重做 3 次 → 保存 → 重开 */
+async function E2E3() {
+  const p = "E2E3-undo.inkbook";
+  seed(p, JSON.stringify(mkBook("撤销链", 2, 0)));
+  const v = await openView();
+  await v.onLoadFile(tf(p));
+  await sleep(400);
+
+  for (let i = 1; i <= 10; i++) v.store.addStroke(strokeId("R" + i, 400 + i), 0);
+  pass(v.store.strokeCount === 10, "E2E3① 写 10 笔：" + v.store.strokeCount);
+
+  for (let i = 0; i < 5; i++) {
+    v.editor.undo();
+    await sleep(80);
+  }
+  const afterUndo = strokeIdsOfPage(v.store.data, 0);
+  pass(
+    afterUndo.join(",") === "R1,R2,R3,R4,R5",
+    "E2E3② 撤销 5 次：剩 " + afterUndo.length + " 笔=" + JSON.stringify(afterUndo)
+  );
+
+  for (let i = 0; i < 3; i++) {
+    v.editor.redo();
+    await sleep(80);
+  }
+  const afterRedo = strokeIdsOfPage(v.store.data, 0);
+  pass(
+    afterRedo.join(",") === "R1,R2,R3,R4,R5,R6,R7,R8",
+    "E2E3③ 重做 3 次：回到 " + afterRedo.length + " 笔=" + JSON.stringify(afterRedo)
+  );
+
+  await v.saveNow();
+  await sleep(150);
+  const saved = parseFile(p);
+  pass(
+    saved?.integrity?.strokeCount === 8 && allStrokeIds(saved).join(",") === "R1,R2,R3,R4,R5,R6,R7,R8",
+    "E2E3④ 落盘 = 撤销重做后的状态：笔迹=" + JSON.stringify(allStrokeIds(saved))
+  );
+  await v.onClose();
+  v.containerEl.remove();
+
+  const v2 = await openView();
+  await v2.onLoadFile(tf(p));
+  await sleep(450);
+  const reopened = allStrokeIds(v2.store.data);
+  pass(
+    v2.store.strokeCount === 8 && reopened.join(",") === "R1,R2,R3,R4,R5,R6,R7,R8",
+    "E2E3⑤ 重开仍是 8 笔且顺序一致：" + JSON.stringify(reopened)
+  );
+  await v2.onClose();
+  v2.containerEl.remove();
+}
+
+/** 动线 4：导入 PDF 页 → 在上面写字 → 导出 PDF，验证导出件包含笔迹 */
+async function E2E4() {
+  const p = "E2E4-import.inkbook";
+  seed(p, JSON.stringify(mkBook("导入导出本", 1, 0)));
+
+  // 真导入需要一份真 PDF：测试服务把 /test/blank.pdf 当静态文件发
+  let srcBytes: Uint8Array | null = null;
+  try {
+    const res = await fetch("/test/blank.pdf");
+    if (res.ok) srcBytes = new Uint8Array(await res.arrayBuffer());
+  } catch (_) {
+    /* 下面统一报 FAIL */
+  }
+  pass(
+    !!srcBytes && srcBytes.length > 100,
+    "E2E4 前置：拿到源 PDF " + (srcBytes ? srcBytes.length : 0) + " 字节"
+  );
+  if (!srcBytes) return;
+  // 导出走 readPdfBytes（copyPages 矢量路径）时从这里读源 PDF
+  binFiles.set("test/blank.pdf", srcBytes);
+
+  const v = await openView();
+  await v.onLoadFile(tf(p));
+  await sleep(350);
+  const beforePages = v.store.pageCount;
+
+  let imported: any = null;
+  let importErr = "";
+  try {
+    imported = await importPdf(app, tf("test/blank.pdf"), p, { from: 1, to: 1 }, undefined, true);
+  } catch (e: any) {
+    importErr = String(e?.message || e);
+  }
+  pass(
+    importErr === "" && imported?.pages?.length === 1,
+    "E2E4① 导入 PDF 第 1 页：错误=" + JSON.stringify(importErr) +
+      "；导入页数=" + (imported?.pages?.length ?? 0)
+  );
+  if (!imported?.pages?.length) {
+    await v.onClose();
+    v.containerEl.remove();
+    return;
+  }
+
+  const at = v.store.pageCount;
+  v.store.insertPages(imported.pages, at, imported.source);
+  v.editor.renderPages();
+  await sleep(120);
+  v.editor.goToPage(at, false);
+  await sleep(150);
+  pass(
+    v.store.pageCount === beforePages + 1 &&
+      !!v.store.data.pages[at]?.background?.pdf &&
+      v.store.data.pages[at].background.pdf.path === "test/blank.pdf",
+    "E2E4① 导入页插进本子：页数 " + beforePages + "→" + v.store.pageCount +
+      "；底图=" + JSON.stringify(v.store.data.pages[at]?.background?.pdf)
+  );
+
+  const beforeInk = v.store.strokeCount;
+  const drew = drawOnPage(v, at);
+  await sleep(200);
+  pass(
+    drew && v.store.strokeCount === beforeInk + 1,
+    "E2E4② 在导入页上写字：落笔=" + drew + "；笔迹 " + beforeInk + "→" + v.store.strokeCount
+  );
+
+  await v.saveNow();
+  await sleep(150);
+  let outPath = "";
+  let exportErr = "";
+  try {
+    outPath = await exportBookPdf(v.app.vault, v.editor, tf(p), 1, { from: at + 1, to: at + 1 });
+  } catch (e: any) {
+    exportErr = String(e?.message || e);
+  }
+  const outBytes = outPath ? binFiles.get(outPath) : undefined;
+  const head = outBytes ? String.fromCharCode(outBytes[0], outBytes[1], outBytes[2], outBytes[3]) : "";
+  pass(
+    exportErr === "" && !!outBytes && outBytes.length > 1000 && head === "%PDF",
+    "E2E4③ 导出 PDF：错误=" + JSON.stringify(exportErr) +
+      "；文件=" + JSON.stringify(outPath) + "；" + (outBytes?.length ?? 0) + " 字节；头=" + JSON.stringify(head)
+  );
+  pass(
+    files.get(p) !== undefined && !!(parseFile(p)?.integrity),
+    "E2E4③ 导出没有动 .inkbook 正文（integrity 仍在）"
+  );
+
+  let ink = { dark: -1, err: "未导出" };
+  if (outBytes) ink = await countExportedInk(outBytes, 1);
+  /*
+   * 阈值 50 而不是 200：这条要抓的是「笔迹根本没进导出件」（那时是 0），
+   * 不是精确像素数。实测同一份导出在不同渲染路径下 183~400 都有可能
+   * （笔迹位置、pdf.js 抗锯齿差异），卡太紧会变成随机红灯。
+   * 空白页恒为 0，所以 50 这个下限足够区分「有/没有」。
+   */
+  pass(
+    ink.err === "" && ink.dark > 50,
+    "E2E4④ 导出件里确实有笔迹：渲染深色像素=" + ink.dark +
+      "（空白页应为 0）；错误=" + JSON.stringify(ink.err)
+  );
+
+  await v.onClose();
+  v.containerEl.remove();
+}
+
+/** 动线 5：改字号 / 字体 / 颜色 / 加粗 → 保存 → 重开，属性全部保留 */
+async function E2E5() {
+  const p = "E2E5-style.inkbook";
+  seed(p, JSON.stringify(mkBook("文字属性本", 1, 0)));
+  const v = await openView();
+  await v.onLoadFile(tf(p));
+  await sleep(400);
+
+  const created: any = await addUserText(v, 0, 120, 260, "属性往返", {
+    size: 16,
+    font: "sans",
+    color: "#1A1A1A",
+  });
+  pass(!!created, "E2E5① 新建一条文字批注：" + JSON.stringify(created?.text));
+  if (!created) {
+    await v.onClose();
+    v.containerEl.remove();
+    return;
+  }
+
+  v.editor.selectText(created.id);
+  await sleep(40);
+  v.editor.updateSelectedText({ size: 26 });
+  v.editor.updateSelectedText({ font: "kai" });
+  v.editor.updateSelectedText({ color: "#D64545" });
+  v.editor.updateSelectedText({ bold: true });
+  await sleep(100);
+  const live = (v.store.data.pages[0].texts || [])[0];
+  pass(
+    !!live && live.size === 26 && live.font === "kai" && live.color === "#D64545" && live.bold === true,
+    "E2E5② 改属性在内存生效：" +
+      JSON.stringify(live && { size: live.size, font: live.font, color: live.color, bold: live.bold })
+  );
+  pass(
+    (v.store.data.pages[0].texts || []).length === 1,
+    "E2E5② 改属性没有复制出第二条：条数=" + (v.store.data.pages[0].texts || []).length
+  );
+
+  await v.saveNow();
+  await sleep(150);
+  const savedText = parseFile(p)?.pages?.[0]?.texts?.[0];
+  pass(
+    !!savedText && savedText.size === 26 && savedText.font === "kai" &&
+      savedText.color === "#D64545" && savedText.bold === true,
+    "E2E5③ 落盘属性：" +
+      JSON.stringify(savedText && { size: savedText.size, font: savedText.font, color: savedText.color, bold: savedText.bold })
+  );
+  await v.onClose();
+  v.containerEl.remove();
+
+  const v2 = await openView();
+  await v2.onLoadFile(tf(p));
+  await sleep(450);
+  const t2 = (v2.store.data.pages[0].texts || [])[0];
+  pass(
+    !!t2 && t2.text === "属性往返" && t2.size === 26 && t2.font === "kai" &&
+      t2.color === "#D64545" && t2.bold === true,
+    "E2E5④ 重开后文字与属性全保留：" +
+      JSON.stringify(t2 && { text: t2.text, size: t2.size, font: t2.font, color: t2.color, bold: t2.bold })
+  );
+  await v2.onClose();
+  v2.containerEl.remove();
+}
+
 const CASES: Array<[string, () => Promise<void>]> = [
   ["A1+A2", A12],
   ["A3", A3],
@@ -2609,6 +3154,12 @@ const CASES: Array<[string, () => Promise<void>]> = [
   ["T2 外部设置变更", T2],
   ["T3 存档防 NaN", T3],
   ["T4 syncSettings 与自动保存", T4],
+  // INK-205 真实用户动线（往返后一条都不能少）
+  ["E2E1 整页写→存→关→重开", E2E1],
+  ["E2E2 多本子 A→B→A 不串写", E2E2],
+  ["E2E3 撤销 5 → 重做 3 → 往返", E2E3],
+  ["E2E4 导入 PDF→标注→导出", E2E4],
+  ["E2E5 文字属性往返", E2E5],
 ];
 
 async function main() {

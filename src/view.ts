@@ -5319,7 +5319,11 @@ export class InkbookView extends FileView {
       return;
     }
     if (this.conflict) {
-      new Notice("当前处于冲突状态，未写入原文件。请先处理冲突副本。", 8000);
+      new Notice(
+        "当前处于冲突状态，未写入原文件。请先处理冲突副本，" +
+          "然后关掉这个标签页重新打开本子即可恢复保存。",
+        10000
+      );
       return;
     }
     if (!this.dirty && !this.metaDirty) {
@@ -5571,8 +5575,19 @@ export class InkbookView extends FileView {
           if (this.store !== store) return;
           this.conflict = true;
           this.saveState = "dirty";
+          /*
+           * 提示里必须给出**怎么退出这个状态**（INK-206）。
+           *
+           * 进入冲突后 `saveNow` 整个跳过，本标签页再也不会写主文件。
+           * 老文案只说「请手动检查后选择保留哪一份」，没告诉用户
+           * 处理完之后怎么继续写——他改完副本回到这个标签页，
+           * 发现还是存不进去，只能自己猜。
+           * 实际自救路径就是「关掉本子重新打开」（`openBook` 会复位
+           * `conflict`），必须写出来。
+           */
           new Notice(
-            "检测到文件已被外部修改，已另存为两份副本，本次未覆盖原文件。请手动检查后选择保留哪一份。",
+            "检测到文件已被外部修改，已另存为两份副本，本次未覆盖原文件。" +
+              "请手动检查后选择保留哪一份；处理完后**关掉这个标签页重新打开本子**即可恢复保存。",
             15000
           );
           return;
