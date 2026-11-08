@@ -843,6 +843,18 @@
   touch-action: none;
 }
 
+/*
+ * 阅读模式：纸面必须放开 touch-action（INK-191）。
+ *
+ * 上面那条 `touch-action: none` 是硬编码的，会**覆盖**父级 docEl 的
+ * `auto`——`applyTouchAction()` 只改了 docEl，纸面自己这条不跟着变。
+ * 结果是阅读模式下文字层仍然选不中、拖不动，而代码注释里明明写着
+ * 「阅读模式交给浏览器原生滚动 / 选字」。这里按同样语义补一条。
+ */
+.mb-root.is-reading .mb-page {
+  touch-action: auto;
+}
+
 .mb-doc[data-tool="pen"] .mb-page,
 .mb-doc[data-tool="ballpoint"] .mb-page,
 .mb-doc[data-tool="highlighter"] .mb-page,

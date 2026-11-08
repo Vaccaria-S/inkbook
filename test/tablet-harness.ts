@@ -123,6 +123,56 @@ async function main() {
     pass(rr === "ignore", "笔优先：双指也不会打断正在写的笔画");
   }
 
+  /*
+   * INK-191 🔴 掌根计数泄漏 → 幽灵手势卡死。
+   *
+   * 真实场景：页底写字时掌根 + 腕同时贴屏。老代码 `touchCount++`
+   * 在 `penActive` 判断之前，掌根被标 ignored 却已计数；`up()` 又按
+   * ignored 不减 → 每只掌根永久 +1。抬笔后 touchCount 已是 2，
+   * 手在屏上一滑就触发 beginGesture；可两指全是 ignored、
+   * pinchState() 为 null，仍以 (0,0) 为锚点启动手势 → gesturing
+   * 再也退不出去，滚动/捏合全失灵。
+   */
+  {
+    const starts: Array<{ dist: number; cx: number; cy: number }> = [];
+    const arbP = new TouchArbiter({ onGestureStart: (s) => starts.push(s) });
+
+    // 笔在写，掌根 + 腕同时贴屏
+    arbP.down({ id: 1, type: "pen", x: 300, y: 1000, pressure: 0.5 });
+    arbP.down({ id: 2, type: "touch", x: 250, y: 1050, pressure: 0.5 });
+    arbP.down({ id: 3, type: "touch", x: 400, y: 1060, pressure: 0.5 });
+    pass(
+      arbP.touchCountNow === 0,
+      "INK-191 笔写时掌根+腕贴屏：touchCount 仍是 0（实际 " + arbP.touchCountNow + "）"
+    );
+
+    // 抬笔
+    arbP.up({ id: 1, type: "pen", x: 300, y: 1000, pressure: 0 });
+    pass(
+      arbP.touchCountNow === 0,
+      "INK-191 抬笔后 touchCount 仍是 0（实际 " + arbP.touchCountNow + "）"
+    );
+
+    // 手在屏上一滑：两指都是掌根，绝不能启动手势
+    const mv = arbP.move({ id: 2, type: "touch", x: 260, y: 1055, pressure: 0.5 });
+    pass(
+      mv !== "gesture" && starts.length === 0,
+      "INK-191 掌根滑动不触发手势（role=" + mv + "，gestureStart 次数 " + starts.length + "）"
+    );
+
+    // 掌根抬起后计数仍为 0，之后真正的两指能正常工作
+    arbP.up({ id: 2, type: "touch", x: 260, y: 1055, pressure: 0 });
+    arbP.up({ id: 3, type: "touch", x: 400, y: 1060, pressure: 0 });
+    pass(arbP.touchCountNow === 0, "INK-191 掌根全抬起后 touchCount 归零");
+    arbP.down({ id: 4, type: "touch", x: 100, y: 200, pressure: 0.5 });
+    const g = arbP.down({ id: 5, type: "touch", x: 300, y: 200, pressure: 0.5 });
+    pass(g === "gesture" && starts.length === 1, "INK-191 之后真正的两指仍能正常起手势");
+    pass(
+      starts[0].dist > 0,
+      "INK-191 手势起始几何有效（dist=" + starts[0].dist.toFixed(1) + "，不再是 (0,0)）"
+    );
+  }
+
   /* -------------------- Ctrl+滚轮缩放 -------------------- */
   {
     const book = createBook("缩放测试", "grid", "white");

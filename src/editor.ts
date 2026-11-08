@@ -731,12 +731,23 @@ export class BookEditor {
   private onWindowBlur = () => {
     this.commitTextEditNow();
     this.finishInkGesture();
+    /*
+     * 仲裁器也要复位（INK-191）。
+     *
+     * 切后台时笔的 pointerup / pointercancel 可能永远不来，
+     * `penActive` 就残留成 true。回来之后所有手指都被判成「掌根」，
+     * 页面滚不动、也写不了字，得等下一次落笔才自愈。
+     * `reset()` 清空 pointers / penActive / touchCount / gesturing。
+     */
+    this.arbiter.reset();
   };
   private onVisibilityHidden = () => {
     if (document.visibilityState === "hidden") {
       // hidden 之后可能被系统直接回收：不等 compositionend，强制提交已上屏部分
       this.commitTextEditNow(true);
       this.finishInkGesture();
+      // 同上：切后台等于「所有指针都不可信了」，必须清干净
+      this.arbiter.reset();
     }
   };
   private resizeObserver: ResizeObserver | null = null;
@@ -1897,7 +1908,23 @@ export class BookEditor {
 
     this.docEl.addEventListener("pointerdown", (e) => {
       const rec = findRec(e.target);
-      if (rec) this.onDown(e as PointerEvent, rec);
+      if (rec) {
+        this.onDown(e as PointerEvent, rec);
+        return;
+      }
+      /*
+       * 落在纸面之外（缩小后的空白区 / 页缝）的指针，也要**喂给仲裁器**
+       * （INK-191）。
+       *
+       * 老代码 `if (rec) onDown(...)` 直接把这类事件丢掉，于是：
+       * 两指从空白处捏合时，第二根手指仲裁器根本没看见（它只知道
+       * 第一根），第一根照旧当 pan 滚页 —— 用户想缩小，页面反而滚走。
+       * 甩动过程中按在空白处也停不住惯性。
+       *
+       * 这里只做「记账」：让 arbiter 知道有几根手指、是不是双指。
+       * 真正的手势处理仍在 onMove 里按 rec 走（纸外没有页面可以落笔）。
+       */
+      this.arbiter.down(this.pointerInfo(e));
     });
     this.docEl.addEventListener("pointermove", (e) => {
       const rec = findRec(e.target);
@@ -2393,6 +2420,16 @@ export class BookEditor {
     this.gesture = "none";
     this.pointerId = null;
     this.pan = null;
+    /*
+     * 捏合打断正在进行的「拖文字 / 改宽」时，要**先把那条历史结算掉**
+     * （INK-191）。
+     *
+     * `moveText` 第一次真正拖动时已经调过 `snapshotPage()` 挂了个
+     * `pendingBefore`，而 `store.touch()` 只在 `onUp` 里调。被捏合打断后
+     * 这个 pending 就一直悬着，会被**下一个不相干操作**的 `touch()` 结算成
+     * 一条错误的历史条目（撤销时撤错东西）。
+     */
+    if (this.moveText?.moved || this.resizeText?.moved) this.store.touch();
     // 捏合开始前若拖着改宽手柄，残留状态会让余指一动就继续改宽度（INK-112 同类坑）
     this.moveText = null;
     this.resizeText = null;
@@ -2478,6 +2515,16 @@ export class BookEditor {
       }
       this.pinchReleaseTimer = 0;
       this.pinchActive = false;
+      /*
+       * 解冻时**补算一次页码**（INK-191）。
+       *
+       * 冻结期间 `pinchActive` 抑制了 `updateCurrentFromScroll`，
+       * 而这段时间里缩放已经改变了页高、scrollTop 也被锚点补偿挪过。
+       * 不补算的话页码会停在捏合前的值，用户换另一只手滚页时
+       * 才「突然跳」一下——看起来像页码卡住了最长 4.8 秒（20×240ms）。
+       */
+      this.updateCurrentFromScroll(true);
+      this.emitState();
     }, 240);
   }
 
@@ -2508,20 +2555,30 @@ export class BookEditor {
     if (!pinch) return;
 
     const scale = info.dist / pinch.baseDist;
-    if (Math.abs(scale - 1) < 0.0005) return; // 距离没变，不用动
-
     const before = this.zoom;
     const after = clamp(pinch.baseZoom * scale, 0.3, 2.8);
-    if (after === before) return;
+    /*
+     * **zoom 没变也要走 restoreAnchor**（INK-191）。
+     *
+     * 老代码这里有两道早退：`|scale-1| < 0.0005` 和 `after === before`，
+     * 都会跳过下面的 `restoreAnchor`。而它不只是"缩放后对锚点"——
+     * **两指等距平移（scale 恰好 = 1）时页面靠它跟随手指移动**，
+     * 这是 touchDraw 开着时双指滚页的主要方式。早退的结果就是
+     * 「两指并排滑动，页面完全不动」；缩放到 0.3/2.8 极限后同理。
+     */
+    const zoomChanged = Math.abs(after - before) > 1e-9;
+    if (zoomChanged) {
+      this.fitMode = false;
+      this.zoom = after;
+      this.applyLayout();
+    }
 
-    this.fitMode = false;
-    this.zoom = after;
-    this.applyLayout();
-
-    // 把固定的锚点对回当前两指中心
+    // 把固定的锚点对回当前两指中心（zoom 没变时这一步就是纯平移）
     this.restoreAnchor(pinch.anchor, info.cx, info.cy);
-    this.measurePageMetrics();
-    this.emitState();
+    if (zoomChanged) {
+      this.measurePageMetrics();
+      this.emitState();
+    }
   }
 
   /* ------------------------------- 惯性滚动 ------------------------------- */
@@ -4492,6 +4549,20 @@ export class BookEditor {
       this.pointerId = null;
       this.pan = null;
     }
+    /*
+     * 笔落下时也要收掉「正在拖文字框」的手势（INK-191）。
+     *
+     * 老代码只收 "pan"，`gesture === "moveText"` 会一路走到下面的
+     * `if (this.gesture !== "none") return;` 被直接 return 掉——
+     * 用户正用手指拖文字框、笔落下来想写字，**第一笔就丢了**。
+     * 收尾方式和 pan 一样：停掉拖动、复位手势，让笔接管。
+     * `moveText` 的位移已经实时写进 store，收掉不会丢内容。
+     */
+    if (e.pointerType === "pen" && this.gesture === "moveText") {
+      this.moveText = null;
+      this.gesture = "none";
+      this.pointerId = null;
+    }
 
     if (this.gesture !== "none") return;
 
@@ -4658,6 +4729,15 @@ export class BookEditor {
   private onMove(e: PointerEvent, rec: PageRec): void {
     /* 拖动文字：每帧改坐标，重建文字层（文字条数很少，重建比逐节点改省心） */
     if (this.gesture === "moveText" && this.moveText) {
+      /*
+       * **只有发起这次拖动的那根指针能改文字位置**（INK-191）。
+       *
+       * `resizeText` 早就有这道自校验，`moveText` 漏了。缺了它的后果：
+       * 手指正拖着文字框时笔落下来（笔的 pointerId 不同），笔的
+       * pointermove 会走进这个分支把文本框拖着跑——用户看到的是
+       * 「笔一落，文字框自己跳走了」，而且那一笔也画不出来。
+       */
+      if (e.pointerId !== this.pointerId) return;
       const m = this.moveText;
       const p = this.pointFromEvent(e, m.rec);
       const dx = p[0] - m.startX;

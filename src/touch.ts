@@ -134,8 +134,21 @@ export class TouchArbiter {
     }
 
     if (e.type === "touch") {
-      this.touchCount++;
-      // 笔正在写的时候落下的手指 = 掌根
+      /*
+       * **掌根绝不能计数**（INK-191，2026-11-08）。
+       *
+       * 老代码先 `touchCount++` 再判 `penActive`：笔正在写时落下的掌根
+       * 虽然被标成 ignored，计数却已经加了，而 `up()` 里 ignored 的又
+       * 不减（那是为了「掌根从没计入」的旧假设）→ 每只掌根永久 +1。
+       *
+       * 真实场景：页底写字时掌根 + 腕同时贴屏（平板最常见姿势）。
+       * 抬笔后 touchCount 已经是 2，手在屏上一滑就命中下面
+       * `touchCount >= 2` → `beginGesture()`；可两指全是 ignored，
+       * `pinchState()` 返回 null，仍回调 `{dist:0,cx:0,cy:0}`，
+       * beginPinch 拿 (0,0) 当锚点。此后 gesturing 再也退不出去
+       * （ignored 抬起不减计数，`touchCount < 2` 永不成立）——
+       * 移动被吞、捏合与触摸滚动全失灵，要等下一次落笔才自愈。
+       */
       if (this.penActive) {
         const p = this.pointers.get(e.id);
         if (p) p.ignored = true;
@@ -238,8 +251,17 @@ export class TouchArbiter {
     }
 
     if (e.type === "touch") {
-      // 掌根（被忽略的手指）从没计入 touchCount，抬起时也不能减
-      if (!p.ignored) this.touchCount = Math.max(0, this.touchCount - 1);
+      /*
+       * 计数按**有效触摸**重算，不做加减法（INK-191）。
+       *
+       * 以前是 `if (!p.ignored) touchCount--`，前提是「掌根从没计入」。
+       * 但 down() 里掌根曾被误计（已修），而即便修好，加减法也容易在
+       * 「同一根手指被标 ignored 又抬起」的时序里算歪。这里直接从
+       * pointers 里数剩下的有效触摸，天然自洽。
+       */
+      this.touchCount = [...this.pointers.values()].filter(
+        (q) => q.type === "touch" && !q.ignored
+      ).length;
       if (this.gesturing) {
         if (this.touchCount < 2) this.endGesture();
         this.cb.onRoleChange?.("ignore", e);
@@ -266,9 +288,18 @@ export class TouchArbiter {
 
   private beginGesture(): void {
     if (this.gesturing) return;
-    this.gesturing = true;
     const st = this.pinchState();
-    this.cb.onGestureStart?.(st ?? { dist: 0, cx: 0, cy: 0 });
+    /*
+     * **拿不到两指几何就不算手势开始**（INK-191）。
+     *
+     * 老代码 `st ?? {dist:0,cx:0,cy:0}` 会在两指全被忽略（掌根）时
+     * 回调一个 (0,0) 锚点，而 `gesturing` 已经置真 → 手势进入一个
+     * 永远退不出去的死状态（ignored 抬起不触发 endGesture）。
+     * 直接 return：这一次按下什么都不做，等真正的两指。
+     */
+    if (!st) return;
+    this.gesturing = true;
+    this.cb.onGestureStart?.(st);
   }
 
   private endGesture(): void {
