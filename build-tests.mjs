@@ -32,6 +32,10 @@ const HARNESSES = [
   "harness.ts",
   "feel-harness.ts",
   "view-harness.ts",
+  // 6 个弹窗的回归（INK-199）：跳页 / 单行输入 / 目录 / 选导入源 / 选页码范围。
+  // 用 obsidian-stub 的 Modal 桩（close() 同步调 onClose），锁 ImportRangeModal
+  // 「确认被当成取消」的时序。
+  "modals-harness.ts",
   "tablet-harness.ts",
   "perf-harness.ts",
   // 打开 300+ 页大本子的分阶段计时 + 首屏/阻塞上界（"打开很慢"回归闸门）

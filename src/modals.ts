@@ -133,8 +133,8 @@ export class NewBookModal extends Modal {
       this.plugin.settings.defaultTemplate = this.template;
       this.plugin.settings.defaultPaper = this.paper;
       await this.plugin.saveSettings();
-      this.close();
       this.onDone(file);
+      this.close();
     } catch (e: any) {
       new Notice("创建失败：" + (e && e.message ? e.message : e), 8000);
     }
@@ -167,13 +167,21 @@ export class JumpPageModal extends Modal {
     });
     const hint = contentEl.createDiv({ cls: "mb-jump-hint", text: "输入页码后回车；Esc 取消" });
     const submit = () => {
-      const n = Number(input.value);
-      if (!n || n < 1 || n > this.total) {
+      /*
+       * 用 `Math.trunc` 而不是直接 `Number()`（INK-200）。
+       *
+       * 输入框是 `type="number"`，用户能输 `1.5`。以前直接把 1.5 传给
+       * `go(0.5)` → `scrollToPage(0.5)` → `recs[0.5]` 是 undefined →
+       * 静默 return。用户看到的是「输了个数字，按回车毫无反应」。
+       * `OutlineModal` 早就用了 `Math.trunc`，这里漏了。
+       */
+      const n = Math.trunc(Number(input.value));
+      if (!Number.isFinite(n) || n < 1 || n > this.total) {
         hint.setText(`页码要在 1 到 ${this.total} 之间`);
         return;
       }
-      this.close();
       this.go(n - 1);
+      this.close();
     };
     input.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
@@ -220,8 +228,8 @@ export class PromptModal extends Modal {
     const submit = () => {
       const v = input.value.trim();
       if (!v) return;
-      this.close();
       this.onSubmit(v);
+      this.close();
     };
     ok.onclick = submit;
     input.addEventListener("keydown", (e) => {
@@ -321,8 +329,8 @@ export class OutlineModal extends Modal {
         hint.setText(`页码要在 1 到 ${this.total} 之间`);
         return;
       }
-      this.close();
       this.onSubmit(name, n - 1);
+      this.close();
     };
     ok.onclick = submit;
     nameInput.addEventListener("keydown", (e) => {
@@ -407,8 +415,8 @@ export class ImportSourceModal extends Modal {
         text: `${f.extension.toUpperCase()} · ${this.formatSize(f.stat.size)}`,
       });
       row.onclick = () => {
-        this.close();
         this.onPick(f);
+        this.close();
       };
     }
   }

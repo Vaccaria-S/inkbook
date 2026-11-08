@@ -50,6 +50,7 @@ const PAGES = [
   ["qa-embed4.html", 122],
   ["pdftext.html", 177],
   ["qa-ink118-visual.html", 296],
+  ["modals.html", 70],
 ];
 
 const runOne = (page, i, runner = "run.mjs") =>
