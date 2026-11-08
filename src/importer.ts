@@ -40,12 +40,19 @@ function dataUrlToBytes(dataUrl: string): Uint8Array {
   return out;
 }
 
-/** 把 PNG dataURL 存到库里 */
+/**
+ * 把 PNG dataURL 存到库里。
+ *
+ * `written` 传入时，路径会在**写盘之前**就记进去：调用方靠它做失败回滚。
+ * 提前记的理由是「写到一半失败」——那时文件可能已经存在（半截），
+ * 也必须被清掉。清不掉最多留个脏文件，比漏删好。
+ */
 async function saveAsset(
   app: App,
   bookPath: string,
   name: string,
-  dataUrl: string
+  dataUrl: string,
+  written?: string[]
 ): Promise<string> {
   const folder = bookPath.includes("/") ? bookPath.slice(0, bookPath.lastIndexOf("/")) : "";
   const dir = folder ? `${folder}/${ASSET_DIR}` : ASSET_DIR;
@@ -62,6 +69,7 @@ async function saveAsset(
   while (await app.vault.adapter.exists(path)) {
     path = `${dir}/${name}-${++n}.png`;
   }
+  written?.push(path);
   const bytes = dataUrlToBytes(dataUrl);
   await app.vault.adapter.writeBinary(
     path,
@@ -286,49 +294,69 @@ export async function importWord(
 
   const base = file.basename.replace(/[^\w一-龥-]/g, "_");
   const pages: Page[] = [];
+  /*
+   * 本次实际写进去的图片路径。任何一页失败都要把它们删掉（见 catch）：
+   * 否则导入失败会在 `.inkbook-assets` 里留下一堆孤儿 PNG，用户看不到、
+   * 也删不掉，只会在同步和磁盘占用上一直碍事。
+   *
+   * **只删本次写的**：不能用 `${base}-p*` 前缀批量删 —— 同一个 Word
+   * 之前成功导入过的话，那些图正被旧本子用着（saveAsset 的 -2 去重
+   * 就是为同名共存准备的）。
+   */
+  const written: string[] = [];
+  try {
+    // 逐页渲染：拿到一页就立刻存盘，然后丢掉它的 dataURL
+    let pageNo = 0;
+    for await (const shot of renderDocxToPages(paras)) {
+      pageNo++;
+      const fit = fitBackground(shot.width, shot.height, 0);
+      const assetPath = await saveAsset(
+        app,
+        bookPath,
+        `${base}-p${pageNo}`,
+        shot.dataUrl,
+        written
+      );
 
-  // 逐页渲染：拿到一页就立刻存盘，然后丢掉它的 dataURL
-  let pageNo = 0;
-  for await (const dataUrl of renderDocxToPages(paras)) {
-    pageNo++;
-    const img = await loadImageSize(dataUrl);
-    const fit = fitBackground(img.w, img.h, 0);
-    const assetPath = await saveAsset(app, bookPath, `${base}-p${pageNo}`, dataUrl);
-
-    const page = createPage("blank", "white");
-    page.background = {
-      src: assetPath,
-      sourceName: file.name,
-      sourcePage: pageNo,
-      x: fit.x,
-      y: fit.y,
-      width: fit.width,
-      height: fit.height,
-      kind: "word",
-    };
-    pages.push(page);
-    /*
-     * Word 的页数要渲染完才知道（每页文字量不同、分页是流式的），
-     * 所以 `total` 传 **0 表示未知** —— 调用方据此只显示「已生成 N 页」，
-     * 而不是永远「第 N/N 页」（看着像没进度）。
-     */
-    onProgress?.("pages", pageNo, 0);
+      const page = createPage("blank", "white");
+      page.background = {
+        src: assetPath,
+        sourceName: file.name,
+        sourcePage: pageNo,
+        x: fit.x,
+        y: fit.y,
+        width: fit.width,
+        height: fit.height,
+        kind: "word",
+      };
+      pages.push(page);
+      /*
+       * Word 的页数要渲染完才知道（每页文字量不同、分页是流式的），
+       * 所以 `total` 传 **0 表示未知** —— 调用方据此只显示「已生成 N 页」，
+       * 而不是永远「第 N/N 页」（看着像没进度）。
+       */
+      onProgress?.("pages", pageNo, 0);
+      /*
+       * 每 3 页让出一次事件循环：渲染 + 编码 + 写盘是连续的重活，
+       * 中间不让出的话，平板上进度提示会一直不刷新（看着像卡死）。
+       */
+      if (pageNo % 3 === 0) await new Promise((r) => setTimeout(r, 0));
+    }
+  } catch (e) {
+    for (const p of written.reverse()) {
+      try {
+        await app.vault.adapter.remove(p);
+      } catch (_) {
+        /* 删不掉就留着，不能因为清理失败把原始错误盖掉 */
+      }
+    }
+    throw e;
   }
 
   return {
     pages,
     source: { name: file.name, kind: "word", pageCount: pages.length },
   };
-}
-
-/** 读一张 dataURL 图片的像素尺寸 */
-export function loadImageSize(dataUrl: string): Promise<{ w: number; h: number }> {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
-    img.onerror = () => reject(new Error("图片解码失败"));
-    img.src = dataUrl;
-  });
 }
 
 /**

@@ -10,7 +10,7 @@
  *   6. 立即保存：点一下就落盘，干净时不重复写，存不下去时必须说清楚
  */
 import { InkbookView } from "../src/view";
-import { createBook, createPage, DEFAULT_SETTINGS, type Pt } from "../src/types";
+import { createBook, createLayer, createPage, DEFAULT_SETTINGS, type Pt } from "../src/types";
 
 const lines: string[] = [];
 const out = document.getElementById("out")!;
@@ -759,6 +759,61 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       restored === 4,
       "还原 3 页后侧栏条目恢复（3 页 + 加页，实际 " + restored + " 个）"
     );
+  }
+
+  /* ============ 2.6.2 平板缩略图按钮防误删 ============ */
+  {
+    // `.mb-root` 类就挂在 contentEl 本身，不是它的子节点
+    const item = sideEl.querySelector('.mb-thumb[data-page="0"]') as HTMLElement;
+    const dup = item.querySelector(".mb-thumb-dup") as HTMLButtonElement;
+    const del = item.querySelector(".mb-thumb-del") as HTMLButtonElement;
+    const wasTablet = root.classList.contains("is-tablet");
+    root.classList.add("is-tablet");
+    const a = dup.getBoundingClientRect();
+    const b = del.getBoundingClientRect();
+    const owner = item.getBoundingClientRect();
+    pass(
+      getComputedStyle(dup).display !== "none" && getComputedStyle(del).display !== "none",
+      "平板缩略图复制/删除按钮无需 hover 即常显"
+    );
+    pass(
+      a.width > 0 && b.width > 0 &&
+        (a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top) &&
+        b.top - a.bottom >= 8,
+      "平板缩略图复制/删除按钮矩形不相交，竖向间距至少 8px"
+    );
+    pass(
+      a.left >= owner.left && a.right <= owner.right &&
+        b.left >= owner.left && b.right <= owner.right &&
+        b.bottom <= owner.bottom,
+      "平板缩略图两个按钮仍在缩略图边界内"
+    );
+    if (!wasTablet) root.classList.remove("is-tablet");
+
+    const before = view.store!.pageCount;
+    const originalPages = view.store!.data.pages.slice();
+    const pageId = originalPages[0].id;
+    del.click();
+    const modal = [...document.querySelectorAll(".modal-content")].find((el) =>
+      el.textContent?.includes("将永久删除第 1 页")
+    ) as HTMLElement | undefined;
+    pass(!!modal && view.store!.pageCount === before, "点删除先弹不可撤销确认，不立即删页");
+    (modal?.querySelector("button") as HTMLButtonElement | undefined)?.click();
+    pass(view.store!.pageCount === before, "取消删除确认后页数不变");
+    del.click();
+    const confirm = [...document.querySelectorAll(".modal-content")].find((el) =>
+      el.textContent?.includes("将永久删除第 1 页")
+    ) as HTMLElement | undefined;
+    const buttons = [...(confirm?.querySelectorAll("button") ?? [])] as HTMLButtonElement[];
+    buttons.find((button) => button.textContent === "删除本页")?.click();
+    pass(
+      view.store!.pageCount === before - 1 && !view.store!.data.pages.some((page) => page.id === pageId),
+      "明确确认后才删除原页"
+    );
+    // 后续拖拽测试仍以原来的三页及原页 id 为前提。
+    view.store!.data.pages = originalPages;
+    (view as any).pageCountSig = -1;
+    (view as any).renderPageList();
   }
 
   /* ============ 2.7 缩略图长按拖拽重排 ============ */
@@ -1668,21 +1723,74 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   );
   const tRect = (tools[0] as HTMLElement).getBoundingClientRect();
   pass(
-    tRect.height >= 32,
-    "平板端按钮 ≥ 32px（实测 " + tRect.height.toFixed(0) + "px）"
+    tRect.height >= 40,
+    "平板端按钮 ≥ 40px（实测 " + tRect.height.toFixed(0) + "px）"
   );
 
-  // 浮标里的撤销/重做是手指直接点的，平板档必须 ≥ 36px
+  // 浮标里的撤销/重做是手指直接点的，平板档必须 ≥ 44px
   const fBtnEl = float.querySelector(".mb-float-edit .mb-float-btn") as HTMLElement;
   const fBtnRect = fBtnEl.getBoundingClientRect();
   pass(
-    fBtnRect.width >= 36 && fBtnRect.height >= 36,
-    "平板端浮标撤销/重做按钮 ≥ 36px（实测 " +
+    fBtnRect.width >= 44 && fBtnRect.height >= 44,
+    "平板端浮标撤销/重做按钮 ≥ 44px（实测 " +
       fBtnRect.width.toFixed(0) +
       "×" +
       fBtnRect.height.toFixed(0) +
       "px）"
   );
+
+  const fNumEl = float.querySelector(".mb-float-num") as HTMLElement;
+  pass(
+    fNumEl.getBoundingClientRect().height >= 44,
+    "平板端浮标页码按钮高度 ≥ 44px（实测 " +
+      fNumEl.getBoundingClientRect().height.toFixed(0) +
+      "px）"
+  );
+
+  /*
+   * 侧栏关闭钮：平板只有这一条明确出口，26px 手指点不准 → 44px。
+   * 侧栏此时可能收起（display:none），所以量 computed style 而不是 rect。
+   */
+  const sideCloseEl = root.querySelector(".mb-side-close") as HTMLElement | null;
+  pass(
+    !!sideCloseEl && getComputedStyle(sideCloseEl).width === "44px",
+    "平板端侧栏关闭钮 44px（computed width " +
+      (sideCloseEl ? getComputedStyle(sideCloseEl).width : "缺失") +
+      "）"
+  );
+
+  /*
+   * 真缺陷回归：图层删除钮原本只在 :hover 时 opacity:1。
+   * 平板没有 hover → 按钮永远不可见。这里断言平板上常显且热区 ≥32px。
+   *
+   * 删除钮只在「一层以上」时渲染（单层不能删），所以临时往当前页塞一层。
+   * 直接改数据、不走 store.addLayer：后者会拍撤销快照并把文档标脏，
+   * 影响后面「立即保存」套件对干净状态的断言。
+   */
+  {
+    const st = (view as any).store;
+    const page = st!.data.pages[st!.data.activePage];
+    const extra = createLayer("临时图层");
+    page.layers.push(extra);
+    (view as any).updateUI();
+    await sleep(80);
+    const layerDelEl = root.querySelector(".mb-layer-del") as HTMLElement | null;
+    pass(
+      !!layerDelEl && getComputedStyle(layerDelEl).opacity === "1",
+      "平板端图层删除钮常显（不依赖 hover，opacity=" +
+        (layerDelEl ? getComputedStyle(layerDelEl).opacity : "缺失") +
+        "）"
+    );
+    pass(
+      !!layerDelEl && getComputedStyle(layerDelEl).width === "32px",
+      "平板端图层删除钮热区 32px（computed width=" +
+        (layerDelEl ? getComputedStyle(layerDelEl).width : "缺失") +
+        "）"
+    );
+    page.layers = page.layers.filter((l: any) => l !== extra);
+    (view as any).updateUI();
+    await sleep(80);
+  }
 
   /*
    * 用户反馈："平板上这 3 个图标间距有点近"。
@@ -1986,10 +2094,11 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       const contentBottom =
         bodyRect.top + sideBody.clientTop + sideBody.clientHeight - parseFloat(bodyCS.paddingBottom);
 
-      // 高度：旧布局约 200px（色点被挤成竖排），两行方案 ~50px
+      // 高度：旧布局约 200px（色点被挤成竖排），两行方案 ~50px；
+      // 平板把分段按钮抬到 34px 后可到 ~68px，上限放宽到 70px 仍能卡住竖排退步。
       pass(
-        dynRect.height <= 64,
-        "文字工具区高度 ≤64px（实测 " + dynRect.height.toFixed(1) + "px，改前约 200px）"
+        dynRect.height <= 70,
+        "文字工具区高度 ≤70px（实测 " + dynRect.height.toFixed(1) + "px，改前约 200px）"
       );
       // 字号与字体同一行（纵向区间重叠）
       pass(
@@ -2395,16 +2504,16 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
         "）"
     );
 
-    // 平板档：chip 放大到 34px、padding 9px（现有 .mb-tablet 规则），不是被撑到 42
+    // 平板档：chip 放大到 42px、padding 11px（现有 .mb-tablet 规则），不是被撑到 42+
     host.classList.add("mb-tablet");
     await sleep(80);
     const chipTab = chip ? getComputedStyle(chip) : null;
     const chipTabRect = chip ? chip.getBoundingClientRect() : null;
     pass(
       !!chipTabRect &&
-        Math.abs(chipTabRect.height - 34) <= 0.5 &&
-        chipTab!.paddingLeft === "9px",
-      "平板档顶栏当前笔 chip 保持设计尺寸 34px / padding 9（实测 " +
+        Math.abs(chipTabRect.height - 42) <= 0.5 &&
+        chipTab!.paddingLeft === "11px",
+      "平板档顶栏当前笔 chip 保持设计尺寸 42px / padding 11（实测 " +
         (chipTabRect ? chipTabRect.height.toFixed(1) : "缺失") +
         "px / " +
         (chipTab ? chipTab.paddingLeft : "缺失") +
@@ -2457,10 +2566,10 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       const ebBtnCS = ebBtn ? getComputedStyle(ebBtn) : null;
       pass(
         !!ebBtnRect &&
-          Math.abs(ebBtnRect.height - 28) <= 0.5 &&
+          Math.abs(ebBtnRect.height - 34) <= 0.5 &&
           ebBtnCS!.paddingLeft === "3px" &&
           ebBtnCS!.paddingTop === "0px",
-        "宿主 padding 下样式条按钮高度保持 28px、padding 0 3（实测 " +
+        "宿主 padding 下样式条按钮高度保持 34px、padding 0 3（实测 " +
           (ebBtnRect ? ebBtnRect.height.toFixed(1) : "缺失") +
           "px / " +
           (ebBtnCS ? ebBtnCS.paddingTop + " " + ebBtnCS.paddingLeft : "缺失") +
@@ -2472,11 +2581,11 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       const ebStepCS = ebStep ? getComputedStyle(ebStep) : null;
       pass(
         !!ebStepRect &&
-          Math.abs(ebStepRect.height - 28) <= 0.5 &&
-          ebStepRect.width >= 26 &&
+          Math.abs(ebStepRect.height - 34) <= 0.5 &&
+          ebStepRect.width >= 32 &&
           ebStepCS!.paddingLeft === "3px" &&
           ebStepCS!.paddingTop === "0px",
-        "宿主 padding 下样式条 −/＋ 步进高度保持 28px、宽 ≥26px（实测 " +
+        "宿主 padding 下样式条 −/＋ 步进高度保持 34px、宽 ≥32px（实测 " +
           (ebStepRect ? ebStepRect.width.toFixed(1) + "×" + ebStepRect.height.toFixed(1) : "缺失") +
           "）"
       );

@@ -371,15 +371,16 @@
 
 /* 平板上跟着顶栏按钮放大一档，手指点得准 */
 .mb-tablet .mb-toprow .mb-pen-chip {
-  height: 34px;
-  gap: 6px;
-  padding: 0 9px;
-  font-size: 12px;
+  height: 42px;
+  gap: 7px;
+  padding: 0 11px;
+  border-radius: 11px;
+  font-size: 13px;
 }
 
 .mb-tablet .mb-toprow .mb-pen-chip-dot {
-  width: 17px;
-  height: 17px;
+  width: 18px;
+  height: 18px;
 }
 
 
@@ -1309,8 +1310,9 @@
 
 /*
  * 顶栏「当前笔」chip 在 containerEl 上（不在 .mb-root 内），
- * 基础 padding 0 6、平板 0 9。用 [class] 把特异性抬到 (0,3,0)，
- * 才压得过宿主的 (0,2,1)；平板那条写在后，赢在源顺序。
+ * 基础 padding 0 6、平板 0 11（随 42px 高的按钮一起放大）。
+ * 用 [class] 把特异性抬到 (0,3,0)，才压得过宿主的 (0,2,1)；
+ * 平板那条写在后，赢在源顺序。
  */
 .mb-toprow .mb-pen-chip[class],
 .mb-topbar .mb-pen-chip[class] {
@@ -1320,7 +1322,7 @@
 .mb-tablet .mb-toprow .mb-pen-chip,
 .mb-tablet .mb-topbar .mb-pen-chip {
   box-sizing: border-box;
-  padding: 0 9px;
+  padding: 0 11px;
 }
 
 /* 纸面底部「添加一页」：保住自己的 9px 22px 设计值 */
@@ -1413,27 +1415,58 @@
   font-size: 13px;
 }
 
-/* 平板：属性条得用手指点得准，按钮放大到 30px */
+/* 平板：属性条得用手指点得准，按钮放大到 34px，色点保持 22px 视觉尺寸
+ * 但用 ::before 把热区撑到 36px（见下方「装饰性控件热区」）。 */
 .mb-tablet .mb-textbar {
-  gap: 7px;
-  padding: 6px 8px;
+  gap: 8px;
+  padding: 7px 9px;
 }
 
 .mb-tablet .mb-tb-btn {
-  min-width: 30px;
-  height: 30px;
-  font-size: 13px;
+  min-width: 34px;
+  height: 34px;
+  font-size: 14px;
 }
 
 .mb-tablet .mb-tb-font {
-  height: 30px;
-  max-width: 88px;
+  height: 34px;
+  max-width: 96px;
   font-size: 13px;
 }
 
 .mb-tablet .mb-tb-dot {
+  position: relative;
   width: 22px;
   height: 22px;
+}
+
+/*
+ * 色点（装饰性 / 紧凑区）：视觉仍是 22/24px，热区靠伪元素向四周扩。
+ *
+ * 不直接改宽高，因为：
+ *   · 纸面样式条是 flex-wrap 的，色点变大会把整条挤成两行；
+ *   · 侧栏 8 个色点那一行是 nowrap 的硬约束（见 .mb-text-tools 注释），
+ *     20px 已经是窄视口（288px）下的极限。
+ * 上下各扩 7px、左右各扩 3px：热区约 28×36，相邻色点之间仍留 1px 缝隙，
+ * 不会点 A 触发 B。
+ */
+.mb-tablet .mb-tb-dot::before {
+  content: "";
+  position: absolute;
+  inset: -7px -3px;
+  border-radius: 50%;
+}
+
+.mb-root.is-tablet .mb-text-tools .mb-tcolor {
+  position: relative;
+}
+
+/* 侧栏色点行更紧（gap 4），横向只扩 2px，热区 24×36 */
+.mb-root.is-tablet .mb-text-tools .mb-tcolor::before {
+  content: "";
+  position: absolute;
+  inset: -8px -2px;
+  border-radius: 50%;
 }
 
 /* ---------------- 新建输入框上方的就近样式条 ----------------
@@ -1487,18 +1520,20 @@
   height: 14px;
 }
 
-/* 平板：手指也要点得准，按钮/色点放大到 28/24，但仍保持单行 */
+/* 平板：手指也要点得准，按钮放大到 34px（色点保持 24px 视觉，热区用
+ * ::before 扩到 38px），仍保持单行——整条由 positionTextEditBar 等比缩放。 */
 .mb-tablet .mb-texteditbar {
   gap: 4px;
   padding: 3px 5px;
 }
 
 .mb-tablet .mb-texteditbar .mb-tb-btn {
-  min-width: 28px;
-  height: 28px;
+  min-width: 34px;
+  height: 34px;
 }
 
 .mb-tablet .mb-texteditbar .mb-tb-dot {
+  position: relative;
   width: 24px;
   height: 24px;
 }
@@ -1563,9 +1598,9 @@
 }
 
 .mb-tablet .mb-texteditbar .mb-tb-sizestep {
-  min-width: 26px;
-  height: 28px;
-  font-size: 14px;
+  min-width: 32px;
+  height: 34px;
+  font-size: 15px;
 }
 
 .mb-canvas,
@@ -2714,7 +2749,7 @@
 
 /*
  * 平板上顶栏按钮再大一档，手指点得准：
- *   · 按钮 34px（电脑 30px）
+ *   · 按钮 42px（电脑 30px；≥40px 才算靠谱的手指热区）
  *   · 图标 22px（电脑 18px，Obsidian 默认只有 16px）
  *   · 间距 7px——电脑上 2px 挨得刚好，手指上就太挤了
  */
@@ -2728,9 +2763,9 @@
 }
 
 .mb-tablet .mb-toprow .mb-topbtn {
-  width: 34px;
-  height: 34px;
-  border-radius: 9px;
+  width: 42px;
+  height: 42px;
+  border-radius: 11px;
 }
 
 .mb-tablet .mb-toprow .mb-ic {
@@ -2845,28 +2880,48 @@
   padding-bottom: 110px;
 }
 
-/* 浮标在平板上也大一点，手指点得准（撤销/重做也吃这一档，≥36px 触控目标） */
+/* 浮标在平板上也大一点，手指点得准。
+ * 撤销/重做是写字时最高频的动作，直接给到 44px（Material 的 48 手感
+ * 在这个紧凑浮标里会把纸面压得太满，44px 是目视与可达性的折中）。 */
 .mb-root.is-tablet .mb-float-btn {
-  width: 36px;
-  height: 36px;
+  box-sizing: border-box;
+  width: 44px;
+  height: 44px;
+  padding: 0;
 }
 
 .mb-root.is-tablet .mb-float-btn .mb-ic {
-  width: 20px;
-  height: 20px;
+  width: 22px;
+  height: 22px;
 }
 
 .mb-root.is-tablet .mb-float-num {
-  min-width: 58px;
-  height: 36px;
-  font-size: 13px;
+  box-sizing: border-box;
+  min-width: 64px;
+  height: 44px;
+  padding: 0 8px;
+  font-size: 14px;
 }
 
-/* 缩略图更大，好点 */
+/* 平板无可靠 hover：按钮常显。窄缩略图里竖排，中心距 38px，避免复制误触删除。 */
 .mb-root.is-tablet .mb-thumb-act {
-  width: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  left: 50%;
+  right: auto;
+  width: min(30px, calc(100% - 4px));
   height: 30px;
-  min-width: 30px;
+  min-width: 0;
+  transform: translateX(-50%);
+}
+
+.mb-root.is-tablet .mb-thumb-dup {
+  top: 2px;
+}
+
+.mb-root.is-tablet .mb-thumb-del {
+  top: 40px;
 }
 
 .mb-root.is-tablet .mb-thumb-act .mb-ic {
@@ -2899,6 +2954,136 @@
 .mb-root.is-tablet .mb-hint {
   font-size: 11px;
   max-width: 130px;
+}
+
+/* ====================== 平板触控目标（手指热区） ======================
+ *
+ * 优先级：高频动作 40~44px；低频/危险动作 ≥32px 且拉开间距；
+ * 装饰性 / 紧凑区（色点、字号步进）保持视觉尺寸，用 ::before 扩热区。
+ * 全部只在平板作用域（.mb-root.is-tablet / .mb-tablet）内生效。
+ */
+
+/* 侧栏关闭：平板上侧栏是盖住纸面的，这是唯一的明确出口 → 44px。
+ * box-sizing / padding 显式声明，压住宿主
+ * `.is-tablet button:not(.clickable-icon) { padding: 4px 20px }`（0,2,1）。 */
+.mb-root.is-tablet .mb-side-close {
+  box-sizing: border-box;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border-radius: 11px;
+}
+
+.mb-root.is-tablet .mb-side-close .mb-ic {
+  width: 20px;
+  height: 20px;
+}
+
+/*
+ * 侧栏字号分段按钮（14 / 18 / 24 / 32）。
+ * 高度 34px 与旁边 30px 的字体下拉基本齐平；整区高度会因此从 64
+ * 涨到 ~68px，仍远低于当年 200px 的竖排退步。
+ */
+.mb-root.is-tablet .mb-seg-btn {
+  box-sizing: border-box;
+  height: 34px;
+  padding: 0 10px;
+  font-size: 12.5px;
+}
+
+/*
+ * 侧栏「字号 −/＋」是 14×24 的紧凑控件：视觉尺寸不变，
+ * ::before 上下扩 4px、左右扩 2px → 热区约 18×32。
+ * 这行是 nowrap 硬约束（详见 .mb-text-tools 注释），不能再加宽。
+ */
+.mb-root.is-tablet .mb-text-tools .mb-size-step {
+  position: relative;
+}
+
+.mb-root.is-tablet .mb-text-tools .mb-size-step::before {
+  content: "";
+  position: absolute;
+  inset: -4px -2px;
+  border-radius: 6px;
+}
+
+/*
+ * 目录行：整行加高到 40px，动作钮 32px。
+ * 删除是低频危险动作，和编辑钮之间留 4px 间距，避免误触。
+ */
+.mb-root.is-tablet .mb-outline {
+  min-height: 40px;
+  gap: 8px;
+  padding: 4px 6px 4px 9px;
+  font-size: 12px;
+}
+
+.mb-root.is-tablet .mb-outline-act {
+  gap: 4px;
+}
+
+.mb-root.is-tablet .mb-outline-btn {
+  box-sizing: border-box;
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border-radius: 8px;
+}
+
+.mb-root.is-tablet .mb-outline-btn:hover {
+  background: var(--background-modifier-hover);
+}
+
+.mb-root.is-tablet .mb-outline-btn .mb-ic {
+  width: 16px;
+  height: 16px;
+}
+
+/*
+ * 图层行：眼睛 / 删除 18px → 32px，行高 26 → 42。
+ * 透明度滑杆的缩进同步到「眼睛 32 + gap 8」。
+ */
+.mb-root.is-tablet .mb-layer {
+  min-height: 42px;
+  gap: 8px;
+  padding: 4px 6px;
+  font-size: 12px;
+}
+
+.mb-root.is-tablet .mb-layer-eye,
+.mb-root.is-tablet .mb-layer-del {
+  box-sizing: border-box;
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  padding: 0;
+  border-radius: 8px;
+}
+
+.mb-root.is-tablet .mb-layer-eye .mb-ic,
+.mb-root.is-tablet .mb-layer-del .mb-ic {
+  width: 18px;
+  height: 18px;
+}
+
+/*
+ * 真缺陷修复：图层删除钮原本只写在 .mb-layer:hover 上（opacity:0 → 1）。
+ * 平板没有 hover，这条规则等于按钮永远不可见、不可点。
+ * 与 .mb-root.is-tablet .mb-outline-act 同一策略：平板上常驻。
+ * 顺手染成危险色，常显时不会和眼睛图标混淆。
+ */
+.mb-root.is-tablet .mb-layer-del {
+  opacity: 1;
+  color: var(--text-error, #d64545);
+}
+
+.mb-root.is-tablet .mb-layer-op {
+  padding-left: 40px;
+}
+
+.mb-root.is-tablet .mb-layer-op-val {
+  font-size: 11px;
 }
 
 /* 仅阅读：工具面板收起，只留右侧长条 */

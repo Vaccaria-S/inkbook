@@ -34,6 +34,7 @@ import {
   NewBookModal,
   JumpPageModal,
   PromptModal,
+  DeletePageModal,
   OutlineModal,
   ImportSourceModal,
   ImportRangeModal,
@@ -4482,7 +4483,12 @@ export class InkbookView extends FileView {
       setIcon(del, "trash-2");
       del.onclick = (e) => {
         e.stopPropagation();
-        this.editor?.deletePage(index);
+        const pageId = item.dataset.pageId;
+        new DeletePageModal(this.app, index + 1, () => {
+          // 确认期间页序可能已经变化：按页 id 找回原页，绝不误删新的同序号页。
+          const at = this.store?.data.pages.findIndex((page) => page.id === pageId) ?? -1;
+          if (at >= 0) this.editor?.deletePage(at);
+        }).open();
       };
     }
     // 长按：不动弹「上移/下移」菜单，移动即承接到拖拽重排（见 onThumbPressMove）

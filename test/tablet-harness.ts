@@ -337,6 +337,106 @@ async function main() {
       '<w:document><w:body><w:p><w:r><w:t>a &amp; b &lt;c&gt;</w:t></w:r></w:p></w:body></w:document>'
     );
     pass(ents[0].text === "a & b <c>", "XML 实体解码：" + ents[0].text);
+
+    /*
+     * INK-219 Word 解析健壮性：坏输入要给中文可操作提示，
+     * 不能抛 RangeError / 内部英文 / 把合法文档误判成「不是 Word」。
+     */
+    const errOf = (fn: () => unknown): string => {
+      try {
+        fn();
+        return "";
+      } catch (e: any) {
+        return String(e?.message || e);
+      }
+    };
+
+    // 老式 .doc / 加密 docx 是 OLE 头，不是 zip
+    const ole = new Uint8Array(64);
+    ole.set([0xd0, 0xcf, 0x11, 0xe0]);
+    const oleMsg = errOf(() => parseZip(ole));
+    pass(
+      oleMsg.includes("OLE") && oleMsg.includes("另存为"),
+      "INK-219 OLE 头（老 .doc / 加密 docx）给出另存为建议（" + oleMsg + "）"
+    );
+
+    // 完全不是 zip
+    const junk = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    pass(
+      errOf(() => parseZip(junk)).includes("找不到 zip 结构"),
+      "INK-219 非 zip 文件有明确提示"
+    );
+
+    /*
+     * 截断的 zip：EOCD 在，但中央目录偏移越界。
+     * 老代码会抛 DataView 的英文越界错误，现在应是中文。
+     */
+    const truncated = new Uint8Array(100);
+    // 在末尾造一个 EOCD：PK\x05\x06
+    truncated.set([0x50, 0x4b, 0x05, 0x06], 78);
+    const dv = new DataView(truncated.buffer);
+    dv.setUint16(78 + 10, 4, true); // 声称 4 个条目
+    dv.setUint32(78 + 16, 5000, true); // 目录偏移远超文件长度
+    const truncMsg = errOf(() => parseZip(truncated));
+    pass(
+      truncMsg.includes("不完整") || truncMsg.includes("截断"),
+      "INK-219 截断的 zip 给中文提示而不是英文越界（" + truncMsg + "）"
+    );
+    pass(
+      !/outside the bounds|RangeError|DataView/i.test(truncMsg),
+      "INK-219 不再泄漏英文内部错误"
+    );
+
+    /*
+     * ZIP64 哨兵值但缺 locator：不能默默返回空数组（那样会被上层
+     * 报成「缺少 word/document.xml」，把合法文档说成不是 Word）。
+     */
+    const z64 = new Uint8Array(80);
+    z64.set([0x50, 0x4b, 0x05, 0x06], 58);
+    const dv2 = new DataView(z64.buffer);
+    dv2.setUint16(58 + 10, 0xffff, true); // 条目数哨兵
+    dv2.setUint32(58 + 16, 0xffffffff, true); // 偏移哨兵
+    const z64Msg = errOf(() => parseZip(z64));
+    pass(
+      z64Msg.includes("ZIP64"),
+      "INK-219 ZIP64 哨兵值给明确提示（" + z64Msg + "）"
+    );
+
+    /*
+     * 不支持的压缩方法（非 0 / 8）必须被如实保留，交给 readZipText 报可操作错误。
+     * 造一个结构完整的 zip：本地头 + 中央目录 + EOCD，method = 12（bzip2）。
+     */
+    const bz = new Uint8Array(128);
+    const dv3 = new DataView(bz.buffer);
+    // 本地文件头（偏移 0）
+    bz.set([0x50, 0x4b, 0x03, 0x04], 0);
+    dv3.setUint16(0 + 8, 12, true); // method 12
+    dv3.setUint16(0 + 26, 4, true); // nameLen
+    bz.set([0x61, 0x2e, 0x78, 0x6d], 30); // "a.xm"
+    // 中央目录（偏移 34）
+    const cd = 34;
+    bz.set([0x50, 0x4b, 0x01, 0x02], cd);
+    dv3.setUint16(cd + 10, 12, true); // method 12
+    dv3.setUint32(cd + 20, 0, true); // compSize
+    dv3.setUint16(cd + 28, 4, true); // nameLen
+    dv3.setUint32(cd + 42, 0, true); // localOff = 0
+    bz.set([0x61, 0x2e, 0x78, 0x6d], cd + 46);
+    // EOCD（偏移 cd + 50 = 84）
+    const eo = cd + 50;
+    bz.set([0x50, 0x4b, 0x05, 0x06], eo);
+    dv3.setUint16(eo + 10, 1, true); // 1 个条目
+    dv3.setUint32(eo + 16, cd, true); // 目录偏移
+    const entries = (() => {
+      try {
+        return parseZip(bz);
+      } catch {
+        return [];
+      }
+    })();
+    pass(
+      entries.length === 1 && entries[0].method === 12,
+      "INK-219 压缩方法被如实保留（method=" + (entries[0]?.method ?? "-") + "）"
+    );
   }
 
   await sleep(60);

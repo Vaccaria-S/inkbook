@@ -4211,7 +4211,7 @@ export class BookEditor {
         ta.select();
       }
       ta.style.height = `${ta.scrollHeight}px`;
-      this.keepTextEditVisible(rec, ta);
+      this.keepTextEditVisible(ta);
     });
   }
 
@@ -4226,7 +4226,7 @@ export class BookEditor {
    * 比 window.innerHeight 准。拿不到时（老 WebView）退回 clientHeight。
    * 键盘动画有 200~300ms，所以在 focus 后多补两次。
    */
-  private keepTextEditVisible(rec: PageRec, ta: HTMLTextAreaElement): void {
+  private keepTextEditVisible(ta: HTMLTextAreaElement): void {
     const reveal = () => {
       if (this.destroyed || this.textEdit?.el !== ta) return;
       const vv = window.visualViewport;
@@ -4243,7 +4243,6 @@ export class BookEditor {
       if (above > 0) this.scrollEl.scrollTop -= above;
       // 样式条跟着重定位：它按纸面坐标算，scrollTop 变了屏幕位置也变了
       this.positionTextEditBar();
-      void rec;
     };
     reveal();
     window.setTimeout(reveal, 120);

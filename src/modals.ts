@@ -324,6 +324,29 @@ export class PromptModal extends Modal {
   }
 }
 
+/** 删除页不可撤销：仅明确按下「删除本页」才执行，关闭/取消均保留原页。 */
+export class DeletePageModal extends Modal {
+  constructor(app: App, private pageNumber: number, private onConfirm: () => void) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.createEl("h3", { text: "删除本页？" });
+    contentEl.createEl("p", { text: `将永久删除第 ${this.pageNumber} 页，此操作不可撤销。` });
+    const actions = contentEl.createDiv("mb-new-actions");
+    actions.createEl("button", { text: "取消" }).onclick = () => this.close();
+    actions.createEl("button", { cls: "mod-warning", text: "删除本页" }).onclick = () => {
+      this.close();
+      this.onConfirm();
+    };
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
 /* ------------------------------- 目录弹窗 ------------------------------- */
 
 /**

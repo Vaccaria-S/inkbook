@@ -12,7 +12,10 @@ import { A4_HEIGHT, A4_WIDTH, type Pt } from "./types";
 
 interface ZipEntry {
   name: string;
-  data: Uint8Array;
+  /** 压缩方法：0 = store，8 = deflate，其余一律不支持 */
+  method: number;
+  /** 压缩后的原始字节（解压前） */
+  raw: Uint8Array;
 }
 
 /**
@@ -20,6 +23,22 @@ interface ZipEntry {
  * 只支持 deflate（方法 8）和 store（方法 0），够 .docx 用了。
  */
 export function parseZip(bytes: Uint8Array): ZipEntry[] {
+  /*
+   * 老式 .doc（OLE 复合文档）和加了密码的 docx 都不是 zip。
+   * 它们的文件头是 `D0 CF 11 E0`，直接说清楚比「找不到 zip 结构」有用得多。
+   */
+  if (
+    bytes.length >= 4 &&
+    bytes[0] === 0xd0 &&
+    bytes[1] === 0xcf &&
+    bytes[2] === 0x11 &&
+    bytes[3] === 0xe0
+  ) {
+    throw new Error(
+      "这个文件是 OLE 格式（老式 .doc，或加了密码的 .docx）。请用 Word / WPS 另存为 .docx（并取消密码）后再导入。"
+    );
+  }
+
   // 找 EOCD（End of Central Directory）
   let eocd = -1;
   for (let i = bytes.length - 22; i >= 0 && i >= bytes.length - 66000; i--) {
@@ -31,11 +50,45 @@ export function parseZip(bytes: Uint8Array): ZipEntry[] {
   if (eocd < 0) throw new Error("不是有效的 docx（找不到 zip 结构）");
 
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const count = view.getUint16(eocd + 10, true);
+  let count = view.getUint16(eocd + 10, true);
   let off = view.getUint32(eocd + 16, true);
+
+  /*
+   * ZIP64（2026-11-08）。条目数 / 目录偏移超范围时，EOCD 里写的是
+   * 哨兵值 0xFFFF / 0xFFFFFFFF，真实值在紧邻 EOCD 之前的 ZIP64 EOCD 里。
+   *
+   * 老代码直接用哨兵值当偏移：`bytes[0xFFFFFFFF]` 是 undefined，
+   * 循环第一轮就 break，out 为空 —— 于是一个**合法**的大 docx 被报成
+   * 「缺少 word/document.xml」，用户完全不知道发生了什么。
+   * 正常 docx 几乎不会走到 ZIP64（几 MB 而已），但既然成本只有十几行，
+   * 顺手兜住；真兜不住时也给一句能照做的中文，而不是内部术语。
+   */
+  if (count === 0xffff || off === 0xffffffff) {
+    const locatorAt = eocd - 20;
+    const hasLocator =
+      locatorAt >= 0 && view.getUint32(locatorAt, true) === 0x07064b50;
+    // ZIP64 EOCD 记录本身在 locator 的「相对偏移」字段里
+    const z64 = hasLocator ? view.getUint32(locatorAt + 8, true) : -1;
+    if (z64 < 0 || z64 + 56 > bytes.length) {
+      throw new Error(
+        "这个 Word 文档用了 ZIP64 格式，墨本暂不支持。请用 Word / WPS 另存为 .docx 后重试，或先导出 PDF 再导入。"
+      );
+    }
+    // 低 32 位够用：单本 Word 不可能超过 4GB 条目数 / 偏移
+    count = view.getUint32(z64 + 32, true);
+    off = view.getUint32(z64 + 48, true);
+  }
 
   const out: ZipEntry[] = [];
   for (let i = 0; i < count; i++) {
+    /*
+     * 目录被截断时 `getUint16(off + …)` 会抛
+     * 「Offset is outside the bounds of the DataView」—— 英文内部错误。
+     * 每轮先确认整个固定头都在文件内，再读。
+     */
+    if (off + 46 > bytes.length) {
+      throw new Error("Word 文件不完整（zip 目录被截断）。请重新导出后再导入。");
+    }
     if (bytes[off] !== 0x50 || bytes[off + 1] !== 0x4b) break;
     const method = view.getUint16(off + 10, true);
     const compSize = view.getUint32(off + 20, true);
@@ -46,15 +99,15 @@ export function parseZip(bytes: Uint8Array): ZipEntry[] {
     const name = new TextDecoder("utf-8").decode(bytes.subarray(off + 46, off + 46 + nameLen));
 
     // 局部头的 extra 长度可能与中央目录不同，要重新读
+    if (localOff + 30 > bytes.length) {
+      throw new Error("Word 文件不完整（条目头越界）。请重新导出后再导入。");
+    }
     const lNameLen = view.getUint16(localOff + 26, true);
     const lExtraLen = view.getUint16(localOff + 28, true);
     const dataStart = localOff + 30 + lNameLen + lExtraLen;
     const raw = bytes.subarray(dataStart, dataStart + compSize);
 
-    out.push({ name, data: method === 0 ? raw : raw }); // deflate 在下面解压
-    (out[out.length - 1] as any)._method = method;
-    (out[out.length - 1] as any)._raw = raw;
-
+    out.push({ name, method, raw });
     off += 46 + nameLen + extraLen + commentLen;
   }
   return out;
@@ -96,9 +149,38 @@ export async function readZipText(bytes: Uint8Array, target: string): Promise<st
   const entries = parseZip(bytes);
   const hit = entries.find((e) => e.name === target);
   if (!hit) return null;
-  const method = (hit as any)._method;
-  const raw = (hit as any)._raw as Uint8Array;
-  const data = method === 0 ? raw : await inflateRaw(raw);
+  /*
+   * **只认 store(0) 和 deflate(8)**（2026-11-08）。
+   *
+   * 老代码 `method === 0 ? raw : raw` 两边一样，等于所有非 0 方法
+   * 都硬塞给 deflate。真遇上别的算法（12 = bzip2、99 = AES 加密）
+   * 会抛各内核文案不一的底层错误（invalid stored block lengths /
+   * TypeError），用户完全看不懂，也不知道下一步该做什么。
+   */
+  if (hit.method !== 0 && hit.method !== 8) {
+    throw new Error(
+      hit.method === 99
+        ? "这个 .docx 是加密文档，墨本暂不支持。请在 Word 里取消密码后另存为 .docx，或先导出 PDF 再导入。"
+        : `这个 .docx 用了不支持的压缩方式（method ${hit.method}）。请用 Word / WPS「另存为 .docx」后重试，或先导出 PDF。`
+    );
+  }
+  let data: Uint8Array;
+  if (hit.method === 0) {
+    data = hit.raw;
+  } else {
+    try {
+      data = await inflateRaw(hit.raw);
+    } catch (e) {
+      /*
+       * inflateRaw 自己抛的是「系统不支持解压」这类可操作提示，
+       * 别用通用文案盖掉它 —— 那种情况用户该去更新 WebView，
+       * 而不是以为文件坏了。
+       */
+      const msg = String((e as any)?.message || e || "");
+      if (msg.includes("解压") || msg.includes("DecompressionStream")) throw e;
+      throw new Error("文档内容解压失败（文件可能已损坏）。请用 Word 另存为 .docx 后重试。");
+    }
+  }
   return new TextDecoder("utf-8").decode(data);
 }
 
@@ -263,15 +345,29 @@ function layout(paras: DocParagraph[]): string[][] {
   return pages.length ? pages : [[]];
 }
 
+/** 渲染出的一页：图片 + 像素尺寸（尺寸由渲染方直接给出，省一次解码） */
+export interface RenderedDocxPage {
+  dataUrl: string;
+  width: number;
+  height: number;
+}
+
 /**
  * 把 Word 段落渲染成一张张 A4 图片（PNG dataURL）。
  *
  * 用异步生成器逐页产出：调用方拿到一页就能立刻存盘，
  * 不必等所有页渲染完——避免几十页的文档把内存堆满。
+ *
+ * **画布必须在 yield 之前释放**（2026-11-08）。老代码是先 yield 再
+ * `canvas.width = 0`，但生成器的 yield 是**把控制权交回调用方**：
+ * 调用方解码 dataURL、写盘的那几帧里，这张 794×1123×3² ≈ 800 万像素、
+ * 约 32MB 的画布还活着。再叠加调用方为量尺寸解码出的 Image（又 32MB），
+ * 低端平板会直接 OOM。现在先 toDataURL、立刻清画布，再把尺寸一起带出去
+ * ——调用方不必再解码一次。
  */
 export async function* renderDocxToPages(
   paragraphs: DocParagraph[]
-): AsyncGenerator<string> {
+): AsyncGenerator<RenderedDocxPage> {
   const pages = layout(paragraphs);
 
   for (const lines of pages) {
@@ -279,8 +375,10 @@ export async function* renderDocxToPages(
     // 用 3 倍分辨率：Word 底图是静态位图，放大后无法再升级，
     // 所以一次性渲染到足够高（3x 覆盖到 2.8 倍缩放仍有 1.07x 余量）
     const dpr = 3;
-    canvas.width = A4_WIDTH * dpr;
-    canvas.height = A4_HEIGHT * dpr;
+    const width = A4_WIDTH * dpr;
+    const height = A4_HEIGHT * dpr;
+    canvas.width = width;
+    canvas.height = height;
     const ctx = canvas.getContext("2d")!;
     ctx.scale(dpr, dpr);
     ctx.fillStyle = "#ffffff";
@@ -294,10 +392,11 @@ export async function* renderDocxToPages(
       ctx.fillText(line, MARGIN, y);
       y += LINE_H;
     }
-    yield canvas.toDataURL("image/png");
-    // 立刻释放画布
+    const dataUrl = canvas.toDataURL("image/png");
+    // 先释放画布，再把结果交出去（见上方说明）
     canvas.width = 0;
     canvas.height = 0;
+    yield { dataUrl, width, height };
   }
 }
 
