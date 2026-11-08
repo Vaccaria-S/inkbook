@@ -934,10 +934,42 @@
  * 折行后用 1.32 的行距跟画布/导出对齐，屏幕上看到的就是最终排出来的样子。
  */
 .mb-text.is-user {
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-  word-break: break-word;
+  /*
+   * **不让浏览器折行**（INK-192）。
+   *
+   * 断行位置由 `layoutUserText` 算好后用显式 \n 写进 textContent，
+   * 这里只负责把 \n 当换行渲染。用 `pre-wrap` 的话浏览器会在
+   * `overflow-wrap: break-word` 配合下再折一次，而它的规则
+   * （在空格处断）和 `wrapText`（空格断需行满 60%，否则逐字硬断）
+   * 不一样——窄框英文会得到两套不同的断点，屏幕和导出对不上。
+   */
+  white-space: pre;
   line-height: 1.32;
+}
+
+/*
+ * 纵向裁行的可见提示（INK-192）：装不下的行不再静默掉到页底之外，
+ * 「还有 N 行未显示」必须让用户看见。
+ *
+ * 为什么单独一个 span 而不是拼进 .mb-text 的文本：阅读模式拖选/复制时
+ * 这句 UI 文案会混进原文，违反「导出一个字都不能少/多」；
+ * user-select:none + 独立元素既不污染数据也不抢指针（文字层默认穿透）。
+ * 尺寸用页面坐标 + 较小字号，跟随 .mb-textlayer 的 --mb-zoom 一起缩放。
+ */
+.mb-text-more {
+  position: absolute;
+  display: inline-block;
+  max-width: 240px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: rgba(108, 92, 231, 0.12);
+  color: var(--text-muted, #6c5ce7);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 /* 仅阅读模式才允许选字：这时本来就不写字，不会抢触摸 */

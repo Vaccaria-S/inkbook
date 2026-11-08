@@ -126,6 +126,13 @@ type Gesture = "none" | "draw" | "shape" | "erase" | "pan" | "moveText" | "resiz
  * 屏幕渲染、编辑框、导出画布三处都走 `textFontStack()`，
  * 否则「编辑时是这个宽度、存下来变另一个宽度」。
  *
+ * 回退链统一以「Noto Sans SC, sans-serif」收尾（INK-193）：
+ * 导出 PDF 只有一款字体（Noto Sans SC，见 fontasset.ts），而系统未必装了
+ * 用户选的宋体/楷体/等宽——旧的尾部 `serif` / `monospace` 通用回退在 Windows
+ * 上会落到 SimSun / Consolas，拉丁字宽和导出差 18.5%，屏幕上 3 行的字
+ * 导出来变成 4 行。首选字体仍排在最前，「选了楷体就该看到楷体」不受影响；
+ * 只有首选字体缺失时才回退到导出同款的 Noto/系统无衬线，量宽尽量贴近导出。
+ *
  * id 会写进文件，所以别随便改名；新增可以，老 id 要留着。
  */
 export const TEXT_FONTS: Array<{ id: string; label: string; stack: string }> = [
@@ -138,17 +145,23 @@ export const TEXT_FONTS: Array<{ id: string; label: string; stack: string }> = [
   {
     id: "serif",
     label: "宋体",
-    stack: '"Songti SC", "Noto Serif SC", "Source Han Serif SC", "SimSun", serif',
+    stack:
+      '"Songti SC", "Noto Serif SC", "Source Han Serif SC", "SimSun", "Noto Sans SC", sans-serif',
   },
   {
     id: "kai",
     label: "楷体",
-    stack: '"Kaiti SC", "STKaiti", "KaiTi", "Noto Serif SC", serif',
+    // 不把 "Noto Serif SC" 留在楷体的回退里：它不是楷体，字宽又和导出字体差得远，
+    // 首选楷体缺失时直接回退到导出同款，比"看起来像宋体"更重要。
+    stack: '"Kaiti SC", "STKaiti", "KaiTi", "Noto Sans SC", sans-serif',
   },
   {
     id: "mono",
     label: "等宽",
-    stack: 'ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, "Courier New", monospace',
+    // 等宽字体没有汉字：西文仍用等宽（用户选的），汉字按字回落到导出同款无衬线，
+    // 不再落到 `monospace` 通用族的 CJK 回退（各平台差异极大）。
+    stack:
+      'ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, "Courier New", "Noto Sans SC", sans-serif',
   },
 ];
 
@@ -160,14 +173,6 @@ export function textFontStack(id?: string): string {
 
 /** 兼容旧代码里的单字体引用（PDF 原文也用黑体） */
 const TEXT_FONT = TEXT_FONTS[0].stack;
-
-/**
- * 新建批注的编辑框宽度（页面坐标）。
- *
- * 太窄了打字体验很差（一上来就折行），太宽了又会顶到纸边，
- * 所以取「可用宽度」和这个值里的小者。
- */
-const TEXT_EDIT_WIDTH = 320;
 
 /** 编辑框的左右内边距 + 边框（CSS px）：算 width 时要补上，否则折行位置比渲染早一步 */
 const TEXT_EDIT_CHROME = 10;
@@ -422,6 +427,13 @@ export interface EditorOptions {
    * 位图渲染完必须补一次，否则侧栏会一直停在灰底占位上。
    */
   onThumbNeedsRedraw?: (index: number) => void;
+  /**
+   * 批注文字装不下纸面、有行被裁掉时回调（参数是被裁的行数）。
+   *
+   * 排版层必须裁（不裁就是溢出纸外被静默吃掉，屏幕/导出/嵌入三处
+   * 一致地"字不见了"）。原文不丢，但用户看不到就得告诉他。
+   */
+  onTextOverflow?: (hiddenLines: number) => void;
 }
 
 /** 按住连调：第一次重复前的等待（先 400ms 再开始加速） */
@@ -3499,22 +3511,55 @@ export class BookEditor {
         el.style.color = t.color || "#1A1A1A";
         if (t.bold) el.style.fontWeight = "600";
         /*
-         * 长批注在屏幕上也要按纸宽折行。
+         * **屏幕断行必须用 layoutUserText 的结果**（INK-192）。
          *
-         * 之前 span 不设宽度，一直往右长，超出纸面的部分被 .mb-textlayer
-         * 的 overflow:hidden 吃掉——屏幕上就已经"少半句"了，只是没人细看。
-         * 宽度定成可用宽度交给 CSS 的 pre-wrap 折；位置也用**排版后**的
-         * x/y（越界的老批注会被夹回纸内），这样屏幕和导出看到的是同一份排版。
-         * 折行后的行距要跟画布/导出对齐（TEXT_LINE_HEIGHT），
-         * 所以 transform 用 0.82 + 半个行距补偿基线上移。
+         * 以前只给 span 写 `width`，折行交给 CSS（`white-space: pre-wrap`
+         * + `overflow-wrap: break-word`）。但 `wrapText` 有一套自己的规则：
+         * 「空格处断，但断出来的行不满 60% 就逐字硬断」。两套规则在窄框
+         * 英文上**必然不同**——实测框宽 160 时 `Introduction` 被 `wrapText`
+         * 劈成 `Introducti` / `on`，而 CSS 会在空格处断成完整单词。
+         * 结果就是「屏幕上两行、导出三行」，正是「排版规则只能有一份」
+         * 这条红线被破坏的样子。
+         *
+         * 改法：把 `l.lines` 用**显式换行**拼起来，再 `white-space: pre`
+         * 关掉浏览器自己的折行。断点完全由排版源决定。
+         *
+         * 为什么不拆成多个 span：拆开会让**跨行选中/复制**断掉
+         * （拖选一段多行批注只能选中一行）。单 span + 显式 \n 既锁死
+         * 断点，又保住整段文字的可选性。
          */
         const l = this.textLayout(t);
+        el.textContent = l.lines.join("\n");
+        el.style.whiteSpace = "pre";
         el.style.left = `${l.x}px`;
         el.style.top = `${l.y}px`;
-        // 宽度直接吃排版结果：手动调过框宽的批注，屏幕折行必须和导出一致
         el.style.width = `${l.width}px`;
         el.style.lineHeight = String(TEXT_LINE_HEIGHT);
         el.style.transform = `translateY(-${0.82 + (TEXT_LINE_HEIGHT - 1) / 2}em)`;
+        /*
+         * 纵向装不下时的可见提示（INK-192）：被裁掉的行不能**静默**消失，
+         * 在可见文字块下方挂一条「还有 N 行未显示」。
+         *
+         * 为什么不把提示拼进 span 的 textContent：那样在阅读模式拖选/复制时
+         * 会把这句 UI 文案混进原文，违反「一个字都不能少/多」。用独立元素 +
+         * `user-select:none` 才能既看得见又不污染数据。
+         * 徽标只挂在屏幕上：导出 PDF / 嵌入图没有 DOM，那两处按同一份
+         * `l.lines` 裁行，原文仍在 PageText.text 里（数据不丢）。
+         * 位置按最后一行的基线再往下 half 个行高；上限减 24 是因为
+         * .mb-textlayer 有 overflow:hidden，徽标自身约 17px 高，顶到
+         * 纸底再画会被裁掉半截——「看得见的提示」不能被裁。
+         */
+        if (l.hidden && l.hidden > 0) {
+          const more = document.createElement("span");
+          more.className = "mb-text-more";
+          more.textContent = `还有 ${l.hidden} 行未显示`;
+          more.style.left = `${l.x}px`;
+          more.style.top = `${Math.min(
+            this.store.data.height - 24,
+            l.y + (l.lines.length - 1) * l.lineHeight + l.lineHeight * 0.5
+          )}px`;
+          layer.appendChild(more);
+        }
       }
       layer.appendChild(el);
     }
@@ -3609,7 +3654,9 @@ export class BookEditor {
       const avail = availableTextWidth(this.store.data.width, t.x);
       const custom = Number.isFinite(t.width) ? (t.width as number) : 0;
       const width = custom > 0 ? Math.min(Math.max(custom, MIN_BOX_WIDTH), avail) : avail;
-      return { x: t.x, y: t.y, lines, lineHeight: t.size * TEXT_LINE_HEIGHT, width };
+      // hidden: 0 —— 这条退化路径量不了宽、也就排不了版，谈不上裁行；
+      // 补上字段只为让返回类型和正常路径一致（调用方统一读 l.hidden）
+      return { x: t.x, y: t.y, lines, lineHeight: t.size * TEXT_LINE_HEIGHT, width, hidden: 0 };
     }
     return layoutUserText(
       t,
@@ -3849,12 +3896,17 @@ export class BookEditor {
     // 否则框里断字的位置和提交后的渲染对不上（INK-116 的老坑）。
     const avail = layout.width;
     /*
-     * 新建：给个不算窄的初始框；改已有文字：至少放得下它自己。
-     * 本来要折行的长批注直接给满可用宽度——只有宽度等于可折行宽度，
-     * 框里断字的位置才跟提交后的渲染一致（这是这个 bug 的关键）。
-     * 两者都封顶 avail，不顶出纸面。
+     * 新建和改已有文字都用同一个宽度：排版结果的 l.width。
+     *
+     * 新建时不再把框宽封顶到 320（旧的 TEXT_EDIT_WIDTH）：新建文字落盘时
+     * **不写 width**，渲染/导出都按 availableTextWidth 折行；框里却按 320 折，
+     * 于是「框里看着 4 行、提交后按纸宽变成 2 行」，位置全跳了（INK-193）。
+     * 现在框宽 = 折行宽 = 落盘后的渲染宽，三者同源。
+     *
+     * 「太宽顶到纸边」不用担心：l.width 来自 availableTextWidth，右缘已经
+     * 留了 TEXT_RIGHT_MARGIN、物理上不会出纸——旧上限想防的事它本来就防住了。
      */
-    const wantW = hit ? avail : Math.min(avail, TEXT_EDIT_WIDTH);
+    const wantW = avail;
     ta.style.width = `${wantW * this.zoom + TEXT_EDIT_CHROME}px`;
     rec.pageEl.appendChild(ta);
 
@@ -4057,6 +4109,13 @@ export class BookEditor {
       }
     } else if (value) {
       this.store.snapshotPage(rec.index);
+      /*
+       * 新建文字**不写 width**（INK-193）。编辑框的宽度已经按
+       * availableTextWidth 打开（见 beginTextEdit），落盘后渲染/导出/嵌入
+       * 也各自从同一个 availableTextWidth 折行，三处自然一致；
+       * 这里再补一个 width 反而把新批注永久钉在某个宽度上。
+       * 只有用户手动拖过框宽时才由 resizeText 写 width（INK-121）。
+       */
       const item: PageText = {
         id: uid("text"),
         source: "user",
@@ -4076,6 +4135,21 @@ export class BookEditor {
     this.changed();
     this.renderTextLayer(rec);
     this.emitState();
+    /*
+     * 文字装不下时提示用户（INK-192）。
+     *
+     * 排版层会把超出行数的部分裁掉（不裁就是溢出纸外被静默裁掉，
+     * 三处一致地"字不见了"）。原文一个字没丢，但用户看不到就得告诉他，
+     * 否则他会以为字打丢了。
+     * 提示里给可操作的建议：调小字号、把框拖宽，或者分到下一段。
+     */
+    const target = old ?? (page.texts ?? [])[(page.texts ?? []).length - 1];
+    if (target) {
+      const lay = this.textLayout(target);
+      if (lay.hidden && lay.hidden > 0) {
+        this.opts.onTextOverflow?.(lay.hidden);
+      }
+    }
   }
 
   /**

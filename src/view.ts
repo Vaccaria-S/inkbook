@@ -1144,6 +1144,20 @@ export class InkbookView extends FileView {
         // 页号可能不在当前窗口里（大本子只物化可视区），拿不到就等它滚进来再画
         if (cv && cv.isConnected) this.editor?.renderThumbnail(cv, i);
       },
+      /*
+       * 文字装不下纸面（INK-192）。
+       *
+       * 排版层会裁掉超出的行——不裁就是溢出到纸外被静默吃掉，
+       * 屏幕/导出/嵌入三处一致地"字不见了"。原文一个字没丢，
+       * 但用户看不到就必须当场告诉他，否则他会以为字打丢了。
+       */
+      onTextOverflow: (hidden: number) => {
+        new Notice(
+          `这段文字太长，有 ${hidden} 行超出纸面没有显示（原文没有丢）。` +
+            `调小字号、把文字框拖宽，或者分成两段写。`,
+          8000
+        );
+      },
     });
     this.editor.penColor = this.plugin.settings.lastPenColor || "#1A1A1A";
     this.editor.penSize = finiteSetting(this.plugin.settings.defaultPenSize, 2.8, 1, 8);

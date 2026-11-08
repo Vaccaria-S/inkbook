@@ -1,4 +1,4 @@
-import { BookEditor } from "../src/editor";
+import { BookEditor, TEXT_FONTS, textFontStack } from "../src/editor";
 import { BookStore } from "../src/store";
 import { createBook, createPage, type Pt, type Stroke } from "../src/types";
 import { readBook, writeBook } from "../src/storage";
@@ -1896,6 +1896,30 @@ async function main() {
       "右缘夹取：纸还够宽时仍保底 120（x=634 → " + availableTextWidth(W, 634).toFixed(0) + "）"
     );
 
+    /*
+     * 非有限值兜底（INK-193）：这几条以前全是 NaN。
+     * NaN 宽度喂给 wrapText 等价于"不折行"，长句直接画出纸外，
+     * 症状和越界一样是「我自己打的字不完整」，但更难查（数值一路是 NaN）。
+     */
+    for (const bad of [NaN, Infinity, -Infinity]) {
+      const w = availableTextWidth(W, bad);
+      pass(
+        Number.isFinite(w) && w > 0,
+        "NaN 兜底：x=" + String(bad) + " 时可用宽度仍是有限正数（" + w.toFixed(0) + "）"
+      );
+    }
+    pass(
+      availableTextWidth(W, NaN) === availableTextWidth(W, 0),
+      "NaN 兜底：x=NaN 按页左缘 0 处理（宽度取满）"
+    );
+    for (const bad of [NaN, Infinity, -Infinity]) {
+      const w = availableTextWidth(bad, 100);
+      pass(
+        Number.isFinite(w) && w >= 1,
+        "NaN 兜底：pageWidth=" + String(bad) + " 时可用宽度有限且 ≥ 1（" + w.toFixed(0) + "）"
+      );
+    }
+
     const longH = "横向越界扫描用的长句不能让纸边裁掉".repeat(3);
     for (const x of [634, 674, 700, 760]) {
       const l = layoutUserText({ x, y: 300, size: 16, text: longH }, W, H, bySize(16));
@@ -1937,17 +1961,33 @@ async function main() {
     }
 
     /*
-     * 内容比纸还高（超大字号 + 超长文本）：物理上装不下，不做分页也不截断，
-     * 但必须「从页顶开始画、首行在纸内」，不能反过来被推到纸外。
+     * 内容比纸还高（超大字号 + 超长文本，INK-192）：物理上装不下时按可用高度
+     * **裁行**，不能再「从页顶开始画、底部溢出接受」——溢出的行会被
+     * .mb-page / /MediaBox 整行裁掉，用户看到的就是「我打的字不见了」。
+     * 裁的是渲染结果：PageText.text / wrapText 里原文一个字都不动，
+     * 调小字号或拖宽文字框后被裁的字会重新出现。
+     *
+     * 断言条数保持 2 条，别动 run-all.mjs 里 test.html 的期望数。
      */
     {
       const huge = "超高内容".repeat(50); // 200 字
       const l = layoutUserText({ x: 40, y: 500, size: 96, text: huge }, W, H, bySize(96));
+      const full = wrapText(huge, availableTextWidth(W, 40), bySize(96));
+      const wantMax = Math.max(1, Math.floor((H - 8 - 96 * 1.2) / (96 * 1.32)) + 1);
+      const lastBaseline = l.y + (l.lines.length - 1) * l.lineHeight;
       pass(
-        Math.abs(l.y - 96 * 1.2) < 0.01,
-        "超高内容：首行基线落在 " + l.y.toFixed(1) + "（= 字号×1.2），从页顶开始画"
+        full.join("") === huge &&
+          l.lines.length <= wantMax &&
+          (l.hidden ?? 0) === full.length - l.lines.length &&
+          l.lines.join("") === full.slice(0, l.lines.length).join(""),
+        "超高内容：按纸高裁行（" + l.lines.length + "/" + full.length + " 行，hidden " +
+          (l.hidden ?? 0) + "），wrapText 拼回去仍是完整原文（数据不丢）"
       );
-      pass(l.lines.join("") === huge, "超高内容：一个字都不丢（不做截断）");
+      pass(
+        l.y >= 96 * 1.2 - 0.01 && lastBaseline <= H - 8 + 0.01,
+        "超高内容：裁行后首行不低于页顶、末行基线 " + lastBaseline.toFixed(0) +
+          " ≤ 1115（不再整行掉出页底）"
+      );
     }
   }
 
@@ -2002,6 +2042,22 @@ async function main() {
     const tinyBox = layoutUserText({ x: 60, y: 300, size: 16, text, width: 1 }, W, H, bySize(16));
     pass(tinyBox.width >= 24, "框宽：width=1 被夹到下限 24（不会退化成一行一个字）");
     pass(tinyBox.lines.join("") === text, "框宽：极窄框仍一个字都不丢");
+  }
+
+  /*
+   * 字体回退链（INK-193）。
+   *
+   * 导出 PDF 只有一款 Noto Sans SC，屏幕却可能回退到 SimSun / Consolas：
+   * 拉丁字宽差 18.5%，屏幕 3 行的字导出来变 4 行。回退链必须以导出同款
+   * （Noto Sans SC → 系统无衬线）收尾；首选字体仍排最前，选楷体要看到楷体。
+   */
+  {
+    for (const f of TEXT_FONTS) {
+      pass(/"Noto Sans SC"/.test(f.stack), "字体 " + f.id + "：回退链包含导出同款 Noto Sans SC");
+      pass(/sans-serif\s*$/.test(f.stack), "字体 " + f.id + "：末尾是系统无衬线（不再落到 serif/monospace 通用族）");
+    }
+    pass(textFontStack("kai") === TEXT_FONTS.find((f) => f.id === "kai")!.stack, "字体：按 id 取回对应栈（首选字体不被回退覆盖）");
+    pass(textFontStack("不存在的id") === TEXT_FONTS[0].stack && textFontStack(undefined) === TEXT_FONTS[0].stack, "字体：未知/id 缺省落回黑体栈");
   }
 
   /*

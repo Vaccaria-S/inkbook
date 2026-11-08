@@ -2,7 +2,8 @@
  * QA（严过关）独立验证：批注折行 / 导出不丢字。
  *
  * 这个套件**不重复**工程师加的用例，而是从另一头验同一个性质：
- *   1. 画布折行（wrapText + measureText）与屏幕 DOM（CSS 折行）断在同一个字后面；
+ *   1. 画布折行（wrapText + measureText）与屏幕 DOM 断在同一个字后面
+ *      （INK-192 起屏幕直接渲染 l.lines，浏览器不再参与折行）；
  *   2. 屏幕上最宽的一行确实落在纸内，不靠 overflow:hidden「看不见就当没事」；
  *   3. 命中判定：折成多行的批注，点第 3 行能选中、点字上方不误选；
  *   4. 编辑框宽度 = 可折行宽度（框里断在哪、提交后就断在哪）；
@@ -279,11 +280,24 @@ async function main() {
       text: "批注 1：写一段 mixed text，含 English words 和 2024 年的数字。\n第二行故意长一点，长到必须折行才放得下，不然就会被纸的右边界切掉，一个字都看不全。",
       color: "#1A1A1A",
     };
+    /*
+     * 屏幕已经不靠 CSS 折行了（INK-192）：文字层把 l.lines 用显式 \n 写进
+     * textContent、white-space:pre 锁死断点。所以这里必须量**真实渲染出来的
+     * DOM 行**，不能再用 cssLines() 模拟旧 CSS——那测的是已经删掉的行为，
+     * 而且永远会绿（模拟器和自己比）。渲染完把 texts 还原，后面的用例照旧。
+     */
     const cv = ed.textLines(mixed);
-    const dm = cssLines(mixed.text, mixed.size, 'system-ui, sans-serif', ed.textAvailWidth(mixed.x));
-    log(`中英混排：画布 ${cv.length} 行 ${JSON.stringify(cv.map((l: string) => l.length))} ｜ CSS ${dm.length} 行 ${JSON.stringify(dm.map((l) => l.length))}`);
+    store.data.pages[0].texts = [mixed];
+    ed.renderTextLayer(rec);
+    await sleep(25);
+    const spanMixed = pageEl().querySelector(".mb-text.is-user") as HTMLElement | null;
+    const dm = spanMixed ? domLineTexts(spanMixed) : [];
+    log(`中英混排：画布 ${cv.length} 行 ${JSON.stringify(cv.map((l: string) => l.length))} ｜ 屏幕 DOM ${dm.length} 行 ${JSON.stringify(dm.map((l) => l.length))}`);
     pass(cv.join("") === mixed.text.split("\n").join(""), "混排：画布折行不丢字");
-    pass(sameLines(dm, cv), "混排：CSS 与画布断字位置一致");
+    pass(sameLines(dm, cv), "混排：屏幕 DOM 与排版源断字位置一致");
+    store.data.pages[0].texts = [note1];
+    ed.renderTextLayer(rec);
+    await sleep(20);
   }
 
   /* ---------- E. 命中判定：多行批注的第 3 行 / 字上方 / 右侧 ---------- */
@@ -1106,6 +1120,270 @@ async function main() {
     ed.renderTextLayer(rec);
     editor.setTool("select");
     await sleep(20);
+  }
+
+  /* ---------- K5. 新建框「所见 = 落盘后」（INK-193） ---------- */
+  {
+    /*
+     * 旧实现：新建框封顶 320，落盘又不写 width，渲染按纸宽重排——
+     * 框里 4 行、提交后 2 行，用户看到的位置不是最终位置。
+     * 这里走完整 UI（点纸面 → 打字 → 回车提交），
+     * 比较框内 CSS 折行与落盘后的排版，两条链路不共享中间量。
+     */
+    store.data.pages[0].texts = [];
+    ed.renderTextLayer(rec);
+    editor.setTool("text");
+    await sleep(25);
+    const r5 = pageEl().getBoundingClientRect();
+    const k5 = r5.width / PAGE_W;
+    const ev6 = (type: string, x: number, y: number, buttons: number, pid: number) =>
+      new PointerEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        pointerId: pid,
+        pointerType: "mouse",
+        isPrimary: true,
+        button: 0,
+        buttons,
+        clientX: r5.left + x * k5,
+        clientY: r5.top + y * k5,
+      });
+    pageEl().dispatchEvent(ev6("pointerdown", 200, 700, 1, 603));
+    pageEl().dispatchEvent(ev6("pointerup", 200, 700, 0, 603));
+    await sleep(60);
+    const ta5 = pageEl().querySelector(".mb-text-edit") as HTMLTextAreaElement | null;
+    pass(!!ta5 && !!ed.textEdit, "新建：输入框打开");
+    // 框没开出来就不往下算：让本段干净地少几条 PASS，别把后面整页带成 FATAL
+    if (ta5) {
+      const z5 = zoom();
+      const cs5 = getComputedStyle(ta5);
+      const chrome5 =
+        parseFloat(cs5.paddingLeft) +
+        parseFloat(cs5.paddingRight) +
+        parseFloat(cs5.borderLeftWidth) +
+        parseFloat(cs5.borderRightWidth);
+      const contentW5 = (ta5.getBoundingClientRect().width - chrome5) / z5;
+      const avail5 = availableTextWidth(PAGE_W, ed.textEdit.x);
+      pass(
+        Math.abs(contentW5 - avail5) < 1,
+        `新建：框宽 ${contentW5.toFixed(0)} = 纸面可用宽 ${avail5.toFixed(0)}（不再固定 320）`
+      );
+
+      const value5 = CN54.repeat(2);
+      ta5.value = value5;
+      ta5.dispatchEvent(new Event("input", { bubbles: true }));
+      const boxLines5 = cssLines(value5, ed.textEdit.size, cs5.fontFamily, contentW5);
+      ta5.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      await sleep(80);
+      const landed = (store.data.pages[0].texts || [])[0] as PageText | undefined;
+      pass(!!landed && landed.width === undefined, "新建落盘：不写 width（继续走纸面自动宽度）");
+      const L5 = landed ? ed.textLayout(landed) : null;
+      pass(
+        !!L5 && sameLines(boxLines5, L5.lines),
+        `新建：框里 ${boxLines5.length} 行 = 落盘后 ${L5 ? L5.lines.length : "-"} 行（断字位置一致）`
+      );
+    }
+
+    store.data.pages[0].texts = [note1];
+    ed.renderTextLayer(rec);
+    editor.setTool("select");
+    await sleep(20);
+  }
+
+  /* ---------- K6. 屏幕断行 = 排版源（INK-192，窄框英文） ---------- */
+  {
+    /*
+     * 红线：排版规则只能有一份。屏幕曾把折行交给 CSS
+     * （`pre-wrap` + `break-word`，在空格处断），而导出/嵌入用
+     * `wrapText`（空格断需行满 60%，否则逐字硬断）。
+     * 窄框英文上两者必然不同：`Introduction` 会被 wrapText 劈成
+     * `Introducti` / `on`，CSS 则断成完整单词。
+     *
+     * 这里用**窄框英文**把两条链路都跑一遍：
+     * 屏幕 DOM 的实际断行 必须等于 layoutUserText 的 lines。
+     * 旧实现在这条上会红（DOM 按单词断、lines 按字符断）。
+     */
+    const EN =
+      "Chapter 3 Introduction to Inkbook: a handwriting notebook that keeps your ink";
+    for (const boxW of [160, 240]) {
+      const t: PageText = {
+        id: "k6-" + boxW,
+        source: "user",
+        x: 60,
+        y: 200,
+        size: 16,
+        text: EN,
+        color: "#1A1A1A",
+        font: "sans",
+        width: boxW,
+      };
+      store.data.pages[0].texts = [t];
+      ed.renderTextLayer(rec);
+      await sleep(30);
+      const span6 = pageEl().querySelector(".mb-text.is-user") as HTMLElement | null;
+      const L6 = ed.textLayout(t);
+      const dom6 = span6 ? domLineTexts(span6) : [];
+      pass(
+        !!span6 && sameLines(dom6, L6.lines),
+        `INK-192 窄框 ${boxW} 英文：屏幕 ${dom6.length} 行 = 排版源 ${L6.lines.length} 行` +
+          `（DOM ${JSON.stringify(dom6.map((s) => s.length))} / lines ${JSON.stringify(L6.lines.map((s) => s.length))}）`
+      );
+      pass(
+        dom6.join("").replace(/\n/g, "") === EN,
+        `INK-192 窄框 ${boxW}：屏幕上一个字都没少（${dom6.join("").replace(/\n/g, "").length}/${EN.length}）`
+      );
+      pass(
+        span6 ? getComputedStyle(span6).whiteSpace === "pre" : false,
+        `INK-192 窄框 ${boxW}：span 是 white-space:pre（浏览器不再自己折）`
+      );
+    }
+    store.data.pages[0].texts = [note1];
+    ed.renderTextLayer(rec);
+    await sleep(20);
+  }
+
+  /* ---------- K7. 纵向装不下要裁行，不能整行消失（INK-192） ---------- */
+  {
+    /*
+     * 老实现只夹起点 y，装不下时「从页顶画、底部溢出接受」：
+     * 屏幕上被 .mb-page 裁掉、导出被 /MediaBox 裁掉，
+     * **三处一致地整行消失**（实测 60 字 size16 框宽 24 → 丢 8 行）。
+     *
+     * 现在 layoutUserText 会裁行并回报 hidden；PageText.text 一个字不动。
+     */
+    const longText = CN54.repeat(4); // 216 字
+    const tiny: PageText = {
+      id: "k7",
+      source: "user",
+      x: 60,
+      y: 200,
+      size: 16,
+      text: longText,
+      color: "#1A1A1A",
+      font: "sans",
+      width: 24, // 极窄框 → 一行一个字 → 必然超页高
+    };
+    const L7 = ed.textLayout(tiny);
+    pass(
+      L7.lines.length < 216,
+      `INK-192 极窄框长文：行数被裁到 ${L7.lines.length}（原 216 行，装不下）`
+    );
+    pass(
+      typeof L7.hidden === "number" && L7.hidden > 0,
+      `INK-192 裁行数回报 hidden=${L7.hidden}（供 UI 提示"还有 N 行未显示"）`
+    );
+    // 末行基线必须落在纸内
+    const lastBaseline7 = L7.y + (L7.lines.length - 1) * L7.lineHeight;
+    pass(
+      lastBaseline7 <= PAGE_H - 8 + 0.01,
+      `INK-192 末行基线 ${lastBaseline7.toFixed(0)} ≤ ${PAGE_H - 8}（不再溢出到纸外）`
+    );
+    // 原文一个字都不丢
+    pass(
+      tiny.text.length === longText.length,
+      `INK-192 原文完整保存在数据里（${tiny.text.length} 字，裁行只影响渲染）`
+    );
+    // 装得下的情况 hidden 必须是 0（不能误报）
+    const short: PageText = { ...tiny, text: "短批注", width: undefined };
+    const L8 = ed.textLayout(short);
+    pass(L8.hidden === 0, `INK-192 装得下时不报 hidden（实际 ${L8.hidden}）`);
+  }
+
+  /* ---------- K8. 窄框混排 / wrapText 不丢字 / 裁行可见提示（INK-192） ---------- */
+  {
+    /*
+     * K6 只覆盖了纯英文窄框。这里补中英混排（空格断 + 逐字硬断都在同一段里），
+     * 并用同一个 measure 验「wrapText 拼回去 === 原文」——折行只决定在哪切，
+     * 不丢字、不加字，这是导出端「一个字都不能少」的保证。
+     * 裁行是**渲染**层的事：wrapText 本身永远返回完整原文。
+     */
+    const MIX =
+      "第 3 章 Chapter 3 Introduction to Inkbook：手写 notebook 的 English words 和数字 2024。\n" +
+      "下一行 mixed text 也要按同一份规则断，中文逐字、西文看 60% 阈值。";
+    const measure = (s: string) => {
+      const cv = document.createElement("canvas").getContext("2d")!;
+      cv.font = "16px system-ui, sans-serif";
+      return cv.measureText(s).width;
+    };
+    for (const boxW of [160, 240]) {
+      const t: PageText = {
+        id: "k8-" + boxW,
+        source: "user",
+        x: 60,
+        y: 200,
+        size: 16,
+        text: MIX,
+        color: "#1A1A1A",
+        font: "sans",
+        width: boxW,
+      };
+      store.data.pages[0].texts = [t];
+      ed.renderTextLayer(rec);
+      await sleep(25);
+      const sp = pageEl().querySelector(".mb-text.is-user") as HTMLElement | null;
+      const L = ed.textLayout(t);
+      const dom = sp ? domLineTexts(sp) : [];
+      pass(
+        !!sp && sameLines(dom, L.lines),
+        `K8 混排窄框 ${boxW}：屏幕 ${dom.length} 行 = 排版源 ${L.lines.length} 行（逐行字数 ${JSON.stringify(dom.map((s) => s.length))}）`
+      );
+      const wrapped = wrapText(t.text, L.width, measure);
+      pass(
+        wrapped.join("") === t.text.split("\n").join(""),
+        `K8 混排窄框 ${boxW}：wrapText(${L.width.toFixed(0)}) 拼回去 === 原文（${wrapped.length} 行不丢字）`
+      );
+    }
+    /* 纯英文 / 纯中文各再验一次不丢字（空格留在行尾、硬断不吞字） */
+    const enOnly = "Chapter 3 Introduction to Inkbook: a handwriting notebook";
+    pass(
+      wrapText(enOnly, 160, measure).join("") === enOnly,
+      "K8 纯英文 160 宽：wrapText 拼回去 === 原文（空格不被吞）"
+    );
+    pass(
+      wrapText(CN54, 24, measure).join("") === CN54,
+      "K8 纯中文 24 宽：wrapText 拼回去 === 原文（逐字硬断不丢字）"
+    );
+
+    /* 裁行时屏幕上必须有可见提示，且提示不能混进原文 */
+    const tinyMix: PageText = {
+      id: "k8-over",
+      source: "user",
+      x: 60,
+      y: 200,
+      size: 16,
+      text: CN54.repeat(4),
+      color: "#1A1A1A",
+      font: "sans",
+      width: 24,
+    };
+    store.data.pages[0].texts = [tinyMix];
+    ed.renderTextLayer(rec);
+    await sleep(25);
+    const more = pageEl().querySelector(".mb-text-more") as HTMLElement | null;
+    const overSpan = pageEl().querySelector(".mb-text.is-user") as HTMLElement | null;
+    const overL = ed.textLayout(tinyMix);
+    pass(
+      !!more && more.textContent === `还有 ${overL.hidden} 行未显示`,
+      `K8 裁行：屏幕显示「还有 ${overL.hidden} 行未显示」（实测 ${more?.textContent ?? "无"}）`
+    );
+    pass(
+      !!overSpan && overSpan.textContent === overL.lines.join("\n"),
+      "K8 裁行：提示没混进 textContent（拖选/复制不会多出 UI 文案）"
+    );
+    pass(
+      wrapText(tinyMix.text, 24, measure).join("") === tinyMix.text,
+      "K8 裁行：wrapText 仍返回完整原文（裁行只发生在 layoutUserText/渲染层）"
+    );
+
+    /* 还原：不裁行时不该留徽标（renderTextLayer 每次先清空整层） */
+    store.data.pages[0].texts = [note1];
+    ed.renderTextLayer(rec);
+    await sleep(20);
+    const noMore = pageEl().querySelector(".mb-text-more");
+    pass(
+      !noMore,
+      `K8 还原：装得下时不显示徽标（没有孤儿节点${noMore ? "，实测 " + noMore.textContent : ""}）`
+    );
   }
 
   /* ---------- L. 编辑框开着时外部换掉数据，提交不能复活成第二条 ---------- */

@@ -41,10 +41,19 @@ export const PAGE_SAFE_INSET = 8;
  *     只有下限没有上限的话，x=700 时「至少 120」会把每行右端推到 820 > 794，
  *     超出的部分被页边界裁掉，又是「字不完整」。
  * 但上限也不能退成 0：宽度 0 时一个字符都放不下，折行没有意义。
+ *
+ * 非有限值兜底（INK-193）：x 或 pageWidth 是 NaN/Infinity 时，原式会一路
+ * 算出 NaN 宽度。wrapText 把 NaN maxWidth 当「非法」等价于**不折行**，
+ * 长句就一路画出纸外被裁掉。存档层已经拦了脏值，但内存态（布局计算的中间量、
+ * 外部直接构造的 PageText）仍可能传进来，所以在这里兜：
+ *   · x 非有限 → 当作页左缘 0（这是"不知道在哪"里最安全的位置，宽度取满）；
+ *   · pageWidth 非有限 → 当作 0，hardMax 至少保证 1，绝不返回 0/NaN。
  */
 export function availableTextWidth(pageWidth: number, x: number): number {
-  const hardMax = Math.max(1, pageWidth - x - PAGE_SAFE_INSET);
-  const room = pageWidth - x - TEXT_RIGHT_MARGIN;
+  const pw = Number.isFinite(pageWidth) ? pageWidth : 0;
+  const sx = Number.isFinite(x) ? x : 0;
+  const hardMax = Math.max(1, pw - sx - PAGE_SAFE_INSET);
+  const room = pw - sx - TEXT_RIGHT_MARGIN;
   return Math.min(Math.max(MIN_TEXT_WIDTH, room), hardMax);
 }
 
@@ -77,6 +86,14 @@ export interface TextLayout {
    * 不许各自再按 x 算一遍——算散了就会出现「屏幕上两行、导出三行」。
    */
   width: number;
+  /**
+   * 因纸面高度装不下而被裁掉的行数（0 = 全部显示）。
+   *
+   * 注意 `PageText.text` **不会**因为裁行而丢字——原文完整保存在数据里，
+   * 这里只是「这一版排版显示不下」。用户调小字号或把框拖宽后，
+   * 被裁的字会重新出现。UI 可以据此提示「还有 N 行未显示」。
+   */
+  hidden?: number;
 }
 
 /**
@@ -109,23 +126,40 @@ export function layoutUserText(
    */
   const custom = Number.isFinite(t.width) ? (t.width as number) : 0;
   const wrapW = custom > 0 ? Math.min(Math.max(custom, MIN_BOX_WIDTH), avail) : avail;
-  const lines = wrapText(t.text, wrapW, measure);
+  let lines = wrapText(t.text, wrapW, measure);
   const lineHeight = size * TEXT_LINE_HEIGHT;
+  /*
+   * **纵向装不下要裁行，不能"从页顶画、底部溢出"**（INK-192）。
+   *
+   * 老实现只夹起点 y：内容比纸高时 yHigh 会被 max(yLow,…) 顶回 yLow，
+   * 于是整段从页顶开始画，超出的行落到页底之外——屏幕上被
+   * `.mb-page` 的 overflow:hidden 裁掉，导出 PDF 被 /MediaBox 裁掉，
+   * **三处一致地整行消失**。实测：60 字 size=16 框宽 24 → 丢 8 行；
+   * 200 字同尺寸 → 丢 148 行。用户看到的就是「我打的字不见了」。
+   *
+   * 现在的做法：先算「从 yLow 起最多能放几行」，超出的行**截断不渲染**。
+   * `PageText.text` 本身一个字都不动（原文完整保存在数据里），
+   * 只是这一版排版不显示超出的部分——用户把字号调小或把文字框拖宽，
+   * 那些字会重新出现。
+   *
+   * `hidden` 回报被裁掉的行数，供 UI 提示「还有 N 行未显示」。
+   */
+  const maxLines = Math.max(
+    1,
+    Math.floor((pageHeight - PAGE_SAFE_INSET - size * 1.2) / lineHeight) + 1
+  );
+  const hidden = Math.max(0, lines.length - maxLines);
+  if (hidden > 0) lines = lines.slice(0, maxLines);
   const last = Math.max(0, lines.length - 1);
   /*
-   * 纵向是**双向**夹取，两头都不能省：
-   *   · yLow：首行基线至少压到字高以下，否则整段顶出页顶——
-   *     屏幕上被 .mb-page 裁掉，导出后基线落在 /MediaBox 之上，
-   *     阅读器一个字节都不显示（54 字变 0 字，这是最彻底的丢字）；
-   *   · yHigh：最后一行基线不越过安全边，否则下面几行整行消失。
-   * yHigh 外面必须再套一层 max(yLow, …)：内容比纸还高时（超大字号 +
-   * 超长文本）yHigh 会算得比 yLow 还小，不套就会反过来把整段推出纸外。
-   * 那种情况属于物理上装不下，只能保证「从页顶开始画」，底部溢出接受。
+   * 纵向夹取（裁行之后一定装得下，yHigh 不会小于 yLow）：
+   *   · yLow：首行基线至少压到字高以下，否则整段顶出页顶；
+   *   · yHigh：最后一行基线不越过安全边。
    */
   const yLow = size * 1.2;
   const yHigh = Math.max(yLow, pageHeight - PAGE_SAFE_INSET - last * lineHeight);
   const y = Math.min(Math.max(t.y, yLow), yHigh);
-  return { x, y, lines, lineHeight, width: wrapW };
+  return { x, y, lines, lineHeight, width: wrapW, hidden };
 }
 
 /**
