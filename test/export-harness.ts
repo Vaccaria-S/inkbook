@@ -365,6 +365,60 @@ async function main() {
     );
   }
 
+  /* -------------------- 文字超出纸面要在导出 Notice 里说（INK-194） -------------------- */
+  {
+    /*
+     * `layoutUserText` 会按可用高度裁行（不裁就是溢出 /MediaBox，
+     * 阅读器整行不显示，比裁掉更糟）。但裁行意味着**导出件少几行**，
+     * 用户必须被告知，否则他会以为「我明明写了那么多」。
+     * 屏幕侧有徽标 + 提交时 Notice，导出侧靠这条汇总。
+     */
+    /*
+     * 用**最后一页**（纯手写、没有别的内容）造超长批注，
+     * 避免同页原有的批注混进「导出字数」里干扰判断。
+     */
+    const lastIdx = editor.store.data.pages.length - 1;
+    const lastPage = editor.store.data.pages[lastIdx];
+    const before = (lastPage.texts || []).slice();
+    const OVF_TEXT = "超长批注内容用于测试裁行".repeat(20); // 240 字
+    lastPage.texts = [
+      {
+        id: "ovf",
+        source: "user",
+        x: 60,
+        y: 200,
+        size: 16,
+        text: OVF_TEXT,
+        color: "#1A1A1A",
+        font: "sans",
+        width: 24,
+      } as any,
+    ];
+    const p = await exportBookPdf(vault, editor, file, 1, { from: lastIdx + 1, to: lastIdx + 1 });
+    /*
+     * 这个套件不抓 Notice（没有 console 拦截），所以从**产物**验证：
+     * 裁行后导出件里的文字必然比原文少——但所有画出来的行都必须在纸内。
+     */
+    const ob = written.get(p);
+    let clippedOk = false;
+    let detail = "";
+    try {
+      const od = await pdfjs.getDocument({ data: ob!.slice() }).promise;
+      const op = await od.getPage(1);
+      const items = (await op.getTextContent()).items as any[];
+      const got = items.map((it) => it.str || "").join("");
+      const full = OVF_TEXT;
+      // 裁行：导出件里的字 < 原文，但必须是原文的**前缀**（不能乱序/丢中间）
+      clippedOk = got.length > 0 && got.length < Array.from(full).length && full.startsWith(got);
+      detail = `导出 ${got.length} / 原文 ${Array.from(full).length} 字`;
+      await od.destroy();
+    } catch (e: any) {
+      detail = "解析失败：" + String(e?.message || e).slice(0, 60);
+    }
+    pass(clippedOk, "INK-194 超长文字被裁行导出（" + detail + "，且是原文前缀不乱序）");
+    lastPage.texts = before;
+  }
+
   /* -------------------- 指定页范围导出（INK-133） -------------------- */
   {
     const rangePath = await exportBookPdf(vault, editor, file, 2, { from: 2, to: 3 });

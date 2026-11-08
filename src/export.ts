@@ -288,9 +288,19 @@ export function pageHasUserText(p?: Page): boolean {
   );
 }
 
-function drawUserTextsPdf(page: PDFPage, src: Page, font: PDFFont, pageH: number): void {
+/**
+ * @returns 这一页是否有文字因超出纸面被裁掉（调用方据此统计、在导出
+ *   Notice 里告诉用户「N 页的文字没完整导出」）。
+ */
+function drawUserTextsPdf(
+  page: PDFPage,
+  src: Page,
+  font: PDFFont,
+  pageH: number
+): boolean {
   const texts = (src.texts || []).filter((t) => t.source === "user" && (t.text || "").trim());
-  if (!texts.length) return;
+  if (!texts.length) return false;
+  let clipped = false;
   /*
    * 纸宽换回页面坐标（794 那套）：textwrap 里的排版规则全程用页面坐标，
    * 量的宽度也换成页面坐标（除以 PT_PER_UNIT），画的时候再乘回去。
@@ -315,6 +325,8 @@ function drawUserTextsPdf(page: PDFPage, src: Page, font: PDFFont, pageH: number
       // 度量换算成页面坐标，跟 maxWidth / x / y 同一套单位
       (s) => font.widthOfTextAtSize(s, sizePt) / PT_PER_UNIT
     );
+    // 这一页有文字被裁（装不下）→ 记下来，导出完告诉用户
+    if (l.hidden && l.hidden > 0) clipped = true;
     for (let i = 0; i < l.lines.length; i += 1) {
       const line = l.lines[i];
       if (!line) continue;
@@ -328,6 +340,7 @@ function drawUserTextsPdf(page: PDFPage, src: Page, font: PDFFont, pageH: number
       });
     }
   }
+  return clipped;
 }
 
 /**
@@ -478,6 +491,15 @@ async function exportBookPdfImpl(
   let vectorPages = 0;
   let textPages = 0;
   let fallbackPages = 0;
+  /*
+   * 有文字超出纸面、没能完整导出的页数（INK-194）。
+   *
+   * `layoutUserText` 现在按可用高度裁行（不裁就是溢出到 /MediaBox 之外，
+   * 阅读器整行不显示——比裁掉更糟，因为用户完全不知道丢了）。
+   * 但裁行意味着**导出件会少几行**，用户必须被告知，否则他会以为
+   * 「我明明写了那么多」。屏幕侧有徽标 + Notice，导出侧只有这条汇总。
+   */
+  let overflowPages = 0;
 
   for (let k = 0; k < indices.length; k++) {
     throwIfCancelled(signal);
@@ -545,7 +567,7 @@ async function exportBookPdfImpl(
             throwIfCancelled(signal);
             out.drawImage(png, { x: 0, y: 0, width: A4_W, height: A4_H });
             if (vectorText && zhFont) {
-              drawUserTextsPdf(out, page, zhFont, pageH);
+              if (drawUserTextsPdf(out, page, zhFont, pageH)) overflowPages += 1;
               // 只统计真有批注的页：否则 Notice 会把整本页数都算进去
               if (pageHasUserText(page)) textPages += 1;
             }
@@ -576,7 +598,7 @@ async function exportBookPdfImpl(
       const out = doc.addPage([A4_W, A4_H]);
       out.drawImage(png, { x: 0, y: 0, width: A4_W, height: A4_H });
       if (vectorText && zhFont) {
-        drawUserTextsPdf(out, page, zhFont, pageH);
+        if (drawUserTextsPdf(out, page, zhFont, pageH)) overflowPages += 1;
         if (pageHasUserText(page)) textPages += 1;
       }
     }
@@ -606,6 +628,9 @@ async function exportBookPdfImpl(
   const notes: string[] = [];
   if (vectorPages) notes.push(`${vectorPages} 页保留了 PDF 原文，可选中可搜索`);
   if (textPages) notes.push(`${textPages} 页的批注文字可选中`);
+  if (overflowPages) {
+    notes.push(`${overflowPages} 页有文字超出纸面，未完整导出（原文没丢，调小字号或拖宽文字框后可重新导出）`);
+  }
   if (fallbackPages) {
     notes.push(`${fallbackPages} 页批注含生僻字，按图片导出（看得见但选不中）`);
   }
