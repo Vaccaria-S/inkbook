@@ -146,13 +146,19 @@ function domLineTexts(el: HTMLElement): string[] {
   return res;
 }
 
-/** 给 span 套上「编辑框同样的 CSS 折行规则」，返回浏览器排出来的行 */
+/**
+ * 给 span 套上「编辑框同样的 CSS 折行规则」，返回浏览器排出来的行。
+ *
+ * word-break 必须跟 .mb-text-edit 的 CSS 同步（INK-192 改成 break-all）：
+ * 这个模拟器量的是 textarea 里用户提交前看到的行，规则写错就成了
+ * 「模拟器与自己比」，永远绿却测不到真实的所见 ≠ 所得。
+ */
 function cssLines(text: string, size: number, fontFamily: string, widthPageUnits: number): string[] {
   const z = zoom();
   const div = document.createElement("div");
   div.style.cssText =
     "position:absolute;left:0;top:0;visibility:hidden;margin:0;padding:0;border:0;" +
-    `white-space:pre-wrap;overflow-wrap:break-word;word-break:break-word;` +
+    `white-space:pre-wrap;overflow-wrap:break-word;word-break:break-all;` +
     `font-family:${fontFamily};font-size:${size * z}px;line-height:1.32;` +
     `width:${widthPageUnits * z}px;`;
   div.textContent = text;
