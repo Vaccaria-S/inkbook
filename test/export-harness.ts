@@ -20,7 +20,7 @@ import {
   type ExportRangeResult,
 } from "../src/export";
 import { chineseFontBytes } from "../src/fontasset";
-import { describeExportError } from "../src/view";
+import { describeExportError, describeImportError } from "../src/view";
 import {
   PDFArray,
   PDFDict,
@@ -1229,6 +1229,28 @@ async function main() {
       "导出错误中文化：认不出来时保留原文（便于贴回来排查）"
     );
     pass(describeExportError(null) === "未知错误", "导出错误中文化：空错误有兜底文案");
+
+    /*
+     * INK-218 导入错误中文化：Word 的错不能被映射成「PDF 有密码」。
+     * docx 是加密 zip 时，解压错误里也带 encrypted 字样，老的裸关键词
+     * 匹配会把用户导的 Word 说成「PDF 有密码」。
+     */
+    const docxErr = describeImportError(
+      new Error("当前系统不支持解压 .docx（deflate-raw 格式不可用）"),
+      "word"
+    );
+    pass(
+      docxErr.includes(".docx") && !docxErr.includes("PDF 有密码"),
+      "INK-218 Word 错误不被误映射成「PDF 有密码」（" + docxErr + "）"
+    );
+    pass(
+      describeImportError(new Error("Encrypted docx content"), "word").includes("PDF") === false,
+      "INK-218 带 encrypted 字样的 Word 错误仍保留原意"
+    );
+    pass(
+      describeImportError(new Error("No password given"), "pdf").includes("PDF 有密码"),
+      "INK-218 真正的 PDF 密码错误仍然提示 PDF 有密码"
+    );
     // 导出链路本身不能吞掉原始错误，否则界面层拿不到可映射的原因
     let rawErr: any = null;
     writeFailFor = (p) => p.endsWith(".tmp");

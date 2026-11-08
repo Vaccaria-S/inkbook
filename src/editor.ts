@@ -2673,7 +2673,7 @@ export class BookEditor {
      * 这里按视口中心重新算一次，当下看到的是哪页就锁哪页。
      */
     this.pinchStartPage = this.pageIndexAt(
-      this.scrollEl.getBoundingClientRect().top + this.scrollEl.clientHeight * 0.42
+      this.scrollEl.getBoundingClientRect().top + this.currentPageProbeOffset()
     );
     window.clearTimeout(this.pinchReleaseTimer);
     this.pinchReleaseTimer = 0;
@@ -5844,6 +5844,22 @@ export class BookEditor {
    *
    * 一次滚动只读一次 scrollTop，不触发任何重排。
    */
+  /**
+   * 「当前页」取样点距视口顶部的距离（视口高度的 42%，最多 460px）。
+   *
+   * **必须只有一个来源**（2026-11-08）。以前 beginPinch 自己写
+   * `clientHeight * 0.42`、updateCurrentFromScroll 写
+   * `min(clientHeight * 0.42, 460)` —— 屏幕高超过约 1095px 时两者
+   * 落在不同页：捏合期间锁的是「偏下那页」，手势结束先回跳到它，
+   * 240ms 解冻后再跳回真正那页，用户看到页码闪两下。
+   *
+   * 上限 460 的理由：大屏上 42% 会跑到下一屏去，取样点离顶部太远
+   * 就不是「用户正在看的那页」了。
+   */
+  private currentPageProbeOffset(): number {
+    return Math.min(this.scrollEl.clientHeight * 0.42, 460);
+  }
+
   private updateCurrentFromScroll(quiet = false): void {
     if (!this.recs.length) return;
     const n = this.recs.length;
@@ -5852,7 +5868,7 @@ export class BookEditor {
 
     const stride = pageH + this.pageGap;
     // 视口中线在滚动内容里的位置
-    const mid = this.scrollEl.scrollTop + Math.min(this.scrollEl.clientHeight * 0.42, 460);
+    const mid = this.scrollEl.scrollTop + this.currentPageProbeOffset();
     // 减去首页顶部，得到"第几页 × stride"
     const rel = mid - this.pageOrigin;
 

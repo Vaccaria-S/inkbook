@@ -208,10 +208,23 @@ function conflictStamp(d: Date): string {
  * 用户不知道该怎么办。这里按关键词映射成中文，认不出来的保留原文
  * （总比吞掉好，至少能贴给我排查）。
  */
-function describeImportError(e: any): string {
+export function describeImportError(e: any, kind?: "pdf" | "word"): string {
   const raw = String((e && e.message) || e || "").trim();
   const low = raw.toLowerCase();
   if (!raw) return "未知错误";
+  /*
+   * **Word 的错不走 PDF 的关键词映射**（2026-11-08）。
+   *
+   * 下面「加密 / 需要密码」那条是按 pdf.js 的措辞写的，但它匹配的是
+   * 裸关键词 `encrypted` —— docx 是加密 zip（Word 的「用密码保护」）
+   * 时，解压阶段抛的错里也带这个词，会被误映射成
+   * 「这个 PDF 有密码」：用户导的明明是 Word，却被告知 PDF 有密码。
+   *
+   * 用**调用方传入的类型**判断，不靠猜错误文本 —— 错误消息里是否出现
+   * ".docx" 完全看抛出点怎么写，不可靠。word.ts 抛的都是中文，原样透出
+   * 已经足够清楚。
+   */
+  if (kind === "word") return raw;
   // 加密 / 需要密码
   if (
     low.includes("password") ||
@@ -3039,7 +3052,7 @@ export class InkbookView extends FileView {
       } catch (_) {
         /* 已释放 / 释放失败都无所谓 */
       }
-      new Notice("导入失败，未新建手写本：" + describeImportError(e), 8000);
+      new Notice("导入失败，未新建手写本：" + describeImportError(e, kind), 8000);
       console.error("[inkbook] 导入并新建失败", e);
       return;
     }
@@ -3213,7 +3226,7 @@ export class InkbookView extends FileView {
       setTimeout(() => notice.hide(), 2500);
     } catch (e: any) {
       notice.hide();
-      new Notice("导入失败：" + describeImportError(e), 8000);
+      new Notice("导入失败：" + describeImportError(e, kind), 8000);
       console.error("[inkbook] 导入失败", e);
     }
   }
