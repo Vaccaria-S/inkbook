@@ -18,10 +18,30 @@ export interface InkbookPluginLike {
 
 export class InkbookSettingTab extends PluginSettingTab {
   plugin: InkbookPluginLike;
+  /** 滑杆防抖保存的定时器（见 saveSoon） */
+  private saveTimer = 0;
 
   constructor(app: App, plugin: InkbookPluginLike) {
     super(app, plugin as any);
     this.plugin = plugin;
+  }
+
+  /**
+   * 滑杆用的防抖保存（INK-202）。
+   *
+   * 滑杆的 `step` 很小（0.2 / 0.05），拖一次能连发几十个 `onChange`。
+   * 每个都 `saveSettings()` = 几十次全量 `saveData`，而多窗口场景下
+   * 全量覆盖会放大竞态（正是 INK-179 担心的那个问题）。
+   *
+   * 防抖 250ms：拖动期间只写最后一次。`refreshViews()` 仍然**立刻**调
+   * ——用户要的是"拖的时候实时看到粗细变化"，延迟它反而像卡了。
+   */
+  private saveSoon(): void {
+    if (this.saveTimer) window.clearTimeout(this.saveTimer);
+    this.saveTimer = window.setTimeout(() => {
+      this.saveTimer = 0;
+      void this.plugin.saveSettings();
+    }, 250);
   }
 
   display(): void {
@@ -64,7 +84,7 @@ export class InkbookSettingTab extends PluginSettingTab {
           .setDynamicTooltip()
           .onChange(async (v) => {
             this.plugin.settings.defaultPenSize = v;
-            await this.plugin.saveSettings();
+            this.saveSoon();
             this.plugin.refreshViews();
           })
       );
@@ -79,7 +99,7 @@ export class InkbookSettingTab extends PluginSettingTab {
           .setDynamicTooltip()
           .onChange(async (v) => {
             this.plugin.settings.defaultHighlighterSize = v;
-            await this.plugin.saveSettings();
+            this.saveSoon();
             this.plugin.refreshViews();
           })
       );
@@ -125,7 +145,7 @@ export class InkbookSettingTab extends PluginSettingTab {
           .setDynamicTooltip()
           .onChange(async (v) => {
             this.plugin.settings.pressure = v;
-            await this.plugin.saveSettings();
+            this.saveSoon();
             this.plugin.refreshViews();
           })
       );
@@ -140,7 +160,7 @@ export class InkbookSettingTab extends PluginSettingTab {
           .setDynamicTooltip()
           .onChange(async (v) => {
             this.plugin.settings.smoothing = v;
-            await this.plugin.saveSettings();
+            this.saveSoon();
             this.plugin.refreshViews();
           })
       );
@@ -175,11 +195,20 @@ export class InkbookSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(this.plugin.settings.touchDraw === true).onChange(async (v) => {
           this.plugin.settings.touchDraw = v;
-          // 与侧栏开关一致：打开手指书写时一并关掉「只认触控笔」，
-          // 否则后者会把手写压住，开关看起来像没生效。
+          /*
+           * 与侧栏开关一致：打开手指书写时一并关掉「只认触控笔」，
+           * 否则后者会把手写压住，开关看起来像没生效。
+           *
+           * **改完必须重绘面板**（INK-202）：上面那个「只认触控笔」
+           * Toggle 的 DOM 是打开设置页时按当时的值建的，这里改了字段
+           * 它不会跟着变——用户会看到「手指书写」开着、「只认触控笔」
+           * 也还亮着，两个互斥的开关同时显示「开」，界面在骗人。
+           */
+          const crossChanged = v && this.plugin.settings.penOnly;
           if (v) this.plugin.settings.penOnly = false;
           await this.plugin.saveSettings();
           this.plugin.refreshViews();
+          if (crossChanged) this.display();
         })
       );
 

@@ -689,6 +689,28 @@ async function T2() {
     cancelled === 1,
     "T2 关自动保存时取消已排队的落盘（cancelPendingSaves " + cancelled + " 次）"
   );
+
+  /*
+   * INK-202：已经打开的设置页也要重绘。
+   *
+   * 别的窗口改了设置 → 重读 + 刷新视图，但设置页的控件 DOM 还是旧值
+   * ——用户看着「自动保存」开关是关的，实际磁盘上已经开了。
+   */
+  {
+    let redrawn = 0;
+    (p as any).settingTab = {
+      display: () => redrawn++,
+      containerEl: { isShown: () => true },
+    };
+    await p.onExternalSettingsChange();
+    pass(redrawn === 1, "INK-202 外部设置变更时重绘已打开的设置页（" + redrawn + " 次）");
+
+    // 设置页没打开时不该白重绘
+    redrawn = 0;
+    (p as any).settingTab.containerEl.isShown = () => false;
+    await p.onExternalSettingsChange();
+    pass(redrawn === 0, "INK-202 设置页没打开时不重绘（" + redrawn + " 次）");
+  }
 }
 
 /** T3：normalizePoints 是最后一道防线，NaN / Infinity 的点不许进存档 */

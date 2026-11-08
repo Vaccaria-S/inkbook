@@ -52,6 +52,13 @@ class BookPickerModal extends FuzzySuggestModal<TFile> {
 
 export default class InkbookPlugin extends Plugin {
   settings: InkbookSettings = { ...DEFAULT_SETTINGS };
+  /**
+   * 设置页实例（`onExternalSettingsChange` 要靠它重绘）。
+   *
+   * Obsidian 的 `addSettingTab` 不返回句柄，只能自己存一份——
+   * 否则多窗口同步改了设置，已打开的设置页还显示旧值。
+   */
+  private settingTab: InkbookSettingTab | null = null;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -101,7 +108,9 @@ export default class InkbookPlugin extends Plugin {
       },
     });
 
-    this.addSettingTab(new InkbookSettingTab(this.app, this));
+    // 存一份引用：多窗口同步改了设置时，要靠它重绘已打开的设置页
+    this.settingTab = new InkbookSettingTab(this.app, this);
+    this.addSettingTab(this.settingTab);
 
     /*
      * 补建历史索引。
@@ -645,6 +654,19 @@ export default class InkbookPlugin extends Plugin {
   async onExternalSettingsChange(): Promise<void> {
     await this.loadSettings();
     this.refreshViews();
+    /*
+     * 已经打开的设置页也要重绘（INK-202）。
+     *
+     * 别的窗口改了设置 → data.json 变了 → 这里重读并刷新视图，
+     * 但设置页的控件是打开时按当时的值建的 DOM，不重绘就还是旧值
+     * ——用户看着「关闭自动保存」的开关是关的，实际磁盘上已经开了。
+     * 不会冲掉正在拖的控件（onChange 实时读 plugin.settings），
+     * 只是让显示跟上真实值。
+     */
+    const tab: any = this.settingTab;
+    if (tab && typeof tab.display === "function" && tab.containerEl?.isShown?.()) {
+      tab.display();
+    }
   }
 
   refreshViews(): void {
