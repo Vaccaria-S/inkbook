@@ -26,7 +26,7 @@ const only = process.argv[2] || "";
 const PAGES = [
   ["test.html", 310],
   ["export.html", 129],
-  ["p1.html", 200],
+  ["p1.html", 209],
   ["view.html", 117],
   ["tablet.html", 32],
   ["zoom.html", 21],
@@ -50,7 +50,7 @@ const PAGES = [
   ["qa-embed4.html", 122],
   ["pdftext.html", 177],
   ["qa-ink118-visual.html", 296],
-  ["modals.html", 70],
+  ["modals.html", 87],
   // 纸面模板渲染（INK-201）：6 模板 × 3 纸色 + 三处（屏幕/导出/嵌入）一致
   ["paper.html", 131],
 ];

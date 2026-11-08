@@ -21,6 +21,7 @@ import {
   JumpPageModal,
   OutlineModal,
   PromptModal,
+  safeImportFileName,
 } from "../src/modals";
 // 走 build-tests.mjs 的 obsidian alias → test/obsidian-stub.mjs；
 // 与 src/modals.ts 里 import 的是同一个模块实例，改 prototype 能影响被测代码。
@@ -737,6 +738,224 @@ async function main(): Promise<void> {
       got.length === 1 && got[0][0] === 1 && got[0][1] === 50,
       "页码范围：导出确认回调默认全范围"
     );
+  }
+
+  /* ---------------------- INK-207 从设备选择文件 ---------------------- */
+  /*
+   * 平板上 `<input type="file">` 拿不到本地路径，但能拿到 File 对象。
+   * 这里验证「File → ArrayBuffer → vault.createBinary → onPick」这条新增的
+   * 来路，以及文件名清洗 / 撞名 / 扩展名自校验 / 大文件提示。
+   */
+  {
+    const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const notices = captureNotices();
+    const realVault = app.vault;
+    const bin = new Map<string, ArrayBuffer>();
+    const folders: string[] = [];
+    /** 让前 N 次路径探测都返回「已存在」，用来稳定复现撞名 */
+    let forceExists = 0;
+    /** 删除记账：用来证明确实**没有**把刚写进库的源文件删掉 */
+    let removed = 0;
+
+    const deviceVault: any = {
+      getFiles: () => vaultFiles,
+      getAbstractFileByPath: () => null,
+      delete: async () => {
+        removed++;
+      },
+      createFolder: async (p: string) => {
+        folders.push(p);
+        return { path: p };
+      },
+      createBinary: async (p: string, data: ArrayBuffer) => {
+        bin.set(p, data);
+        return mkFile(p, data.byteLength);
+      },
+      adapter: {
+        remove: async () => {
+          removed++;
+        },
+        exists: async (p: string) => {
+          if (p === ".inkbook-assets") return folders.includes(p);
+          if (forceExists > 0) {
+            forceExists--;
+            return true;
+          }
+          return bin.has(p);
+        },
+        mkdir: async (p: string) => {
+          folders.push(p);
+        },
+      },
+    };
+    app.vault = deviceVault;
+    vaultFiles = [];
+
+    try {
+      /* 1) 空库也能从设备选：按钮 + 隐藏 input 必须都在 */
+      const picked: any[] = [];
+      const m = new ImportSourceModal(app, "pdf", (f) => picked.push(f));
+      const el = openModal(m);
+      pass(
+        !!button(el, "从设备选择文件…"),
+        "INK-207 库里没有文件时仍显示「从设备选择文件…」"
+      );
+      pass(
+        el.querySelector(".mb-error")?.textContent === "库里还没有 PDF 文件。",
+        "INK-207 空库仍保留原来的空状态提示"
+      );
+
+      const input = el.querySelector('input[type="file"]') as HTMLInputElement;
+      pass(
+        !!input &&
+          input.type === "file" &&
+          (input.getAttribute("accept") || "").includes(".pdf"),
+        "INK-207 隐藏的文件输入框接受 .pdf"
+      );
+
+      const fake: any = {
+        // 带路径分隔符和 Windows 非法字符：模拟平板 / 另一台电脑给的名字
+        name: "我的/讲义?.PDF",
+        size: 4,
+        arrayBuffer: async () => new Uint8Array([37, 80, 68, 70]).buffer,
+      };
+      Object.defineProperty(input, "files", { configurable: true, get: () => [fake] });
+      input.dispatchEvent(new Event("change"));
+      await sleepMs(80);
+
+      const got = picked[0];
+      pass(
+        picked.length === 1 &&
+          /^\.inkbook-assets\/imported-\d+-我的_讲义_\.pdf$/.test(got?.path || ""),
+        "INK-207 文件名被清洗并写进 .inkbook-assets（" + (got?.path || "-") + "）"
+      );
+      const copied = got ? bin.get(got.path) : undefined;
+      pass(
+        !!copied && new Uint8Array(copied).join(",") === "37,80,68,70",
+        "INK-207 字节原样写进库（File → createBinary）"
+      );
+      pass(folders.includes(".inkbook-assets"), "INK-207 自动创建 .inkbook-assets 目录");
+      pass(!el.isConnected, "INK-207 选中设备文件后弹窗关闭");
+      pass(
+        !!got && bin.has(got.path) && removed === 0,
+        "INK-207 源文件保留在库（PDF 懒渲染 / 导出还要用，不删）"
+      );
+
+      /* 2) 扩展名自校验：accept 可能被平板忽略，不能只依赖它 */
+      const picked2: any[] = [];
+      const m2 = new ImportSourceModal(app, "pdf", (f) => picked2.push(f));
+      const el2 = openModal(m2);
+      const input2 = el2.querySelector('input[type="file"]') as HTMLInputElement;
+      const wrong: any = {
+        name: "说明.docx",
+        size: 10,
+        arrayBuffer: async () => new ArrayBuffer(0),
+      };
+      Object.defineProperty(input2, "files", { configurable: true, get: () => [wrong] });
+      input2.dispatchEvent(new Event("change"));
+      await sleepMs(50);
+      pass(
+        picked2.length === 0 && el2.isConnected,
+        "INK-207 选错扩展名不回调、不关窗"
+      );
+      pass(
+        notices.includes("只能导入 PDF 文件：说明.docx"),
+        "INK-207 选错扩展名给出明确提示（" + notices.slice(-1).join("") + "）"
+      );
+      pass(
+        (el2.querySelector(".mb-import-status")?.textContent || "").includes("不是 PDF 文件"),
+        "INK-207 弹窗内也有失败原因"
+      );
+      m2.close();
+
+      /* 3) 撞名：库里已有同名 imported 文件时加序号，绝不覆盖 */
+      forceExists = 1;
+      const picked3: any[] = [];
+      const m3 = new ImportSourceModal(app, "pdf", (f) => picked3.push(f));
+      const el3 = openModal(m3);
+      const input3 = el3.querySelector('input[type="file"]') as HTMLInputElement;
+      const dup: any = {
+        name: "撞名.pdf",
+        size: 2,
+        arrayBuffer: async () => new Uint8Array([1, 2]).buffer,
+      };
+      Object.defineProperty(input3, "files", { configurable: true, get: () => [dup] });
+      input3.dispatchEvent(new Event("change"));
+      await sleepMs(80);
+      pass(
+        picked3.length === 1 && picked3[0].path.includes("-1-撞名.pdf"),
+        "INK-207 撞名时加序号而不是覆盖（" + (picked3[0]?.path || "-") + "）"
+      );
+
+      /* 4) 大文件先提示等待（否则用户以为点了没反应） */
+      const bigNoticesBefore = notices.length;
+      const m4 = new ImportSourceModal(app, "pdf", () => {});
+      const el4 = openModal(m4);
+      const input4 = el4.querySelector('input[type="file"]') as HTMLInputElement;
+      const big: any = {
+        name: "扫描件.pdf",
+        size: 21 * 1024 * 1024,
+        arrayBuffer: async () => new Uint8Array([1]).buffer,
+      };
+      Object.defineProperty(input4, "files", { configurable: true, get: () => [big] });
+      input4.dispatchEvent(new Event("change"));
+      await sleepMs(80);
+      pass(
+        notices.slice(bigNoticesBefore).some((n) => n.includes("文件较大")),
+        "INK-207 大文件给出「需要一点时间」提示（" + notices.slice(bigNoticesBefore).join("|") + "）"
+      );
+
+      /* 5) 空视图的 any：标题、列表、设备 input 都覆盖 PDF + docx */
+      vaultFiles = [mkFile("a.pdf", 10), mkFile("b.docx", 20), mkFile("c.md", 30)];
+      const pickedAny: any[] = [];
+      const mAny = new ImportSourceModal(app, "any", (f) => pickedAny.push(f));
+      const elAny = openModal(mAny);
+      pass(elAny.querySelector("h3")?.textContent === "导入文档", "INK-207 any：标题为「导入文档」");
+      pass(
+        elAny.querySelectorAll(".mb-import-item").length === 2,
+        "INK-207 any：库里同时列出 PDF 与 docx（忽略 md）"
+      );
+      const anyInput = elAny.querySelector('input[type="file"]') as HTMLInputElement;
+      pass(
+        (anyInput.getAttribute("accept") || "").includes(".pdf") &&
+          (anyInput.getAttribute("accept") || "").includes(".docx"),
+        "INK-207 any：文件输入框同时接受 .pdf / .docx"
+      );
+    } finally {
+      app.vault = realVault;
+      vaultFiles = [];
+      releaseNotices();
+    }
+  }
+
+  /* ---------------- INK-208 文件名清洗（含 Windows 保留名） ---------------- */
+  {
+    /*
+     * 「从设备选文件」会拿到任意文件名。除了常规非法字符，
+     * **Windows 保留名**（CON/PRN/AUX/NUL/COM1-9/LPT1-9）根本创建不了
+     * ——带扩展名的 `CON.pdf` 也不行，系统会当成设备名。
+     * 这是新功能直接引入的风险面，必须锁住。
+     */
+    const cases: Array<[string, string, string]> = [
+      ["我的/讲义?.pdf", "我的_讲义_.pdf", "路径分隔符 + ? 被替换"],
+      ["CON", "_CON", "Windows 保留名 CON"],
+      ["CON.pdf", "_CON.pdf", "带扩展名的保留名 CON.pdf"],
+      ["nul.docx", "_nul.docx", "保留名小写 nul"],
+      ["COM1.pdf", "_COM1.pdf", "保留名 COM1"],
+      ["LPT9.pdf", "_LPT9.pdf", "保留名 LPT9"],
+      ["正常文件.pdf", "正常文件.pdf", "正常名字不动"],
+      ["带 空格 的名字.pdf", "带 空格 的名字.pdf", "空格保留（只有一个）"],
+      [".hidden.pdf", "hidden.pdf", "主干不以点开头"],
+      ["a".repeat(200) + ".pdf", "a".repeat(80) + ".pdf", "超长主干截到 80"],
+      ["无扩展名", "无扩展名", "无扩展名时只清洗主干"],
+      ["x.PDF", "x.pdf", "扩展名转小写"],
+    ];
+    let bad = "";
+    for (const [input, want, label] of cases) {
+      const got = safeImportFileName(input);
+      if (got !== want) bad += ` ${label}(得 ${JSON.stringify(got)})`;
+    }
+    pass(bad === "", "INK-208 文件名清洗 " + cases.length + " 种（含 Windows 保留名）" + (bad ? "：" + bad : ""));
   }
 
   log("DONE");

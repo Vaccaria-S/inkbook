@@ -15,6 +15,7 @@ import {
 import {
   A4_HEIGHT,
   A4_WIDTH,
+  createBook,
   HIGHLIGHTER_SIZES,
   PAPERS,
   PEN_COLORS,
@@ -36,8 +37,15 @@ import {
   OutlineModal,
   ImportSourceModal,
   ImportRangeModal,
+  safeName,
 } from "./modals";
-import { humanBytes, importPdf, importWord, peekPdf } from "./importer";
+import {
+  humanBytes,
+  importPdf,
+  importWord,
+  peekPdf,
+  type ImportProgress,
+} from "./importer";
 import { ExportCancelledError, exportBookPdf, exportPagePng } from "./export";
 import { refreshEmbedsForPath } from "./embed";
 
@@ -1477,13 +1485,30 @@ export class InkbookView extends FileView {
     box.createEl("p", {
       text: "A4 纸、压感笔锋、纸张模板、图层、连续翻页。写满一页就往下加。",
     });
-    const btn = box.createEl("button", { cls: "mod-cta", text: "新建手写本" });
+    /*
+     * 两个入口：
+     *   · 新建手写本 —— 原来就有；
+     *   · 导入文档开始 —— 很多用户的第一反应是「我有个 PDF 想在上面写」，
+     *     先让他挑文档、再自动建本子，比「先建空本、再在工具栏里找导入」
+     *     少一步，也避免建完空本又忘了导入。
+     */
+    const actions = box.createDiv("mb-empty-actions");
+    const btn = actions.createEl("button", { cls: "mod-cta", text: "新建手写本" });
     btn.onclick = () => this.openNewBook();
+    const imp = actions.createEl("button", { text: "导入文档开始" });
+    imp.onclick = () => this.startImportNewBook();
   }
 
   private openNewBook(): void {
     new NewBookModal(this.app, this.plugin as any, (file) => {
       this.app.workspace.getLeaf("tab").openFile(file);
+    }).open();
+  }
+
+  /** 空视图里的「导入文档开始」：PDF / docx 都收（由扩展名决定走哪条导入） */
+  private startImportNewBook(): void {
+    new ImportSourceModal(this.app, "any", (file) => {
+      void this.importAsNewBook(file);
     }).open();
   }
 
@@ -2830,51 +2855,228 @@ export class InkbookView extends FileView {
     if (kind === "pdf") {
       const peeked = await peekPdf(this.app, file);
       preopened = peeked.doc;
-      const total = peeked.total;
-      if (total > IMPORT_RANGE_THRESHOLD) {
-        /*
-         * 等用户选范围。
-         *
-         * 取消判定的写法要小心：真实 Obsidian 的 `Modal.close()` 会
-         * **同步**调用 `onClose()`。所以用「确认标志」而不是靠时序 ——
-         * `onDone` 先跑（`finish()` 已改成先回调再 close），
-         * `onClose` 时若没确认过才当取消。
-         *
-         * （`test/dist-harness.ts` 的 Modal.close 不调 onClose，
-         * 自动测试测不出这类时序问题，所以这里逻辑要自己站得住。）
-         */
-        let confirmed = false;
-        const picked = await new Promise<{ from: number; to: number } | null>((resolve) => {
-          let settled = false;
-          const done = (v: { from: number; to: number } | null) => {
-            if (settled) return;
-            settled = true;
-            resolve(v);
-          };
-          const modal = new ImportRangeModal(this.app, "pdf", total, (from, to) => {
-            confirmed = true;
-            done({ from, to });
-          });
-          const origClose = modal.onClose.bind(modal);
-          modal.onClose = () => {
-            origClose();
-            if (!confirmed) done(null); // 没确认就关窗 = 用户取消
-          };
-          modal.open();
-        });
-        if (!picked) {
-          // 用户取消：把已经打开的 doc 释放掉，别让它挂着
-          try {
-            await preopened?.destroy();
-          } catch (_) {
-            /* 释放失败无所谓 */
-          }
-          return;
+      const picked = await this.askPdfRange(peeked.total);
+      if (picked === null) {
+        // 用户取消：把已经打开的 doc 释放掉，别让它挂着
+        try {
+          await preopened?.destroy();
+        } catch (_) {
+          /* 释放失败无所谓 */
         }
-        range = picked;
+        return;
       }
+      range = picked;
     }
     await this.doImport(kind, file, range, preopened, startFile, startStore);
+  }
+
+  /**
+   * 问用户要导入 PDF 的哪几页。
+   *
+   * **只在页数多的时候问**（≤ `IMPORT_RANGE_THRESHOLD` 直接整本）：
+   * 小文档弹一次范围选择纯属打断。
+   *
+   * @returns `undefined` = 不用选（整本）；`null` = 用户取消；对象 = 选定范围
+   */
+  private async askPdfRange(
+    total: number
+  ): Promise<{ from: number; to: number } | null | undefined> {
+    if (!(total > IMPORT_RANGE_THRESHOLD)) return undefined;
+    /*
+     * 取消判定的写法要小心：真实 Obsidian 的 `Modal.close()` 会
+     * **同步**调用 `onClose()`。所以用「确认标志」而不是靠时序 ——
+     * `onDone` 先跑（`finish()` 已改成先回调再 close），
+     * `onClose` 时若没确认过才当取消。
+     *
+     * （`test/dist-harness.ts` 的 Modal.close 不调 onClose，
+     * 自动测试测不出这类时序问题，所以这里逻辑要自己站得住。）
+     */
+    let confirmed = false;
+    return await new Promise<{ from: number; to: number } | null>((resolve) => {
+      let settled = false;
+      const done = (v: { from: number; to: number } | null) => {
+        if (settled) return;
+        settled = true;
+        resolve(v);
+      };
+      const modal = new ImportRangeModal(this.app, "pdf", total, (from, to) => {
+        confirmed = true;
+        done({ from, to });
+      });
+      const origClose = modal.onClose.bind(modal);
+      modal.onClose = () => {
+        origClose();
+        if (!confirmed) done(null); // 没确认就关窗 = 用户取消
+      };
+      modal.open();
+    });
+  }
+
+  /**
+   * 空视图「导入文档开始」的整条动线：选中的文档 → 新建一本本子 → 打开。
+   *
+   * **为什么先导入、再建文件，而不是先建空本子再调 runImport**：
+   *   · 新本子的第一页就是文档第一页，不会先留一张白纸（用户要的是
+   *     「从这份讲义开始」，不是「一份讲义前面还有一页空白」）；
+   *   · 导入可能要几十秒，失败时不该在库里留下一个打不开的空本子；
+   *   · 不用先把文件切过去再等 `onLoadFile` 完成，省掉「导入结果落到
+   *     哪个本子」的竞态（runImport 里专门防过这个问题）。
+   *
+   * 观感上和「新建并打开」一致：进度 Notice 一直转，成功后切到新本子、
+   * 停在第 1 页（`createBook` 的 activePage 默认 0）。
+   */
+  private async importAsNewBook(source: TFile): Promise<void> {
+    const ext = (source.extension || "").toLowerCase();
+    const kind: "pdf" | "word" | null = ext === "pdf" ? "pdf" : ext === "docx" ? "word" : null;
+    if (!kind) {
+      new Notice(`只能导入 PDF 或 Word（.docx），${source.name} 打不开。`, 8000);
+      return;
+    }
+
+    let preopened: any = null;
+    let range: { from: number; to: number } | undefined;
+    if (kind === "pdf") {
+      const peeked = await peekPdf(this.app, source);
+      preopened = peeked.doc;
+      const picked = await this.askPdfRange(peeked.total);
+      if (picked === null) {
+        try {
+          await preopened?.destroy();
+        } catch (_) {
+          /* 释放失败无所谓 */
+        }
+        return;
+      }
+      range = picked;
+    }
+
+    /*
+     * 本子名用源文件名（`讲义.pdf` → 「讲义」）。safeName 会处理
+     * `/ \ : * ? " < > | # ^ [ ]` 这些路径里非法的字符；再掐掉结尾的
+     * 点和空格、限制长度——Windows 上以点 / 空格结尾的路径会建不出来。
+     */
+    const name =
+      safeName(source.basename || "未命名笔记")
+        .slice(0, 80)
+        .replace(/[. ]+$/g, "")
+        .trim() || "未命名笔记";
+    const path = await this.uniqueBookPath(name);
+    const notice = new Notice(kind === "pdf" ? "正在读取 PDF…" : "正在解析 Word…", 0);
+
+    /*
+     * 分成「导入 → 建文件 → 打开」三段各自兜错。
+     *
+     * 不合成一个大 try 是为了文案准确：导入成功、只是最后打开失败时，
+     * 不能让用户以为文档白导了——本子其实已经在库里。
+     */
+    let result: Awaited<ReturnType<typeof importPdf>>;
+    try {
+      result =
+        kind === "pdf"
+          ? await importPdf(this.app, source, path, range, this.importProgressTo(notice), true, preopened)
+          : await importWord(this.app, source, path, this.importProgressTo(notice));
+    } catch (e: any) {
+      notice.hide();
+      // importPdf 成功后 doc 已释放；这里只兜「中途失败」的那一份
+      try {
+        await preopened?.destroy();
+      } catch (_) {
+        /* 已释放 / 释放失败都无所谓 */
+      }
+      new Notice("导入失败，未新建手写本：" + describeImportError(e), 8000);
+      console.error("[inkbook] 导入并新建失败", e);
+      return;
+    }
+
+    /*
+     * 把导入结果直接当成新本子的全部页面，而不是 createBook 的空白首页
+     * 后面追加——见方法注释。
+     */
+    const book = createBook(
+      name,
+      this.plugin.settings.defaultTemplate,
+      this.plugin.settings.defaultPaper
+    );
+    book.pages = result.pages;
+    book.source = result.source;
+    book.activePage = 0;
+
+    let file: TFile;
+    try {
+      notice.setMessage("正在新建手写本…");
+      file = await this.app.vault.create(path, JSON.stringify(book, null, 2));
+    } catch (e: any) {
+      notice.hide();
+      // 注意措辞：文档已经读完了，失败的是落盘，别让用户重复导入
+      new Notice(
+        "文档已读取，但新建手写本失败：" + (e && e.message ? e.message : e),
+        10000
+      );
+      console.error("[inkbook] 新建手写本失败", e);
+      return;
+    }
+
+    notice.hide();
+    new Notice(`已新建「${name}」，导入 ${result.pages.length} 页`, 4000);
+
+    /*
+     * 在**当前标签页**打开：空视图本身就是 InkbookView，复用这个标签
+     * 最自然（不会突然多一个标签）。拿不到 leaf.openFile 的环境
+     * （旧版本 / 测试桩）退回原来的「新标签页」写法。
+     */
+    try {
+      const leaf: any = (this as any).leaf;
+      if (leaf && typeof leaf.openFile === "function") {
+        await leaf.openFile(file);
+      } else {
+        await this.app.workspace.getLeaf("tab").openFile(file);
+      }
+    } catch (e: any) {
+      // 本子已经在库里，打开失败要如实说清位置，别让用户以为它没建成
+      new Notice(
+        `已新建「${name}」（${path}），但打开失败：${e && e.message ? e.message : e}。` +
+          "可以在文件列表里手动打开它。",
+        12000
+      );
+      console.error("[inkbook] 新建后打开失败", e);
+    }
+  }
+
+  /**
+   * 新本子的落点：库根目录，撞名就 `名字 2.inkbook`、`名字 3.inkbook`…
+   *
+   * 空视图里没有「当前文件」，拿不到所在文件夹；放根目录用户一眼能找到，
+   * 之后想挪再挪。撞名绝不能覆盖——那可能是用户已有的另一本。
+   */
+  private async uniqueBookPath(name: string): Promise<string> {
+    const adapter = this.app.vault.adapter;
+    let path = name + ".inkbook";
+    let n = 1;
+    while (await adapter.exists(path)) path = `${name} ${++n}.inkbook`;
+    return path;
+  }
+
+  /**
+   * 导入进度 → Notice 文案。
+   *
+   * `doImport`（往当前本子追加）和 `importAsNewBook`（新建本子）共用，
+   * 免得两处对「字节 / 页数」的解释慢慢走样。
+   */
+  private importProgressTo(notice: Notice): ImportProgress {
+    return (phase, done, total) => {
+      if (phase === "loading") {
+        notice.setMessage(
+          total > 0
+            ? `正在读取 PDF：${humanBytes(done)} / ${humanBytes(total)}`
+            : `正在读取 PDF：${humanBytes(done)}`
+        );
+      } else if (total > 0) {
+        notice.setMessage(`正在处理第 ${done}/${total} 页…`);
+      } else {
+        // 总数未知（Word 是流式分页）：只报已完成多少，别显示「N/N」装成满了
+        notice.setMessage(`已生成 ${done} 页…`);
+      }
+    };
   }
 
   /**
@@ -2903,20 +3105,7 @@ export class InkbookView extends FileView {
        *   · pages   —— 在建页抽文字，数字是**页数**。
        * 老代码把两者都当页数，于是出现「正在读取 PDF：52428800/69500000 页」。
        */
-      const onProg = (phase: "loading" | "pages", done: number, total: number) => {
-        if (phase === "loading") {
-          notice.setMessage(
-            total > 0
-              ? `正在读取 PDF：${humanBytes(done)} / ${humanBytes(total)}`
-              : `正在读取 PDF：${humanBytes(done)}`
-          );
-        } else if (total > 0) {
-          notice.setMessage(`正在处理第 ${done}/${total} 页…`);
-        } else {
-          // 总数未知（Word 是流式分页）：只报已完成多少，别显示「N/N」装成满了
-          notice.setMessage(`已生成 ${done} 页…`);
-        }
-      };
+      const onProg = this.importProgressTo(notice);
       const result =
         kind === "pdf"
           ? await importPdf(this.app, file, bookPath, range, onProg, true, preopened)

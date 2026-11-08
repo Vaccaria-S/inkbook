@@ -3116,6 +3116,116 @@ async function E2E5() {
   v2.containerEl.remove();
 }
 
+/**
+ * INK-207：空视图「导入文档开始」。
+ *
+ * 这里走**真实链路**（`importAsNewBook` → `peekPdf` / `importPdf` →
+ * `vault.create`），不拼假页面。重点证伪三件事：
+ *   · 新本子第一页就是文档，不是空白页；source 也记下了；
+ *   · 同名本子已存在时另起名字，绝不覆盖；
+ *   · 导入失败（不支持的扩展名 / 坏 docx）时**不留下空本子**。
+ */
+async function INK207_importAsNewBook() {
+  // 真 PDF（和 E2E4 同一份测试资源）
+  let srcBytes: Uint8Array | null = null;
+  try {
+    const res = await fetch("/test/blank.pdf");
+    if (res.ok) srcBytes = new Uint8Array(await res.arrayBuffer());
+  } catch (_) {
+    /* 下面统一报 FAIL */
+  }
+  pass(
+    !!srcBytes && srcBytes.length > 100,
+    "INK207 前置：拿到源 PDF " + (srcBytes ? srcBytes.length : 0) + " 字节"
+  );
+  if (!srcBytes) return;
+  binFiles.set("test/blank.pdf", srcBytes);
+
+  // 先放一本同名本子：必须变成「blank 2.inkbook」，原文件一个字节都不能动
+  const oldBook = mkBook("已有的同名本", 1, 1);
+  seed("blank.inkbook", JSON.stringify(oldBook));
+  const oldRaw = files.get("blank.inkbook");
+
+  const v = await openView();
+  const emptyBtns = [...v.contentEl.querySelectorAll(".mb-empty button")].map(
+    (b: any) => (b.textContent || "").trim()
+  );
+  pass(
+    emptyBtns.includes("新建手写本") && emptyBtns.includes("导入文档开始"),
+    "INK207⓪ 空视图同时提供「新建手写本」和「导入文档开始」（" + emptyBtns.join(" / ") + "）"
+  );
+
+  let err = "";
+  try {
+    await (v as any).importAsNewBook(tf("test/blank.pdf"));
+  } catch (e: any) {
+    err = String(e?.message || e);
+  }
+  await sleep(300);
+
+  const madeBook = parseFile("blank 2.inkbook");
+  pass(
+    err === "" && !!madeBook,
+    "INK207① 同名时新建「blank 2.inkbook」而不是覆盖（错误=" + JSON.stringify(err) + "）"
+  );
+  pass(
+    files.get("blank.inkbook") === oldRaw,
+    "INK207① 已存在的同名本子原封不动"
+  );
+  pass(
+    madeBook?.title === "blank" && madeBook?.activePage === 0,
+    "INK207② 本子名取源文件名、停在第 1 页（" +
+      JSON.stringify({ title: madeBook?.title, activePage: madeBook?.activePage }) +
+      "）"
+  );
+  pass(
+    madeBook?.pages?.length === 1 &&
+      madeBook?.pages?.[0]?.background?.kind === "pdf" &&
+      madeBook?.pages?.[0]?.background?.pdf?.path === "test/blank.pdf",
+    "INK207② 第一页就是 PDF 第 1 页（不是空白页）：" +
+      JSON.stringify(madeBook?.pages?.[0]?.background)
+  );
+  pass(
+    madeBook?.source?.kind === "pdf" &&
+      madeBook?.source?.path === "test/blank.pdf" &&
+      madeBook?.source?.name === "blank.pdf",
+    "INK207② source 记录了来源文件：" + JSON.stringify(madeBook?.source)
+  );
+  await v.onClose();
+  v.containerEl.remove();
+
+  // 不支持的扩展名：提示清楚，且不建本子
+  {
+    const before = new Set(files.keys());
+    const v2 = await openView();
+    await (v2 as any).importAsNewBook(tf("note.md"));
+    await sleep(100);
+    const added = [...files.keys()].filter((p) => !before.has(p) && p.endsWith(".inkbook"));
+    pass(
+      added.length === 0 && notices.some((n) => n.includes("只能导入 PDF 或 Word")),
+      "INK207③ 不支持的类型不建本子并提示（新增=" + added.join(",") + "）"
+    );
+    await v2.onClose();
+    v2.containerEl.remove();
+  }
+
+  // 坏 docx：走 Word 分支，导入失败时不能留下空本子
+  {
+    binFiles.set("broken.docx", new Uint8Array([1, 2, 3, 4]));
+    const before = new Set(files.keys());
+    const v3 = await openView();
+    await (v3 as any).importAsNewBook(tf("broken.docx"));
+    await sleep(300);
+    const added = [...files.keys()].filter((p) => !before.has(p) && p.endsWith(".inkbook"));
+    pass(
+      added.length === 0 && notices.some((n) => n.includes("未新建手写本")),
+      "INK207④ 坏 docx 导入失败不留下空本子（新增=" + added.join(",") + "）"
+    );
+    await v3.onClose();
+    v3.containerEl.remove();
+  }
+}
+
 const CASES: Array<[string, () => Promise<void>]> = [
   ["A1+A2", A12],
   ["A3", A3],
@@ -3160,6 +3270,8 @@ const CASES: Array<[string, () => Promise<void>]> = [
   ["E2E3 撤销 5 → 重做 3 → 往返", E2E3],
   ["E2E4 导入 PDF→标注→导出", E2E4],
   ["E2E5 文字属性往返", E2E5],
+  // INK-207 空视图直接导入文档：新建本子 / 第一页是文档 / 撞名不覆盖 / 失败不留空本
+  ["INK207 空视图导入建本", INK207_importAsNewBook],
 ];
 
 async function main() {
