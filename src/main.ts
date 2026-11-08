@@ -594,6 +594,13 @@ export default class InkbookPlugin extends Plugin {
   private openNewBook(): void {
     new NewBookModal(this.app, this, (file) => {
       this.app.workspace.getLeaf("tab").openFile(file);
+    }, () => {
+      // 复用空视图的选源→导入→建本链路，避免在插件入口重写页码选择和三段兜错。
+      const leaf = this.app.workspace.getLeaf("tab");
+      void leaf.setViewState({ type: VIEW_TYPE, active: true }).then(() => {
+        const view = leaf.view;
+        if (view instanceof InkbookView) view.startImportNewBook();
+      });
     }).open();
   }
 

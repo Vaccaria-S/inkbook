@@ -76,6 +76,7 @@ export class NewBookModal extends Modal {
   private template: TemplateId;
   private paper: PaperId;
   private onDone: (file: TFile) => void;
+  private onImport?: () => void;
   private plugin: {
     settings: { defaultTemplate: TemplateId; defaultPaper: PaperId };
     saveSettings(): Promise<void>;
@@ -87,11 +88,13 @@ export class NewBookModal extends Modal {
       settings: { defaultTemplate: TemplateId; defaultPaper: PaperId };
       saveSettings(): Promise<void>;
     },
-    onDone: (file: TFile) => void
+    onDone: (file: TFile) => void,
+    onImport?: () => void
   ) {
     super(app);
     this.plugin = plugin;
     this.onDone = onDone;
+    this.onImport = onImport;
     this.template = plugin.settings.defaultTemplate;
     this.paper = plugin.settings.defaultPaper;
     const active = app.workspace.getActiveFile();
@@ -160,6 +163,14 @@ export class NewBookModal extends Modal {
     }
 
     const actions = contentEl.createDiv("mb-new-actions");
+    if (this.onImport) {
+      const importBtn = actions.createEl("button", { text: "导入外部文档" });
+      importBtn.onclick = () => {
+        // 先关新建弹窗，再交给调用方打开选源弹窗，避免平板上两个 Modal 叠在一起。
+        this.close();
+        this.onImport?.();
+      };
+    }
     const cancel = actions.createEl("button", { text: "取消" });
     cancel.onclick = () => this.close();
     const create = actions.createEl("button", { cls: "mod-cta", text: "创建并打开" });

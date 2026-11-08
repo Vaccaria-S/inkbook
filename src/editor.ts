@@ -1045,10 +1045,15 @@ export class BookEditor {
 
     if (typeof ResizeObserver !== "undefined") {
       this.resizeObserver = new ResizeObserver(() => {
-        if (!this.fitMode || this.destroyed || this.resizeRaf) return;
+        if (this.destroyed || this.resizeRaf) return;
+        // 显式缩放不需要重算比例，但后退切文件时容器可能暂时没有尺寸：
+        // 之前 pending 滚动值三帧重试耗尽后，仍要等容器重新可见才能真正落下。
+        if (!this.fitMode && this.pendingScrollTop == null && this.pendingScrollLeft == null) return;
         this.resizeRaf = requestAnimationFrame(() => {
           this.resizeRaf = 0;
-          if (this.fitMode && !this.destroyed) this.applyLayout();
+          if (this.destroyed) return;
+          if (this.fitMode) this.applyLayout();
+          else this.applyPendingScroll();
         });
       });
       this.resizeObserver.observe(this.scrollEl);

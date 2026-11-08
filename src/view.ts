@@ -1262,13 +1262,17 @@ export class InkbookView extends FileView {
      * 双 rAF：等构造函数的 goToPage、restoreViewState 的滚动恢复、
      * 以及上面 pendingPage 的跳页都跑完再取。
      */
+    const mountedEditor = this.editor;
+    const mountedStore = this.store;
     requestAnimationFrame(() =>
       requestAnimationFrame(() => {
-        if (!this.editor || !this.store) return;
-        this.savedZoom = this.editor.fitMode ? undefined : this.editor.zoom;
-        const rawTop = this.editor.getScrollTop();
+        // 同一 leaf 的 A→B→后退 A 可在两帧内重挂；旧回调绝不能
+        // 用新编辑器的位置覆盖新书的已保存基线。
+        if (!mountedEditor || this.editor !== mountedEditor || this.store !== mountedStore) return;
+        this.savedZoom = mountedEditor.fitMode ? undefined : mountedEditor.zoom;
+        const rawTop = mountedEditor.getScrollTop();
         this.savedScrollTop = rawTop > 0 ? rawTop : undefined;
-        const rawLeft = this.editor.getScrollLeft();
+        const rawLeft = mountedEditor.getScrollLeft();
         this.savedScrollLeft = rawLeft > 0 ? rawLeft : undefined;
       })
     );
@@ -1543,11 +1547,11 @@ export class InkbookView extends FileView {
   private openNewBook(): void {
     new NewBookModal(this.app, this.plugin as any, (file) => {
       this.app.workspace.getLeaf("tab").openFile(file);
-    }).open();
+    }, () => this.startImportNewBook()).open();
   }
 
-  /** 空视图里的「导入文档开始」：PDF / docx 都收（由扩展名决定走哪条导入） */
-  private startImportNewBook(): void {
+  /** 空视图和新建弹窗共用选源入口，避免两处复制导入建本流程。 */
+  startImportNewBook(): void {
     new ImportSourceModal(this.app, "any", (file) => {
       void this.importAsNewBook(file);
     }).open();
