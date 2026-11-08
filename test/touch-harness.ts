@@ -542,6 +542,42 @@ declare global {
     await sleep(150);
   }
 
+  /* ==== 场景 7：纸外单指拖动也能滚页（INK-215） ==== */
+  /*
+   * 缩到 0.3 后大片是空白，`touch-action: none` 又关了浏览器原生滚动。
+   * 纸外按下原先只记账不设 pan → 从空白处往下拖页面纹丝不动，
+   * 必须精确按到那三百多像素高的纸上才能滚。这是老缺口。
+   */
+  {
+    ed.setZoom(0.45);
+    await sleep(320);
+    scroll.scrollTop = 1200;
+    await sleep(200);
+    const docEl2 = ed.docEl as HTMLElement;
+    const sr3 = scroll.getBoundingClientRect();
+    const by = sr3.bottom - 24;
+    const bx = sr3.left + sr3.width / 2;
+    const top0 = scroll.scrollTop;
+
+    ptrTo(docEl2, "pointerdown", 51, bx, by);
+    await sleep(30);
+    for (let i = 1; i <= 8; i++) {
+      ptrTo(docEl2, "pointermove", 51, bx, by - i * 12);
+      await sleep(25);
+    }
+    const top1 = scroll.scrollTop;
+    pass(
+      top1 > top0 + 40,
+      "INK-215 纸外单指上拖真的滚页了（" + top0.toFixed(0) + " → " + top1.toFixed(0) + "）"
+    );
+    ptrTo(docEl2, "pointerup", 51, bx, by - 96);
+    await sleep(400);
+    pass(
+      ed.gesture === "none" && ed.pointerId === null,
+      "INK-215 纸外平移抬手后手势已复位（gesture=" + ed.gesture + "）"
+    );
+  }
+
   log("");
   const fails = lines.filter((l) => l.startsWith("FAIL")).length;
   log(fails === 0 ? "ALL PASS" : fails + " FAILED");

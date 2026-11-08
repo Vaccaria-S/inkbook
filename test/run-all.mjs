@@ -41,7 +41,7 @@ const PAGES = [
   ["thumb.html", 14],
   ["pdf.html", 46],
   ["bigpdf.html", 13],
-  ["touch.html", 21, "touch-run.mjs"],
+  ["touch.html", 23, "touch-run.mjs"],
   ["swipe.html", 7, "swipe-run.mjs"],
   ["qa-wrap.html", 267],
   ["embed.html", 119],

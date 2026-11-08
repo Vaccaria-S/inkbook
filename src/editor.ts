@@ -1964,7 +1964,42 @@ export class BookEditor {
        * 这里只做「记账」：让 arbiter 知道有几根手指、是不是双指。
        * 真正的手势处理仍在 onMove 里按 rec 走（纸外没有页面可以落笔）。
        */
-      this.arbiter.down(this.pointerInfo(e));
+      const role = this.arbiter.down(this.pointerInfo(e as PointerEvent));
+      if (role === "gesture") {
+        e.preventDefault();
+        return;
+      }
+      /*
+       * 纸外单指 / 鼠标拖动 = 平移画面（INK-215）。
+       *
+       * 写入模式下 `touch-action: none` 把浏览器原生滚动关了（见
+       * applyTouchAction），滚动全靠我们自己的 pan。而纸外按下原先只
+       * 「记账」不设 pan —— 缩到 0.3 以后大片都是空白，用户从空白处
+       * 往下拖，页面纹丝不动，只能精确地把手指按到那三百多像素高的
+       * 纸上才能滚。这是老缺口，不是 INK-211 引入的，但同属「缩小后
+       * 操作失灵」，一起补掉。
+       *
+       * 纸外没有页面，所以不需要区分工具：一律平移。笔不参与（笔的
+       * 职责是写字，纸外没有纸可写，落笔即无效）。
+       */
+      const wantsPan =
+        e.pointerType === "mouse"
+          ? e.button === 0 || e.button === 1 || e.button === 2
+          : e.pointerType === "touch" && role === "pan";
+      if (!wantsPan) return;
+      // 纸外点一下也要能收起文字输入框（和 onDown 里纸上点空白处一致）
+      if (this.textEdit && this.tool === "text") this.commitTextEdit(true);
+      this.stopFling();
+      this.velSamples = [];
+      this.gesture = "pan";
+      this.pointerId = e.pointerId;
+      this.pan = {
+        x: e.clientX,
+        y: e.clientY,
+        left: this.scrollEl.scrollLeft,
+        top: this.scrollEl.scrollTop,
+      };
+      e.preventDefault();
     });
     this.docEl.addEventListener("pointermove", (e) => {
       const rec = findRec(e.target);
@@ -1979,11 +2014,25 @@ export class BookEditor {
        * 再怎么张手指都放不大」。
        *
        * 这里只把事件送进仲裁器（它会算距离并回调 applyPinch），
-       * 不落笔、不滚动；纸外依然没有页面可以承载这些动作。
+       * 不落笔；纸外依然没有页面可以承载落笔。
        */
       else {
         const role = this.arbiter.move(this.pointerInfo(e as PointerEvent));
         if (role === "gesture") {
+          e.preventDefault();
+          return;
+        }
+        /*
+         * 纸外起步的平移（INK-215）：和 onMove 的 pan 分支同一套算法，
+         * 1:1 跟手 + 采样速度，抬手时由 globalUp 起算惯性。
+         */
+        if (this.gesture === "pan" && this.pan && e.pointerId === this.pointerId) {
+          this.scrollEl.scrollLeft = this.pan.left - (e.clientX - this.pan.x);
+          this.scrollEl.scrollTop = this.pan.top - (e.clientY - this.pan.y);
+          this.pushVelSample(
+            this.scrollEl.scrollTop,
+            e.timeStamp || performance.now()
+          );
           e.preventDefault();
           return;
         }
@@ -2001,16 +2050,43 @@ export class BookEditor {
      * 不送的话 `touchCount` 永远不减、`gesturing` 永远为真：
      * 手势进入一个退不出去的死状态，之后所有触摸移动都被当成手势吞掉，
      * 缩放和滚动一起失灵，只能等下一次落笔才自愈。
+     *
+     * 纸外平移（INK-215）通常已经被 window 捕获阶段的 globalUp 收尾
+     * （它会按 pointerId 调 onUp，起算惯性）。这里只兜 globalUp 够不着
+     * 的情况：`recs[current]` 不存在时 globalUp 会直接 return，手势就
+     * 永远停在 "pan"。用 `gesture === "pan"` 判重，globalUp 收过就不会
+     * 二次起算惯性。
      */
+    const endOutsidePan = (e: PointerEvent) => {
+      if (this.gesture !== "pan" || this.pointerId !== e.pointerId) return;
+      const s = this.velSamples;
+      if (s.length) {
+        this.startFling(
+          s[s.length - 1].y,
+          e.timeStamp || performance.now(),
+          e.pointerType
+        );
+      }
+      this.velSamples = [];
+      this.gesture = "none";
+      this.pointerId = null;
+      this.pan = null;
+    };
     this.docEl.addEventListener("pointerup", (e) => {
       const rec = findRec(e.target);
       if (rec) this.onUp(e as PointerEvent, rec);
-      else this.arbiter.up(this.pointerInfo(e as PointerEvent));
+      else {
+        this.arbiter.up(this.pointerInfo(e as PointerEvent));
+        endOutsidePan(e as PointerEvent);
+      }
     });
     this.docEl.addEventListener("pointercancel", (e) => {
       const rec = findRec(e.target);
       if (rec) this.onUp(e as PointerEvent, rec);
-      else this.arbiter.up(this.pointerInfo(e as PointerEvent));
+      else {
+        this.arbiter.up(this.pointerInfo(e as PointerEvent));
+        endOutsidePan(e as PointerEvent);
+      }
     });
     /*
      * pointerleave 挂在 docEl 上：冒泡到这里的事件 target 就是 docEl 本身，
