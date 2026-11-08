@@ -1003,10 +1003,17 @@
   /*
    * 必须折行：pre 不折行 + 只给 min-width 时，长句在框里一路向右滚，
    * 用户以为"打完了"，提交后才被纸边裁掉——这里折行才看得见会断在哪。
+   *
+   * word-break 用 break-all（逐字断）而不是 break-word（优先在空格处断）：
+   * 排版源 wrapText 对中文逐字累加、对西文只有「断出来的行满 60%」才在
+   * 空格处断，窄框英文经常是逐字硬断。textarea 是原生控件，没法注入
+   * 那条 60% 规则，只能选更接近的一侧——break-all 让每行字数与
+   * layoutUserText 的 l.lines 尽量一致，提交前看到的行数不会差太多；
+   * 提交后本来就会按 layoutUserText 重排，断字位置以那份为准。
    */
   white-space: pre-wrap;
   overflow-wrap: break-word;
-  word-break: break-word;
+  word-break: break-all;
 }
 
 /*
