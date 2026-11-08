@@ -514,13 +514,33 @@ export class ImportSourceModal extends Modal {
      * 但用户看不见、也不占位。
      */
     input.style.position = "absolute";
-    input.style.width = "0";
-    input.style.height = "0";
+    input.style.left = "-9999px";
+    input.style.top = "0";
+    /*
+     * 不能是 0×0：个别 WebView 会拒绝为「零尺寸元素」打开文件选择器，
+     * 表现同样是「点了没反应」。留 1×1 并且移出视口，视觉上一样看不见。
+     */
+    input.style.width = "1px";
+    input.style.height = "1px";
     input.style.opacity = "0";
     input.style.pointerEvents = "none";
     this.fileInput = input;
     this.deviceBtn.onclick = () => {
       if (this.busy) return;
+      /*
+       * 优先 `showPicker()`：新版 Chromium 里它比 `click()` 可靠，
+       * 尤其是元素被 CSS 隐藏 / 移出视口时。老内核没有这个方法，
+       * 或者调用时抛（非用户手势、跨域 iframe），都退回 click()。
+       */
+      try {
+        const picker = (input as any).showPicker;
+        if (typeof picker === "function") {
+          picker.call(input);
+          return;
+        }
+      } catch (_) {
+        /* 落到 click() */
+      }
       input.click();
     };
     input.addEventListener("change", () => void this.onDeviceFile());
@@ -562,11 +582,23 @@ export class ImportSourceModal extends Modal {
     }
   }
 
-  /** `accept` 只是给桌面系统的过滤器；平板可能忽略，所以选完还会自己校验 */
+  /**
+   * `accept` 是给系统文件选择器的过滤器；平板可能忽略，所以选完还会自己校验。
+   *
+   * **扩展名和 MIME 必须都给**（2026-11-08，真机反馈「平板选 Word 导入不了」）。
+   * 安卓的文件选择器（Storage Access Framework）按 **MIME** 过滤，
+   * 只给 `.docx` 这种扩展名时它匹配不到任何类型 —— 表现是文件列表一片空白
+   * 或全部置灰，用户以为按钮坏了。PDF 之所以一直能用，是因为顺带写了
+   * `application/pdf`。docx 的 MIME 很长，必须写全，写 `application/msword`
+   * 只会匹配老式 .doc。
+   */
   private acceptAttr(): string {
-    if (this.kind === "pdf") return ".pdf,application/pdf";
-    if (this.kind === "word") return ".docx";
-    return ".pdf,.docx,application/pdf";
+    const PDF = ".pdf,application/pdf";
+    const DOCX =
+      ".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    if (this.kind === "pdf") return PDF;
+    if (this.kind === "word") return DOCX;
+    return `${PDF},${DOCX}`;
   }
 
   /**

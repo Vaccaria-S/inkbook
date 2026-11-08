@@ -955,6 +955,60 @@ async function main(): Promise<void> {
           (anyInput.getAttribute("accept") || "").includes(".docx"),
         "INK-207 any：文件输入框同时接受 .pdf / .docx"
       );
+
+      /*
+       * INK-214 平板选 Word 导入不了：安卓文件选择器按 **MIME** 过滤，
+       * 只写扩展名 `.docx` 会匹配不到任何类型（列表空白 / 全置灰）。
+       * 必须同时给出 docx 的完整 MIME。
+       */
+      const docxMime =
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+      const anyAccept = anyInput.getAttribute("accept") || "";
+      pass(
+        anyAccept.includes(docxMime),
+        "INK-214 any：accept 带 docx 完整 MIME（平板按 MIME 过滤）"
+      );
+      const wordModal = new ImportSourceModal(app, "word", () => {});
+      const wordEl = openModal(wordModal);
+      const wordInput = wordEl.querySelector('input[type="file"]') as HTMLInputElement;
+      const wordAccept = wordInput.getAttribute("accept") || "";
+      pass(
+        wordAccept.includes(".docx") && wordAccept.includes(docxMime),
+        "INK-214 word：accept 同时有扩展名与 MIME（" + wordAccept + "）"
+      );
+
+      /*
+       * 零尺寸元素在个别 WebView 里点不开选择器 → 必须是 1×1 且移出视口。
+       * 同时验证点击走 showPicker（新内核）或 click（老内核）都能触发。
+       */
+      pass(
+        wordInput.style.width === "1px" &&
+          wordInput.style.height === "1px" &&
+          wordInput.style.left === "-9999px",
+        "INK-214 文件输入框是 1×1 且移出视口（不是零尺寸）"
+      );
+      let pickerCalls = 0;
+      let clickCalls = 0;
+      const origClick = wordInput.click;
+      (wordInput as any).showPicker = () => {
+        pickerCalls++;
+      };
+      wordInput.click = () => {
+        clickCalls++;
+      };
+      clickButton(wordEl, "从设备选择文件…");
+      pass(
+        pickerCalls === 1 && clickCalls === 0,
+        "INK-214 点击按钮走 showPicker（picker=" + pickerCalls + " click=" + clickCalls + "）"
+      );
+      // 老内核没有 showPicker：必须退回 click()
+      delete (wordInput as any).showPicker;
+      clickButton(wordEl, "从设备选择文件…");
+      pass(
+        clickCalls === 1,
+        "INK-214 没有 showPicker 时退回 click()（click=" + clickCalls + "）"
+      );
+      wordInput.click = origClick;
     } finally {
       app.vault = realVault;
       vaultFiles = [];
