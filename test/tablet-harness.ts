@@ -173,6 +173,44 @@ async function main() {
     );
   }
 
+  /* ------------- 先掌根后落笔：掌根不能污染后续手势（INK-217） ------------- */
+  /*
+   * 真机最常见的顺序是**手掌先贴到屏上、笔才落下**（INK-191 只修了
+   * 「笔已经在写时新落下的手指」）。先落的手掌在 penActive 变 true 之前
+   * 就登记成有效触摸，抬笔后它仍算活手指 —— 再落一根就凑成「两指」
+   * 起手势，用户只是在滚动，页面却被当成捏合缩放。
+   */
+  {
+    const starts2: any[] = [];
+    const arbQ = new TouchArbiter({
+      onGestureStart: (info) => starts2.push(info),
+    });
+    // 掌根先落
+    arbQ.down({ id: 21, type: "touch", x: 200, y: 900, pressure: 0.5 });
+    pass(arbQ.touchCountNow === 1, "INK-217 掌根先落时算 1 个活触摸（实际 " + arbQ.touchCountNow + "）");
+    // 笔落下：掌根应立刻改判，不再计数
+    arbQ.down({ id: 22, type: "pen", x: 400, y: 700, pressure: 0.5 });
+    pass(
+      arbQ.touchCountNow === 0,
+      "INK-217 笔落下后先前的掌根被改判，计数归零（实际 " + arbQ.touchCountNow + "）"
+    );
+    // 抬笔
+    arbQ.up({ id: 22, type: "pen", x: 400, y: 700, pressure: 0 });
+    pass(arbQ.touchCountNow === 0, "INK-217 抬笔后计数仍是 0");
+    // 掌根滑一下：不能起手势
+    const mq = arbQ.move({ id: 21, type: "touch", x: 240, y: 905, pressure: 0.5 });
+    pass(
+      mq !== "gesture" && starts2.length === 0,
+      "INK-217 抬笔后掌根滑动不起手势（role=" + mq + "，gestureStart=" + starts2.length + "）"
+    );
+    // 再落一根手指也不能凑成双指手势
+    const gq = arbQ.down({ id: 23, type: "touch", x: 500, y: 900, pressure: 0.5 });
+    pass(
+      gq !== "gesture" && starts2.length === 0,
+      "INK-217 掌根 + 一根手指不会被当成双指捏合（role=" + gq + "）"
+    );
+  }
+
   /* -------------------- Ctrl+滚轮缩放 -------------------- */
   {
     const book = createBook("缩放测试", "grid", "white");

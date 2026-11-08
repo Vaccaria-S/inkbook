@@ -294,6 +294,24 @@ async function main() {
     pageEl().dispatchEvent(cm);
     pass(cm.defaultPrevented, "右键菜单被拦掉（defaultPrevented=" + cm.defaultPrevented + "）");
 
+    /*
+     * INK-217 但**输入框里不能拦**：平板上长按 textarea 是唯一的粘贴入口，
+     * 无条件 preventDefault 会把「粘贴 / 全选」菜单一起吞掉。
+     */
+    {
+      const ta = document.createElement("textarea");
+      ta.className = "mb-text-edit";
+      pageEl().appendChild(ta);
+      const cmIn = new MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2 });
+      ta.dispatchEvent(cmIn);
+      pass(
+        !cmIn.defaultPrevented,
+        "INK-217 输入框内长按不拦系统菜单（可粘贴，defaultPrevented=" +
+          cmIn.defaultPrevented + "）"
+      );
+      ta.remove();
+    }
+
     editor.setZoom(zPrev);
     await sleep(200);
     // 恢复滚动位置：后面的荧光笔/擦除用例依赖页面停在原处

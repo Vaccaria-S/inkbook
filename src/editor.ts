@@ -2099,13 +2099,21 @@ export class BookEditor {
     });
     this.docEl.addEventListener("contextmenu", (e) => {
       /*
-       * **一律拦掉系统菜单**（2026-11-07）。
+       * **拦掉纸面上的系统菜单**（2026-11-07）。
        *
        * 老条件是 `tool !== "hand"` —— 抓手工具下放行菜单。但现在右键
        * 也是平移手势，鼠标用户按住右键拖动时若弹菜单，拖动直接中断。
-       * 纸面上没有需要浏览器原生菜单的东西（文字编辑有自己的属性条），
-       * 所以无条件拦。
+       * 纸面上没有需要浏览器原生菜单的东西（文字编辑有自己的属性条）。
+       *
+       * 但**输入框例外**（2026-11-08，平板专项）：文字编辑的 textarea
+       * 就挂在 pageEl 里，事件会冒泡到这里。无条件 preventDefault 会把
+       * 输入框里长按的「粘贴 / 全选 / 复制」菜单也吞掉 —— 平板上没有
+       * 别的办法把文字粘进去，等于输入功能残废。
        */
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT" || t.isContentEditable)) {
+        return;
+      }
       e.preventDefault();
     });
   }
@@ -2179,7 +2187,19 @@ export class BookEditor {
    * 只有"已挂载"（真正在视口里）的页需要重建 canvas 尺寸。
    */
   applyLayout(): void {
-    if (this.fitMode) {
+    /*
+     * 正在输入文字时**冻结 fit 比例**（2026-11-08，平板专项）。
+     *
+     * 平板软键盘弹出会把 scrollEl 高度压掉约 300px（宿主 adjustResize），
+     * ResizeObserver 随即触发 applyLayout。fit 模式下 availH 变小 →
+     * zoom 变小 → **整页跟着缩小**，用户正在打字的那一页突然跳一下；
+     * 而 textarea 的 inline left/top/fontSize 是按旧 zoom 写的，
+     * 页面缩了它不缩，输入框和纸面错位。
+     *
+     * 键盘收起时会再次 resize，那时 zoom 会正常重算，所以冻结只是
+     * 「输入期间不重排」，不会留下错误的缩放。
+     */
+    if (this.fitMode && !this.textEdit) {
       const availW = Math.max(240, this.scrollEl.clientWidth - 64);
       const availH = Math.max(240, this.scrollEl.clientHeight - 46);
       this.zoom = clamp(
@@ -4191,7 +4211,43 @@ export class BookEditor {
         ta.select();
       }
       ta.style.height = `${ta.scrollHeight}px`;
+      this.keepTextEditVisible(rec, ta);
     });
+  }
+
+  /**
+   * 把输入框滚进「软键盘上方」的可见区（2026-11-08，平板专项）。
+   *
+   * 平板上点纸张下半部分写字时，软键盘会盖住屏幕下 1/3 —— 输入框
+   * 正好落在被盖住的位置，用户看不见自己在打什么。浏览器不会自动
+   * 帮我们滚（滚动容器是我们自己的 div，不是 document）。
+   *
+   * 用 visualViewport 拿**真实可视高度**：键盘弹出后它才变小，
+   * 比 window.innerHeight 准。拿不到时（老 WebView）退回 clientHeight。
+   * 键盘动画有 200~300ms，所以在 focus 后多补两次。
+   */
+  private keepTextEditVisible(rec: PageRec, ta: HTMLTextAreaElement): void {
+    const reveal = () => {
+      if (this.destroyed || this.textEdit?.el !== ta) return;
+      const vv = window.visualViewport;
+      const visibleBottom = vv ? vv.height + vv.offsetTop : this.scrollEl.clientHeight;
+      const taRect = ta.getBoundingClientRect();
+      const scrollRect = this.scrollEl.getBoundingClientRect();
+      // 输入框底边超出可视区多少（>0 就是被键盘/屏幕底边盖住）
+      const overflow = taRect.bottom - visibleBottom + 24;
+      if (overflow > 0) {
+        this.scrollEl.scrollTop += overflow;
+      }
+      // 顶边跑到可视区上方（滚动补偿过头时）也拉回来
+      const above = scrollRect.top - taRect.top + 8;
+      if (above > 0) this.scrollEl.scrollTop -= above;
+      // 样式条跟着重定位：它按纸面坐标算，scrollTop 变了屏幕位置也变了
+      this.positionTextEditBar();
+      void rec;
+    };
+    reveal();
+    window.setTimeout(reveal, 120);
+    window.setTimeout(reveal, 320);
   }
 
   /** 拆掉编辑框期间挂的 document 级 pointerdown 监听 */

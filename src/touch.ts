@@ -128,6 +128,28 @@ export class TouchArbiter {
     if (e.type === "pen") {
       this.penActive = true;
       this.cancelGesture();
+      /*
+       * **笔落下时，屏上已有的手指一律改判为掌根**（2026-11-08，平板专项）。
+       *
+       * 老代码只处理「笔已经在写时新落下的手指」（下面 touch 分支的
+       * penActive 判定），而真机最常见的顺序是反的：**掌根先贴到屏上**，
+       * 笔才落下。先落的那根手掌在 penActive 变 true 之前就登记成
+       * 「有效触摸」了，之后：
+       *   · 抬笔（penActive=false）后它仍算活手指；
+       *   · 此时再落一根手指 → touchCount = 2 → beginGesture，
+       *     两指几何算出来的是「掌根 + 手指」，用户只是在滚动，
+       *     页面却被当成捏合缩放。
+       * 这里在笔落下的瞬间把已有触摸全部标 ignored 并重算计数，
+       * 后面的单指滚动 / 双指捏合就不会再被那块手掌污染。
+       */
+      let dropped = 0;
+      for (const p of this.pointers.values()) {
+        if (p.type === "touch" && !p.ignored) {
+          p.ignored = true;
+          dropped++;
+        }
+      }
+      if (dropped) this.touchCount = 0;
       const role: TouchRole = "draw";
       this.cb.onRoleChange?.(role, e);
       return role;
