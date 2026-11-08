@@ -464,6 +464,84 @@ declare global {
     }
   }
 
+  /* ==== 场景 6：缩到最小后两指全落在纸外空白里，仍必须能放大（INK-211） ==== */
+  /*
+   * 真机反馈：Word 文档导入后缩到最小，再想双指张开就永远放不大。
+   *
+   * 根因是纸外的 pointermove / pointerup 从来没进仲裁器：
+   *   · move 只在有 .mb-page 时走 onMove，纸外只 onLeave → 两指距离
+   *     永远停在开始值，applyPinch 一次都不执行；
+   *   · up 同理不喂仲裁器 → touchCount 不减、gesturing 永真，
+   *     手势卡死，后续触摸全被吞掉。
+   * 缩到 0.3 时纸只剩三百多像素高，两指几乎必然落在纸外，所以必现。
+   */
+  {
+    ed.setZoom(0.3);
+    await sleep(320);
+    const zoomMin = ed.getState().zoom;
+    const docEl = ed.docEl as HTMLElement;
+    const sr2 = scroll.getBoundingClientRect();
+    // 取滚动容器底部附近的空白：纸已经缩得很小，这里必然没有 .mb-page
+    const blankY = sr2.bottom - 24;
+    const blankX = sr2.left + sr2.width / 2;
+    pass(
+      !docEl.querySelector(".mb-page")?.contains(document.elementFromPoint(blankX, blankY)),
+      "INK-211 前置：所选位置确实在纸外（y=" + blankY.toFixed(0) + "）"
+    );
+
+    const g0 = 40;
+    ptrTo(docEl, "pointerdown", 31, blankX - g0, blankY);
+    await sleep(30);
+    ptrTo(docEl, "pointerdown", 32, blankX + g0, blankY);
+    await sleep(30);
+    for (let i = 1; i <= 10; i++) {
+      const g = g0 + i * 12;
+      ptrTo(docEl, "pointermove", 31, blankX - g, blankY);
+      ptrTo(docEl, "pointermove", 32, blankX + g, blankY);
+      await sleep(25);
+    }
+    await sleep(80);
+    const zoomOut = ed.getState().zoom;
+    pass(
+      zoomOut > zoomMin + 0.05,
+      "INK-211 纸外两指张开真的放大了（" + zoomMin.toFixed(2) + " → " + zoomOut.toFixed(2) + "）"
+    );
+
+    // 纸外抬手也必须收干净，否则手势卡死、下一轮捏合完全失灵
+    ptrTo(docEl, "pointerup", 32, blankX + g0 + 120, blankY);
+    await sleep(40);
+    ptrTo(docEl, "pointerup", 31, blankX - g0 - 120, blankY);
+    await sleep(150);
+    pass(
+      !ed.arbiter.isGesturing && ed.arbiter.touchCountNow === 0,
+      "INK-211 纸外抬手后手势已复位（gesturing=" + ed.arbiter.isGesturing +
+        "；touchCount=" + ed.arbiter.touchCountNow + "）"
+    );
+
+    // 再来一轮：证明不是「第一次侥幸」，手势没有残留死状态
+    const zoomBefore2 = ed.getState().zoom;
+    ptrTo(docEl, "pointerdown", 41, blankX - 30, blankY);
+    await sleep(30);
+    ptrTo(docEl, "pointerdown", 42, blankX + 30, blankY);
+    await sleep(30);
+    for (let i = 1; i <= 8; i++) {
+      const g = 30 + i * 14;
+      ptrTo(docEl, "pointermove", 41, blankX - g, blankY);
+      ptrTo(docEl, "pointermove", 42, blankX + g, blankY);
+      await sleep(25);
+    }
+    await sleep(80);
+    pass(
+      ed.getState().zoom > zoomBefore2 + 0.03,
+      "INK-211 连续第二次纸外捏合仍然有效（" + zoomBefore2.toFixed(2) + " → " +
+        ed.getState().zoom.toFixed(2) + "）"
+    );
+    ptrTo(docEl, "pointerup", 42, blankX + 142, blankY);
+    await sleep(30);
+    ptrTo(docEl, "pointerup", 41, blankX - 142, blankY);
+    await sleep(150);
+  }
+
   log("");
   const fails = lines.filter((l) => l.startsWith("FAIL")).length;
   log(fails === 0 ? "ALL PASS" : fails + " FAILED");

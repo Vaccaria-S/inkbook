@@ -1098,6 +1098,21 @@ export class BookEditor {
     const docRect = this.docEl.getBoundingClientRect();
     const scrollRect = this.scrollEl.getBoundingClientRect();
     const firstTop = first.getBoundingClientRect().top;
+    /*
+     * **容器/页面还没布局时不要污染基准**（INK-211）。
+     *
+     * 这三个 rect 全是 0 说明元素还没进渲染树（标签页刚重建、容器
+     * display:none、Word 大底图正把主线程占满导致这一帧没布局）。
+     * 此时算出来的 `pageOrigin` 是个垃圾值（通常是 0 或负的容器高），
+     * 而它被 `pickAnchor` 用来定位「手指下方是哪一页的哪个点」——
+     * 基准一错，锚点就选错，`restoreAnchor` 再按错误锚点补偿，
+     * 会把页面推到滚动极限并卡在那儿（用户描述：「缩小后卡在最下面，
+     * 再也放不大」）。保留上一次的有效值，等布局好了再量。
+     */
+    const laidOut =
+      (scrollRect.width > 0 || scrollRect.height > 0) &&
+      (firstTop !== 0 || this.scrollEl.scrollTop === 0);
+    if (!laidOut) return;
     // 首页顶部在滚动内容里的位置
     this.pageOrigin =
       firstTop - scrollRect.top + this.scrollEl.scrollTop;
@@ -1955,19 +1970,47 @@ export class BookEditor {
       const rec = findRec(e.target);
       if (rec) this.onMove(e as PointerEvent, rec);
       /*
-       * 页与页之间有空隙（gap / 添加页按钮），那些地方没有 .mb-page：
-       * 鼠标从一页滑到另一页会经过空隙，onMove 收不到，上一页的圈
-       * 就会一直挂着。经过空隙时按"离开纸面"处理，收掉圈。
+       * 纸外（缩小后的空白区 / 页缝）的移动也必须喂给仲裁器（INK-211）。
+       *
+       * 老代码这里只有 onLeave。于是：缩到 0.3 后 Word 页只剩三百多像素高，
+       * 手指多半落在纸外空白里 —— 双指手势虽然已经由纸外的 pointerdown
+       * 起了头（INK-191 修过），但后续 move 全被丢掉，`applyPinch` 一次都
+       * 不执行，两指距离永远停在开始值。用户看到的就是「缩到最小以后
+       * 再怎么张手指都放不大」。
+       *
+       * 这里只把事件送进仲裁器（它会算距离并回调 applyPinch），
+       * 不落笔、不滚动；纸外依然没有页面可以承载这些动作。
        */
-      else this.onLeave(e as PointerEvent);
+      else {
+        const role = this.arbiter.move(this.pointerInfo(e as PointerEvent));
+        if (role === "gesture") {
+          e.preventDefault();
+          return;
+        }
+        /*
+         * 页与页之间有空隙（gap / 添加页按钮），那些地方没有 .mb-page：
+         * 鼠标从一页滑到另一页会经过空隙，onMove 收不到，上一页的圈
+         * 就会一直挂着。经过空隙时按"离开纸面"处理，收掉圈。
+         */
+        this.onLeave(e as PointerEvent);
+      }
     });
+    /*
+     * 纸外的抬起同样要送进仲裁器（INK-211）。
+     *
+     * 不送的话 `touchCount` 永远不减、`gesturing` 永远为真：
+     * 手势进入一个退不出去的死状态，之后所有触摸移动都被当成手势吞掉，
+     * 缩放和滚动一起失灵，只能等下一次落笔才自愈。
+     */
     this.docEl.addEventListener("pointerup", (e) => {
       const rec = findRec(e.target);
       if (rec) this.onUp(e as PointerEvent, rec);
+      else this.arbiter.up(this.pointerInfo(e as PointerEvent));
     });
     this.docEl.addEventListener("pointercancel", (e) => {
       const rec = findRec(e.target);
       if (rec) this.onUp(e as PointerEvent, rec);
+      else this.arbiter.up(this.pointerInfo(e as PointerEvent));
     });
     /*
      * pointerleave 挂在 docEl 上：冒泡到这里的事件 target 就是 docEl 本身，

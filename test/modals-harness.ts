@@ -22,6 +22,7 @@ import {
   OutlineModal,
   PromptModal,
   safeImportFileName,
+  NewBookModal,
 } from "../src/modals";
 // 走 build-tests.mjs 的 obsidian alias → test/obsidian-stub.mjs；
 // 与 src/modals.ts 里 import 的是同一个模块实例，改 prototype 能影响被测代码。
@@ -125,6 +126,39 @@ function releaseNotices(): void {
 }
 
 async function main(): Promise<void> {
+  /* -------------------------- INK-213 新建弹窗导入 -------------------------- */
+  {
+    const events: string[] = [];
+    const plugin: any = {
+      settings: { defaultTemplate: "blank", defaultPaper: "white" },
+      saveSettings: async () => {},
+    };
+    const originalWorkspace = app.workspace;
+    app.workspace = { getActiveFile: () => null };
+    try {
+      const modal = new NewBookModal(app, plugin, () => events.push("create"), () => events.push("import"));
+      const originalClose = modal.onClose.bind(modal);
+      modal.onClose = () => {
+        events.push("close");
+        originalClose();
+      };
+      const el = openModal(modal);
+      pass(!!button(el, "导入外部文档"), "INK-213 新建手写本弹窗显示导入外部文档入口");
+      pass(!!button(el, "创建并打开"), "INK-213 原有创建并打开入口仍保留");
+      clickButton(el, "导入外部文档");
+      pass(events.join(",") === "close,import", "INK-213 先关新建弹窗再启动导入，不创建空白本");
+      pass(!el.isConnected, "INK-213 进入导入后新建弹窗已关闭");
+
+      const cancelled: string[] = [];
+      const cancelModal = new NewBookModal(app, plugin, () => cancelled.push("create"), () => cancelled.push("import"));
+      const cancelEl = openModal(cancelModal);
+      clickButton(cancelEl, "取消");
+      pass(cancelled.length === 0 && !cancelEl.isConnected, "INK-213 取消不触发创建或导入");
+    } finally {
+      app.workspace = originalWorkspace;
+    }
+  }
+
   /* ------------------------------ JumpPageModal ------------------------------ */
   {
     const opened: number[] = [];

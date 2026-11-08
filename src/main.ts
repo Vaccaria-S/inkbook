@@ -600,6 +600,9 @@ export default class InkbookPlugin extends Plugin {
       void leaf.setViewState({ type: VIEW_TYPE, active: true }).then(() => {
         const view = leaf.view;
         if (view instanceof InkbookView) view.startImportNewBook();
+        else new Notice("无法打开墨本视图，请重试导入。", 8000);
+      }).catch((e: unknown) => {
+        new Notice("无法打开墨本视图：" + (e instanceof Error ? e.message : String(e)), 8000);
       });
     }).open();
   }

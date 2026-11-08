@@ -2393,6 +2393,130 @@ async function P173() {
   await vz.onClose();
   vz.containerEl.remove();
 
+  /* ---------- ⑥ Obsidian 后退：同一个 leaf 的 A→B→A，不重新创建视图 ---------- */
+  const backA = "P173-back-A.inkbook";
+  const backB = "P173-back-B.inkbook";
+  seed(backA, JSON.stringify(mkBook("后退 A", 3, 0)));
+  seed(backB, JSON.stringify(mkBook("后退 B", 2, 0)));
+  const vb = await openView();
+  await vb.onLoadFile(tf(backA));
+  await sleep(100);
+  vb.editor.setZoom(2);
+  vb.editor.scrollEl.scrollTop = 550;
+  vb.editor.scrollEl.scrollLeft = 220;
+  await vb.onUnloadFile();
+  const backSaved: any = JSON.parse(files.get(backA));
+  pass(
+    Math.abs(backSaved.zoom - 2) < 1e-6 && Math.abs(backSaved.scrollTop - 550) <= 2 &&
+      Math.abs(backSaved.scrollLeft - 220) <= 2,
+    "P173⑫ 后退前切走 A 已保存：zoom=" + backSaved.zoom +
+      "；top=" + backSaved.scrollTop + "；left=" + backSaved.scrollLeft
+  );
+  await vb.onLoadFile(tf(backB));
+  await vb.onUnloadFile();
+  await vb.onLoadFile(tf(backA));
+  await sleep(100);
+  pass(
+    vb.editor.fitMode === false && Math.abs(vb.editor.zoom - 2) < 1e-6 &&
+      Math.abs(vb.editor.scrollEl.scrollTop - 550) <= 2 &&
+      Math.abs(vb.editor.scrollEl.scrollLeft - 220) <= 2,
+    "P173⑬ 同 leaf 后退 A 恢复：zoom=" + vb.editor.zoom +
+      "；top=" + vb.editor.scrollEl.scrollTop + "；left=" + vb.editor.scrollEl.scrollLeft
+  );
+  await vb.onClose();
+  vb.containerEl.remove();
+
+  /*
+   * 后退时显式 zoom 恰好在隐藏布局里装载：三帧内都拿不到尺寸，
+   * 显示后 ResizeObserver 必须补落 pending（只看 getScrollTop 会假绿）。
+   */
+  const hiddenBook: any = mkBook("后退隐藏 A", 3, 0);
+  hiddenBook.zoom = 2;
+  hiddenBook.scrollTop = 480;
+  hiddenBook.scrollLeft = 180;
+  const hiddenPath = "P173-back-hidden.inkbook";
+  seed(hiddenPath, JSON.stringify(hiddenBook));
+  const vhBack = await openView();
+  /*
+   * 监听真实 ResizeObserver 实例的回调，避免测试直接调用私有
+   * applyPendingScroll 假绿。
+   *
+   * 必须按实例取回调：一次 onLoadFile 里可能不止建一个 ResizeObserver
+   * （嵌入渲染 / 顶栏等），只记「最后一个」会拿到别人的 observer，
+   * 触发的是别人的回调，编辑器的 pending 自然不动。
+   */
+  const NativeResizeObserver = window.ResizeObserver;
+  const observerCallbacks = new WeakMap<object, ResizeObserverCallback>();
+  (window as any).ResizeObserver = class extends NativeResizeObserver {
+    constructor(callback: ResizeObserverCallback) {
+      super(callback);
+      observerCallbacks.set(this, callback);
+    }
+  };
+  try {
+    await vhBack.onLoadFile(tf(hiddenPath));
+  } finally {
+    (window as any).ResizeObserver = NativeResizeObserver;
+  }
+  const editorObserver: any = (vhBack.editor as any).resizeObserver;
+  const notifyResize: (() => void) | null = editorObserver
+    ? () => observerCallbacks.get(editorObserver)?.([], editorObserver)
+    : null;
+  const hiddenEd: any = vhBack.editor;
+  const hiddenScroll = hiddenEd.scrollEl;
+  const hiddenHeight = Object.getOwnPropertyDescriptor(hiddenScroll, "clientHeight");
+  const hiddenWidth = Object.getOwnPropertyDescriptor(hiddenScroll, "clientWidth");
+  Object.defineProperty(hiddenScroll, "clientHeight", { configurable: true, value: 0 });
+  Object.defineProperty(hiddenScroll, "clientWidth", { configurable: true, value: 0 });
+  await sleep(120);
+  pass(
+    hiddenEd.pendingScrollTop === 480 && hiddenEd.pendingScrollLeft === 180 &&
+      hiddenScroll.scrollTop === 0 && hiddenScroll.scrollLeft === 0,
+    "P173⑭ 无尺寸时 pending 保留、不落成 0：top=" + hiddenEd.pendingScrollTop +
+      "；left=" + hiddenEd.pendingScrollLeft
+  );
+  if (hiddenHeight) Object.defineProperty(hiddenScroll, "clientHeight", hiddenHeight);
+  else delete (hiddenScroll as any).clientHeight;
+  if (hiddenWidth) Object.defineProperty(hiddenScroll, "clientWidth", hiddenWidth);
+  else delete (hiddenScroll as any).clientWidth;
+  /*
+   * 无头环境不会真的算布局：`clientHeight` 恢复成真实值后，
+   * `scrollHeight` / `scrollWidth` 仍然是 0（没有真实内容撑开）。
+   * 而 `applyPendingScroll` 的就绪判据要求两者都 > 0
+   * （「内容装得下时 max 也是 0」那种合法情况不能重试）。
+   * 所以这里把 scroll 尺寸也 mock 成「内容比容器高/宽」——
+   * 否则测的就不是「恢复」而是「测试环境没布局」，会假红。
+   */
+  Object.defineProperty(hiddenScroll, "scrollHeight", { configurable: true, value: 2000 });
+  Object.defineProperty(hiddenScroll, "scrollWidth", { configurable: true, value: 1600 });
+  /*
+   * 走 ResizeObserver 回调（真实路径）：容器尺寸从 0 变回真实值，
+   * 编辑器要靠这个回调把挂着的 pending 落下。
+   *
+   * `resizeRaf` 可能还压着上一帧（mount 时那次 applyLayout 排的），
+   * 不先清掉的话这次 notify 会被 `if (this.resizeRaf) return` 挡掉，
+   * 测试就变成「时序偶然」而不是「行为正确」。
+   */
+  if (hiddenEd.resizeRaf) {
+    cancelAnimationFrame(hiddenEd.resizeRaf);
+    hiddenEd.resizeRaf = 0;
+  }
+  // 真的触发一次回调；回调内部还要排一帧 rAF 才落 pending，
+  // 所以必须等帧过去再断言（同步读 DOM 只会看到 0）。
+  if (notifyResize) notifyResize();
+  await sleep(80);
+  pass(
+    Math.abs(hiddenScroll.scrollTop - 480) <= 2 &&
+      Math.abs(hiddenScroll.scrollLeft - 180) <= 2 &&
+      hiddenEd.pendingScrollTop == null && hiddenEd.pendingScrollLeft == null,
+    "P173⑮ 尺寸恢复后实际 DOM 补落：top=" + hiddenScroll.scrollTop +
+      "；left=" + hiddenScroll.scrollLeft
+  );
+  delete (hiddenScroll as any).scrollHeight;
+  delete (hiddenScroll as any).scrollWidth;
+  await vhBack.onClose();
+  vhBack.containerEl.remove();
+
   // 非法水平值：负数 / 字符串在 normalizeBook 阶段就当没写（不进内存对象）
   const negBook: any = mkBook("P173水平脏本", 1, 0);
   negBook.scrollLeft = -50;

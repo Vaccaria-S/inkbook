@@ -26,7 +26,7 @@ const only = process.argv[2] || "";
 const PAGES = [
   ["test.html", 310],
   ["export.html", 129],
-  ["p1.html", 214],
+  ["p1.html", 218],
   ["view.html", 117],
   ["tablet.html", 32],
   ["zoom.html", 21],
@@ -41,7 +41,7 @@ const PAGES = [
   ["thumb.html", 14],
   ["pdf.html", 46],
   ["bigpdf.html", 13],
-  ["touch.html", 17, "touch-run.mjs"],
+  ["touch.html", 21, "touch-run.mjs"],
   ["swipe.html", 7, "swipe-run.mjs"],
   ["qa-wrap.html", 267],
   ["embed.html", 119],
@@ -50,7 +50,7 @@ const PAGES = [
   ["qa-embed4.html", 122],
   ["pdftext.html", 177],
   ["qa-ink118-visual.html", 296],
-  ["modals.html", 87],
+  ["modals.html", 92],
   // 纸面模板渲染（INK-201）：6 模板 × 3 纸色 + 三处（屏幕/导出/嵌入）一致
   ["paper.html", 131],
 ];
