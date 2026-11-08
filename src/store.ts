@@ -98,6 +98,31 @@ export type HistoryEntry =
 /** 撤销栈最多保留多少条 */
 const MAX_HISTORY = 60;
 
+/**
+ * 撤销栈的**字节**上限（INK-197）。
+ *
+ * 只按条数封顶是不够的：`addPage` / `deletePage` / `insertPages` /
+ * `duplicatePage` / `setAllTemplates` 存的都是**整本 JSON 快照**
+ * （`snapshotBook`）。实测真实本子：
+ *   · 试用.inkbook 1.7MB × 60 层 = **101MB**
+ *   · 未命名笔记 2  4.0MB × 60 层 = **241MB**
+ * 而同一时刻还有位图缓存（160+32+8+64 = 264MB）——平板直接 OOM。
+ *
+ * 而且这些快照**大部分内容重复**：加一页只改页数，却把整本存一遍。
+ *
+ * 取 32MB：够存「4MB 本子的 8 层整本快照」，或者「几十层的单页快照」
+ * （单页快照通常几十 KB）。超过就从最旧的开始丢——撤销少几步，
+ * 总比应用被系统杀掉好。
+ */
+const MAX_HISTORY_BYTES = 32 * 1024 * 1024;
+
+/** 一条历史条目大概占多少字节（book/page 存的是 JSON 字符串） */
+function historyEntryBytes(e: HistoryEntry): number {
+  if (e.kind === "book" || e.kind === "page") return e.data.length * 2; // UTF-16
+  if (e.kind === "layer") return e.strokes.length * 64; // 粗估：每条笔迹对象引用 + 数组开销
+  return 64; // order / outline 只存 id / 小对象
+}
+
 export class BookStore {
   data: InkBook;
   onChange: () => void = () => {};
@@ -119,6 +144,11 @@ export class BookStore {
   /** 撤销栈：每项是一次操作的前后状态 */
   private undoStack: Array<{ before: HistoryEntry; after: HistoryEntry }> = [];
   private redoStack: Array<{ before: HistoryEntry; after: HistoryEntry }> = [];
+  /**
+   * 撤销栈的估算字节数（只算 undoStack；redoStack 与它共享同一批对象）。
+   * 维护它是为了按字节封顶——大本子的整本快照光按条数封不住（INK-197）。
+   */
+  private historyBytes = 0;
 
   constructor(book: InkBook) {
     this.data = book;
@@ -166,9 +196,49 @@ export class BookStore {
     // 增量操作自己记录前后状态，不需要挂起的快照
     this.pendingBefore = null;
     this.undoStack.push({ before, after });
-    if (this.undoStack.length > MAX_HISTORY) this.undoStack.shift();
+    this.historyBytes += historyEntryBytes(before) + historyEntryBytes(after);
+    /*
+     * 双重封顶：条数（MAX_HISTORY）+ 字节（MAX_HISTORY_BYTES）。
+     * 只按条数封顶时，大本子的整本快照能把内存吃到几百 MB（见常量注释）。
+     * 至少保留 1 条——哪怕单条就超预算，否则「撤销」直接不可用。
+     */
+    while (this.undoStack.length > 1 && this.undoStack.length > MAX_HISTORY) {
+      this.dropOldestUndo();
+    }
+    while (this.undoStack.length > 1 && this.historyBytes > MAX_HISTORY_BYTES) {
+      this.dropOldestUndo();
+    }
     // 新操作会让「重做」失效；但 undo/redo 的补结算不算新操作（见 settleHistory）
-    if (!keepRedo) this.redoStack.length = 0;
+    if (!keepRedo) {
+      this.redoStack.length = 0;
+      this.historyBytes = this.recountHistoryBytes();
+    }
+  }
+
+  /** 丢掉最旧的一条撤销记录，同步扣减字节计数 */
+  private dropOldestUndo(): void {
+    const old = this.undoStack.shift();
+    if (!old) return;
+    this.historyBytes -= historyEntryBytes(old.before) + historyEntryBytes(old.after);
+    if (this.historyBytes < 0) this.historyBytes = 0;
+  }
+
+  /**
+   * 重算撤销 + 重做栈的总字节数。
+   *
+   * `redoStack` 里的条目和 `undoStack` **共享同一批对象**（undo 时
+   * push 进去的是同一个 pair），所以不能简单相加。只在清空 redo 之后
+   * 重算一次，保证计数不漂移。
+   */
+  private recountHistoryBytes(): number {
+    let n = 0;
+    for (const p of this.undoStack) n += historyEntryBytes(p.before) + historyEntryBytes(p.after);
+    return n;
+  }
+
+  /** 撤销栈当前占用的估算字节数（测试/调试用） */
+  get historyUsedBytes(): number {
+    return this.historyBytes;
   }
 
   /**
@@ -297,6 +367,13 @@ export class BookStore {
     this.settleHistory(true);
     const pair = this.undoStack.pop();
     if (!pair) return false;
+    /*
+     * 条目从 undo 移到 redo：`historyBytes` 只统计 undoStack，
+     * 所以这里要扣掉（redo 时再加回来）。不扣的话计数会虚高，
+     * 导致「撤销几次之后突然开始丢历史」。
+     */
+    this.historyBytes -= historyEntryBytes(pair.before) + historyEntryBytes(pair.after);
+    if (this.historyBytes < 0) this.historyBytes = 0;
     // 回到操作前
     this.apply(pair.before);
     // 重做时用操作后的状态
@@ -309,6 +386,8 @@ export class BookStore {
     this.settleHistory(true);
     const pair = this.redoStack.pop();
     if (!pair) return false;
+    // 条目回到 undo 栈：字节计数要加回来（undo 时扣过）
+    this.historyBytes += historyEntryBytes(pair.before) + historyEntryBytes(pair.after);
     // 回到操作后
     this.apply(pair.after);
     this.undoStack.push(pair);

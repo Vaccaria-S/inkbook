@@ -2045,6 +2045,63 @@ async function main() {
   }
 
   /*
+   * 撤销栈按**字节**封顶（INK-197）。
+   *
+   * 只按条数（60）封顶不够：`addPage` / `deletePage` / `insertPages` /
+   * `duplicatePage` / `setAllTemplates` 存的是**整本 JSON 快照**。
+   * 实测真实本子：4MB 的本子 × 60 层 = **241MB**，加上位图缓存
+   * （160+32+8+64 = 264MB）平板直接 OOM。而且这些快照内容大部分重复
+   * （加一页只改页数，却把整本存一遍）。
+   */
+  {
+    const big = createBook("撤销字节上限", "grid", "white");
+    // 造一个「单层快照就很大」的本子：每页塞满笔迹
+    for (let i = 0; i < 40; i++) {
+      const p = createPage("grid", "white");
+      for (let j = 0; j < 120; j++) {
+        p.layers[0].strokes.push({
+          id: `s${i}_${j}`,
+          tool: "pen",
+          color: "#1A1A1A",
+          size: 2.8,
+          opacity: 1,
+          points: Array.from({ length: 12 }, (_, k) => [100 + k * 4, 200 + k * 3, 0.5]),
+        } as any);
+      }
+      big.pages.push(p);
+    }
+    const st = new BookStore(big);
+    const oneSnap = JSON.stringify({ pages: big.pages, activePage: 0 }).length * 2;
+    log("  单层整本快照约 " + (oneSnap / 1048576).toFixed(1) + "MB");
+
+    // 连加 30 页：每次都是整本快照
+    for (let i = 0; i < 30; i++) st.addPage(0);
+    const used = st.historyUsedBytes;
+    pass(
+      used <= 32 * 1024 * 1024 + oneSnap,
+      "INK-197 连加 30 页后撤销栈被字节封顶（实测 " + (used / 1048576).toFixed(1) +
+        "MB ≤ 32MB + 一层余量；不加封顶会是 " + ((oneSnap * 30) / 1048576).toFixed(0) + "MB）"
+    );
+    pass(
+      (st as any).undoStack.length < 30,
+      "INK-197 确实丢了最旧的记录（剩 " + (st as any).undoStack.length + " 条 < 30）"
+    );
+    pass(st.canUndo(), "INK-197 至少保留 1 条可撤销（不能一封顶就撤销全废）");
+    // 撤销仍然工作
+    const pagesBefore = big.pages.length;
+    st.undo();
+    pass(big.pages.length === pagesBefore - 1, "INK-197 封顶后撤销仍生效（页数 " + pagesBefore + " → " + big.pages.length + "）");
+    // redo 后字节计数不能漂
+    const usedAfterUndo = st.historyUsedBytes;
+    st.redo();
+    pass(
+      st.historyUsedBytes > usedAfterUndo,
+      "INK-197 redo 后字节计数加回来（" + (usedAfterUndo / 1048576).toFixed(1) + " → " +
+        (st.historyUsedBytes / 1048576).toFixed(1) + "MB）"
+    );
+  }
+
+  /*
    * 字体回退链（INK-193）。
    *
    * 导出 PDF 只有一款 Noto Sans SC，屏幕却可能回退到 SimSun / Consolas：
