@@ -89,12 +89,29 @@ export function boundsContain(b: Bounds, x: number, y: number): boolean {
 }
 
 export function strokeHit(stroke: Stroke, x: number, y: number, tolerance: number): boolean {
+  const reach = tolerance + stroke.size / 2;
+  /*
+   * 包围盒是**快速排除**用的粗筛，必须按 reach 外扩（INK-188）。
+   *
+   * `strokeBounds` 只外扩了 `size/2 + 5`（够画抗锯齿，不够判命中）。
+   * 拿它当硬门槛会漏掉「圈盖住了、但点在包围盒外」的情况：
+   * 一条短笔迹 `(210,500)-(212,500)` 的包围盒右边界是 218.4，
+   * 而橡皮圈半径 20 盖到 230 —— 在 225 处擦，距离只有 13（< reach 21.55），
+   * 明明该擦到，却被第一道门挡掉。用户感受就是
+   * 「圈明明罩住了笔迹，就是擦不掉」。
+   */
   const b = strokeBounds(stroke);
-  if (!boundsContain(b, x, y)) return false;
+  if (
+    x < b.minX - reach ||
+    x > b.maxX + reach ||
+    y < b.minY - reach ||
+    y > b.maxY + reach
+  ) {
+    return false;
+  }
   if (stroke.tool === "shape") return true;
   const pts = stroke.points;
   if (pts.length === 0) return false;
-  const reach = tolerance + stroke.size / 2;
   if (pts.length === 1) return distance(x, y, pts[0][0], pts[0][1]) <= reach;
   for (let i = 1; i < pts.length; i++) {
     if (pointSegmentDistance(x, y, pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]) <= reach) {

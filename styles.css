@@ -851,8 +851,19 @@
   cursor: crosshair;
 }
 
+/*
+ * 橡皮工具藏掉系统光标：改用 overlay 上画的范围圈当光标，
+ * 圈同时是「真实擦除范围」（半径与擦除共用同一个公式）。
+ *
+ * 圈在 editor.ts 里鼠标悬停时就画（不必按下），移出纸面 / 切工具即清，
+ * 所以这里藏了光标也不会出现「鼠标不见了」。
+ * 仅阅读模式下不画圈，把光标还给用户，别让纸面上完全看不见指针。
+ */
 .mb-doc[data-tool="eraser"] .mb-page {
   cursor: none;
+}
+.mb-root.is-reading .mb-doc[data-tool="eraser"] .mb-page {
+  cursor: default;
 }
 
 .mb-doc[data-tool="hand"] .mb-page {

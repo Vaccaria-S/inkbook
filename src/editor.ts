@@ -9,6 +9,7 @@ import {
   type ShapeKind,
   type Stroke,
   type TemplateId,
+  type Layer,
   type ToolId,
   uid,
 } from "./types";
@@ -640,8 +641,31 @@ export class BookEditor {
   private pointerId: number | null = null;
   private draft: Stroke | null = null;
   private draftRec: PageRec | null = null;
-  private eraserPos: { x: number; y: number; r: number } | null = null;
+  /**
+   * 橡皮范围圈：既是"按下时擦到哪"，也是"没按下时鼠标在哪"。
+   *
+   * 为什么两种状态共用一个字段：CSS 里 `cursor: none` 把系统光标藏了，
+   * 这个圈就是唯一的光标。悬停（不按下）和拖动（按下）都要显示，
+   * 且都得用**同一个半径公式**（见 eraserRadiusAt），否则用户看到的圈
+   * 和真正擦掉的范围对不上。
+   *
+   * pageIndex 记圈在哪一页：每页各有自己的 overlay，跨页移动时要能
+   * 把上一页残留的圈抹掉；坐标是页面坐标系（pointFromEvent），
+   * 所以缩放 / 滚动后不用重算。
+   */
+  private eraserPos: { x: number; y: number; r: number; pageIndex: number } | null = null;
   private undoPushed = false;
+  /**
+   * 擦除手势锁定的「页 + 层 id」。
+   *
+   * 为什么锁：手势期间用户可能切到别的层，若每次 eraseAt 都重新取
+   * activeLayer，前态（eraseBefore）记的是 A 层、后态却又抓了 B 层，
+   * 撤销记录就废了。开手势时定死，整段手势只动这一层。
+   *
+   * 存 id 而不是 Layer 对象引用：undo/redo 会用 JSON 快照整页重建，
+   * 那一瞬间所有旧 Layer 对象都成了孤儿，持引用会改到看不见的死数据。
+   */
+  private eraseLayer: { pageIndex: number; layerId: string } | null = null;
   private lastPoint: { x: number; y: number; t: number } | null = null;
   private lastPressure: number | null = null;
   /** 输入滤波：去掉手抖和采样噪声 */
@@ -683,6 +707,8 @@ export class BookEditor {
    */
   private velSamples: { t: number; y: number }[] = [];
   private overlayRaf = 0;
+  /** 待重画的页（跨页移动时可能同时有新旧两页） */
+  private overlayPending = new Set<number>();
   private scrollRaf = 0;
   private destroyed = false;
   private globalUp = (e: PointerEvent) => {
@@ -1091,6 +1117,7 @@ export class BookEditor {
     if (this.gesture === "erase") {
       this.gesture = "none";
       this.pointerId = null;
+      // 切后台 / 丢事件兜底：圈不该在回来后还挂在旧位置
       this.eraserPos = null;
       // 与 onUp 的 erase 分支保持一致：整条擦除手势合成一条历史，并补一次整页重画
       this.finishEraseGesture(this.recs[this.current] ?? null);
@@ -1204,7 +1231,11 @@ export class BookEditor {
   setTool(tool: ToolId): void {
     if (this.tool === tool) return;
     this.tool = tool;
-    this.eraserPos = null;
+    /*
+     * 切走橡皮时圈必须真的从屏幕上消失：eraserPos 只清了数据，
+     * 不重画 overlay 的话上一帧画的圈会一直留着（"幽灵圈"）。
+     */
+    this.clearEraserPos();
     // 离开文字/选择工具就没有"选中文字"这回事了，属性条一并收掉
     if (tool !== "text" && tool !== "select") this.selectText(null);
     this.applyTouchAction();
@@ -1871,6 +1902,12 @@ export class BookEditor {
     this.docEl.addEventListener("pointermove", (e) => {
       const rec = findRec(e.target);
       if (rec) this.onMove(e as PointerEvent, rec);
+      /*
+       * 页与页之间有空隙（gap / 添加页按钮），那些地方没有 .mb-page：
+       * 鼠标从一页滑到另一页会经过空隙，onMove 收不到，上一页的圈
+       * 就会一直挂着。经过空隙时按"离开纸面"处理，收掉圈。
+       */
+      else this.onLeave(e as PointerEvent);
     });
     this.docEl.addEventListener("pointerup", (e) => {
       const rec = findRec(e.target);
@@ -1880,9 +1917,14 @@ export class BookEditor {
       const rec = findRec(e.target);
       if (rec) this.onUp(e as PointerEvent, rec);
     });
+    /*
+     * pointerleave 挂在 docEl 上：冒泡到这里的事件 target 就是 docEl 本身，
+     * findRec 沿 target 往上找 .mb-page 永远返回 null → onLeave 从来没跑过，
+     * 鼠标移出纸面后圈会一直挂在最后的位置（幽灵圈）。
+     * 所以这里不查 target，直接收掉圈并重画所有已挂载页的 overlay。
+     */
     this.docEl.addEventListener("pointerleave", (e) => {
-      const rec = findRec(e.target);
-      if (rec) this.onLeave(e as PointerEvent, rec);
+      this.onLeave(e as PointerEvent);
     });
     this.docEl.addEventListener("contextmenu", (e) => {
       /*
@@ -1904,6 +1946,16 @@ export class BookEditor {
     this.clearLocateHint();
     // 页面全部重建，旧的锚点索引失效
     this.lockedAnchor = null;
+    /*
+     * 页 DOM 马上整批重建：正在擦的手势必须先把撤销记录结算掉。
+     * 以前这里直接把 gesture 抹成 "none"，finishEraseGesture 永远不跑，
+     * 擦掉的笔迹留在数据里却进不了撤销栈（Ctrl+Z 撤不回来）。
+     * 只处理 erase——正在画的草稿照旧丢弃，不改变落笔的既有语义。
+     */
+    if (this.gesture === "erase") {
+      this.finishEraseGesture(this.recs[this.current] ?? null);
+      if (this.opts.onInkGestureEnd) this.opts.onInkGestureEnd();
+    }
     this.draft = null;
     this.draftRec = null;
     this.gesture = "none";
@@ -2313,6 +2365,16 @@ export class BookEditor {
    */
   private beginPinch(info: PinchInfo): void {
     this.cancelStroke();
+
+    /*
+     * 第二根手指落下会打断正在擦的手势：先把这一段的撤销记录结算掉。
+     * 否则下面把 gesture 抹成 "none" 后 finishEraseGesture 永远不执行，
+     * 擦掉的笔迹留在数据里却撤不回来（🔴 数据丢失）。
+     */
+    if (this.gesture === "erase") {
+      this.finishEraseGesture(this.recs[this.current] ?? null);
+      if (this.opts.onInkGestureEnd) this.opts.onInkGestureEnd();
+    }
 
     /*
      * 把单指滚动那个"半残状态"清干净。
@@ -3256,6 +3318,29 @@ export class BookEditor {
     const w = this.store.data.width;
     const h = this.store.data.height;
     ctx.clearRect(0, 0, w, h);
+
+    /*
+     * 橡皮范围圈放在 current 判定**之前**：鼠标可能悬停在非当前页上
+     * （长本子滚动后视口里同时有好几页），圈得跟着鼠标走，不能只画在 current 页。
+     * 其余 overlay 内容（草稿 / 笔尖 / 选中框）仍只属于当前页。
+     *
+     * 圈是橡皮本身的范围；strokeHit 里另有 `+ stroke.size / 2`（笔迹自身
+     * 的粗细），所以实际擦掉的笔迹边缘可能略超出这个圈——这是有意为之，
+     * 用来把粗笔迹的外沿一起擦掉，不是半径对不上。
+     */
+    if (this.eraserPos && this.eraserPos.pageIndex === rec.index) {
+      const e = this.eraserPos;
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.r, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255,255,255,0.45)";
+      ctx.fill();
+      ctx.strokeStyle = "rgba(60,60,60,0.7)";
+      ctx.lineWidth = 1 / this.zoom;
+      ctx.stroke();
+      ctx.restore();
+    }
+
     if (rec.index !== this.current) return;
 
     if (this.draft && this.draftRec === rec) {
@@ -3273,19 +3358,6 @@ export class BookEditor {
       ctx.fillStyle = "rgba(28,28,32,0.34)";
       ctx.fill();
       ctx.strokeStyle = "rgba(255,255,255,0.85)";
-      ctx.lineWidth = 1 / this.zoom;
-      ctx.stroke();
-      ctx.restore();
-    }
-
-    if (this.eraserPos) {
-      const e = this.eraserPos;
-      ctx.save();
-      ctx.beginPath();
-      ctx.arc(e.x, e.y, e.r, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(255,255,255,0.45)";
-      ctx.fill();
-      ctx.strokeStyle = "rgba(60,60,60,0.7)";
       ctx.lineWidth = 1 / this.zoom;
       ctx.stroke();
       ctx.restore();
@@ -3984,11 +4056,35 @@ export class BookEditor {
   }
 
   private scheduleOverlay(rec: PageRec): void {
+    /*
+     * 按页收集待重画，而不是只记一个 rec：鼠标从一页滑到另一页时
+     * 同一帧里可能先排了旧页再排新页，旧实现 `if (overlayRaf) return`
+     * 会把新页丢掉，圈就少画一帧。
+     */
+    this.overlayPending.add(rec.index);
     if (this.overlayRaf) return;
     this.overlayRaf = requestAnimationFrame(() => {
       this.overlayRaf = 0;
-      if (rec.mounted) this.renderOverlay(rec);
+      const pages = [...this.overlayPending];
+      this.overlayPending.clear();
+      for (const i of pages) {
+        const r = this.recs[i];
+        if (r?.mounted) this.renderOverlay(r);
+      }
     });
+  }
+
+  /**
+   * 收掉橡皮圈，并把它原来所在页的 overlay 重画一次（否则残留像素擦不掉）。
+   * @returns 圈原来在哪一页；没有圈时返回 -1
+   */
+  private clearEraserPos(): number {
+    if (!this.eraserPos) return -1;
+    const pageIndex = this.eraserPos.pageIndex;
+    this.eraserPos = null;
+    const rec = this.recs[pageIndex];
+    if (rec) this.renderOverlay(rec);
+    return pageIndex;
   }
 
   /* ------------------------------- 坐标与压力 ------------------------------- */
@@ -4232,6 +4328,8 @@ export class BookEditor {
     if (this.readOnly === on) return;
     this.readOnly = on;
     if (on) {
+      // 阅读模式不画橡皮圈（CSS 也把光标还给用户了），把悬停圈收掉
+      this.clearEraserPos();
       this.cancelStroke();
       this.commitTextEdit();
     }
@@ -4509,12 +4607,16 @@ export class BookEditor {
     this.undoPushed = false;
     // 用户开始操作 → 锚点失效
     this.lockedAnchor = null;
-    // 新手势：清掉上一轮擦除的中间状态
+    // 新手势：清掉上一轮擦除的中间状态（层锁也要重置，见 erasingLayer）
     this.eraseBefore = null;
     this.eraseAfter = null;
+    this.eraseLayer = null;
 
     if (this.tool === "eraser") {
       this.gesture = "erase";
+      // 按下就画圈：半径和 eraseAt 用的同一个公式
+      this.eraserPos = { x: p[0], y: p[1], r: this.eraserRadiusAt(e), pageIndex: rec.index };
+      this.scheduleOverlay(rec);
       this.eraseAt(rec, p[0], p[1], e);
       return;
     }
@@ -4645,8 +4747,52 @@ export class BookEditor {
 
     // 笔尖悬停：没有按下时也显示笔尖位置，方便对准
     if (e.pointerType === "pen" && this.gesture === "none" && !this.arbiter.penDown) {
+      if (this.tool === "eraser") {
+        /*
+         * 橡皮工具下笔尖悬停不画范围圈（笔压要等落笔才有意义，
+         * 且平板主要用手指，不该有一个甩不掉的悬停圈）。
+         * 但鼠标刚切到笔时要把上一个圈收掉，否则会留幽灵圈。
+         */
+        this.clearEraserPos();
+      }
       const hp = this.pointFromEvent(e, rec);
       this.hoverPos = { x: hp[0], y: hp[1], p: e.pressure || 0.5 };
+      this.scheduleOverlay(rec);
+      return;
+    }
+
+    /*
+     * 橡皮工具下鼠标悬停（没按下）就画范围圈。
+     *
+     * 为什么必须放在 arbiter.move 之前：没按下时仲裁器里没有这根指针，
+     * move() 直接返回 "ignore"，后面的擦除分支根本走不到 —— 这正是
+     * `cursor:none` 让鼠标完全消失、只有按下才冒出圈的根因。
+     *
+     * 只认 mouse：手指 / 触控笔没有真正的 hover（手指贴屏即 pointerdown，
+     * 笔悬停归上面的 hoverPos 管），给它们画圈会在抬手后留一个甩不掉的圈。
+     */
+    if (
+      this.tool === "eraser" &&
+      e.pointerType === "mouse" &&
+      this.gesture === "none" &&
+      e.buttons === 0 &&
+      !this.readOnly
+    ) {
+      // 从笔尖悬停切回鼠标：笔尖小圆点不该和橡皮圈叠在一起
+      this.hoverPos = null;
+      const hp = this.pointFromEvent(e, rec);
+      const prev = this.eraserPos;
+      this.eraserPos = {
+        x: hp[0],
+        y: hp[1],
+        r: this.eraserRadiusAt(null),
+        pageIndex: rec.index,
+      };
+      // 跨页移动：上一页的 overlay 要单独重画一次，把旧圈擦掉
+      if (prev && prev.pageIndex !== rec.index) {
+        const old = this.recs[prev.pageIndex];
+        if (old) this.renderOverlay(old);
+      }
       this.scheduleOverlay(rec);
       return;
     }
@@ -4670,9 +4816,42 @@ export class BookEditor {
     }
 
     if (this.tool === "eraser" && this.gesture !== "draw") {
-      this.eraserPos = { x: p[0], y: p[1], r: this.eraserSize / 2 };
+      /*
+       * 快速划动时一帧能来好几个坐标：绘制路径会遍历 coalesced events，
+       * 橡皮以前只用最后一个点，120Hz 笔下相邻点间距可能超过橡皮直径，
+       * 留下没擦到的「断带」。这里同样遍历，但把 dirty 并起来，
+       * 一帧只局部重绘一次（不退化成每个点都重画整块）。
+       */
+      const raw =
+        typeof e.getCoalescedEvents === "function" ? e.getCoalescedEvents() || [] : [];
+      const events = this.gesture === "erase" && raw.length ? raw : [e];
+      // 圈跟最后一个（最新的）坐标与笔压，和这一帧最后一次擦除完全一致
+      const last = events[events.length - 1];
+      const lp = this.pointFromEvent(last, rec);
+      this.eraserPos = {
+        x: lp[0],
+        y: lp[1],
+        r: this.eraserRadiusAt(last),
+        pageIndex: rec.index,
+      };
       this.scheduleOverlay(rec);
-      if (this.gesture === "erase") this.eraseAt(rec, p[0], p[1], e);
+      if (this.gesture === "erase") {
+        if (events.length <= 1) {
+          this.eraseAt(rec, lp[0], lp[1], last);
+        } else {
+          const dirty: Bounds = {
+            minX: Infinity,
+            minY: Infinity,
+            maxX: -Infinity,
+            maxY: -Infinity,
+          };
+          for (const ev of events) {
+            const q = this.pointFromEvent(ev, rec);
+            this.eraseAt(rec, q[0], q[1], ev, dirty);
+          }
+          if (dirty.minX !== Infinity) this.repaintEraseRegion(rec, dirty);
+        }
+      }
       return;
     }
 
@@ -4800,7 +4979,22 @@ export class BookEditor {
     } else if (gesture === "draw" || gesture === "shape") {
       this.commitDraft(rec);
     } else if (gesture === "erase") {
-      this.eraserPos = null;
+      /*
+       * 鼠标抬手后仍悬停在纸上：圈要留在抬手处继续当光标，
+       * 否则 cursor:none 又让鼠标凭空消失，用户得再动一下才找得到。
+       * 手指 / 笔没有 hover，直接收掉。
+       */
+      if (e.pointerType === "mouse") {
+        const up = this.pointFromEvent(e, rec);
+        this.eraserPos = {
+          x: up[0],
+          y: up[1],
+          r: this.eraserRadiusAt(null),
+          pageIndex: rec.index,
+        };
+      } else {
+        this.eraserPos = null;
+      }
       // 擦除手势结束：这时才结算整条历史，并整页重画一次
       this.finishEraseGesture(rec);
     }
@@ -4812,11 +5006,20 @@ export class BookEditor {
     }
   }
 
-  private onLeave(e: PointerEvent, rec: PageRec): void {
-    if (this.gesture === "erase" && this.eraserPos) {
-      this.eraserPos = null;
-      this.scheduleOverlay(rec);
-    }
+  /**
+   * 鼠标离开纸面：收掉橡皮圈。
+   *
+   * 以前这里只在 `gesture === "erase"` 时清，悬停画的圈清不掉；
+   * 而且事件委托挂 docEl、target 恒为 docEl，findRec 返回 null 导致
+   * 整个回调从不执行 —— 圈会一直留在最后的位置（幽灵圈）。
+   * 现在不依赖 target，直接清数据并重画所有已挂载页的 overlay。
+   *
+   * 正在擦除的手势不清：指针被 pageEl 捕获着，中途离开纸面只是
+   * 擦到了边缘，抬手时 onUp 会自己收尾。
+   */
+  private onLeave(_e: PointerEvent): void {
+    if (this.gesture === "erase") return;
+    this.clearEraserPos();
   }
 
   private commitDraft(rec: PageRec): void {
@@ -4857,28 +5060,74 @@ export class BookEditor {
     this.emitState();
   }
 
-  private eraseAt(rec: PageRec, x: number, y: number, e: PointerEvent): void {
-    const page = this.store.data.pages[rec.index];
-    const layer = activeLayer(page);
+  /**
+   * 橡皮实际半径：画圈和擦除**共用这一处**。
+   *
+   * 为什么抽出来：以前画圈用 eraserSize/2（恒定 13），擦除却乘了
+   * (0.55 + press)，鼠标 press=1 时是 20.15 —— 圈 13 却擦掉 20，
+   * 用户直接报「擦出的范围跟圈有出入」。
+   *
+   * 选 (a) 保留压感：用力大擦得多对触控笔是有意义的手感，不能因为
+   * 鼠标 press 恒为 1 就把笔的能力砍掉。代价是圈的半径会随笔压变，
+   * 但这正是「圈 = 真实擦除范围」——轻按圈就小，重按圈就大。
+   * 悬停（没按下、没有真实笔压）按满压算，和鼠标按下时一致。
+   */
+  private eraserRadiusAt(e: PointerEvent | null): number {
     const base = this.eraserSize / 2;
-    const press = e.pointerType === "pen" ? clamp(e.pressure || 0.5, 0.05, 1) : 1;
-    const radius = base * (0.55 + press * 1.0);
+    const press = e && e.pointerType === "pen" ? clamp(e.pressure || 0.5, 0.05, 1) : 1;
+    return base * (0.55 + press * 1.0);
+  }
+
+  /**
+   * 擦一次（可带 dirty 外接矩形用于合并重绘）。
+   *
+   * @param dirty 传入时把本轮改动区域并进去、且不立即重绘；
+   *              不传时（pointerdown 的第一次）自己重绘一次。
+   */
+  private eraseAt(
+    rec: PageRec,
+    x: number,
+    y: number,
+    e: PointerEvent,
+    dirty?: Bounds
+  ): void {
+    const page = this.store.data.pages[rec.index];
+    if (!page) return;
+    // 隐藏层看不见却仍会被擦掉，静默删数据；直接跳过
+    const layer = this.erasingLayer(rec.index);
+    if (!layer || !layer.visible) return;
+    const radius = this.eraserRadiusAt(e);
     let changed = false;
     const remove = new Set<string>();
     const replacements: Array<{ oldId: string; pieces: Stroke[] }> = [];
     /*
-     * 这次 pointermove 实际会改到哪些像素：被删 / 被替换笔迹的包围盒并集。
+     * 这次擦除实际会改到哪些像素：被删 / 被替换笔迹的包围盒并集。
      * 手势期间只重绘这一块（见 repaintEraseRegion），不再整页重画。
      * 新切出的碎片都在老笔迹的包围盒内，所以不用再算一遍碎片的范围。
+     * 合并事件一次能来好几个坐标，用外部传入的 dirty 把它们并成一帧重绘。
      */
-    const dirty: Bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+    const region: Bounds = dirty ?? {
+      minX: Infinity,
+      minY: Infinity,
+      maxX: -Infinity,
+      maxY: -Infinity,
+    };
+    const isEmpty = () =>
+      region.minX === Infinity || region.maxX === -Infinity;
     const unionBounds = (s: Stroke) => {
       const b = strokeBounds(s);
       const pad = this.strokeExtraPad(s);
-      if (b.minX - pad < dirty.minX) dirty.minX = b.minX - pad;
-      if (b.minY - pad < dirty.minY) dirty.minY = b.minY - pad;
-      if (b.maxX + pad > dirty.maxX) dirty.maxX = b.maxX + pad;
-      if (b.maxY + pad > dirty.maxY) dirty.maxY = b.maxY + pad;
+      if (isEmpty()) {
+        region.minX = b.minX - pad;
+        region.minY = b.minY - pad;
+        region.maxX = b.maxX + pad;
+        region.maxY = b.maxY + pad;
+        return;
+      }
+      if (b.minX - pad < region.minX) region.minX = b.minX - pad;
+      if (b.minY - pad < region.minY) region.minY = b.minY - pad;
+      if (b.maxX + pad > region.maxX) region.maxX = b.maxX + pad;
+      if (b.maxY + pad > region.maxY) region.maxY = b.maxY + pad;
     };
 
     for (const s of layer.strokes) {
@@ -4923,10 +5172,30 @@ export class BookEditor {
     }
     if (remove.size) store.removeStrokes(remove, rec.index, true);
     for (const r of replacements) store.replaceStroke(r.oldId, r.pieces, rec.index, true);
-    // 只重画改动区域；抬手时 finishEraseGesture 再整页重画一次兜底
-    this.repaintEraseRegion(rec, dirty);
+    // 没传 dirty = 单独一次擦除，立刻重画；传了 = 合并事件的一帧，等外层画一次
+    if (!dirty) this.repaintEraseRegion(rec, region);
     store.touch();
     this.changed();
+  }
+
+  /**
+   * 取本次擦除手势锁定的层。
+   *
+   * 手势第一次擦到东西时把「页 + 层 id」定死，之后不再跟着 activeLayer 变：
+   * 手势中途切层的话，前后态必须落在同一层，否则撤销记录前后对不上。
+   * 存 id 每次现查，是为了避开 undo/redo 整页重建后拿着旧 Layer 对象。
+   */
+  private erasingLayer(pageIndex: number): Layer | null {
+    const lock = this.eraseLayer;
+    if (lock && lock.pageIndex === pageIndex) {
+      const page = this.store.data.pages[pageIndex];
+      return page?.layers.find((l) => l.id === lock.layerId) ?? null;
+    }
+    const page = this.store.data.pages[pageIndex];
+    if (!page) return null;
+    const layer = activeLayer(page);
+    this.eraseLayer = { pageIndex, layerId: layer.id };
+    return layer;
   }
 
   /**
@@ -4955,6 +5224,8 @@ export class BookEditor {
     this.eraseBefore = null;
     this.eraseAfter = null;
     this.undoPushed = false;
+    // 手势结束，下一轮重新按当下的 activeLayer 锁定
+    this.eraseLayer = null;
     if (rec) {
       // 没擦到东西的点击（比如空页上点一下）不值得整页重画，只清 overlay
       if (edited) this.renderRec(rec);
@@ -5869,6 +6140,8 @@ export class BookEditor {
     if (this.observer) this.observer.disconnect();
     this.observer = null;
     if (this.overlayRaf) cancelAnimationFrame(this.overlayRaf);
+    this.overlayRaf = 0;
+    this.overlayPending.clear();
     if (this.scrollRaf) cancelAnimationFrame(this.scrollRaf);
     if (this.wheelRaf) cancelAnimationFrame(this.wheelRaf);
     // 释放位图显存和 PDF 文档句柄

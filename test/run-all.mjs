@@ -24,7 +24,7 @@ const only = process.argv[2] || "";
  * 所以这几页在这一列标出 runner，别"顺手统一"成 run.mjs。
  */
 const PAGES = [
-  ["test.html", 258],
+  ["test.html", 288],
   ["export.html", 128],
   ["p1.html", 161],
   ["view.html", 117],

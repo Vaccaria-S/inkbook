@@ -72,6 +72,40 @@ async function draw(points: Array<[number, number]>, pointerId = 7) {
   await sleep(30);
 }
 
+/** 自定义 pointerType / pressure 的事件（橡皮圈、双指捏合用） */
+function ptr(
+  type: string,
+  x: number,
+  y: number,
+  buttons: number,
+  pointerId: number,
+  pointerType = "mouse",
+  pressure = 0.5
+): PointerEvent {
+  const r = pageEl().getBoundingClientRect();
+  const k = r.width / 794;
+  return new PointerEvent(type, {
+    bubbles: true,
+    cancelable: true,
+    pointerId,
+    pointerType,
+    isPrimary: true,
+    button: 0,
+    buttons,
+    clientX: r.left + x * k,
+    clientY: r.top + y * k,
+    pressure: type === "pointerup" ? 0 : pressure,
+  });
+}
+
+/** 从当前页 overlay 的圆心/圆周取像素，判断橡皮圈画没画 */
+function overlayAlphaAt(x: number, y: number): number {
+  const cv = document.querySelector(".mb-overlay") as HTMLCanvasElement;
+  const k = cv.width / 794;
+  const d = cv.getContext("2d")!.getImageData(Math.round(x * k), Math.round(y * k), 1, 1).data;
+  return d[3];
+}
+
 async function main() {
   await sleep(500);
   const s0 = editor.getState();
@@ -412,6 +446,294 @@ async function main() {
       "一条擦除手势只记一条撤销（撤销后回到 " + n0 + " 条）"
     );
     pass(avg(300, 332).b < 230, "撤销后荧光笔墨迹像素恢复");
+  }
+
+  /* ================= INK-186：橡皮圈 = 光标 = 真实擦除范围 =================
+   *
+   * 用户报的两条：① 橡皮工具下鼠标进了笔记就完全不显示，只有按下才冒圈；
+   * ② 擦出来的范围比圈大（圈 13、实际擦 20）。
+   * 外加审查员挖出的 1 个 🔴（双指捏合打断擦除会吞掉撤销记录）
+   * 与几个 🟡（幽灵圈 / 隐藏层 / 切层 / 合并事件漏擦）。
+   */
+  {
+    editor.setTool("eraser");
+    editor.setEraserMode("part");
+    editor.eraserSize = 26;
+    await sleep(50);
+    const hx = 250;
+    const hy = 500;
+    const doc = document.querySelector(".mb-doc") as HTMLElement;
+
+    /* ---- ① 悬停（不按下）就该有圈 ---- */
+    pageEl().dispatchEvent(ev("pointermove", hx, hy, 0, 61));
+    await sleep(60);
+    const hoverCircle = (editor as any).eraserPos;
+    pass(!!hoverCircle, "INK-186 鼠标悬停不按下：overlay 有橡皮圈数据");
+    pass(
+      !!hoverCircle && Math.abs(hoverCircle.x - hx) < 2 && Math.abs(hoverCircle.y - hy) < 2,
+      "INK-186 悬停圈落在鼠标位置（页面坐标 " +
+        (hoverCircle ? hoverCircle.x.toFixed(0) + "," + hoverCircle.y.toFixed(0) : "-") + "）"
+    );
+    pass(overlayAlphaAt(hx, hy) > 12, "INK-186 悬停时 overlay 圆心真的画出了像素");
+
+    /* ---- ② 圈半径 = 实际擦除半径（同一个公式） ---- */
+    const expectedR = (editor as any).eraserRadiusAt(null);
+    pass(
+      !!hoverCircle && Math.abs(hoverCircle.r - expectedR) < 0.001,
+      "INK-186 悬停圈半径 = eraserRadiusAt (" +
+        (hoverCircle ? hoverCircle.r.toFixed(2) : "-") + " / " + expectedR.toFixed(2) + ")"
+    );
+    pass(
+      Math.abs(expectedR - 26 / 2 * 1.55) < 0.001,
+      "INK-186 鼠标（press=1）半径是 20.15，不再是旧的恒定 13"
+    );
+
+    /*
+     * 行为层面的边界验证：把橡皮圆心放在笔迹的**垂直方向**上，
+     * 才能用「距圆心多远」干净地量半径（水平方向圆心会落在线段上，距离恒为 0）。
+     *
+     * r = 20.15，penSize/2 = 1.4，strokeHit 的 reach = 21.55。
+     *  · 距 30 > reach：不该擦到；
+     *  · 距 17 < reach：该擦到，且**圈的半径必须 ≥ 17 才盖得住这段笔迹**。
+     *    旧代码画圈用 13（< 17）却擦掉 17 处的笔迹，正是用户报的
+     *    「擦出的范围跟圈有出入」——这条断言会当场失败。
+     */
+    const r = expectedR;
+    const nBefore = store.strokeCount;
+    editor.setTool("pen");
+    /*
+     * 用**多个点**画：1€ 滤波会把「只有两个点」的线段严重收缩
+     * （起点 210 → 终点 290，滤波后实际只到 212），
+     * 那样测出来的笔迹根本不是水平的 80 单位长，边界断言就失真了。
+     */
+    const lineePts: Array<[number, number]> = [];
+    for (let i = 0; i <= 16; i++) lineePts.push([hx - 40 + i * 5, hy]);
+    await draw(lineePts, 62);
+    pass(store.strokeCount === nBefore + 1, "INK-186 边缘测试：先画好一条水平笔迹");
+    editor.setTool("eraser");
+    editor.setEraserMode("whole"); // 整笔模式：擦到就整条删，条数好数
+    await draw([[hx, hy + 30]], 63);
+    pass(
+      store.strokeCount === nBefore + 1,
+      "INK-186 距圆心 30 (> reach 21.55) 的笔迹擦不到"
+    );
+    await draw([[hx, hy + 17]], 64);
+    pass(
+      store.strokeCount === nBefore,
+      "INK-186 距圆心 17 (< reach) 的笔迹确实被擦掉"
+    );
+    pass(
+      r >= 17,
+      "INK-186 圈半径 " + r.toFixed(2) + " ≥ 17，盖得住刚被擦到的笔迹（旧圈 13 会失败）"
+    );
+    editor.undo();
+    await sleep(40);
+    pass(store.strokeCount === nBefore + 1, "INK-186 圈内擦除可撤销");
+    editor.undo();
+    await sleep(40);
+    pass(store.strokeCount === nBefore, "INK-186 边缘测试笔迹撤干净");
+    editor.setEraserMode("part");
+
+    /*
+     * ---- ②b 短笔迹的**端部外**也要能擦到（INK-188）----
+     *
+     * `strokeHit` 的第一道门是按 `strokeBounds` 判包围盒，而那个包围盒
+     * 只外扩了 `size/2 + 5`（够画抗锯齿，**不够判命中**）。
+     * 一条只有十几单位长的短笔迹，包围盒右边界离笔迹末端只有 6.4，
+     * 橡皮半径 20 盖到 26 —— 在 20 处擦，距末端只有 20 < reach 21.55，
+     * 明明该擦到，却被包围盒挡掉。用户感受：「圈罩住了笔迹就是擦不掉」。
+     */
+    {
+      const n0 = store.strokeCount;
+      editor.setTool("pen");
+      // 一条很短的横线（末端约在 hx+12）
+      const shortPts: Array<[number, number]> = [];
+      for (let i = 0; i <= 8; i++) shortPts.push([hx, hy + 200 + i * 1.5]);
+      await draw(shortPts, 80);
+      const shortStroke = store.page.layers[0].strokes[store.page.layers[0].strokes.length - 1];
+      const endY = Math.max(...shortStroke.points.map((p) => p[1]));
+      editor.setTool("eraser");
+      editor.setEraserMode("whole");
+      // 在笔迹末端**下方 18 单位**擦：距末端 18 < reach 21.55，但远在包围盒外
+      await draw([[hx, endY + 18]], 81);
+      pass(
+        store.strokeCount === n0,
+        "INK-188 短笔迹端部外侧 18 单位（圈内）能擦到（包围盒不该当硬门槛）"
+      );
+      for (let i = 0; i < 4 && store.strokeCount !== n0; i++) {
+        editor.undo();
+        await sleep(40);
+      }
+      editor.setEraserMode("part");
+    }
+
+    /* ---- ③ 移出纸面 / 切工具 / 页间空隙：幽灵圈必须消失 ---- */
+    pageEl().dispatchEvent(ev("pointermove", hx, hy, 0, 65));
+    await sleep(50);
+    pass(!!(editor as any).eraserPos, "INK-186 幽灵圈：先悬停造出一个圈");
+    doc.dispatchEvent(new PointerEvent("pointerleave", { bubbles: true, pointerId: 65, pointerType: "mouse" }));
+    await sleep(50);
+    pass(!(editor as any).eraserPos, "INK-186 鼠标移出纸面后圈被清掉");
+    pass(overlayAlphaAt(hx, hy) < 12, "INK-186 移出纸面后 overlay 上不再有圈像素");
+
+    pageEl().dispatchEvent(ev("pointermove", hx, hy, 0, 66));
+    await sleep(50);
+    editor.setTool("pen");
+    await sleep(50);
+    pass(!(editor as any).eraserPos, "INK-186 切走橡皮工具后圈被清掉");
+    pass(overlayAlphaAt(hx, hy) < 12, "INK-186 切工具后 overlay 上不再有幽灵圈像素");
+
+    /* ---- ④ 手指 / 笔不该有悬停圈（只有鼠标有 hover） ---- */
+    editor.setTool("eraser");
+    pageEl().dispatchEvent(ptr("pointermove", hx, hy, 0, 67, "touch", 0.5));
+    await sleep(50);
+    pass(!(editor as any).eraserPos, "INK-186 手指没有 hover，不画悬停圈");
+    pageEl().dispatchEvent(ptr("pointermove", hx, hy, 0, 68, "pen", 0.5));
+    await sleep(50);
+    pass(!(editor as any).eraserPos, "INK-186 笔尖悬停不画范围圈（只有笔尖预览）");
+
+    /* ---- ⑤ 缩放后圈仍落在正确位置 ---- */
+    const zPrev = editor.getState().zoom;
+    editor.setZoom(2.0);
+    await sleep(200);
+    pageEl().dispatchEvent(ev("pointermove", hx, hy, 0, 69));
+    await sleep(60);
+    const zoomed = (editor as any).eraserPos;
+    pass(
+      !!zoomed && Math.abs(zoomed.x - hx) < 2 && Math.abs(zoomed.y - hy) < 2,
+      "INK-186 2 倍缩放后悬停圈仍在页面坐标 (" +
+        (zoomed ? zoomed.x.toFixed(0) + "," + zoomed.y.toFixed(0) : "-") + ")"
+    );
+    editor.setZoom(zPrev);
+    await sleep(200);
+    doc.dispatchEvent(new PointerEvent("pointerleave", { bubbles: true, pointerId: 69, pointerType: "mouse" }));
+    await sleep(30);
+
+    /* ---- ⑥ 🔴 双指捏合打断擦除手势，撤销记录不能丢 ---- */
+    {
+      const n0 = store.strokeCount;
+      editor.setTool("pen");
+      // 多点画线：只有两个点会被 1€ 滤波收缩，笔迹长度不够就擦不到（同边缘测试）
+      const pinchLine: Array<[number, number]> = [];
+      for (let i = 0; i <= 16; i++) pinchLine.push([400 + i * 10, 900]);
+      await draw(pinchLine, 70);
+      pass(store.strokeCount === n0 + 1, "INK-186 捏合测试：先画一条笔迹");
+      const beforeErase = store.strokeCount;
+      editor.setTool("eraser");
+      editor.setEraserMode("whole");
+      editor.setTouchDraw(true);
+      // 手指按下开始擦（擦掉刚画的笔迹）
+      pageEl().dispatchEvent(ptr("pointerdown", 480, 900, 1, 71, "touch", 0.5));
+      pageEl().dispatchEvent(ptr("pointermove", 481, 900, 1, 71, "touch", 0.5));
+      await sleep(20);
+      pass(store.strokeCount === n0, "INK-186 捏合测试：第一指已擦掉笔迹");
+      // 第二根手指落下 → 仲裁器进入双指手势 → beginPinch 打断擦除手势
+      pageEl().dispatchEvent(ptr("pointerdown", 300, 700, 1, 72, "touch", 0.5));
+      await sleep(40);
+      pass((editor as any).gesture !== "erase", "INK-186 捏合打断后 gesture 已复位");
+      // 关键：这一段擦除必须进撤销栈，Ctrl+Z 能撤回来
+      editor.undo();
+      await sleep(50);
+      pass(
+        store.strokeCount === beforeErase,
+        "INK-186 🔴 双指打断后擦除仍可撤销（" + store.strokeCount + " → " + beforeErase + "）"
+      );
+      // 收尾：抬掉两根手指，还原手势状态与测试笔迹
+      for (const id of [71, 72]) {
+        pageEl().dispatchEvent(ptr("pointerup", 300, 700, 0, id, "touch", 0));
+      }
+      await sleep(60);
+      editor.setTouchDraw(false);
+      editor.undo();
+      await sleep(40);
+      pass(store.strokeCount === n0, "INK-186 捏合测试收尾：笔迹撤干净");
+    }
+
+    /* ---- ⑦ 🟡 隐藏层不该被擦 ---- */
+    {
+      const n0 = store.strokeCount;
+      editor.setTool("pen");
+      await draw([
+        [120, 1000],
+        [240, 1000],
+      ], 73);
+      const layer = store.page.layers[0];
+      const nWith = store.strokeCount;
+      // 直接改 visible：toggleLayer 会 snapshotPage，多出历史会打乱收尾的 undo 计数
+      layer.visible = false;
+      pass(!layer.visible, "INK-186 隐藏层测试：当前层已隐藏");
+      editor.setTool("eraser");
+      editor.setEraserMode("whole");
+      await draw([[180, 1000]], 74);
+      pass(
+        store.strokeCount === nWith,
+        "INK-186 🟡 在隐藏层上擦不删数据（条数仍 " + nWith + "）"
+      );
+      layer.visible = true; // 恢复显示
+      editor.setTool("pen");
+      editor.undo();
+      await sleep(40);
+      pass(store.strokeCount === n0, "INK-186 隐藏层测试收尾");
+    }
+
+    /* ---- ⑧ 🟡 合并事件（一帧多个坐标）不能漏擦 ---- */
+    {
+      const n0 = store.strokeCount;
+      editor.setTool("pen");
+      // 多点画线（同前：两个点会被 1€ 滤波收缩）
+      const mergeLine: Array<[number, number]> = [];
+      for (let i = 0; i <= 16; i++) mergeLine.push([300 + i * 12.5, 1050]);
+      await draw(mergeLine, 75);
+      editor.setTool("eraser");
+      editor.setEraserMode("part");
+      editor.eraserSize = 10;
+      /*
+       * 直接在 eraseAt 上挂探针数它被调用了几次：
+       * 一帧里 3 个合并坐标就必须擦 3 次，旧实现只用帧末坐标会只调 1 次，
+       * 相邻点间距超过橡皮直径时留下「断带」。
+       * 比数切分段数稳——段数会被 splitStrokeByEraser 的重密化吃掉。
+       */
+      const realEraseAt = (editor as any).eraseAt.bind(editor);
+      let eraseCalls = 0;
+      (editor as any).eraseAt = (...args: any[]) => {
+        eraseCalls++;
+        return realEraseAt(...args);
+      };
+      const down = ev("pointerdown", 360, 1050, 1, 76);
+      const move = ev("pointermove", 420, 1050, 1, 76);
+      const merged = [
+        ev("pointermove", 340, 1050, 1, 76),
+        ev("pointermove", 380, 1050, 1, 76),
+        ev("pointermove", 420, 1050, 1, 76),
+      ];
+      Object.defineProperty(move, "getCoalescedEvents", { value: () => merged });
+      pageEl().dispatchEvent(down);
+      pageEl().dispatchEvent(move);
+      pageEl().dispatchEvent(ev("pointerup", 420, 1050, 0, 76));
+      await sleep(60);
+      delete (editor as any).eraseAt;
+      pass(
+        eraseCalls === 4,
+        "INK-186 🟡 合并事件每个坐标都擦到（eraseAt 调用 " + eraseCalls + " 次，旧实现 2 次）"
+      );
+      /*
+       * 收尾：撤到画这条线之前。
+       *
+       * 不用固定次数——这条线被局部擦除后可能切成多段，一次手势只记
+       * **一条**历史，但前面还有「画线」那一条。撤到 strokeCount === n0
+       * 为止最稳（最多撤 5 次兜底）。
+       */
+      for (let i = 0; i < 5 && store.strokeCount !== n0; i++) {
+        editor.undo();
+        await sleep(40);
+      }
+      editor.eraserSize = 26;
+      pass(store.strokeCount === n0, "INK-186 合并事件测试收尾");
+    }
+
+    editor.setTool("pen");
+    doc.dispatchEvent(new PointerEvent("pointerleave", { bubbles: true, pointerId: 79, pointerType: "mouse" }));
+    await sleep(30);
   }
 
   /* 文字：添加、编辑、删除、撤销、导出 */
