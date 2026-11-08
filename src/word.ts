@@ -60,9 +60,32 @@ export function parseZip(bytes: Uint8Array): ZipEntry[] {
   return out;
 }
 
-/** 用浏览器自带的 DecompressionStream 解 deflate */
+/**
+ * 用浏览器自带的 DecompressionStream 解 deflate。
+ *
+ * `deflate-raw` 是 Compression Streams 规范里较早加入的格式，Chromium 103+
+ * 才有。旧版安卓 WebView / 老 Electron 上要么没有 `DecompressionStream`，
+ * 要么只认 `deflate` / `gzip` —— 直接 new 会抛 TypeError，而错误原文是
+ * 「The provided value 'deflate-raw' is not a valid enum value…」，
+ * 用户完全看不懂。这里换成能照做的中文提示。
+ *
+ * 注意：`deflate`（带 zlib 头 + Adler-32 校验）不能拿来解 raw 数据，
+ * 所以没有「换个格式名重试」这种便宜兜底 —— 只能明确告诉用户升级或换文件。
+ */
 async function inflateRaw(data: Uint8Array): Promise<Uint8Array> {
-  const ds = new DecompressionStream("deflate-raw");
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error(
+      "当前系统的解压组件不支持 .docx（缺少 DecompressionStream）。请更新 Obsidian / 系统 WebView 后重试，或先把文档另存为 PDF 再导入。"
+    );
+  }
+  let ds: DecompressionStream;
+  try {
+    ds = new DecompressionStream("deflate-raw");
+  } catch (e) {
+    throw new Error(
+      "当前系统不支持解压 .docx（deflate-raw 格式不可用）。请更新 Obsidian / 系统 WebView 后重试，或先把文档另存为 PDF 再导入。"
+    );
+  }
   const stream = new Blob([data as unknown as BlobPart]).stream().pipeThrough(ds);
   const buf = await new Response(stream).arrayBuffer();
   return new Uint8Array(buf);

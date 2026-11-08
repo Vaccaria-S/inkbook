@@ -902,6 +902,31 @@ async function main(): Promise<void> {
       );
       m2.close();
 
+      /*
+       * INK-214 续：老式 .doc 要给出「另存为 .docx」的操作建议，
+       * 不能只说「只能导入 .docx」——用户手里拿的往往就是 .doc。
+       */
+      const pickedDoc: any[] = [];
+      const mDoc = new ImportSourceModal(app, "word", (f) => pickedDoc.push(f));
+      const elDoc = openModal(mDoc);
+      const inputDoc = elDoc.querySelector('input[type="file"]') as HTMLInputElement;
+      const oldDoc: any = {
+        name: "老文档.doc",
+        size: 10,
+        arrayBuffer: async () => new ArrayBuffer(0),
+      };
+      Object.defineProperty(inputDoc, "files", { configurable: true, get: () => [oldDoc] });
+      inputDoc.dispatchEvent(new Event("change"));
+      await sleepMs(50);
+      const docNotice = notices[notices.length - 1] || "";
+      pass(
+        pickedDoc.length === 0 &&
+          docNotice.includes(".doc") &&
+          docNotice.includes("另存为"),
+        "INK-214 老式 .doc 给出「另存为 .docx」的建议（" + docNotice + "）"
+      );
+      mDoc.close();
+
       /* 3) 撞名：库里已有同名 imported 文件时加序号，绝不覆盖 */
       forceExists = 1;
       const picked3: any[] = [];

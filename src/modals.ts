@@ -627,7 +627,21 @@ export class ImportSourceModal extends Modal {
     if (!allowed.includes(ext)) {
       const want = this.kind === "pdf" ? "PDF" : this.kind === "word" ? "Word（.docx）" : "PDF 或 Word（.docx）";
       this.setStatus(`「${f.name}」不是 ${want} 文件`);
-      new Notice(`只能导入 ${want} 文件：${f.name}`, 5000);
+      /*
+       * 老式 `.doc` 单独说清楚怎么办（2026-11-08）。
+       *
+       * 用户手里常常是 `.doc`，它和 `.docx` 是**两种完全不同的格式**
+       * （老的是 OLE 复合文档，新的是 zip）。只说「只能导入 .docx」
+       * 用户不知道下一步该干嘛，会以为功能坏了。这里直接给操作建议。
+       */
+      if (ext === "doc") {
+        new Notice(
+          `「${f.name}」是老式 .doc 格式，墨本只支持 .docx。请用 Word / WPS 另存为 .docx 后再导入。`,
+          10000
+        );
+      } else {
+        new Notice(`只能导入 ${want} 文件：${f.name}`, 5000);
+      }
       return;
     }
 
