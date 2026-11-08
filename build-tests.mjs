@@ -66,6 +66,9 @@ const HARNESSES = [
   "qa-ink118-visual-harness.ts",
   // QA 独立验证：批注折行（屏幕 DOM / 画布 / 导出三处断字一致 + 不越界）
   "qa-wrap-harness.ts",
+  // 纸面模板渲染（INK-201）：6 模板 × 3 纸色像素级验证 +
+  // 屏幕 / 导出 / 嵌入三处线条位置一致 + fill=false 透明 + scale + 侧栏预览
+  "paper-harness.ts",
   // P1 数据安全（指纹 / 原子写 / 版本闸门 / 冲突 / 完整性）
   "p1-harness.ts",
   // 笔记内嵌入（INK-105）：链接解析 / 一页渲染 / 缓存 / postprocessor 端到端

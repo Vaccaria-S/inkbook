@@ -51,6 +51,8 @@ const PAGES = [
   ["pdftext.html", 177],
   ["qa-ink118-visual.html", 296],
   ["modals.html", 70],
+  // 纸面模板渲染（INK-201）：6 模板 × 3 纸色 + 三处（屏幕/导出/嵌入）一致
+  ["paper.html", 131],
 ];
 
 const runOne = (page, i, runner = "run.mjs") =>
