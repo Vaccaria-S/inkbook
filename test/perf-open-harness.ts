@@ -497,6 +497,16 @@ async function openViewOnce(sample: Sample, collectProbe: boolean): Promise<View
    */
   if (!view.store) errors.push("onLoadFile 后 store 为空（读盘/解析失败，检查测试服务是否还在）");
 
+  /*
+   * 缩略图已搬到左侧抽屉，**默认收起时不建**（这正是首屏变快的原因之一）。
+   * 要测「窗口化有没有生效」必须先展开抽屉，否则量到 0 个 —— 那是正确行为，
+   * 不是窗口化失效。
+   */
+  const dockHandle = view.contentEl.querySelector(".mb-pagedock-handle") as HTMLElement | null;
+  if (dockHandle && !view.contentEl.querySelector(".mb-pagedock.is-open")) {
+    dockHandle.click();
+    await sleep(200);
+  }
   const thumbs = view.contentEl.querySelectorAll(".mb-thumb").length;
   const pageCountOk = view.store?.pageCount === sample.expectPages;
   for (const fn of undo) fn();

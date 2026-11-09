@@ -693,6 +693,132 @@
   position: relative;
 }
 
+/* ==================== 左侧「页面」抽屉 ====================
+ *
+ * 用户要的是 Obsidian 原生 PDF 阅读器那种：屏幕左边最上面的框里有个
+ * 按钮，点一下把缩略图翻出来。所以抽屉默认**收起成一条把手**，
+ * 展开时从左侧推出，压住纸面左缘（不改变纸面可用宽度，避免展开/收起
+ * 时整页重排——那是比遮挡更难受的跳动）。
+ *
+ * 只在 .mb-editor 内，不占右侧工具侧栏的位置。
+ */
+/*
+ * 抽屉**收起时不占布局宽度**：否则把手会永久吃掉纸面左侧 40px，
+ * 让「纸面通栏」失效（用户在平板上最在意的就是纸能占满宽度）。
+ * 所以整块用绝对定位浮在纸面左上角；展开时抽屉主体才真正推出来。
+ */
+.mb-pagedock {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  display: flex;
+  align-items: stretch;
+  z-index: 30;
+  pointer-events: none;
+}
+
+/* 把手：永远可见的左上角按钮 */
+.mb-pagedock-handle {
+  pointer-events: auto;
+  position: absolute;
+  left: 6px;
+  top: 8px;
+  z-index: 2;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--background-primary) 88%, transparent);
+  color: var(--text-muted);
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+}
+
+.mb-pagedock-handle:hover {
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
+}
+
+.mb-pagedock.is-open .mb-pagedock-handle {
+  color: var(--interactive-accent);
+  border-color: color-mix(in srgb, var(--interactive-accent) 55%, transparent);
+}
+
+/* 抽屉主体：收起时宽度 0，展开时 240px（绝对定位，盖在纸面左侧） */
+.mb-pagedock-body {
+  pointer-events: auto;
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid transparent;
+  background: var(--background-primary);
+  transition:
+    width 0.18s cubic-bezier(0.2, 0.9, 0.3, 1),
+    border-color 0.18s ease;
+}
+
+.mb-pagedock.is-open .mb-pagedock-body {
+  width: 240px;
+  border-right-color: var(--background-modifier-border);
+  box-shadow: 6px 0 18px -12px rgba(0, 0, 0, 0.35);
+  /* 抽屉盖住把手时，把标签往下让出把手的高度 */
+  padding-top: 48px;
+}
+
+/* 收起时内部不参与布局，避免 0 宽容器里还去量尺寸 */
+.mb-pagedock:not(.is-open) .mb-pagedock-body > * {
+  visibility: hidden;
+}
+
+.mb-pagedock-body .mb-side-tabs {
+  margin: 8px 8px 6px;
+  flex: 0 0 auto;
+}
+
+/*
+ * 面板本身就是滚动容器：updatePageWindow 需要「视口 rect 与列表 rect
+ * 不是同一个元素」才能算出可见行范围（两者相同则差值恒 0，窗口化失效）。
+ */
+.mb-pagedock-body .mb-side-pane {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: 0 6px 8px;
+}
+
+.mb-pagedock-body .mb-side-pane.is-hidden {
+  display: none;
+}
+
+.mb-pagedock-body .mb-pages,
+.mb-pagedock-body .mb-outlines {
+  flex: 0 0 auto;
+}
+
+/* 平板：把手和标签都要手指点得准 */
+.mb-root.is-tablet .mb-pagedock-handle {
+  width: 42px;
+  height: 42px;
+  border-radius: 11px;
+}
+
+.mb-root.is-tablet .mb-pagedock.is-open .mb-pagedock-body {
+  width: min(280px, 62vw);
+}
+
 /* 纸面列：装滚动容器和右下角浮标 */
 .mb-paper {
   flex: 1 1 auto;
@@ -1894,6 +2020,35 @@
 .mb-ib:hover {
   background: var(--background-modifier-hover);
   color: var(--text-normal);
+}
+
+/*
+ * 带文字的图标按钮（导入 / 导出）。
+ *
+ * 用户两次反馈这两个按钮「太像、分不出来」，换图标解决不了 ——
+ * 直接写成「图标 + 文字」，宽度自适应。
+ */
+.mb-ib.mb-ib-labeled {
+  width: auto;
+  min-width: 34px;
+  padding: 0 9px;
+  gap: 5px;
+}
+
+.mb-ib-label {
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+/* 平板：标签字号跟着按钮一起放大 */
+.mb-root.is-tablet .mb-ib.mb-ib-labeled {
+  padding: 0 12px;
+  gap: 6px;
+}
+
+.mb-root.is-tablet .mb-ib-label {
+  font-size: 13px;
 }
 
 .mb-ib:active {

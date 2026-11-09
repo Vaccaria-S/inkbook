@@ -173,7 +173,11 @@ async function main() {
   pass(view.sideEl.textContent!.includes("笔盒"), "侧栏有笔盒");
   pass(view.sideEl.querySelectorAll(".mb-tpl").length === 6, "6 个纸张模板");
   pass(view.sideEl.querySelectorAll(".mb-paper-chip").length === 3, "3 种纸色");
-  pass(view.sideEl.querySelectorAll(".mb-thumb").length === 3, "2 页 + 加页按钮");
+  {
+    const dh = view.contentEl.querySelector(".mb-pagedock-handle") as HTMLElement;
+    if (dh && !view.contentEl.querySelector(".mb-pagedock.is-open")) { dh.click(); await sleep(200); }
+    pass(view.contentEl.querySelectorAll(".mb-pagedock .mb-thumb").length === 3, "2 页 + 加页按钮");
+  }
   pass(view.sideEl.querySelectorAll(".mb-layer").length === 1, "1 个图层");
 
   /*
@@ -373,36 +377,41 @@ async function main() {
       return orig(cv, i);
     }) as any;
 
-    v.sideShown = false;
-    v.applySideVisibility();
+    v.pagedockOpen = false;
+    v.applyPageDock();
     calls = 0;
     v.refreshThumbs();
     pass(calls === 0, "侧栏收起：refreshThumbs 不渲染任何缩略图（实际 " + calls + " 次）");
 
-    v.sideShown = true;
-    v.applySideVisibility();
+    /*
+     * 展开抽屉的**补建动作**在 togglePageDock 里（切 class 之外还要
+     * 补建页列表 + 补画缩略图），所以这里走真实入口而不是只改字段。
+     */
+    v.togglePageDock();
+    await sleep(200);
     pass(calls > 0, "展开侧栏：自动补画当前页附近的缩略图（" + calls + " 次）");
 
     /*
      * 「从未建过列表」的路径：收起状态打开文件时列表根本不建。
      * 展开必须能补建出完整列表，不能是空白。
      */
-    v.sideShown = false;
-    v.applySideVisibility();
+    v.pagedockOpen = false;
+    v.applyPageDock();
     v.pageListEl.empty();
     v.thumbCanvases.clear();
     v.pageCountSig = -1;
     calls = 0;
     v.refreshThumbs();
     pass(
-      view.sideEl.querySelectorAll(".mb-thumb").length === 0,
-      "侧栏收起且列表未建：打开时不创建缩略图条目（" + view.sideEl.querySelectorAll(".mb-thumb").length + " 个）"
+      view.contentEl.querySelectorAll(".mb-pagedock .mb-thumb").length === 0,
+      "侧栏收起且列表未建：打开时不创建缩略图条目（" + view.contentEl.querySelectorAll(".mb-pagedock .mb-thumb").length + " 个）"
     );
-    v.sideShown = true;
-    v.applySideVisibility();
+    v.pagedockOpen = true;
+    v.applyPageDock();
+    v.updatePageWindow(true);
     pass(
-      view.sideEl.querySelectorAll(".mb-thumb").length === 3,
-      "首次展开：补建完整页列表（2 页 + 加页，实际 " + view.sideEl.querySelectorAll(".mb-thumb").length + " 个）"
+      view.contentEl.querySelectorAll(".mb-pagedock .mb-thumb").length === 3,
+      "首次展开：补建完整页列表（2 页 + 加页，实际 " + view.contentEl.querySelectorAll(".mb-pagedock .mb-thumb").length + " 个）"
     );
 
     view.editor!.renderThumbnail = orig;
@@ -991,14 +1000,18 @@ async function main() {
   }
 
   /* 页面 */
-  // 「加一页」现在在侧栏的「页面」区里
+  // 「加一页」现在在左侧抽屉的「页面」区里
   const addPageBtn = [...view.contentEl.querySelectorAll(".mb-link")].find(
     (el) => (el as HTMLElement).textContent?.includes("加一页")
   ) as HTMLElement;
   addPageBtn.click();
   await sleep(200);
   pass(view.store!.pageCount === 3, "加页后 3 页");
-  pass(view.sideEl.querySelectorAll(".mb-thumb").length === 4, "缩略图 3 + 加页");
+  pass(
+    (view.contentEl.querySelector(".mb-pagedock") as HTMLElement)?.querySelectorAll(".mb-thumb")
+      .length === 4,
+    "缩略图 3 + 加页"
+  );
   view.editor!.undo();
   await sleep(100);
   pass(view.store!.pageCount === 2, "撤销加页回 2 页");

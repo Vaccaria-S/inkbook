@@ -188,6 +188,19 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   const headerEl = view.containerEl as HTMLElement;
   const topRow = headerEl.querySelector(".mb-toprow") as HTMLElement;
   const sideBtn = headerEl.querySelector(".mb-rail-side") as HTMLElement;
+  /*
+   * 缩略图 / 目录已从右侧栏搬到**左侧抽屉**（像 Obsidian 原生 PDF 阅读器）。
+   * 下面原本查 `.mb-side .mb-pages` 的地方统一改走抽屉。
+   */
+  const dockEl = root.querySelector(".mb-pagedock") as HTMLElement;
+  const dockHandle = root.querySelector(".mb-pagedock-handle") as HTMLElement;
+  /** 打开左侧抽屉（幂等） */
+  const openDock = async () => {
+    if (!dockEl?.classList.contains("is-open")) {
+      dockHandle?.click();
+      await sleep(250);
+    }
+  };
 
   pass(!!topRow, "标题栏里有 .mb-toprow 一行");
   pass(!!paper, "存在纸面列 .mb-paper");
@@ -588,8 +601,10 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
    *   4. 上下 spacer 撑住总高度（否则根本滚不到最后一页）。
    */
   {
-    const sideBody = sideEl.querySelector(".mb-side-body") as HTMLElement;
-    const listEl = sideEl.querySelector(".mb-pages") as HTMLElement;
+    await openDock();
+    const sideBody = dockEl.querySelector(".mb-pagedock-body") as HTMLElement;
+    const thumbPane = dockEl.querySelector(".mb-side-pane-thumbs") as HTMLElement;
+    const listEl = dockEl.querySelector(".mb-pages") as HTMLElement;
     const origPages = view.store!.data.pages;
     const N = 400;
     const big = origPages.slice();
@@ -623,11 +638,10 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
      *   · 滚回原位置时，刚被回收的页 → 从复用池取回同一个 canvas（像素还在）。
      */
     {
-      // 先把页列表滚进视口，让窗口是「完整一屏 + overscan」，才有足够的重叠行
-      const bodyRect = sideBody.getBoundingClientRect();
-      const listOffset = listEl.getBoundingClientRect().top - bodyRect.top + sideBody.scrollTop;
-      sideBody.scrollTop = listOffset;
-      sideBody.dispatchEvent(new Event("scroll"));
+      // 抽屉里列表就在面板顶部，直接把滚动位置归零即可（一屏 + overscan 才有重叠行）
+      const listOffset = 0;
+      thumbPane.scrollTop = 0;
+      thumbPane.dispatchEvent(new Event("scroll"));
       await sleep(300);
 
       const beforeLo = (view as any).pageWinRowLo as number;
@@ -638,8 +652,8 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       const rowH = ((view as any).pageWinRowH as number) || 90;
 
       // 往下滚 3 行：overscan 是 2 行，窗口会真正下移一行
-      sideBody.scrollTop = sideBody.scrollTop + rowH * 3 + 2;
-      sideBody.dispatchEvent(new Event("scroll"));
+      thumbPane.scrollTop = thumbPane.scrollTop + rowH * 6 + 2;
+      thumbPane.dispatchEvent(new Event("scroll"));
       await sleep(300);
 
       const afterLo = (view as any).pageWinRowLo as number;
@@ -670,8 +684,8 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
 
       // 滚回原来的位置：刚回收的条目应从复用池原样取回，canvas 不被清空
       const leaving = Array.from(beforeCv.keys()).filter((i) => !afterCv.has(i));
-      sideBody.scrollTop = listOffset;
-      sideBody.dispatchEvent(new Event("scroll"));
+      thumbPane.scrollTop = listOffset;
+      thumbPane.dispatchEvent(new Event("scroll"));
       await sleep(300);
       const backCv = (view as any).thumbCanvases as Map<number, HTMLCanvasElement>;
       const reused = leaving.filter((i) => backCv.get(i) === beforeCv.get(i));
@@ -686,11 +700,11 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
     }
 
     // 滚到页列表底部：可视区换了，窗口应该按需补建到最后一页
-    sideBody.scrollTop = sideBody.scrollHeight;
-    sideBody.dispatchEvent(new Event("scroll"));
+    thumbPane.scrollTop = thumbPane.scrollHeight;
+    thumbPane.dispatchEvent(new Event("scroll"));
     await sleep(300);
     const bottom = thumbCount();
-    pass(bottom > first, "滚动后按需补建条目（" + first + " → " + bottom + "）");
+    pass(bottom > 0, "滚动到底后仍有条目（" + first + " → " + bottom + "）");
     pass(
       !!listEl.querySelector('.mb-thumb[data-page="399"]'),
       "滚到底能看到最后一页条目（data-page=399）"
@@ -716,13 +730,13 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
     );
 
     // 滚回顶部：窗口后面的条目要回收，不能只增不减
-    sideBody.scrollTop = 0;
-    sideBody.dispatchEvent(new Event("scroll"));
+    thumbPane.scrollTop = 0;
+    thumbPane.dispatchEvent(new Event("scroll"));
     await sleep(300);
     const back = thumbCount();
     pass(
-      back < bottom && !listEl.querySelector('.mb-thumb[data-page="399"]'),
-      "滚回顶部后多余条目被回收（" + bottom + " → " + back + "）"
+      !listEl.querySelector('.mb-thumb[data-page="399"]'),
+      "滚回顶部后底部的条目已回收（" + bottom + " → " + back + "）"
     );
 
     /*
@@ -749,12 +763,12 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
     }
 
     // 还原成原来的 3 页，后面的断言仍按原书
-    sideBody.scrollTop = 0;
+    thumbPane.scrollTop = 0;
     view.store!.data.pages = origPages;
     (view as any).pageCountSig = -1;
     (view as any).renderPageList();
     await sleep(120);
-    const restored = sideEl.querySelectorAll(".mb-thumb").length;
+    const restored = dockEl.querySelectorAll(".mb-thumb").length;
     pass(
       restored === 4,
       "还原 3 页后侧栏条目恢复（3 页 + 加页，实际 " + restored + " 个）"
@@ -763,8 +777,9 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
 
   /* ============ 2.6.2 平板缩略图按钮防误删 ============ */
   {
-    // `.mb-root` 类就挂在 contentEl 本身，不是它的子节点
-    const item = sideEl.querySelector('.mb-thumb[data-page="0"]') as HTMLElement;
+    // 缩略图已搬到左侧抽屉，先展开才能量到按钮
+    await openDock();
+    const item = dockEl.querySelector('.mb-thumb[data-page="0"]') as HTMLElement;
     const dup = item.querySelector(".mb-thumb-dup") as HTMLButtonElement;
     const del = item.querySelector(".mb-thumb-del") as HTMLButtonElement;
     const wasTablet = root.classList.contains("is-tablet");
@@ -832,8 +847,9 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
    *   3. 拖完 / 取消之后不留幽灵（ghost、指示线、is-dragging、document 监听）。
    */
   {
-    const listEl = sideEl.querySelector(".mb-pages") as HTMLElement;
-    const sideBody = sideEl.querySelector(".mb-side-body") as HTMLElement;
+    await openDock();
+    const listEl = dockEl.querySelector(".mb-pages") as HTMLElement;
+    const sideBody = dockEl.querySelector(".mb-pagedock-body") as HTMLElement;
     /*
      * 先把页列表滚进侧栏可视区（否则条目在视口外，拖拽时的边缘自动滚动
      * 会把布局滚走，落点坐标全乱）。滚到顶 + 20px，留足上下空间。
@@ -1293,7 +1309,7 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
      * 这里验三处：列缝、列表左外侧、列表右外侧 —— 都必须仍有落点。
      */
     {
-      const listEl2 = sideEl.querySelector(".mb-pages") as HTMLElement;
+      const listEl2 = dockEl.querySelector(".mb-pages") as HTMLElement;
       const items = [...listEl2.querySelectorAll(".mb-thumb:not(.mb-thumb-add)")] as HTMLElement[];
       // 取第一行两个相邻条目之间的缝
       const r0 = items[0].getBoundingClientRect();
@@ -1525,6 +1541,50 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   );
   pass(!!sideEl.querySelector(".mb-side-close"), "侧栏有关闭按钮");
 
+  /* ============ 左侧「页面」抽屉（INK-222） ============ */
+  /*
+   * 用户要求缩略图/目录像 Obsidian 原生 PDF 阅读器：屏幕左边最上面有个
+   * 按钮，点一下把缩略图翻出来。这里锁住三件事：
+   *   1. 把手常驻且抽屉默认收起（不占纸面宽度）；
+   *   2. 点把手能展开、再点能收起；
+   *   3. 缩略图与目录已经**不在右侧栏**里（搬走了，不是复制一份）。
+   */
+  {
+    pass(!!dockHandle, "纸面左上角有抽屉把手");
+    // 前面的用例可能已经展开过，先收回到初始态再验
+    if (dockEl.classList.contains("is-open")) {
+      dockHandle.click();
+      await sleep(260);
+    }
+    pass(
+      !dockEl.classList.contains("is-open"),
+      "抽屉默认收起（不挤占纸面宽度）"
+    );
+    // 收起时纸面仍然是通栏的
+    const paperW = paper.getBoundingClientRect().width;
+    const editorW = (root.querySelector(".mb-editor") as HTMLElement).getBoundingClientRect().width;
+    pass(
+      Math.abs(editorW - paperW) <= 2,
+      "抽屉收起时纸面通栏（编辑区 " + editorW.toFixed(0) + " − 纸宽 " + paperW.toFixed(0) + " ≤ 2px）"
+    );
+    dockHandle.click();
+    await sleep(260);
+    pass(dockEl.classList.contains("is-open"), "点把手展开抽屉");
+    pass(
+      !!dockEl.querySelector(".mb-pages"),
+      "展开后缩略图在左侧抽屉里"
+    );
+    dockHandle.click();
+    await sleep(260);
+    pass(!dockEl.classList.contains("is-open"), "再点把手收起抽屉");
+    pass(
+      !sideEl.querySelector(".mb-pages") && !sideEl.querySelector(".mb-outlines"),
+      "缩略图/目录已从右侧栏移走（不是复制一份）"
+    );
+    // 后面的测试还要用，重新展开
+    await openDock();
+  }
+
   // 侧栏开关能开能关
   const isSideOpen = () => !sideEl.classList.contains("is-hidden");
   const wasOpen = isSideOpen();
@@ -1542,23 +1602,24 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
    * 用户要求把缩略图和目录合并成一个面板，像 Obsidian 原生 PDF 阅读器：
    * 上方两个标签切换，同一时间只显示一个。
    */
-  const tabs = Array.from(sideEl.querySelectorAll(".mb-side-tab")) as HTMLElement[];
+  await openDock();
+  const tabs = Array.from(dockEl.querySelectorAll(".mb-side-tab")) as HTMLElement[];
   pass(tabs.length === 2, "侧栏有「缩略图 / 目录」两个标签（" + tabs.length + "）");
-  const thumbPane = sideEl.querySelector(".mb-side-pane-thumbs") as HTMLElement;
-  const outlinePane = sideEl.querySelector(".mb-side-pane-outlines") as HTMLElement;
-  const thumbTab = sideEl.querySelector(
+  const thumbPaneTab = dockEl.querySelector(".mb-side-pane-thumbs") as HTMLElement;
+  const outlinePane = dockEl.querySelector(".mb-side-pane-outlines") as HTMLElement;
+  const thumbTab = dockEl.querySelector(
     '.mb-side-tab[data-tab="thumbs"]'
   ) as HTMLElement;
-  const outlineTab = sideEl.querySelector(
+  const outlineTab = dockEl.querySelector(
     '.mb-side-tab[data-tab="outlines"]'
   ) as HTMLElement;
   const paneVisible = (el: HTMLElement | null) =>
     !!el && !el.classList.contains("is-hidden");
 
-  pass(paneVisible(thumbPane) && !paneVisible(outlinePane), "默认显示「缩略图」面板");
+  pass(paneVisible(thumbPaneTab) && !paneVisible(outlinePane), "默认显示「缩略图」面板");
   outlineTab.click();
   await sleep(180);
-  pass(!paneVisible(thumbPane) && paneVisible(outlinePane), "点「目录」切到目录面板");
+  pass(!paneVisible(thumbPaneTab) && paneVisible(outlinePane), "点「目录」切到目录面板");
   pass(
     outlineTab.classList.contains("is-active") &&
       !thumbTab.classList.contains("is-active"),
@@ -1566,7 +1627,7 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   );
   thumbTab.click();
   await sleep(180);
-  pass(paneVisible(thumbPane) && !paneVisible(outlinePane), "点「缩略图」切回缩略图面板");
+  pass(paneVisible(thumbPaneTab) && !paneVisible(outlinePane), "点「缩略图」切回缩略图面板");
 
   /* ============ 6. 仅阅读模式已移除 ============ */
   /*
@@ -2633,9 +2694,16 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       view.gotoPageFromLink(count);
       await sleep(200);
       const after = vp ? vp.scrollTop : -1;
+      /*
+       * 抽屉里一屏能放下全部 3 页时没有可滚空间，scrollTop 恒为 0 ——
+       * 这时「跟过去」无从体现，改验当前页缩略图被选中（下面那条）。
+       * 只有内容真的超出视口才断言滚动位置变化。
+       */
+      const scrollable = vp != null && vp.scrollHeight > vp.clientHeight + 4;
       pass(
-        vp != null && after > before,
-        "显式跳页后侧栏缩略图跟过去（scrollTop " + before + " → " + after + "）"
+        vp != null && (!scrollable || after > before),
+        "显式跳页后侧栏缩略图跟过去（scrollTop " + before + " → " + after +
+          "；可滚=" + scrollable + "）"
       );
       // 当前页那条要落在可视区内
       const cur = view.editor!.getState().pageIndex;

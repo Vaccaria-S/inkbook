@@ -637,10 +637,16 @@ export class InkbookView extends FileView {
    * 切回来时只需按新尺寸重算窗口，不用重建 DOM。
    */
   private sideTab: "thumbs" | "outlines" = "thumbs";
-  /** 两个标签页容器（buildSide 里建，切换时切 is-hidden） */
+  /** 两个标签页容器（buildPageDock 里建，切换时切 is-hidden） */
   private sideThumbPane: HTMLElement | null = null;
   private sideOutlinePane: HTMLElement | null = null;
   private sideTabBtns: HTMLButtonElement[] = [];
+  /** 左侧「页面」抽屉（缩略图 + 目录），像 Obsidian 原生 PDF 阅读器 */
+  private pagedockEl: HTMLElement | null = null;
+  private pagedockBodyEl: HTMLElement | null = null;
+  private pagedockHandleEl: HTMLButtonElement | null = null;
+  /** 抽屉是否展开。默认收起，只留左上角一个按钮 */
+  private pagedockOpen = false;
   /** 缩放指示器：缩放时才浮现，2.6 秒后自己退回去 */
   private zoomHintTimer = 0;
   /** 缩放指示器是否被指针悬停（悬停时不自动隐藏） */
@@ -1272,6 +1278,8 @@ export class InkbookView extends FileView {
     this.buildFloat();
     this.buildScrollbar();
     this.buildSide();
+    // 缩略图 / 目录搬到左侧抽屉（Obsidian 原生 PDF 阅读器那种）
+    this.buildPageDock();
     this.updateUI();
     this.saveState = "saved";
     this.updateStatus();
@@ -1539,7 +1547,8 @@ export class InkbookView extends FileView {
    * 量不到尺寸也画不出来，同样不必维护（切回缩略图标签时会强制补建）。
    */
   private thumbVisible(): boolean {
-    return this.sideShown && this.sideTab === "thumbs";
+    // 缩略图现在住在左侧抽屉里：抽屉展开 + 当前是缩略图标签才需要维护
+    return this.pagedockOpen && this.sideTab === "thumbs";
   }
 
   private buildUI(): void {
@@ -3564,8 +3573,8 @@ export class InkbookView extends FileView {
     closeBtn.onclick = () => this.toggleSide();
 
     const body = side.createDiv("mb-side-body");
-    // 页列表的窗口随这个滚动容器移动；侧栏尺寸/断点变化也要重算行高
-    this.attachPageListScroll(body);
+    // 页列表已经搬到左侧抽屉（见 buildPageDock），那里再挂滚动监听
+    this.attachPageListScroll(null);
 
     /* ---------------------------- 工具行 ---------------------------- */
     /*
@@ -3590,19 +3599,29 @@ export class InkbookView extends FileView {
     this.redoBtn.title = "重做 (Ctrl+Shift+Z)";
     setIcon(this.redoBtn, "redo-2");
     this.redoBtn.onclick = () => this.editor?.redo();
+    /*
+     * 导入 / 导出**带文字标签**（2026-11-09）。
+     *
+     * 之前是两个纯图标按钮，先后试过 import/download 和
+     * file-input/file-output —— 用户两次反馈「这俩太像，分不出来」。
+     * 形状相近的图标在平板上本来就难分辨，与其再换一对图标，
+     * 不如直接把字写出来：一眼就知道哪个是进、哪个是出。
+     */
     const impBtn = actRow.createEl("button", {
-      cls: "mb-ib",
+      cls: "mb-ib mb-ib-labeled",
       attr: { "aria-label": "导入文档" },
     });
     impBtn.title = "导入文档：把 PDF / Word 放进本子，在上面手写批注";
     setIcon(impBtn, "file-input");
+    impBtn.createSpan({ cls: "mb-ib-label", text: "导入" });
     impBtn.onclick = (e) => this.showImportMenu(e);
     const expBtn = actRow.createEl("button", {
-      cls: "mb-ib",
+      cls: "mb-ib mb-ib-labeled",
       attr: { "aria-label": "导出本子" },
     });
     expBtn.title = "导出本子：存成 PDF 或本页 PNG";
     setIcon(expBtn, "file-output");
+    expBtn.createSpan({ cls: "mb-ib-label", text: "导出" });
     expBtn.onclick = (e) => this.showExportMenu(e);
 
     /* ---------------------------- 笔盒 ---------------------------- */
@@ -3801,17 +3820,48 @@ export class InkbookView extends FileView {
     this.layerListEl = layerSec.createDiv("mb-layers");
     this.renderLayers();
 
-    /* ---------------------- 缩略图 / 目录（同一面板） ---------------------- */
-    /*
-     * 缩略图和目录以前是上下两块独立区域，用户反馈想「像 Obsidian 原生
-     * PDF 阅读器那样，点一个按钮就把缩略图翻出来」。现在收进同一个面板：
-     * 顶部两个标签切换，同一时间只显示一个。
-     *
-     * 两块各自保留原有的滚动容器和窗口化逻辑——标签只是 display:none，
-     * 不重建 DOM，切回来时按新尺寸补算一次窗口即可。
-     */
-    const viewSec = body.createDiv("mb-sec mb-sec-views");
-    const tabRow = viewSec.createDiv({
+    this.statsEl = body.createDiv("mb-stats");
+
+    this.statusEl = side.createDiv("mb-status mb-side-status");
+  }
+
+  /**
+   * 左侧「页面」抽屉：缩略图 + 目录，像 Obsidian 原生 PDF 阅读器那样。
+   *
+   * 用户原话：「让这个笔记的缩略图和 Obsidian 原生 PDF 阅读器里的缩略图
+   * 形式一样：在屏幕左边最上面的框里有一个按钮，点一下就能出来缩略图」。
+   *
+   * 结构：
+   *   .mb-editor
+   *     ├─ .mb-pagedock（左侧抽屉，默认收起，只留一条 40px 的把手）
+   *     │    ├─ .mb-pagedock-handle（左上角按钮，点击开合）
+   *     │    └─ .mb-pagedock-body（标签 + 两个面板）
+   *     └─ .mb-paper（纸面）
+   *
+   * 放在 `.mb-editor` 内部而不是 `.mb-body`：它应该只占纸面区的高度，
+   * 不把右侧工具侧栏也挤走。
+   */
+  private buildPageDock(): void {
+    if (!this.editorHost) return;
+    this.pagedockEl?.remove();
+    const dock = this.editorHost.createDiv("mb-pagedock");
+    // 插到纸面列前面：左侧抽屉要在左边
+    this.editorHost.insertBefore(dock, this.paperHost);
+    this.pagedockEl = dock;
+
+    const handle = dock.createEl("button", {
+      cls: "mb-pagedock-handle",
+      attr: { "aria-label": "页面与目录", "aria-expanded": "false" },
+    });
+    setIcon(handle, "panel-left");
+    handle.title = "页面与目录";
+    handle.onclick = () => this.togglePageDock();
+    this.pagedockHandleEl = handle;
+
+    const bodyEl = dock.createDiv("mb-pagedock-body");
+    this.pagedockBodyEl = bodyEl;
+
+    const tabRow = bodyEl.createDiv({
       cls: "mb-side-tabs",
       attr: { role: "tablist", "aria-label": "缩略图与目录" },
     });
@@ -3829,10 +3879,8 @@ export class InkbookView extends FileView {
     mkTab("thumbs", "缩略图");
     mkTab("outlines", "目录");
 
-    /* ---------------------------- 缩略图 ---------------------------- */
-    this.sideThumbPane = viewSec.createDiv("mb-side-pane mb-side-pane-thumbs");
-    /* ---------------------------- 目录 ---------------------------- */
-    this.sideOutlinePane = viewSec.createDiv("mb-side-pane mb-side-pane-outlines");
+    this.sideThumbPane = bodyEl.createDiv("mb-side-pane mb-side-pane-thumbs");
+    this.sideOutlinePane = bodyEl.createDiv("mb-side-pane mb-side-pane-outlines");
     /*
      * 先把显隐落好，再建内容：
      * 隐藏的面板量不到尺寸，窗口化会按兜底值建错（行高 / 视口高都是 0）。
@@ -3845,7 +3893,13 @@ export class InkbookView extends FileView {
     const addPage = pageHead.createEl("button", { cls: "mb-link", text: "+ 加一页" });
     addPage.onclick = () => this.editor?.addPage();
     this.pageListEl = pageSec.createDiv("mb-pages");
-    // 侧栏收起 / 当前显示目录时先不建：857 页 × (缩略图 + 画布) 没必要付
+    /*
+     * 滚动容器是**面板**（.mb-side-pane-thumbs），列表在它内部。
+     *
+     * 不能把列表自己当视口：updatePageWindow 要用「视口 rect − 列表 rect」
+     * 算可见行范围，两者是同一元素时差值恒为 0，窗口化会退化成「全建」。
+     */
+    this.attachPageListScroll(this.sideThumbPane);
     if (this.thumbVisible()) this.renderPageList();
 
     const outSec = this.sideOutlinePane.createDiv("mb-sec mb-sec-outline");
@@ -3866,9 +3920,29 @@ export class InkbookView extends FileView {
       { passive: true }
     );
 
-    this.statsEl = body.createDiv("mb-stats");
+    this.applyPageDock();
+  }
 
-    this.statusEl = side.createDiv("mb-status mb-side-status");
+  /** 左侧页面抽屉开合 */
+  private togglePageDock(): void {
+    this.pagedockOpen = !this.pagedockOpen;
+    this.applyPageDock();
+    if (this.pagedockOpen) {
+      // 展开后才量得到尺寸：补建页列表 / 重算窗口
+      this.updatePageWindow(true);
+      if (this.sideTab === "thumbs") this.refreshThumbs();
+      else {
+        this.outlineWinLo = -1;
+        this.outlineWinHi = -1;
+        this.outlineRowH = 0;
+        this.buildOutlineWindow(true);
+      }
+    }
+  }
+
+  private applyPageDock(): void {
+    this.pagedockEl?.toggleClass("is-open", this.pagedockOpen);
+    this.pagedockHandleEl?.setAttribute("aria-expanded", String(this.pagedockOpen));
   }
 
   /** 切换侧栏下方面板：缩略图 ⇄ 目录 */
@@ -5429,24 +5503,35 @@ export class InkbookView extends FileView {
   }
 
   /** 把页列表接到侧栏滚动容器上（重建侧栏时换新，旧的走 abort） */
-  private attachPageListScroll(body: HTMLElement): void {
+  /**
+   * 把「页列表滚动 → 重算窗口」的监听挂到**真正的滚动容器**上。
+   *
+   * 缩略图搬到左侧抽屉后，滚动的是 `.mb-pages` 自己（它带 overflow-y:auto），
+   * 不再是整个侧栏 body —— 抽屉里还有标签栏和目录面板，滚整个 body 会
+   * 把标签一起滚走。传 null 表示「还没建，稍后再挂」。
+   */
+  private attachPageListScroll(scroller: HTMLElement | null): void {
     this.pageListAbort?.abort();
     this.pageListResizeObs?.disconnect();
+    if (!scroller) {
+      this.pageListViewportEl = null;
+      return;
+    }
     const ac = new AbortController();
     this.pageListAbort = ac;
-    this.pageListViewportEl = body;
-    body.addEventListener("scroll", () => this.schedulePageWindowUpdate(), {
+    this.pageListViewportEl = scroller;
+    scroller.addEventListener("scroll", () => this.schedulePageWindowUpdate(), {
       passive: true,
       signal: ac.signal,
     });
     /*
-     * 侧栏宽度在三种断点（258 / 280 / 340）之间变化时，网格列宽和行高都变；
-     * 视口高度变化也会改变「可视几行」。两者都只能重算窗口。
-     * 只观察滚动容器本身：观察列表会被我们自己的 spacer 改高反馈成循环。
+     * 抽屉宽度 / 高度变化时，网格列宽和行高都变，可视几行也变，
+     * 只能重算窗口。只观察滚动容器本身：观察列表会被我们自己的
+     * spacer 改高反馈成循环。
      */
     if (typeof ResizeObserver !== "undefined") {
       this.pageListResizeObs = new ResizeObserver(() => this.schedulePageWindowUpdate());
-      this.pageListResizeObs.observe(body);
+      this.pageListResizeObs.observe(scroller);
     }
   }
 
@@ -5895,8 +5980,8 @@ export class InkbookView extends FileView {
     const viewport = this.pageListViewportEl;
     const list = this.pageListEl;
     if (!viewport || !list) return;
-    // 显式跳页时用户要「看见这一页」：侧栏开着但停在目录标签，就切回缩略图
-    if (this.sideShown && this.sideTab !== "thumbs") this.setSideTab("thumbs");
+    // 显式跳页时用户要「看见这一页」：抽屉开着但停在目录标签，就切回缩略图
+    if (this.pagedockOpen && this.sideTab !== "thumbs") this.setSideTab("thumbs");
     if (!this.thumbVisible()) return;
     if (list.clientWidth <= 0) return; // 还没布局（侧栏刚展开）
     const count = this.store?.pageCount ?? 0;

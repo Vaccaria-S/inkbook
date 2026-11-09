@@ -168,13 +168,24 @@ export const TEXT_FONTS: Array<{ id: string; label: string; stack: string }> = [
     label: "手写",
     /*
      * Excalidraw 那种手写风（Virgil）用系统字体栈模拟，不打包字体。
-     * 行楷优先（中文最像手写），西文依次试 Segoe Script / Bradley Hand /
-     * Comic Sans MS，最后落到 cursive 通用族。尾部仍按 INK-193 的约定
-     * 以导出同款 "Noto Sans SC", sans-serif 收尾：上面几款都缺字时，
-     * 中文按字回落到和 PDF 导出一样的字宽，避免屏幕折行与导出不一致。
+     *
+     * **中文字体名必须写实际安装的名字**（2026-11-09 修）。上一版写的是
+     * `"Xingkai SC" / "STXingkai" / "行楷"` —— 那是 macOS / 旧版 Office 的
+     * 名字，Windows 上一个都匹配不上，于是整段中文静默回退到 Noto Sans SC，
+     * 用户切到「手写」看不出任何变化（真机反馈）。
+     *
+     * 现在按平台列全：
+     *   · Windows：方正行楷简体 / 楷体（实测本机都有）
+     *   · macOS：Xingkai SC / STKaiti / Kaiti SC
+     *   · 西文：Segoe Script（Win）/ Bradley Hand（mac）/ Ink Free（Win10+）
+     *     都比 Comic Sans 更像手写
+     *
+     * 尾部仍按 INK-193 的约定以导出同款 "Noto Sans SC", sans-serif 收尾：
+     * 上面几款都缺字时按字回落到与 PDF 导出相同的字宽，避免屏幕折行和
+     * 导出不一致。
      */
     stack:
-      '"Xingkai SC", "STXingkai", "行楷", "Segoe Script", "Bradley Hand", "Comic Sans MS", cursive, "Noto Sans SC", sans-serif',
+      '"方正行楷简体", "FZ Xingkai", "楷体", "KaiTi", "楷体_GB2312", "Xingkai SC", "STXingkai", "STKaiti", "Kaiti SC", "Segoe Script", "Bradley Hand", "Ink Free", "Comic Sans MS", cursive, "Noto Sans SC", sans-serif',
   },
 ];
 

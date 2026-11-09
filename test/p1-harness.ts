@@ -1382,6 +1382,17 @@ async function J() {
   const v = await openView();
   await v.onLoadFile(tf(p));
   await sleep(400);
+  /*
+   * 缩略图已搬到左侧抽屉，**默认收起时不建条目**。这一组测的是长按
+   * 换序的完整 UI 路径，必须先把抽屉展开。
+   */
+  {
+    const dh = v.contentEl.querySelector(".mb-pagedock-handle") as HTMLElement | null;
+    if (dh && !v.contentEl.querySelector(".mb-pagedock.is-open")) {
+      dh.click();
+      await sleep(250);
+    }
+  }
 
   const ids = (): string[] => v.store.data.pages.map((pg: any) => pg.id);
   const strokesById = (): Map<string, number> => {
