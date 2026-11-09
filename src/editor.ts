@@ -745,6 +745,8 @@ export class BookEditor {
   /** 待重画的页（跨页移动时可能同时有新旧两页） */
   private overlayPending = new Set<number>();
   private scrollRaf = 0;
+  /** 捏合期间 onState 的每帧合并（避免每帧刷整条工具栏） */
+  private pinchStateRaf = 0;
   private destroyed = false;
   private globalUp = (e: PointerEvent) => {
     if (this.gesture === "none" || this.pointerId !== e.pointerId) return;
@@ -775,6 +777,8 @@ export class BookEditor {
      * `reset()` 清空 pointers / penActive / touchCount / gesturing。
      */
     this.arbiter.reset();
+    // 手势可能被切后台 / 笔落下打断，收不到 onGestureEnd：别把糊图留下来
+    this.abortPinch();
   };
   private onVisibilityHidden = () => {
     if (document.visibilityState === "hidden") {
@@ -783,6 +787,7 @@ export class BookEditor {
       this.finishInkGesture();
       // 同上：切后台等于「所有指针都不可信了」，必须清干净
       this.arbiter.reset();
+      this.abortPinch();
     }
   };
   private resizeObserver: ResizeObserver | null = null;
@@ -1239,6 +1244,19 @@ export class BookEditor {
   }
 
   private emitState(): void {
+    /*
+     * 捏合每帧都改 zoom，工具栏的百分比不能一直停在手势开始前的值。
+     * onState → view.updateUI() 会 setText 并排一次滑条同步，直接每帧调
+     * 又是主线程活儿；合并到一帧里只跑一次。手势外的状态变化仍走同步路径。
+     */
+    if (this.pinch) {
+      if (this.pinchStateRaf) return;
+      this.pinchStateRaf = requestAnimationFrame(() => {
+        this.pinchStateRaf = 0;
+        if (this.opts.onState) this.opts.onState();
+      });
+      return;
+    }
     /*
      * 选中对象失效就丢掉：
      *   · 换了页（selectedText 只在当前页找）
@@ -1809,6 +1827,33 @@ export class BookEditor {
     this.positionTextEditBar();
   }
 
+  /** 缩放后把正在输入的 textarea 的像素样式重算一遍（编辑期间捏合要用） */
+  private applyTextEditZoom(): void {
+    const ed = this.textEdit;
+    if (!ed) return;
+    const ta = ed.el;
+    const z = this.zoom;
+    ta.style.fontSize = `${ed.size * z}px`;
+    ta.style.left = `${ed.x * z}px`;
+    ta.style.top = `${(ed.y - ed.size * 0.82) * z}px`;
+    // 新建框的折行宽可用纸宽决定；改已有文字时要尊重它手动拖过的框宽
+    const hit = ed.id
+      ? this.hitText(this.store.data.pages[ed.rec.index]?.texts ?? [], ed.x, ed.y)
+      : null;
+    const layout = this.textLayout({
+      x: ed.x,
+      y: ed.y,
+      size: ed.size,
+      text: ta.value,
+      font: ed.font,
+      width: hit?.width,
+    });
+    ta.style.width = `${layout.width * z + TEXT_EDIT_CHROME}px`;
+    ta.style.height = "auto";
+    ta.style.height = `${ta.scrollHeight}px`;
+    this.updateTextEditBar();
+  }
+
   /** 样式值变了以后同步高亮与位置（不重建 DOM，避免点按钮时把它自己换掉） */
   private updateTextEditBar(): void {
     const bar = this.textEditBarEl;
@@ -2162,6 +2207,14 @@ export class BookEditor {
     this.moveText = null;
     this.resizeText = null;
     this.arbiter.reset();
+    // 页对象整批重建（手势中切页 / 新建页）：旧 rec 已失效；
+    // 新页 mount 时会按当前 zoom 自己 resizeRec，不会残留糊图。
+    // 页码冻结 / 定时器也一并收掉，否则手势的残留状态会压住新页。
+    this.pinch = null;
+    this.pinchNeedsRedraw = false;
+    this.pinchActive = false;
+    window.clearTimeout(this.pinchReleaseTimer);
+    this.pinchReleaseTimer = 0;
     if (this.observer) {
       this.observer.disconnect();
       this.observer = null;
@@ -2242,6 +2295,12 @@ export class BookEditor {
     this.positionTextBar();
     // 新建输入框上方的样式条同理（页面坐标 × zoom）
     this.positionTextEditBar();
+    /*
+     * 正在输入的 textarea 的 inline left/top/fontSize/width 是按像素写死的
+     * （不是 CSS 变量），纸面被 CSS 拉伸时它不会跟着变——手势期间也要重排，
+     * 否则输入框和纸面错位。只在 textEdit 存在时才有这点开销。
+     */
+    if (this.textEdit) this.applyTextEditZoom();
     /*
      * 只重建已挂载页的 canvas（数量很少，通常 1-3 个）。
      * 但捏合手势期间**必须跳过**：写 canvas.width/height 会让浏览器重新
@@ -2712,6 +2771,38 @@ export class BookEditor {
   }
 
   /**
+   * 补回捏合期间被 CSS 拉伸的位图清晰度。
+   *
+   * 正常路径由 endPinch 调；窗口失焦 / 仲裁器复位 / renderPages 时
+   * onGestureEnd 不会来，这条兜底保证不会永远停在糊图上。
+   * 只 resizeRec、不走完整 applyLayout：zoom / CSS 变量 / 属性条位置
+   * 手势每帧都已经落好了，没必要再写一遍，也不该在这里重算 fit 比例。
+   */
+  private flushPinchRedraw(): void {
+    if (!this.pinchNeedsRedraw) return;
+    this.pinchNeedsRedraw = false;
+    for (const rec of this.recs) {
+      if (rec.mounted) this.resizeRec(rec);
+    }
+    // 手势期间可能重算过正在输入的 textarea，补清晰度时一并对齐
+    if (this.textEdit) this.applyTextEditZoom();
+  }
+
+  /**
+   * 手势被切后台 / 仲裁器复位打断，onGestureEnd 不会来。
+   * 补清晰度的同时把页码冻结放开，否则 pinchActive 会一直压着 current。
+   */
+  private abortPinch(): void {
+    if (!this.pinch && !this.pinchNeedsRedraw) return;
+    this.pinch = null;
+    this.pinchActive = false;
+    window.clearTimeout(this.pinchReleaseTimer);
+    this.pinchReleaseTimer = 0;
+    this.flushPinchRedraw();
+    this.measurePageMetrics();
+  }
+
+  /**
    * 捏合手势结束。
    *
    * 这里**不能**用视口中线重算当前页：缩放补偿有 1px 误差就会落到相邻页，
@@ -2721,19 +2812,8 @@ export class BookEditor {
   private endPinch(): void {
     const keep = clamp(this.pinchStartPage, 0, Math.max(0, this.recs.length - 1));
     this.pinch = null;
-    /*
-     * 手势期间只改过 CSS 变量，位图还是旧 zoom 下画的（被浏览器拉伸）。
-     * 这里一次性把已挂载页的 backing 尺寸与全部笔迹重画补回清晰度。
-     *
-     * 只 resizeRec、不走完整 applyLayout：zoom / CSS 变量 / 属性条位置
-     * 手势每帧都已经落好了，没必要再写一遍，也不该在这里重算 fit 比例。
-     */
-    if (this.pinchNeedsRedraw) {
-      this.pinchNeedsRedraw = false;
-      for (const rec of this.recs) {
-        if (rec.mounted) this.resizeRec(rec);
-      }
-    }
+    // 手势期间只改过 CSS 变量，位图还是旧 zoom 下画的；一次性补回清晰度
+    this.flushPinchRedraw();
     this.measurePageMetrics();
 
     if (this.recs.length && this.current !== keep) {
@@ -2742,6 +2822,11 @@ export class BookEditor {
       this.mount(this.recs[keep]);
     }
     this.emitState();
+    /*
+     * emitState 在手势期间是 rAF 合并的，endPinch 里 pinch=null 后走同步路径，
+     * 但那一帧排队的 rAF 仍会跑一次；无害（只是多刷一次工具栏），
+     * 且能保证手势最后一帧的 zoom 百分比一定落到 UI 上。
+     */
 
     // 手势结束了，滚轮用的锚点锁没有意义了，留着会在下一次滚动时判成"用户没动"
     this.lockedAnchor = null;
@@ -2823,13 +2908,26 @@ export class BookEditor {
     if (zoomChanged) {
       this.fitMode = false;
       this.zoom = after;
-      this.applyLayout();
+      /*
+       * fast 路径：只写 CSS 变量 + 属性条位置，让浏览器缩放已有位图。
+       * 不碰 canvas backing、不全量重绘——这是捏合跟手的关键。
+       * 手势结束后 endPinch 会按最终 zoom 补一次清晰度。
+       */
+      this.applyLayout(true);
+      this.pinchNeedsRedraw = true;
     }
 
     // 把固定的锚点对回当前两指中心（zoom 没变时这一步就是纯平移）
     this.restoreAnchor(pinch.anchor, info.cx, info.cy);
     if (zoomChanged) {
-      this.measurePageMetrics();
+      /*
+       * measurePageMetrics 做 4 次 getBoundingClientRect（强制同步布局），
+       * 而它量出来的 pageGap / pageOrigin 只被 pickAnchor / 页码推算用：
+       *   · 捏合期间锚点已固定、pinchActive 又冻结了页码；
+       *   · CSS 变量同样是等比缩放，pageGap / pageOrigin 并不会变。
+       * 所以手势期间整段跳过，endPinch 里统一量一次。
+       * restoreAnchor 那一次 rect 是锚点补偿必需的实时量，不能省。
+       */
       this.emitState();
     }
   }
@@ -6593,6 +6691,8 @@ export class BookEditor {
     this.overlayPending.clear();
     if (this.scrollRaf) cancelAnimationFrame(this.scrollRaf);
     if (this.wheelRaf) cancelAnimationFrame(this.wheelRaf);
+    if (this.pinchStateRaf) cancelAnimationFrame(this.pinchStateRaf);
+    this.pinchStateRaf = 0;
     // 释放位图显存和 PDF 文档句柄
     this.bgBitmaps.clear();
     this.thumbBitmaps.clear();

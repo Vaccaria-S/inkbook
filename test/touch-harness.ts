@@ -329,6 +329,47 @@ declare global {
     }
 
     pass(pageAfter === pageBefore, "捏合不跳页（" + pageBefore + " → " + pageAfter + "）");
+
+    /*
+     * INK-221 捏合性能：手势期间不能重建 canvas backing。
+     *
+     * 老路径每帧 applyLayout → resizeRec（改 canvas.width/height 会重分配
+     * 整块内存并清空）+ 重绘全部笔迹，60fps 下必然卡。
+     * 这里在捏合中途抓一次已挂载页的 backing 尺寸：如果 fast 路径生效，
+     * 手势期间它**不会**被改动（位图靠 CSS 拉伸），松手后才补清晰度。
+     */
+    {
+      // 上一轮可能已经放到 2.8 上限，先回到中间值才有放大空间
+      ed.setZoom(1.2);
+      await sleep(250);
+      const rec0 = ed.recs[ed.current];
+      const wBefore = rec0.canvas.width;
+      await touch("touchStart", [
+        { x: cx - 80, y: cy, id: 1 },
+        { x: cx + 80, y: cy, id: 2 },
+      ]);
+      await sleep(40);
+      for (let i = 1; i <= 6; i++) {
+        const g = 80 + i * 15;
+        await touch("touchMove", [
+          { x: cx - g, y: cy, id: 1 },
+          { x: cx + g, y: cy, id: 2 },
+        ]);
+        await sleep(30);
+      }
+      const wDuring = rec0.canvas.width;
+      pass(
+        wDuring === wBefore,
+        "INK-221 捏合期间不重建 canvas backing（" + wBefore + " → " + wDuring + "）"
+      );
+      await touch("touchEnd", []);
+      await sleep(350);
+      const wAfter = rec0.canvas.width;
+      pass(
+        wAfter !== wBefore,
+        "INK-221 松手后补回清晰度（backing " + wBefore + " → " + wAfter + "）"
+      );
+    }
   }
 
   /* ============ 场景 4：先抬一根手指，余指不能把页面拽走 ============ */
