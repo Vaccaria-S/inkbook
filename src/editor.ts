@@ -163,6 +163,19 @@ export const TEXT_FONTS: Array<{ id: string; label: string; stack: string }> = [
     stack:
       'ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, "Courier New", "Noto Sans SC", sans-serif',
   },
+  {
+    id: "hand",
+    label: "手写",
+    /*
+     * Excalidraw 那种手写风（Virgil）用系统字体栈模拟，不打包字体。
+     * 行楷优先（中文最像手写），西文依次试 Segoe Script / Bradley Hand /
+     * Comic Sans MS，最后落到 cursive 通用族。尾部仍按 INK-193 的约定
+     * 以导出同款 "Noto Sans SC", sans-serif 收尾：上面几款都缺字时，
+     * 中文按字回落到和 PDF 导出一样的字宽，避免屏幕折行与导出不一致。
+     */
+    stack:
+      '"Xingkai SC", "STXingkai", "行楷", "Segoe Script", "Bradley Hand", "Comic Sans MS", cursive, "Noto Sans SC", sans-serif',
+  },
 ];
 
 /** 字体 id → CSS font-family；未知 id 落回黑体 */
@@ -935,6 +948,11 @@ export class BookEditor {
   private pinchActive = false;
   /** 捏合开始时的当前页（手势结束后要锁回它，缩放不是翻页） */
   private pinchStartPage = 0;
+  /**
+   * 捏合期间是否已经走过 fast 路径（位图被 CSS 拉伸、尚未按新 zoom 重画）。
+   * endPinch 据此补一次清晰度；窗口失焦 / 仲裁器复位收不到 endPinch 时也用它兜底。
+   */
+  private pinchNeedsRedraw = false;
   /** 手势结束后继续冻结页码判定的定时器（补偿还会再触发几帧 scroll） */
   private pinchReleaseTimer = 0;
   /**
@@ -2186,7 +2204,7 @@ export class BookEditor {
    * 一次写入，所有页生效，O(1)。
    * 只有"已挂载"（真正在视口里）的页需要重建 canvas 尺寸。
    */
-  applyLayout(): void {
+  applyLayout(fast = false): void {
     /*
      * 正在输入文字时**冻结 fit 比例**（2026-11-08，平板专项）。
      *
@@ -2198,8 +2216,13 @@ export class BookEditor {
      *
      * 键盘收起时会再次 resize，那时 zoom 会正常重算，所以冻结只是
      * 「输入期间不重排」，不会留下错误的缩放。
+     *
+     * fast（捏合手势专用）：这一帧的 zoom 已经由 applyPinch 定好，
+     * 不再按视口重算 fit 比例，也跳过下面的 resizeRec 循环。
+     * `.mb-canvas/.mb-overlay` 的显示尺寸是 100%（跟 backing 解耦），
+     * 只改 --mb-page-w/h 浏览器就会缩放已有位图，视觉跟手且无需重绘。
      */
-    if (this.fitMode && !this.textEdit) {
+    if (this.fitMode && !this.textEdit && !fast) {
       const availW = Math.max(240, this.scrollEl.clientWidth - 64);
       const availH = Math.max(240, this.scrollEl.clientHeight - 46);
       this.zoom = clamp(
@@ -2219,9 +2242,16 @@ export class BookEditor {
     this.positionTextBar();
     // 新建输入框上方的样式条同理（页面坐标 × zoom）
     this.positionTextEditBar();
-    // 只重建已挂载页的 canvas（数量很少，通常 1-3 个）
-    for (const rec of this.recs) {
-      if (rec.mounted) this.resizeRec(rec);
+    /*
+     * 只重建已挂载页的 canvas（数量很少，通常 1-3 个）。
+     * 但捏合手势期间**必须跳过**：写 canvas.width/height 会让浏览器重新
+     * 分配整块 backing 内存并清空，随后 renderRec + renderOverlay 全量重绘
+     * 该页所有笔迹。60fps 下每帧都做这件事，页数多 / 笔迹多时必然卡。
+     */
+    if (!fast) {
+      for (const rec of this.recs) {
+        if (rec.mounted) this.resizeRec(rec);
+      }
     }
     /*
      * 尺寸就绪后补落待恢复的滚动位置。
@@ -2678,6 +2708,7 @@ export class BookEditor {
     window.clearTimeout(this.pinchReleaseTimer);
     this.pinchReleaseTimer = 0;
     this.pinchActive = true;
+    this.pinchNeedsRedraw = false;
   }
 
   /**
@@ -2690,6 +2721,19 @@ export class BookEditor {
   private endPinch(): void {
     const keep = clamp(this.pinchStartPage, 0, Math.max(0, this.recs.length - 1));
     this.pinch = null;
+    /*
+     * 手势期间只改过 CSS 变量，位图还是旧 zoom 下画的（被浏览器拉伸）。
+     * 这里一次性把已挂载页的 backing 尺寸与全部笔迹重画补回清晰度。
+     *
+     * 只 resizeRec、不走完整 applyLayout：zoom / CSS 变量 / 属性条位置
+     * 手势每帧都已经落好了，没必要再写一遍，也不该在这里重算 fit 比例。
+     */
+    if (this.pinchNeedsRedraw) {
+      this.pinchNeedsRedraw = false;
+      for (const rec of this.recs) {
+        if (rec.mounted) this.resizeRec(rec);
+      }
+    }
     this.measurePageMetrics();
 
     if (this.recs.length && this.current !== keep) {
@@ -3691,12 +3735,12 @@ export class BookEditor {
       const el = document.createElement("span");
       el.className = "mb-text " + (t.source === "user" ? "is-user" : "is-pdf");
       /*
-       * PDF 原文每行末尾补一个换行：拖选多行时复制出来才是分开的句子。
-       * 绝对定位的 span 之间浏览器不会自动插入分隔符，不补就成了
-       * "Line 0 of page 1Line 1 of page 1" 一长串。
+       * 非用户来源（PDF 原文 / Word 正文）每行末尾补一个换行：
+       * 拖选多行时复制出来才是分开的句子。绝对定位的 span 之间浏览器
+       * 不会自动插入分隔符，不补就成了 "第一行第二行" 一长串。
        * 用户文字不补——它自己的 \n 就是用户想要的换行。
        */
-      el.textContent = t.text + (t.source === "pdf" ? "\n" : "");
+      el.textContent = t.text + (t.source !== "user" ? "\n" : "");
       el.dataset.id = t.id;
       el.style.left = `${t.x}px`;
       el.style.top = `${t.y}px`;
@@ -3888,8 +3932,12 @@ export class BookEditor {
    * 现在按真实字体测量，量出来就是画出来/导出时占的宽度。
    */
   private measureTextWidth(t: PageText, lines?: string[]): number {
-    // PDF 原文带的是抽出来的真实行宽，比重新量一遍准（也省一次测量）
-    if (t.source === "pdf" && t.width) return t.width;
+    /*
+     * 导入来源（PDF 原文 / Word 正文）带的是排版时的真实行宽，
+     * 比重新量一遍准（也省一次测量）。Word 的行宽来自 layout()，
+     * 与底图上画出来的字严格同源。
+     */
+    if (t.source !== "user" && t.width) return t.width;
     const ctx = measureContext(this.textFontCss(t));
     const text = String(t.text ?? "");
     if (!ctx) return Math.max(1, text.length * t.size * 0.62);

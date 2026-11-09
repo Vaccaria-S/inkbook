@@ -839,28 +839,49 @@ async function main() {
     await sleep(20);
   }
 
-  /* ---------- H. 仅阅读模式：span 设了 width 还能拖选吗 ---------- */
+  /* ---------- H. 只读态：span 设了 width 仍然封在可用宽度内 ---------- */
   {
-    const root = document.querySelector(".mb-root") as HTMLElement;
-    root.classList.add("is-reading");
     editor.setReadOnly(true);
     await sleep(30);
     const sp = pageEl().querySelector(".mb-text.is-user") as HTMLElement;
+    pass(sp.getBoundingClientRect().width <= (avail + 1) * zoom(), "只读态 span 宽仍然封在可用宽度内");
+    editor.setReadOnly(false);
+    await sleep(20);
+  }
+
+  /* ---------- H2. 文字默认就能拖选复制（2026-11-09 删仅阅读后的回归） ---------- */
+  /*
+   * 仅阅读模式删掉时，`.mb-root.is-reading .mb-textlayer { user-select: text }`
+   * 这条规则也一起被删了 —— 于是 PDF 原文 / Word 正文**彻底选不中**。
+   * 「选择」工具只做单击命中用户文字，不支持拖选复制，也不管导入来源，
+   * 所以 DOM 拖选是唯一的复制途径，必须常开。
+   *
+   * 注意 pointer-events 仍然是 none（书写要穿透），这里断言的是
+   * user-select，不是 pointer-events —— 两者互不影响。
+   */
+  {
     const layer = pageEl().querySelector(".mb-textlayer") as HTMLElement;
-    pass(getComputedStyle(layer).pointerEvents === "auto", "阅读模式：文字层恢复指针事件（能拖选）");
-    pass(getComputedStyle(sp).userSelect === "text" || (getComputedStyle(sp) as any).webkitUserSelect === "text", "阅读模式：span 可被选中");
+    pass(
+      getComputedStyle(layer).pointerEvents === "none",
+      "文字层仍然 pointer-events:none（书写时穿透，不被文字吃掉）"
+    );
+    const cs = getComputedStyle(layer);
+    pass(
+      cs.userSelect === "text" || (cs as any).webkitUserSelect === "text",
+      "文字层默认 user-select:text（不需要仅阅读也能拖选）"
+    );
+    const sp = pageEl().querySelector(".mb-text.is-user") as HTMLElement;
     const sel = window.getSelection()!;
     const range = document.createRange();
     range.selectNodeContents(sp);
     sel.removeAllRanges();
     sel.addRange(range);
     const got = sel.toString();
-    pass(got.replace(/\s/g, "") === note1.text.replace(/\s/g, ""), `阅读模式跨行拖选能选到全部字（${got.replace(/\s/g, "").length}/${note1.text.length}）`);
+    pass(
+      got.replace(/\s/g, "") === note1.text.replace(/\s/g, ""),
+      `默认态跨行拖选能选到全部字（${got.replace(/\s/g, "").length}/${note1.text.length}）`
+    );
     sel.removeAllRanges();
-    pass(sp.getBoundingClientRect().width <= (avail + 1) * zoom(), "阅读模式 span 宽仍然封在可用宽度内");
-    root.classList.remove("is-reading");
-    editor.setReadOnly(false);
-    await sleep(20);
   }
 
   /* ---------- I. 回归：选中 / 拖动 / 改字号字体颜色 / 删除 ---------- */

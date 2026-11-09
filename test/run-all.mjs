@@ -24,9 +24,9 @@ const only = process.argv[2] || "";
  * 所以这几页在这一列标出 runner，别"顺手统一"成 run.mjs。
  */
 const PAGES = [
-  ["test.html", 311],
+  ["test.html", 313],
   ["export.html", 132],
-  ["p1.html", 218],
+  ["p1.html", 217],
   ["view.html", 117],
   ["tablet.html", 43],
   ["zoom.html", 21],
@@ -37,7 +37,7 @@ const PAGES = [
   ["perf.html", 21],
   ["perf-open.html", 60],
   ["qa-open.html", 49],
-  ["dock.html", 237],
+  ["dock.html", 245],
   ["thumb.html", 14],
   ["pdf.html", 46],
   ["bigpdf.html", 13],
@@ -48,7 +48,7 @@ const PAGES = [
   ["qa-embed2.html", 115],
   ["qa-embed3.html", 16],
   ["qa-embed4.html", 122],
-  ["pdftext.html", 177],
+  ["pdftext.html", 181],
   ["qa-ink118-visual.html", 296],
   ["modals.html", 98],
   // 纸面模板渲染（INK-201）：6 模板 × 3 纸色 + 三处（屏幕/导出/嵌入）一致

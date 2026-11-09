@@ -262,12 +262,12 @@
 }
 
 /*
- * 长条上的三个"方按钮"：立即保存 / 侧栏开关 / 仅阅读。
+ * 长条上的两个"方按钮"：立即保存 / 侧栏开关。
  *
- * 三者必须同族——同样的宽高、圆角、底色、按压手感。
- * 只给其中一两个写样式会让长条看起来像拼起来的。
+ * 两者必须同族——同样的宽高、圆角、底色、按压手感。
+ * 只给其中一个写样式会让长条看起来像拼起来的。
  */
-/* 顶栏上的三个按钮（保存 / 侧栏 / 仅阅读）
+/* 顶栏上的两个按钮（保存 / 侧栏）
  *
  * 由 addAction 提供位置和点击区，图标换成自绘的 .mb-ic。
  * 尺寸按视图头的图标钮来（30×30），和宿主其他 action 视觉一致。
@@ -383,6 +383,84 @@
   height: 18px;
 }
 
+/* ====================== 顶栏笔按钮的快捷笔盒浮层 ======================
+ *
+ * 已经在某支笔上再点一下笔按钮，在按钮正下方弹出。
+ * DOM 挂在 document.body、position:fixed（top/left 由 JS 按按钮位置算），
+ * 所以不会被标题栏的 overflow 裁掉，窄屏也会被夹回视口内。
+ *
+ * 触控目标 ~40px：平板上手指点色点 / 粗细都不能误触。
+ */
+.mb-pen-pop {
+  position: fixed;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  box-sizing: border-box;
+  max-width: calc(100vw - 16px);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.22);
+}
+
+.mb-pen-pop-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mb-pen-pop-colors {
+  /* 8 个 40px 色点在窄屏（竖屏平板/手机）会自动换行，不会被裁 */
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+
+.mb-pen-pop-dot {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  box-sizing: border-box;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+  box-shadow: none;
+}
+
+/* 荧光笔色点用圆角方块，跟侧栏的 .mb-swatch-hl 保持一致 */
+.mb-pen-pop-dot.is-hl {
+  border-radius: 9px;
+}
+
+.mb-pen-pop-dot.is-active {
+  box-shadow:
+    0 0 0 2px var(--background-primary),
+    0 0 0 4px var(--interactive-accent);
+}
+
+.mb-pen-pop-size {
+  flex: 0 0 auto;
+  min-width: 44px;
+  height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.mb-pen-pop-size.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: transparent;
+}
+
 
 
 
@@ -414,26 +492,11 @@
   cursor: default;
 }
 
-.mb-rail-side.is-active,
-.mb-rail-read.is-active {
+.mb-rail-side.is-active {
   background: var(--interactive-accent);
   border-color: color-mix(in srgb, var(--interactive-accent) 70%, #000);
   color: var(--text-on-accent);
 }
-
-/*
- * 仅阅读模式：整条长条退到背景里。
- *
- * 只留一枚小圆钮（笔的图标），点它回到书写。
- * 纸面干干净净，一个干扰都没有。
- */
-.mb-root.is-reading .mb-top-tools {
-  display: none;
-}
-
-
-
-
 
 /* ------------------------------ 右下角浮标 ------------------------------ */
 
@@ -576,38 +639,6 @@
   font-weight: 600;
 }
 
-/* ---------------------------- 仅阅读提示 ---------------------------- */
-
-.mb-read-hint {
-  position: absolute;
-  left: 50%;
-  bottom: 26px;
-  transform: translate(-50%, 8px);
-  z-index: 6;
-  max-width: 280px;
-  padding: 8px 13px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 12px;
-  background: var(--background-primary);
-  background: color-mix(in srgb, var(--background-primary) 92%, transparent);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  color: var(--text-muted);
-  font-size: 12px;
-  line-height: 1.5;
-  box-shadow: 0 10px 28px -10px rgba(0, 0, 0, 0.45);
-  pointer-events: none;
-  opacity: 0;
-  transition:
-    opacity 0.3s ease,
-    transform 0.3s cubic-bezier(0.2, 0.9, 0.3, 1);
-}
-
-.mb-read-hint.is-show {
-  opacity: 1;
-  transform: translate(-50%, 0);
-}
-
 /* 尊重系统的「减少动态效果」设置 */
 @media (prefers-reduced-motion: reduce) {
   .mb-toprow,
@@ -615,7 +646,6 @@
   .mb-topbtn,
   .mb-float,
   .mb-float-zoom,
-  .mb-read-hint,
   .mb-ib {
     transition-duration: 0.01ms !important;
   }
@@ -844,18 +874,6 @@
   touch-action: none;
 }
 
-/*
- * 阅读模式：纸面必须放开 touch-action（INK-191）。
- *
- * 上面那条 `touch-action: none` 是硬编码的，会**覆盖**父级 docEl 的
- * `auto`——`applyTouchAction()` 只改了 docEl，纸面自己这条不跟着变。
- * 结果是阅读模式下文字层仍然选不中、拖不动，而代码注释里明明写着
- * 「阅读模式交给浏览器原生滚动 / 选字」。这里按同样语义补一条。
- */
-.mb-root.is-reading .mb-page {
-  touch-action: auto;
-}
-
 .mb-doc[data-tool="pen"] .mb-page,
 .mb-doc[data-tool="ballpoint"] .mb-page,
 .mb-doc[data-tool="highlighter"] .mb-page,
@@ -870,13 +888,9 @@
  *
  * 圈在 editor.ts 里鼠标悬停时就画（不必按下），移出纸面 / 切工具即清，
  * 所以这里藏了光标也不会出现「鼠标不见了」。
- * 仅阅读模式下不画圈，把光标还给用户，别让纸面上完全看不见指针。
  */
 .mb-doc[data-tool="eraser"] .mb-page {
   cursor: none;
-}
-.mb-root.is-reading .mb-doc[data-tool="eraser"] .mb-page {
-  cursor: default;
 }
 
 .mb-doc[data-tool="hand"] .mb-page {
@@ -895,7 +909,7 @@
  * 必须在 canvas 之后：底图是不透明白底，放下面会被整块盖住。
  *
  * 默认 pointer-events:none —— 写字时这一层必须完全穿透，
- * 否则手指点上来会被文字吃掉，写不出笔。只有进入仅阅读才接管指针。
+ * 否则手指点上来会被文字吃掉，写不出笔。选字由「选择」工具接管。
  *
  * 尺寸写死成页面坐标系（794×1123 之类），整层用 --mb-zoom 缩放：
  * 这样缩放时不用重算每个字的位置。
@@ -909,8 +923,21 @@
   transform-origin: 0 0;
   transform: scale(var(--mb-zoom, 1));
   pointer-events: none;
-  user-select: none;
-  -webkit-user-select: none;
+  /*
+   * **默认允许选中**（2026-11-09）。
+   *
+   * 以前只有「仅阅读模式」下才放开 `user-select: text`，靠
+   * `.mb-root.is-reading .mb-textlayer { user-select: text }` 那一条。
+   * 仅阅读删掉后，PDF 原文 / Word 正文就彻底选不中了 —— 用户想复制
+   * 一段导入的文字会发现鼠标划不过去。
+   *
+   * 关键点：**选中能力和 `pointer-events` 无关**。这一层仍然是
+   * `pointer-events: none`，所以写字时手指照样穿透、不会「被文字吃掉」；
+   * 桌面端用鼠标拖选时浏览器按文字几何做选择，不看 pointer-events。
+   * 放开 `user-select` 不会破坏书写，只是把「能选中」还回来。
+   */
+  user-select: text;
+  -webkit-user-select: text;
   overflow: hidden;
 }
 
@@ -971,18 +998,6 @@
   pointer-events: none;
   user-select: none;
   -webkit-user-select: none;
-}
-
-/* 仅阅读模式才允许选字：这时本来就不写字，不会抢触摸 */
-.mb-root.is-reading .mb-textlayer {
-  pointer-events: auto;
-  user-select: text;
-  -webkit-user-select: text;
-  touch-action: auto;
-}
-
-.mb-root.is-reading .mb-text {
-  cursor: text;
 }
 
 /* 编辑框：覆盖在页面上，跟随缩放定位 */
@@ -1786,6 +1801,59 @@
   background: var(--background-primary);
 }
 
+/* ---------------------------- 缩略图 / 目录 标签页 ---------------------------- */
+
+/*
+ * 缩略图和目录共用一个面板（用户要的是「像 Obsidian 原生 PDF 阅读器
+ * 那样，点一下就把缩略图翻出来」）。顶部两枚标签切换，同一时间只显示一个。
+ */
+.mb-side-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 2px 0 8px;
+  padding: 3px;
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+
+.mb-side-tab {
+  flex: 1 1 0;
+  height: 28px;
+  padding: 0 6px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: none;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.mb-side-tab:hover {
+  color: var(--text-normal);
+}
+
+/* 选中态要一眼看出来：白底 + 加粗 + 主色文字 */
+.mb-side-tab.is-active {
+  background: var(--background-primary);
+  color: var(--interactive-accent);
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.14);
+}
+
+.mb-side-pane.is-hidden {
+  display: none;
+}
+
+/* 标签已经说明了内容，面板里的标题别再往下顶一大截 */
+.mb-side-pane .mb-sec {
+  margin-bottom: 4px;
+}
+
 /* 常用动作区：撤销 / 重做 / 删除 / 导入 / 导出 */
 .mb-sec-act {
   padding-bottom: 2px;
@@ -2472,31 +2540,6 @@
   color: var(--text-faint);
 }
 
-.mb-side-foot {
-  display: flex;
-  gap: 6px;
-  padding: 8px 10px;
-  border-top: 1px solid var(--background-modifier-border);
-  flex: 0 0 auto;
-}
-
-.mb-foot-btn {
-  flex: 1 1 0;
-  height: 26px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 5px;
-  background: transparent;
-  color: var(--text-muted);
-  font-size: 10.5px;
-  cursor: pointer;
-  box-shadow: none;
-}
-
-.mb-foot-btn:hover {
-  border-color: var(--interactive-accent);
-  color: var(--text-normal);
-}
-
 /* -------------------------------- 空状态 -------------------------------- */
 
 .mb-empty {
@@ -2935,9 +2978,9 @@
   gap: 10px;
 }
 
-/* 侧栏底部按钮加大 */
-.mb-root.is-tablet .mb-foot-btn {
-  height: 42px;
+/* 侧栏标签页（缩略图 / 目录）在平板上放大热区 */
+.mb-root.is-tablet .mb-side-tab {
+  height: 40px;
   font-size: 14px;
 }
 
@@ -3085,22 +3128,6 @@
 .mb-root.is-tablet .mb-layer-op-val {
   font-size: 11px;
 }
-
-/* 仅阅读：工具面板收起，只留右侧长条 */
-/*
- * 仅阅读模式：面板收起，屏幕尽量全给纸。
- *
- * 之前底部要留 90px 给浮在右下角的圆钮，
- * 现在圆钮变成了右缘的长条，横向不再被占，
- * 底部整条都能写字。
- *
- * ⚠️ 2026-10-30：**不要在这里改 padding / gap**。
- * 曾经是 `padding: 10px 0 22px` + `gap: 28px`，结果一进阅读模式
- * 页面整体位移：上边距少 12px、下半页少 88px、每页间距多 4px，
- * 第 20 页就偏出 80px。真机表现就是「一开仅阅读，平板上的页面会变」。
- * 阅读模式的价值是隐藏工具 + 可选字，排版必须和书写模式一模一样——
- * 否则切模式等于跳页。
- */
 
 /* ============================ 导入 ============================ */
 

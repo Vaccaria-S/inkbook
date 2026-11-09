@@ -247,7 +247,7 @@ export function normalizeBook(raw: any, fallbackTitle: string): InkBook {
       activeLayerId: active.id,
     };
     /*
-     * 文字层（v2）：PDF 原文 + 手动添加的文字。
+     * 文字层（v2）：PDF / Word 原文 + 手动添加的文字。
      * 同样白名单重建——旧版文件没有这个字段，读出来就是空数组。
      */
     const texts = Array.isArray(p?.texts)
@@ -264,7 +264,7 @@ export function normalizeBook(raw: any, fallbackTitle: string): InkBook {
           .map((t: any) => {
             const item: any = {
               id: String(t.id || `text_${Math.random().toString(36).slice(2, 9)}`),
-              source: t.source === "user" ? "user" : "pdf",
+              source: t.source === "user" ? "user" : t.source === "word" ? "word" : "pdf",
               x: Number(t.x),
               y: Number(t.y),
               text: String(t.text),

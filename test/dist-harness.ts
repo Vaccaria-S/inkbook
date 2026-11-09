@@ -361,7 +361,7 @@ async function main() {
    */
   pass(!!view.containerEl.querySelector(".mb-toprow"), "顶栏工具行已渲染");
   pass(!!view.containerEl.querySelector(".mb-rail-side"), "顶栏侧栏开关已渲染");
-  pass(!!view.containerEl.querySelector(".mb-rail-read"), "顶栏仅阅读按钮已渲染");
+  pass(!view.containerEl.querySelector(".mb-rail-read"), "顶栏已无仅阅读按钮（功能已删）");
   pass(!!host.querySelector(".mb-float"), "右下角浮标已渲染");
   pass(
     view.containerEl.querySelectorAll(".mb-top-tool").length === 8,

@@ -97,6 +97,19 @@ const SHAPES: Array<{ id: ShapeKind; label: string }> = [
 const TOOLS_NEED_SIDE = new Set<ToolId>(["text", "eraser", "shape"]);
 
 /**
+ * 顶栏工具按钮「二次点击」会在正下方弹出快捷笔盒的工具。
+ *
+ * 只有这三支有真正意义上的笔参数（颜色 + 粗细），也正好对应侧栏「笔盒」区：
+ *   · pen / ballpoint —— 共用 PEN_COLORS + PEN_SIZES
+ *   · highlighter     —— HIGHLIGHTER_PALETTE + HIGHLIGHTER_SIZES
+ *
+ * 橡皮没有颜色；形状虽然也用 penColor / penSize 落笔，但它的种类选择
+ * 只住在侧栏，点第二下已经会展开侧栏，再叠一个浮层反而碍事；
+ * 文字 / 选择 / 抓手没有笔参数（见 TOOLS_NEED_SIDE 的说明）。
+ */
+const PEN_POP_TOOLS = new Set<ToolId>(["pen", "ballpoint", "highlighter"]);
+
+/**
  * 侧栏页列表窗口化。
  *
  * `.mb-pages` 是「固定列数的等高网格」：同一行里每个条目、以及每一行
@@ -350,7 +363,6 @@ export class InkbookView extends FileView {
    */
   allowNoFile = true;
 
-  private railReadBtn!: HTMLElement;
   private railSideBtn!: HTMLElement;
   /**
    * 顶栏上的「立即保存」按钮。
@@ -359,7 +371,6 @@ export class InkbookView extends FileView {
    * 按钮常驻在顶栏上，不用先展开侧栏。
    */
   private railSaveBtn!: HTMLElement;
-  private readHintEl!: HTMLElement;
   private floatEl!: HTMLElement;
   private floatZoomEl!: HTMLElement;
   private bodyEl!: HTMLElement;
@@ -381,9 +392,9 @@ export class InkbookView extends FileView {
    */
   private dynToolsSig = "";
   private pageLbl!: HTMLElement;
-  /** 顶栏那一行：7 支笔 + 保存/侧栏/仅阅读，全部挤在标题栏同一行 */
+  /** 顶栏那一行：8 支笔 + 保存/侧栏，全部挤在标题栏同一行 */
   private topRowEl: HTMLElement | null = null;
-  /** 顶栏里的工具组（仅阅读时整组收起） */
+  /** 顶栏里的工具组 */
   private topToolsEl: HTMLElement | null = null;
   /** 标题栏里原本挂 action 的那个容器（放不下时把整行搬回来用） */
   private actionsHostEl: HTMLElement | null = null;
@@ -451,6 +462,18 @@ export class InkbookView extends FileView {
   private penChipEl: HTMLElement | null = null;
   private penChipDotEl: HTMLElement | null = null;
   private penChipSizeEl: HTMLElement | null = null;
+  /**
+   * 顶栏笔按钮二次点击弹出的快捷笔盒（.mb-pen-pop）。
+   *
+   * 挂在 document.body + position:fixed：顶栏在标题栏里，祖先可能有
+   * overflow/transform，绝对定位会被裁；fixed 不受影响，平板竖屏也能
+   * 贴着按钮左右夹住不越界（见 positionPenPop）。
+   */
+  private penPopEl: HTMLElement | null = null;
+  /** 当前浮层挂在哪枚按钮上；再点同一枚按钮即收起 */
+  private penPopAnchorEl: HTMLElement | null = null;
+  /** 浮层打开期间挂上的 document/window 监听，关闭时逐个摘掉 */
+  private penPopDetach: Array<() => void> = [];
   private sideBtn!: HTMLElement;
   private layerListEl: HTMLElement | null = null;
   private pageListEl: HTMLElement | null = null;
@@ -607,19 +630,17 @@ export class InkbookView extends FileView {
    */
   private sideShown = false;
   /**
-   * 仅阅读模式。
+   * 侧栏下方「缩略图 / 目录」当前显示哪一页。
    *
-   * 与「侧栏开合」是**两件独立的事**：
-   *   · 侧栏收起 → 只是收起工具，照样能写字
-   *   · 仅阅读 → 显式切过去，长条淡出、编辑器只读
-   *
-   * 之前这两件事是绑在一起的（面板收起 = 仅阅读），
-   * 那在「面板是唯一入口」时成立；长条常驻后就不成立了——
-   * 工具一直可点却不能生效，说不通。
+   * 两个面板共用一个标签区（像 Obsidian 原生 PDF 阅读器的缩略图栏），
+   * 同一时间只显示一个；没显示的那个保留自己的滚动容器和窗口化状态，
+   * 切回来时只需按新尺寸重算窗口，不用重建 DOM。
    */
-  private reading = false;
-  /** 仅阅读提示的自动消失定时器 */
-  private hintTimer = 0;
+  private sideTab: "thumbs" | "outlines" = "thumbs";
+  /** 两个标签页容器（buildSide 里建，切换时切 is-hidden） */
+  private sideThumbPane: HTMLElement | null = null;
+  private sideOutlinePane: HTMLElement | null = null;
+  private sideTabBtns: HTMLButtonElement[] = [];
   /** 缩放指示器：缩放时才浮现，2.6 秒后自己退回去 */
   private zoomHintTimer = 0;
   /** 缩放指示器是否被指针悬停（悬停时不自动隐藏） */
@@ -669,7 +690,7 @@ export class InkbookView extends FileView {
   private conflict = false;
   /** 只读态的"改动不会保存"提示是否已经弹过（每本书一次，别刷屏） */
   private readOnlyNoticeShown = false;
-  /** 是否正在装配视图（装配期的 setReading / markDirty 不算用户操作） */
+  /** 是否正在装配视图（装配期的 markDirty 不算用户操作） */
   private assembling = false;
   /** 只读恢复时另存出来的副本**文件名**；有它才能告诉用户"改用那份" */
   private recoveredCopyName: string | null = null;
@@ -780,6 +801,8 @@ export class InkbookView extends FileView {
   }
 
   async onClose(): Promise<void> {
+    // 浮层挂在 document.body 上，视图关了它不会自己消失，先摘干净
+    this.closePenPop();
     this.syncActivePage();
     const ok = await this.flushSave();
     // 关窗时写不进去：至少把内容另存出来，别跟着视图一起消失
@@ -938,8 +961,7 @@ export class InkbookView extends FileView {
     this.savedScrollLeft = book.scrollLeft;
     this.destroyEditor();
     /*
-     * 装配期（buildUI → buildRail → setReading）会顺手动到 setReading /
-     * markDirty，那不是用户操作。用 assembling 挡住它，否则"每本一次"的
+     * 装配期（buildUI → buildRail）会顺手动到 markDirty，那不是用户操作。用 assembling 挡住它，否则"每本一次"的
      * 只读提示会在打开的一瞬间就被消耗掉，用户真正改内容时反而一声不响。
      */
     this.assembling = true;
@@ -953,8 +975,8 @@ export class InkbookView extends FileView {
     this.saveState = "saved";
     this.updateStatus();
     /*
-     * 只读提示的复位必须放在装配**之后**：buildUI → buildRail → setReading
-     * 会在装配期就调一次 warning，若在这里之前复位，那一次就把"每本一次"
+     * 只读提示的复位必须放在装配**之后**：mountEditor 会在装配期
+     * 就调一次 warning，若在这里之前复位，那一次就把"每本一次"
      * 的额度用光了，等用户真正动手改内容时反而一声不响。
      */
     this.readOnlyNoticeShown = false;
@@ -1197,7 +1219,7 @@ export class InkbookView extends FileView {
        * 用户以为那页是空的。
        */
       onThumbNeedsRedraw: (i: number) => {
-        // 侧栏收起/仅阅读时不要画：隐藏状态的 rect 是 0，会走 60×84 的回退尺寸，
+        // 侧栏收起/目录标签时不要画：隐藏状态的 rect 是 0，会走 60×84 的回退尺寸，
         // 白白把 PDF 页排进光栅化队列（展开时会统一补画）
         if (!this.thumbVisible()) return;
         const cv = this.thumbCanvases.get(i);
@@ -1341,7 +1363,6 @@ export class InkbookView extends FileView {
     this.topBarEl?.remove();
     this.topRowEl = null;
     this.topBarEl = null;
-    window.clearTimeout(this.hintTimer);
     window.clearTimeout(this.zoomHintTimer);
     window.clearTimeout(this.indexTimer);
     this.indexTimer = 0;
@@ -1470,9 +1491,9 @@ export class InkbookView extends FileView {
     this.applySideVisibility();
   }
 
-  /** 侧栏显隐：仅阅读时一律收起来，把屏幕让给纸 */
+  /** 侧栏显隐：只由 sideShown 决定 */
   private applySideVisibility(): void {
-    const visible = !this.reading && this.sideShown;
+    const visible = this.sideShown;
     this.sideEl?.toggleClass("is-hidden", !visible);
     /*
      * 平板上侧栏是**绝对定位盖在纸面上**的（见 styles.css 的
@@ -1486,7 +1507,7 @@ export class InkbookView extends FileView {
      */
     this.bodyEl?.toggleClass("mb-side-open", visible);
     /*
-     * 展开侧栏（或退出仅阅读）时补建/补画缩略图。
+     * 展开侧栏时补建/补画缩略图。
      * 收起状态下不建页列表、不渲染缩略图：857 页的本子光建 DOM 就要几十毫秒，
      * 更贵的是会立刻用 pdf.js 渲 5 页缩略图，和首屏抢同一份 PDF。
      *
@@ -1511,9 +1532,14 @@ export class InkbookView extends FileView {
     }
   }
 
-  /** 缩略图/页列表现在有必要维护吗（侧栏收起或仅阅读时都不必要） */
+  /**
+   * 缩略图/页列表现在有必要维护吗。
+   *
+   * 侧栏收起时当然不用；显示「目录」标签时页列表被 display:none，
+   * 量不到尺寸也画不出来，同样不必维护（切回缩略图标签时会强制补建）。
+   */
   private thumbVisible(): boolean {
-    return !this.reading && this.sideShown;
+    return this.sideShown && this.sideTab === "thumbs";
   }
 
   private buildUI(): void {
@@ -1659,6 +1685,8 @@ export class InkbookView extends FileView {
    * 全名放在 title 里，长按 / 悬停能看到。
    */
   private buildToolRow(row: HTMLElement): void {
+    // 顶栏重建（换文件 / 宿主清空标题栏）时旧浮层的锚点就不在了，先收掉
+    this.closePenPop();
     this.toolButtons.clear();
     const wrap = row.createDiv("mb-top-tools");
     this.topToolsEl = wrap;
@@ -1678,19 +1706,28 @@ export class InkbookView extends FileView {
       setIcon(b, t.icon);
       b.title = t.name;
       b.setAttribute("aria-label", t.name);
-      b.onclick = () => this.chooseTool(t.id);
+      b.onclick = () => {
+        /*
+         * 第一次点 = 切到这支笔；已经在这支笔上再点一下 = 按钮正下方
+         * 弹出快捷笔盒（用户原话：「再点一下 就直接能在钢笔下边弹出
+         * 一个笔盒 能直接切换颜色和粗细」）。
+         *
+         * 浮层已经开着时再点同一颗按钮就收起——保持"点一下开、再点一下关"
+         * 的开关手感，不用去够别处。
+         */
+        const cur = this.editor?.getState().tool;
+        if (t.id === cur && PEN_POP_TOOLS.has(t.id)) {
+          if (this.penPopEl && this.penPopAnchorEl === b) this.closePenPop();
+          else this.openPenPop(b, t.id);
+          return;
+        }
+        this.closePenPop();
+        this.chooseTool(t.id);
+      };
       wrap.appendChild(b);
       this.toolButtons.set(t.id, b);
     }
 
-    /* ---------------------------- 仅阅读提示 ---------------------------- */
-    // 自愈重装顶栏时别再挂一条重复的提示
-    if (!this.readHintEl || !this.readHintEl.parentElement) {
-      this.readHintEl = this.editorHost.createDiv({
-        cls: "mb-read-hint",
-        text: "仅阅读模式 · 点顶栏的眼睛图标开始书写",
-      });
-    }
   }
 
   /**
@@ -1780,17 +1817,171 @@ export class InkbookView extends FileView {
     // 重复点同一支笔：不重新弹侧栏（用户可能刚手动收起）
     if (id === prev) return;
     if (!TOOLS_NEED_SIDE.has(id)) return;
-    // 仅阅读时纸面优先；侧栏已经开着也不用动
-    if (this.reading || this.sideShown) return;
+    // 侧栏已经开着也不用动
+    if (this.sideShown) return;
     this.sideShown = true;
     this.applySideVisibility();
     this.updateUI();
   }
 
+  /* --------------------------- 快捷笔盒浮层 --------------------------- */
+
+  /**
+   * 在当前工具按钮正下方弹出快捷笔盒：颜色点 + 粗细档位。
+   *
+   * 数据和侧栏「笔盒」用的是同一份常量（PEN_COLORS / PEN_SIZES /
+   * HIGHLIGHTER_PALETTE / HIGHLIGHTER_SIZES），不复制第二套色值；
+   * 点色点 / 粗细**只改参数、不切工具**（与侧栏一致，见 buildSide 的注释），
+   * 且浮层保持打开，方便连续调。
+   */
+  private openPenPop(anchor: HTMLElement, tool: ToolId): void {
+    this.closePenPop();
+    const hl = tool === "highlighter";
+    const el = document.body.createDiv("mb-pen-pop");
+    el.setAttribute("role", "dialog");
+    el.setAttribute("aria-label", hl ? "荧光笔颜色与粗细" : "笔颜色与粗细");
+
+    const colorRow = el.createDiv("mb-pen-pop-row mb-pen-pop-colors");
+    for (const c of hl ? HIGHLIGHTER_PALETTE : PEN_COLORS) {
+      const dot = colorRow.createEl("button", {
+        cls: "mb-pen-pop-dot" + (hl ? " is-hl" : ""),
+        attr: { type: "button", "aria-label": "颜色 " + c },
+      });
+      dot.style.background = c;
+      dot.dataset.color = c;
+      dot.title = hl ? "荧光笔颜色" : "笔颜色";
+      dot.onclick = () => {
+        if (hl) {
+          this.editor?.setHighlighterColor(c);
+          this.plugin.settings.lastHighlighterColor = c;
+        } else {
+          this.editor?.setPenColor(c);
+          this.plugin.settings.lastPenColor = c;
+        }
+        void this.plugin.saveSettings();
+        this.updateUI();
+        this.syncPenPopActive();
+      };
+    }
+
+    const sizeRow = el.createDiv("mb-pen-pop-row");
+    const sizes = hl ? HIGHLIGHTER_SIZES : PEN_SIZES;
+    for (let i = 0; i < sizes.length; i++) {
+      const b = sizeRow.createEl("button", {
+        cls: "mb-pen-pop-size",
+        text: ["细", "中", "粗"][i],
+        attr: { type: "button", "data-size": String(sizes[i]) },
+      });
+      b.title = (hl ? "荧光笔" : "笔") + "粗细：" + b.textContent;
+      b.onclick = () => {
+        if (hl) {
+          this.editor?.setHighlighterSize(sizes[i]);
+          this.plugin.settings.defaultHighlighterSize = sizes[i];
+        } else {
+          this.editor?.setPenSize(sizes[i]);
+          this.plugin.settings.defaultPenSize = sizes[i];
+        }
+        void this.plugin.saveSettings();
+        this.updateUI();
+        this.syncPenPopActive();
+      };
+    }
+
+    this.penPopEl = el;
+    this.penPopAnchorEl = anchor;
+    anchor.setAttribute("aria-expanded", "true");
+    document.body.appendChild(el);
+    this.syncPenPopActive();
+    this.positionPenPop(el, anchor);
+
+    /*
+     * 关闭条件：点外部 / Esc / 滚动或转屏（位置会飘）。
+     * 用 pointerdown 而不是 click：手指还没抬起就把浮层收掉，不会
+     * 出现"点完别处又触发一次那边按钮"的错位。当次点击的 pointerdown
+     * 早已在 onclick 之前派发完毕，所以监听挂上时不会立刻自关。
+     */
+    const onDown = (e: Event) => {
+      const t = e.target as Node | null;
+      if (!t) return;
+      if (el.contains(t) || anchor.contains(t)) return;
+      this.closePenPop();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // 别让 Esc 继续传下去（编辑框等还有自己的 Esc 处理）
+      e.stopPropagation();
+      this.closePenPop();
+    };
+    const onMove = () => this.closePenPop();
+    document.addEventListener("pointerdown", onDown, true);
+    document.addEventListener("keydown", onKey, true);
+    window.addEventListener("resize", onMove);
+    window.addEventListener("scroll", onMove, true);
+    this.penPopDetach = [
+      () => document.removeEventListener("pointerdown", onDown, true),
+      () => document.removeEventListener("keydown", onKey, true),
+      () => window.removeEventListener("resize", onMove),
+      () => window.removeEventListener("scroll", onMove, true),
+    ];
+  }
+
+  /**
+   * 浮层定位：按钮正下方居中，窄屏时左右夹进视口，下面放不下就翻到上方。
+   *
+   * 先 visibility:hidden 挂到 (0,0) 量自然尺寸——position:fixed 且
+   * left/top 都为 0 时是 shrink-to-fit，量到的就是它真正要占的宽高；
+   * 拿到宽高后再夹 left，横竖屏 / 平板窄边都不会被裁掉。
+   */
+  private positionPenPop(el: HTMLElement, anchor: HTMLElement): void {
+    const r = anchor.getBoundingClientRect();
+    el.style.visibility = "hidden";
+    el.style.left = "0px";
+    el.style.top = "0px";
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    const margin = 8;
+    let left = r.left + r.width / 2 - w / 2;
+    left = Math.max(margin, Math.min(left, window.innerWidth - w - margin));
+    let top = r.bottom + 6;
+    if (top + h > window.innerHeight - margin) {
+      // 下方真的放不下（横屏顶栏贴近底边等极端情况）：翻到按钮上方
+      top = Math.max(margin, r.top - h - 6);
+    }
+    el.style.left = Math.round(left) + "px";
+    el.style.top = Math.round(top) + "px";
+    el.style.visibility = "visible";
+  }
+
+  /** 同步浮层里的选中态（当前色 / 当前粗细），不重建 DOM */
+  private syncPenPopActive(): void {
+    const el = this.penPopEl;
+    if (!el || !this.editor) return;
+    const s = this.editor.getState();
+    const hl = s.tool === "highlighter";
+    const color = (hl ? s.highlighterColor : s.penColor).toLowerCase();
+    const size = hl ? s.highlighterSize : s.penSize;
+    for (const dot of Array.from(el.querySelectorAll<HTMLElement>(".mb-pen-pop-dot"))) {
+      dot.toggleClass("is-active", (dot.dataset.color || "").toLowerCase() === color);
+    }
+    for (const b of Array.from(el.querySelectorAll<HTMLElement>(".mb-pen-pop-size"))) {
+      b.toggleClass("is-active", Math.abs(Number(b.dataset.size) - size) < 0.01);
+    }
+  }
+
+  /** 收起快捷笔盒，并摘掉打开期间挂上的所有监听 */
+  private closePenPop(): void {
+    for (const off of this.penPopDetach) off();
+    this.penPopDetach = [];
+    this.penPopAnchorEl?.setAttribute("aria-expanded", "false");
+    this.penPopEl?.remove();
+    this.penPopEl = null;
+    this.penPopAnchorEl = null;
+  }
+
   /* --------------------------- 顶栏上的那一行 --------------------------- */
 
   /**
-   * 顶栏那一行：**7 支笔 + 保存 / 侧栏 / 仅阅读**，一起挂到标题栏。
+   * 顶栏那一行：**8 支笔 + 保存 / 侧栏**，一起挂到标题栏。
    *
    * 用宿主的 addAction 拿到原生位置与点击区域，再把图标换成自绘的：
    * 宿主图标集里查不到的 name 会画成空框，这个坑踩过。
@@ -1845,11 +2036,6 @@ export class InkbookView extends FileView {
     this.railSideBtn = side;
     this.sideBtn = side;
 
-    const read = mk("eye", "仅阅读模式", "mb-rail-read");
-    read.setAttr("aria-pressed", "false");
-    read.onclick = () => this.setReading(!this.reading);
-    this.railReadBtn = read;
-
     /*
      * 组装：宿主 action 原本挂在 .view-actions 里，
      * 把整行塞进同一个父容器，才能和宿主自己的按钮并排成一行。
@@ -1866,7 +2052,6 @@ export class InkbookView extends FileView {
     row.appendChild(row.createDiv("mb-sep"));
     row.appendChild(save);
     row.appendChild(side);
-    row.appendChild(read);
     this.topRowEl = row;
   }
 
@@ -2368,43 +2553,10 @@ export class InkbookView extends FileView {
   }
 
   /**
-   * 切换仅阅读模式。
-   *
-   * 进去以后：长条淡出、编辑器拒绝落笔，
-   * 但翻页、缩放、滚动照常——「看」笔记不该被「写」的能力打扰。
-   */
-  private setReading(on: boolean): void {
-    /*
-     * 只读恢复态（readOnly）是"不能保存"的硬约束。
-     *
-     * 在这里直接放开编辑器 = 让用户写字、却永远存不下去：saveNow 会因
-     * readOnly 早退，状态栏停在"未保存"，切走就全丢。
-     * 所以编辑器是否可写由 reading || readOnly 共同决定。
-     */
-    this.reading = on;
-    this.contentEl.toggleClass("is-reading", on);
-    this.applyEditorReadOnly();
-    this.applySideVisibility();
-
-    if (this.railReadBtn) {
-      this.railReadBtn.classList.toggle("is-active", on);
-      this.railReadBtn.setAttribute("aria-pressed", String(on));
-      this.railReadBtn.setAttribute(
-        "aria-label",
-        on ? "退出仅阅读模式" : "进入仅阅读模式"
-      );
-      this.railReadBtn.title = on ? "退出仅阅读模式 · 开始书写" : "仅阅读模式";
-    }
-    this.showReadHint(on);
-    // 想退出仅阅读却被 readOnly 卡住时说清原因，否则像是"按钮坏了"
-    if (!on && this.readOnly) this.warnReadOnly();
-  }
-
-  /**
-   * 编辑器是否可写：仅阅读 或 只读恢复态，任一成立就不能落笔。
+   * 编辑器是否可写：只读恢复态（文件不可写）成立时就不能落笔。
    */
   private applyEditorReadOnly(): void {
-    this.editor?.setReadOnly(this.reading || this.readOnly);
+    this.editor?.setReadOnly(this.readOnly);
   }
 
   /** 提醒"这份笔记现在存不下去"。同一份笔记只提醒一次。 */
@@ -2425,18 +2577,6 @@ export class InkbookView extends FileView {
           ? "这是只读状态（从备份恢复或原文件不可写），改动不会保存。已另存为 recovered 副本，请改用那份。"
           : "这是只读状态（从备份恢复或原文件不可写），改动不会保存。要接着写，请把同目录的 .bak 复制一份并改名。";
     new Notice(msg, 8000);
-  }
-
-
-  /** 仅阅读提示：浮出来几秒再自己消失，不打扰 */
-  private showReadHint(show: boolean): void {
-    window.clearTimeout(this.hintTimer);
-    this.readHintEl?.toggleClass("is-show", show);
-    if (show) {
-      this.hintTimer = window.setTimeout(() => {
-        this.readHintEl?.removeClass("is-show");
-      }, 4200);
-    }
   }
 
   /**
@@ -3452,17 +3592,17 @@ export class InkbookView extends FileView {
     this.redoBtn.onclick = () => this.editor?.redo();
     const impBtn = actRow.createEl("button", {
       cls: "mb-ib",
-      attr: { "aria-label": "导入 PDF / Word" },
+      attr: { "aria-label": "导入文档" },
     });
-    impBtn.title = "导入 PDF / Word，在上面手写批注";
-    setIcon(impBtn, "import");
+    impBtn.title = "导入文档：把 PDF / Word 放进本子，在上面手写批注";
+    setIcon(impBtn, "file-input");
     impBtn.onclick = (e) => this.showImportMenu(e);
     const expBtn = actRow.createEl("button", {
       cls: "mb-ib",
-      attr: { "aria-label": "导出" },
+      attr: { "aria-label": "导出本子" },
     });
-    expBtn.title = "导出 PNG / PDF";
-    setIcon(expBtn, "download");
+    expBtn.title = "导出本子：存成 PDF 或本页 PNG";
+    setIcon(expBtn, "file-output");
     expBtn.onclick = (e) => this.showExportMenu(e);
 
     /* ---------------------------- 笔盒 ---------------------------- */
@@ -3585,23 +3725,17 @@ export class InkbookView extends FileView {
       }
 
       /*
-       * 打开「手指书写」时，必须把另外两个会**抵消它**的状态一起处理掉。
+       * 打开「手指书写」时，必须把会**抵消它**的状态一起处理掉。
        *
        * 真机反馈：「点了允许手指写字，还是没法用手指写字，只能用手写笔」——
-       * 因为这两个开关各管一段，任何一个开着都写不出来：
-       *   · 仅阅读模式：编辑器整个拒绝落笔（pointer 在 readOnly 分支就被拦了）
-       *   · 只认触控笔：touch 一落下就判成 pan，连落笔分支都进不去
-       * 用户点的是「让我用手指写」，那就该真的能写，别让他自己去猜还有哪个开关。
+       * 「只认触控笔」开着时 touch 一落下就判成 pan，连落笔分支都进不去。
+       * 文件只读（readOnly）是硬约束，不能靠这个开关绕过，只能如实拒绝。
        */
       if (this.readOnly) {
         this.warnReadOnly();
         return;
       }
       const undone: string[] = [];
-      if (this.reading) {
-        this.setReading(false);
-        undone.push("已退出仅阅读模式");
-      }
       if (this.plugin.settings.penOnly) {
         this.plugin.settings.penOnly = false;
         this.editor?.setPenOnly(false);
@@ -3667,13 +3801,54 @@ export class InkbookView extends FileView {
     this.layerListEl = layerSec.createDiv("mb-layers");
     this.renderLayers();
 
-    /* ---------------------------- 目录 ---------------------------- */
+    /* ---------------------- 缩略图 / 目录（同一面板） ---------------------- */
     /*
-     * 目录放在「页面」区**上方**——目录比缩略图常用（它是用户自己写的
-     * 路标，翻本子时第一眼看的就是它），缩略图区有几百上千格，
-     * 放上面会把路标挤到屏幕外。
+     * 缩略图和目录以前是上下两块独立区域，用户反馈想「像 Obsidian 原生
+     * PDF 阅读器那样，点一个按钮就把缩略图翻出来」。现在收进同一个面板：
+     * 顶部两个标签切换，同一时间只显示一个。
+     *
+     * 两块各自保留原有的滚动容器和窗口化逻辑——标签只是 display:none，
+     * 不重建 DOM，切回来时按新尺寸补算一次窗口即可。
      */
-    const outSec = body.createDiv("mb-sec mb-sec-outline");
+    const viewSec = body.createDiv("mb-sec mb-sec-views");
+    const tabRow = viewSec.createDiv({
+      cls: "mb-side-tabs",
+      attr: { role: "tablist", "aria-label": "缩略图与目录" },
+    });
+    this.sideTabBtns = [];
+    const mkTab = (id: "thumbs" | "outlines", label: string): HTMLButtonElement => {
+      const b = tabRow.createEl("button", {
+        cls: "mb-side-tab",
+        text: label,
+        attr: { role: "tab", "data-tab": id },
+      });
+      b.onclick = () => this.setSideTab(id);
+      this.sideTabBtns.push(b);
+      return b;
+    };
+    mkTab("thumbs", "缩略图");
+    mkTab("outlines", "目录");
+
+    /* ---------------------------- 缩略图 ---------------------------- */
+    this.sideThumbPane = viewSec.createDiv("mb-side-pane mb-side-pane-thumbs");
+    /* ---------------------------- 目录 ---------------------------- */
+    this.sideOutlinePane = viewSec.createDiv("mb-side-pane mb-side-pane-outlines");
+    /*
+     * 先把显隐落好，再建内容：
+     * 隐藏的面板量不到尺寸，窗口化会按兜底值建错（行高 / 视口高都是 0）。
+     */
+    this.applySideTab();
+
+    const pageSec = this.sideThumbPane.createDiv("mb-sec");
+    const pageHead = pageSec.createDiv("mb-sec-head");
+    pageHead.createDiv({ cls: "mb-sec-title", text: "页面" });
+    const addPage = pageHead.createEl("button", { cls: "mb-link", text: "+ 加一页" });
+    addPage.onclick = () => this.editor?.addPage();
+    this.pageListEl = pageSec.createDiv("mb-pages");
+    // 侧栏收起 / 当前显示目录时先不建：857 页 × (缩略图 + 画布) 没必要付
+    if (this.thumbVisible()) this.renderPageList();
+
+    const outSec = this.sideOutlinePane.createDiv("mb-sec mb-sec-outline");
     const outHead = outSec.createDiv("mb-sec-head");
     outHead.createDiv({ cls: "mb-sec-title", text: "目录" });
     const addOutline = outHead.createEl("button", { cls: "mb-link", text: "+ 添加目录" });
@@ -3690,26 +3865,39 @@ export class InkbookView extends FileView {
       },
       { passive: true }
     );
-    /* ---------------------------- 页面 ---------------------------- */
-    const pageSec = body.createDiv("mb-sec");
-    const pageHead = pageSec.createDiv("mb-sec-head");
-    pageHead.createDiv({ cls: "mb-sec-title", text: "页面" });
-    const addPage = pageHead.createEl("button", { cls: "mb-link", text: "+ 加一页" });
-    addPage.onclick = () => this.editor?.addPage();
-    this.pageListEl = pageSec.createDiv("mb-pages");
-    // 侧栏收起时先不建：857 页 × (缩略图 + 画布) 没必要在打开文件时付
-    if (this.thumbVisible()) this.renderPageList();
 
     this.statsEl = body.createDiv("mb-stats");
 
-    /* ---------------------------- 底部导出 ---------------------------- */
-    const foot = side.createDiv("mb-side-foot");
-    const b1 = foot.createEl("button", { cls: "mb-foot-btn", text: "导出 PDF" });
-    b1.onclick = () => this.runExport("pdf");
-    const b2 = foot.createEl("button", { cls: "mb-foot-btn", text: "导出本页 PNG" });
-    b2.onclick = () => this.runExport("png");
-
     this.statusEl = side.createDiv("mb-status mb-side-status");
+  }
+
+  /** 切换侧栏下方面板：缩略图 ⇄ 目录 */
+  private setSideTab(tab: "thumbs" | "outlines"): void {
+    if (this.sideTab === tab) return;
+    this.sideTab = tab;
+    this.applySideTab();
+    if (tab === "thumbs") {
+      // 目录标签期间页列表是 display:none，量不到尺寸、也没建过条目
+      this.updatePageWindow(true);
+      this.refreshThumbs();
+    } else {
+      // 目录标签期间视口可能是隐藏的，强制重测行高并重建窗口
+      this.outlineWinLo = -1;
+      this.outlineWinHi = -1;
+      this.outlineRowH = 0;
+      this.buildOutlineWindow(true);
+    }
+  }
+
+  /** 把当前 sideTab 反映到标签选中态和两个面板的显隐上 */
+  private applySideTab(): void {
+    this.sideThumbPane?.toggleClass("is-hidden", this.sideTab !== "thumbs");
+    this.sideOutlinePane?.toggleClass("is-hidden", this.sideTab !== "outlines");
+    for (const b of this.sideTabBtns) {
+      const on = b.dataset.tab === this.sideTab;
+      b.toggleClass("is-active", on);
+      b.setAttribute("aria-selected", String(on));
+    }
   }
 
   private templateIndex(id: TemplateId): number {
@@ -5274,7 +5462,7 @@ export class InkbookView extends FileView {
      */
     this.renderOutlines();
     /*
-     * 侧栏收起 / 仅阅读：页列表和缩略图都看不见，什么活都不用干。
+     * 侧栏收起 / 显示目录标签：页列表和缩略图都看不见，什么活都不用干。
      * 这条也覆盖了「写字时 markDirty → thumbDebounce → refreshThumbs」——
      * 侧栏没开时不会在每次停顿后去重画 5 张缩略图（PDF 页很贵）。
      */
@@ -5330,6 +5518,16 @@ export class InkbookView extends FileView {
     const s = this.editor.getState();
 
     for (const [id, btn] of this.toolButtons) btn.toggleClass("is-active", id === s.tool);
+
+    /*
+     * 快捷笔盒跟着工具 / 参数走：
+     *   · 用键盘切到没有笔参数的工具（P→T 等）时，浮层没有意义了，收起；
+     *   · 还在这支笔上就只同步选中态，不重建 DOM（连续落笔会高频跑这里）。
+     */
+    if (this.penPopEl) {
+      if (PEN_POP_TOOLS.has(s.tool)) this.syncPenPopActive();
+      else this.closePenPop();
+    }
 
     this.syncPenSizeButtons();
 
@@ -5696,7 +5894,10 @@ export class InkbookView extends FileView {
   private revealThumbForPage(index: number): void {
     const viewport = this.pageListViewportEl;
     const list = this.pageListEl;
-    if (!viewport || !list || !this.thumbVisible()) return;
+    if (!viewport || !list) return;
+    // 显式跳页时用户要「看见这一页」：侧栏开着但停在目录标签，就切回缩略图
+    if (this.sideShown && this.sideTab !== "thumbs") this.setSideTab("thumbs");
+    if (!this.thumbVisible()) return;
     if (list.clientWidth <= 0) return; // 还没布局（侧栏刚展开）
     const count = this.store?.pageCount ?? 0;
     if (index < 0 || index >= count) return;
@@ -6253,17 +6454,13 @@ export class InkbookView extends FileView {
       return;
     }
     if (e.key === "Escape") {
-      // 有选中的文字：先取消选中，别一下子跳到"切换仅阅读"
+      // 有选中的文字：先取消选中，别顺手去收侧栏
       if (this.editor.selectedText) {
         this.editor.selectText(null);
         return;
       }
-      // 逐级退出：收起侧栏 → 最后切仅阅读
-      if (this.sideShown) {
-        this.toggleSide();
-      } else {
-        this.setReading(!this.reading);
-      }
+      // Esc 只负责收起侧栏；侧栏本来就没开就什么都不做
+      if (this.sideShown) this.toggleSide();
       return;
     }
     /*

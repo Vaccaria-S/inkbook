@@ -10,6 +10,7 @@
  *   6. 立即保存：点一下就落盘，干净时不重复写，存不下去时必须说清楚
  */
 import { InkbookView } from "../src/view";
+import { TEXT_FONTS, textFontStack } from "../src/editor";
 import { createBook, createLayer, createPage, DEFAULT_SETTINGS, type Pt } from "../src/types";
 
 const lines: string[] = [];
@@ -187,12 +188,11 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   const headerEl = view.containerEl as HTMLElement;
   const topRow = headerEl.querySelector(".mb-toprow") as HTMLElement;
   const sideBtn = headerEl.querySelector(".mb-rail-side") as HTMLElement;
-  const readBtn = headerEl.querySelector(".mb-rail-read") as HTMLElement;
 
   pass(!!topRow, "标题栏里有 .mb-toprow 一行");
   pass(!!paper, "存在纸面列 .mb-paper");
   pass(!!sideBtn, "顶栏上有「侧栏」开关");
-  pass(!!readBtn, "顶栏上有「仅阅读」按钮");
+  pass(!headerEl.querySelector(".mb-rail-read"), "顶栏上已没有「仅阅读」按钮");
 
   // 工具搬上顶栏后，纸上那块可拖动浮层必须彻底消失
   pass(!root.querySelector(".mb-rail"), "纸上不再有浮层工具盘 .mb-rail");
@@ -202,14 +202,14 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   pass(!root.querySelector(".mb-dock-tab"), "旧标签页已移除");
   pass(!root.querySelector(".mb-rail-more"), "旧「更多」按钮已移除");
 
-  // 8 个工具 + 3 个动作 = 11 个按钮，挤在同一行
+  // 8 个工具 + 2 个动作 = 10 个按钮，挤在同一行
   const tools = topRow.querySelectorAll(".mb-top-tool");
   pass(tools.length === 8, "顶栏上 8 个工具按钮（" + tools.length + "）");
 
   const rowBtns = Array.from(
     topRow.querySelectorAll(".mb-topbtn")
   ) as HTMLElement[];
-  pass(rowBtns.length === 11, "一行里 11 个按钮（8 工具 + 3 动作）：" + rowBtns.length);
+  pass(rowBtns.length === 10, "一行里 10 个按钮（8 工具 + 2 动作）：" + rowBtns.length);
 
   /*
    * 用户要求："把钢笔、橡皮啊，侧边的这些东西都挪到最上面去"，
@@ -218,7 +218,7 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
    */
   const tops = rowBtns.map((b) => Math.round(b.getBoundingClientRect().top));
   const rowSpread = Math.max(...tops) - Math.min(...tops);
-  pass(rowSpread <= 2, "11 个按钮在同一水平线上（顶边最大差 " + rowSpread + "px）");
+  pass(rowSpread <= 2, "10 个按钮在同一水平线上（顶边最大差 " + rowSpread + "px）");
 
   // 顺序：笔在左，视图动作在右
   const lastToolRight = (
@@ -1506,19 +1506,22 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   /* ============ 5. 侧栏收纳全部工具 ============ */
   /*
    * 用户要求："导出 PDF 这种工具，可以直接统一全部放在侧边栏里面"。
+   * 之后又反馈侧栏底部那两个导出按钮和顶部导入/导出太像、太多余，
+   * 所以底部不再有重复入口，导出统一走工具行的图标按钮。
    */
   pass(
-    sideEl.textContent!.includes("导出 PDF"),
-    "侧栏里有「导出 PDF」"
+    !!sideEl.querySelector('.mb-ib[aria-label="导出本子"]'),
+    "侧栏工具行有导出入口"
   );
   pass(
-    sideEl.textContent!.includes("导出本页 PNG"),
-    "侧栏里有「导出本页 PNG」"
+    !!sideEl.querySelector('.mb-ib[aria-label="导入文档"]'),
+    "侧栏工具行有导入入口"
   );
+  pass(!sideEl.querySelector(".mb-side-foot"), "侧栏底部不再有重复的导出按钮");
   const ibs = sideEl.querySelectorAll(".mb-ib");
   pass(
     ibs.length >= 5,
-    "侧栏顶部的图标按钮齐全（刷新/撤销/重做/导入/导出，" + ibs.length + " 个）"
+    "侧栏顶部的图标按钮齐全（撤销/重做/导入/导出/输入方式，" + ibs.length + " 个）"
   );
   pass(!!sideEl.querySelector(".mb-side-close"), "侧栏有关闭按钮");
 
@@ -1534,90 +1537,57 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   }
   pass(isSideOpen(), "侧栏重新打开");
 
-  /* ============ 6. 仅阅读模式 ============ */
-  const isReading = () => root.classList.contains("is-reading");
-
+  /* ============ 5.5 缩略图 / 目录 标签页 ============ */
   /*
-   * 切模式不能动排版。
-   *
-   * 曾经 `is-reading` 把 .mb-scroll 的 padding 从 22/90 改成 10/22、
-   * .mb-doc 的 gap 从 24 改成 28：一进阅读模式，上半页少 12px、
-   * 下半页少 88px、每页间距多 4px，第 20 页偏出 80px。
-   * 真机表现就是「一开仅阅读，平板上的页面会变」。
+   * 用户要求把缩略图和目录合并成一个面板，像 Obsidian 原生 PDF 阅读器：
+   * 上方两个标签切换，同一时间只显示一个。
    */
-  const scrollEl = root.querySelector(".mb-scroll") as HTMLElement;
-  const docEl = root.querySelector(".mb-doc") as HTMLElement;
-  const layoutSig = () => {
-    const s = getComputedStyle(scrollEl);
-    const d = getComputedStyle(docEl);
-    return [s.paddingTop, s.paddingBottom, d.gap].join(" | ");
-  };
-  const layoutWrite = layoutSig();
+  const tabs = Array.from(sideEl.querySelectorAll(".mb-side-tab")) as HTMLElement[];
+  pass(tabs.length === 2, "侧栏有「缩略图 / 目录」两个标签（" + tabs.length + "）");
+  const thumbPane = sideEl.querySelector(".mb-side-pane-thumbs") as HTMLElement;
+  const outlinePane = sideEl.querySelector(".mb-side-pane-outlines") as HTMLElement;
+  const thumbTab = sideEl.querySelector(
+    '.mb-side-tab[data-tab="thumbs"]'
+  ) as HTMLElement;
+  const outlineTab = sideEl.querySelector(
+    '.mb-side-tab[data-tab="outlines"]'
+  ) as HTMLElement;
+  const paneVisible = (el: HTMLElement | null) =>
+    !!el && !el.classList.contains("is-hidden");
 
-  (readBtn as HTMLElement).click();
-  await sleep(200);
-  pass(isReading(), "点「阅读」按钮进入仅阅读模式");
+  pass(paneVisible(thumbPane) && !paneVisible(outlinePane), "默认显示「缩略图」面板");
+  outlineTab.click();
+  await sleep(180);
+  pass(!paneVisible(thumbPane) && paneVisible(outlinePane), "点「目录」切到目录面板");
   pass(
-    layoutSig() === layoutWrite,
-    "仅阅读不改页面排版（padding/gap 前后一致：" + layoutSig() + "）"
+    outlineTab.classList.contains("is-active") &&
+      !thumbTab.classList.contains("is-active"),
+    "标签选中态跟着切换"
   );
-  pass(
-    (readBtn as HTMLElement).getAttribute("aria-pressed") === "true",
-    "aria-pressed 同步为 true"
-  );
+  thumbTab.click();
+  await sleep(180);
+  pass(paneVisible(thumbPane) && !paneVisible(outlinePane), "点「缩略图」切回缩略图面板");
 
-  // 真的不能落笔
-  const before = strokeCountAll();
-  drawAt(200, 300);
-  await sleep(150);
-  pass(
-    strokeCountAll() === before,
-    "仅阅读模式下鼠标落笔不产生笔迹（" + before + " → " + strokeCountAll() + "）"
-  );
-
-  drawAt(220, 340, "pen");
-  await sleep(150);
-  pass(strokeCountAll() === before, "仅阅读模式下触控笔落笔不产生笔迹");
-
-  // 撤销 / 重做全部失效
-  view.editor.undo();
-  view.editor.redo();
-  await sleep(100);
-  pass(strokeCountAll() === before, "仅阅读模式下撤销/重做不改动内容");
-
-  // 但翻页和缩放仍然可用
-  const pageBefore = view.editor.getState().pageIndex;
-  view.editor.goToPage(1, false);
-  await sleep(400);
-  pass(
-    view.editor.getState().pageIndex === 1,
-    "仅阅读模式下仍可翻页（" + pageBefore + " → " + view.editor.getState().pageIndex + "）"
-  );
-  const zoomBefore = view.editor.getState().zoom;
-  view.editor.zoomBy(1.2);
-  await sleep(150);
-  pass(view.editor.getState().zoom > zoomBefore, "仅阅读模式下仍可缩放");
-
-  // 退出仅阅读
-  (readBtn as HTMLElement).click();
-  await sleep(200);
-  pass(!isReading(), "再点一次退出仅阅读模式");
+  /* ============ 6. 仅阅读模式已移除 ============ */
+  /*
+   * 用户反馈「进仅阅读模式有点多余了」，功能整体删除。
+   * 文件只读（readOnly）是另一回事，见第 10 节的只读断言，不能一起删。
+   */
+  pass(!root.classList.contains("is-reading"), "不再有 is-reading 状态类");
+  pass((view as any).reading === undefined, "view 上不再有 reading 状态字段");
 
   /* ============ 6.5 「允许手指书写」必须真的能写 ============ */
   /*
-   * 真机 bug：开着仅阅读（或开着「只认触控笔」）时点「允许手指书写」，
-   * 开关亮了但手指还是写不出字——因为那两个状态各自都把落笔拦在前面
-   * （readOnly 直接 return，penOnly 把 touch 判成 pan）。
+   * 真机 bug：开着「只认触控笔」时点「允许手指书写」，开关亮了但手指
+   * 还是写不出字——penOnly 把 touch 判成 pan，连落笔分支都进不去。
    * 用户点的是"让我用手指写"，就该真的能写。
    */
   {
-    // 先造出"点了按钮也写不了"的两个前提
+    // 先造出"点了按钮也写不了"的前提
     (view as any).plugin.settings.penOnly = true;
     view.editor.setPenOnly(true);
     view.editor.setTouchDraw(false);
-    (readBtn as HTMLElement).click();
     await sleep(150);
-    pass(isReading(), "前置：仅阅读 + 只认触控笔 + 手指书写关闭");
 
     const touchBtn = document.querySelector(
       '.mb-ib[aria-label="允许手指书写"]'
@@ -1626,10 +1596,9 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
     touchBtn?.click();
     await sleep(200);
 
-    pass(!isReading(), "点「允许手指书写」会自动退出仅阅读（否则根本落不了笔）");
     pass(
       (view as any).plugin.settings.penOnly === false,
-      "同时关掉「只认触控笔」（它也会把 touch 判成滚动）"
+      "点「允许手指书写」会关掉「只认触控笔」（它会把 touch 判成滚动）"
     );
     pass(view.editor.touchDraw === true, "手指书写开关已打开");
 
@@ -1698,17 +1667,15 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   await sleep(150);
   pass(!isSideOpen(), "Esc 收起侧栏");
 
+  // 侧栏已经收起：再按 Esc 不应有任何副作用（仅阅读已删除）
   document.dispatchEvent(
     new KeyboardEvent("keydown", { key: "Escape", bubbles: true })
   );
   await sleep(150);
-  pass(isReading(), "再按 Esc 切到仅阅读模式");
-
-  document.dispatchEvent(
-    new KeyboardEvent("keydown", { key: "Escape", bubbles: true })
+  pass(
+    !isSideOpen() && !root.classList.contains("is-reading"),
+    "再按 Esc 不再切换到任何模式"
   );
-  await sleep(150);
-  pass(!isReading(), "再按 Esc 退出仅阅读模式");
 
   /* ============ 9. 平板形态 ============ */
   root.classList.add("is-tablet");
@@ -1901,27 +1868,6 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   );
 
   /*
-   * 仅阅读模式下点：没有新内容可存 → 不写盘，但要明确告知，
-   * 不能"点了没反应"。
-   */
-  (readBtn as HTMLElement).click();
-  await sleep(200);
-  const beforeReading = bodyWrites;
-  const noticesBeforeReading = noticeTexts.length;
-  saveBtn!.click();
-  await sleep(300);
-  const readingNotice = noticeTexts.slice(noticesBeforeReading).join(" | ");
-  pass(
-    bodyWrites === beforeReading && readingNotice.includes("无需保存"),
-    "仅阅读模式下点「立即保存」不写盘（" +
-      beforeReading +
-      " → " +
-      bodyWrites +
-      "），提示：" +
-      (readingNotice || "（没有提示！）")
-  );
-
-  /*
    * 只读态（从备份恢复 / 原文件打不开）：这份笔记**存不下去**。
    * 点按钮必须说清楚，不能静默返回——否则用户会以为写进去了。
    */
@@ -1948,8 +1894,6 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
   view.dirty = false;
   view.saveState = "saved";
   view.updateStatus();
-  (readBtn as HTMLElement).click(); // 退出仅阅读
-  await sleep(200);
 
   /* ============ 11. 标题栏放不下 → 整行搬进自建顶栏条 ============ */
   /*
@@ -1993,7 +1937,7 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
     const bar = root.querySelector(".mb-topbar") as HTMLElement;
     pass(!!bar, "标题栏窄到放不下时，整行搬进自建顶栏条 .mb-topbar");
     const btns = bar ? bar.querySelectorAll(".mb-topbtn").length : 0;
-    pass(btns === 11, "搬下来后 11 个按钮都在（没被压扁）：" + btns);
+    pass(btns === 10, "搬下来后 10 个按钮都在（没被压扁）：" + btns);
     const rowNow = bar ? (bar.querySelector(".mb-toprow") as HTMLElement) : null;
     const rowW1 = rowNow ? rowNow.getBoundingClientRect().width : 0;
     pass(
@@ -2716,6 +2660,86 @@ function drawAt(x: number, y: number, pointerType = "mouse") {
       }
     }
   }
+
+  /* ============ 笔按钮二次点击 → 快捷笔盒 ============ */
+  const allToolBtns = Array.from(topRow.querySelectorAll(".mb-top-tool")) as HTMLElement[];
+  const penToolBtn = allToolBtns[0]; // 钢笔
+  const hlToolBtn = allToolBtns[2]; // 荧光笔
+  // 先切到选择工具，保证下面「第一下」确实是切换而不是已在钢笔上
+  allToolBtns[5].click();
+  await sleep(20);
+
+  penToolBtn.click();
+  await sleep(20);
+  pass(!document.querySelector(".mb-pen-pop"), "点第一下只切到钢笔，不弹浮层");
+
+  penToolBtn.click();
+  await sleep(20);
+  const penPop = document.querySelector(".mb-pen-pop") as HTMLElement | null;
+  pass(!!penPop, "已在钢笔上再点一下 → 弹出 .mb-pen-pop");
+  pass(
+    !!penPop && penPop.querySelectorAll(".mb-pen-pop-dot").length === 8,
+    "笔浮层复用 PEN_COLORS（8 个色点）"
+  );
+  pass(
+    !!penPop && penPop.querySelectorAll(".mb-pen-pop-size").length === 3,
+    "笔浮层复用 PEN_SIZES（3 档粗细）"
+  );
+  {
+    const br = penToolBtn.getBoundingClientRect();
+    const pr = penPop?.getBoundingClientRect();
+    pass(
+      !!pr &&
+        pr.top >= br.bottom - 1 &&
+        pr.left >= 7 &&
+        pr.right <= window.innerWidth - 7,
+      "浮层贴在按钮正下方且不越出视口"
+    );
+  }
+  // 点色点：立即生效，且浮层保持打开
+  (penPop!.querySelectorAll(".mb-pen-pop-dot")[2] as HTMLElement).click();
+  await sleep(20);
+  pass(
+    view.editor!.getState().penColor.toLowerCase() === "#d64545",
+    "点色点立即生效（#D64545）"
+  );
+  pass(!!document.querySelector(".mb-pen-pop"), "点色点后浮层保持打开（方便连续调）");
+  // Esc 关闭
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  await sleep(20);
+  pass(!document.querySelector(".mb-pen-pop"), "Esc 关闭浮层");
+
+  // 荧光笔：色板换成 HIGHLIGHTER_PALETTE（5 色）
+  hlToolBtn.click();
+  await sleep(20);
+  hlToolBtn.click();
+  await sleep(20);
+  const hlPop = document.querySelector(".mb-pen-pop") as HTMLElement | null;
+  pass(
+    !!hlPop && hlPop.querySelectorAll(".mb-pen-pop-dot").length === 5,
+    "荧光笔浮层复用 HIGHLIGHTER_PALETTE（5 色）"
+  );
+  // 收尾：切回钢笔（顺带关闭浮层），别影响后续/重跑
+  penToolBtn.click();
+  await sleep(20);
+
+  /* ============ 手写字体 ============ */
+  pass(TEXT_FONTS.length === 5, "字体列表 5 种（新增手写）：" + TEXT_FONTS.length);
+  pass(
+    TEXT_FONTS.some((f) => f.id === "hand" && f.label === "手写"),
+    "存在 id=hand / 标签「手写」的字体档"
+  );
+  const handStack = textFontStack("hand");
+  pass(
+    handStack.indexOf("Segoe Script") >= 0 &&
+      handStack.indexOf("cursive") >= 0 &&
+      handStack.trim().endsWith('"Noto Sans SC", sans-serif'),
+    "手写字体栈含 Segoe Script / cursive，且以 Noto Sans SC 收尾"
+  );
+  pass(
+    textFontStack("no-such-font") === TEXT_FONTS[0].stack,
+    "未知字体 id 回退到黑体"
+  );
 
   log("");
   const fails = lines.filter((l) => l.startsWith("FAIL")).length;

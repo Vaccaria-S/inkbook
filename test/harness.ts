@@ -938,7 +938,7 @@ async function main() {
     pass(ink > 5, "导出画布里画出了文字（非白像素 " + ink + "）");
   }
 
-  /* 文本层：PDF 原文透明、书写时穿透、仅阅读可选 */
+  /* 文本层：PDF 原文透明、书写时穿透 */
   {
     const page = store.data.pages[0];
     page.texts = [
@@ -963,17 +963,18 @@ async function main() {
       getComputedStyle(layer).pointerEvents === "none",
       "书写时文字层穿透（不抢触摸）"
     );
-
-    // 仅阅读：文字层接管指针，才能拖选复制
-    host.classList.add("mb-root", "is-reading");
-    await sleep(30);
-    pass(
-      getComputedStyle(layer).pointerEvents === "auto",
-      "仅阅读时文字层可选中（pointer-events:auto）"
-    );
+    /*
+     * 仅阅读删掉后，`.mb-textlayer` 默认就放开 user-select:text：
+     * PDF 原文 / Word 正文要靠 DOM 拖选复制，「选择」工具只命中用户文字
+     * 且只做单击选中，替代不了它。pointer-events 仍是 none，互不影响。
+     */
     pass(
       getComputedStyle(layer).userSelect === "text",
-      "仅阅读时允许选择文字"
+      "文字层默认可选中（拖选复制，不依赖仅阅读）"
+    );
+    pass(
+      getComputedStyle(pdfSpans[0] as HTMLElement).userSelect === "text",
+      "PDF 原文 span 继承可选中"
     );
 
     // 跨行选中要能复制成两行（否则粘出来是 "A行B行" 一长串）
@@ -988,7 +989,6 @@ async function main() {
     const picked = sel?.toString() || "";
     pass(picked.includes("\n"), "拖选两行，复制内容带换行：" + JSON.stringify(picked));
     sel?.removeAllRanges();
-    host.classList.remove("is-reading");
     host.classList.remove("mb-root");
 
     // 收尾：别让这批文字影响后面的形状测试

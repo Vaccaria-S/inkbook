@@ -7,6 +7,7 @@
  */
 
 import { A4_HEIGHT, A4_WIDTH, type Pt } from "./types";
+import { wrapText } from "./textwrap";
 
 /* ------------------------------- zip 解包 ------------------------------- */
 
@@ -281,10 +282,19 @@ const MARGIN = 56;
 const BODY_SIZE = 15;
 const LINE_H = 24;
 
-/** 把段落排成 A4 页面，返回每页的行 */
-function layout(paras: DocParagraph[]): string[][] {
-  const pages: string[][] = [];
-  let cur: string[] = [];
+/** Word 页中一行文字的 A4 页面坐标；y 是基线，width 为真实画布字宽。 */
+export interface DocxLine {
+  text: string;
+  x: number;
+  y: number;
+  size: number;
+  width: number;
+}
+
+/** 排版与 PNG 绘制共用这一份行数据，导入的透明文字层也照此定位。 */
+function layout(paras: DocParagraph[], ctx: CanvasRenderingContext2D): DocxLine[][] {
+  const pages: DocxLine[][] = [];
+  let cur: DocxLine[] = [];
   let y = MARGIN;
 
   const pushPage = () => {
@@ -296,14 +306,10 @@ function layout(paras: DocParagraph[]): string[][] {
   for (const p of paras) {
     const size = p.level === 0 ? BODY_SIZE : BODY_SIZE + (5 - p.level) * 2;
     const indent = p.list ? 22 : p.level * 18;
-    const maxW = A4_WIDTH - MARGIN * 2 - indent;
-
-    // 粗略估算宽度：中文按 size，英文按 size*0.55
-    const measure = (s: string) => {
-      let w = 0;
-      for (const ch of s) w += ch.charCodeAt(0) > 255 ? size : size * 0.55;
-      return w;
-    };
+    const x = MARGIN + indent;
+    const maxW = A4_WIDTH - MARGIN - x;
+    ctx.font = `${size}px "Segoe UI", "Microsoft YaHei", sans-serif`;
+    const measure = (s: string) => ctx.measureText(s).width;
 
     if (!p.text.trim()) {
       if (y + LINE_H > A4_HEIGHT - MARGIN) pushPage();
@@ -312,30 +318,11 @@ function layout(paras: DocParagraph[]): string[][] {
     }
 
     const prefix = p.list ? "• " : "";
-    let line = prefix;
-    let lineW = measure(line);
-    const chars = [...p.text];
-
-    for (const ch of chars) {
-      const cw = measure(ch);
-      if (lineW + cw > maxW) {
-        if (y + size * 1.5 > A4_HEIGHT - MARGIN) {
-          cur.push(line);
-          pushPage();
-          line = prefix;
-          lineW = measure(line);
-        } else {
-          y += size * 1.5;
-        }
-        cur.push(line);
-        line = prefix;
-        lineW = measure(line);
-      }
-      line += ch;
-      lineW += cw;
-    }
-    if (line.trim()) {
-      cur.push(line);
+    // 行折分只用 textwrap.ts 的规则；分页、字号、坐标在此逐行确定。
+    const lines = wrapText(prefix + p.text, maxW, measure);
+    for (const text of lines) {
+      if (y + size > A4_HEIGHT - MARGIN && cur.length) pushPage();
+      if (text) cur.push({ text, x, y: y + size, size, width: measure(text) });
       y += size * 1.5;
     }
     if (y + LINE_H > A4_HEIGHT - MARGIN) pushPage();
@@ -350,6 +337,8 @@ export interface RenderedDocxPage {
   dataUrl: string;
   width: number;
   height: number;
+  /** 坐标仍是 794×1123 页面单位，不随 PNG 的 3x 像素倍率变化。 */
+  lines: DocxLine[];
 }
 
 /**
@@ -368,7 +357,10 @@ export interface RenderedDocxPage {
 export async function* renderDocxToPages(
   paragraphs: DocParagraph[]
 ): AsyncGenerator<RenderedDocxPage> {
-  const pages = layout(paragraphs);
+  // 用同一款浏览器字体度量和绘制，避免估算行宽造成透明选择层错位。
+  const measureCanvas = document.createElement("canvas");
+  const pages = layout(paragraphs, measureCanvas.getContext("2d")!);
+  measureCanvas.width = 0;
 
   for (const lines of pages) {
     const canvas = document.createElement("canvas");
@@ -384,19 +376,17 @@ export async function* renderDocxToPages(
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, A4_WIDTH, A4_HEIGHT);
 
-    let y = MARGIN;
     for (const line of lines) {
       ctx.fillStyle = "#1a1a1a";
-      ctx.font = `${BODY_SIZE}px "Segoe UI", "Microsoft YaHei", sans-serif`;
-      ctx.textBaseline = "top";
-      ctx.fillText(line, MARGIN, y);
-      y += LINE_H;
+      ctx.font = `${line.size}px "Segoe UI", "Microsoft YaHei", sans-serif`;
+      ctx.textBaseline = "alphabetic";
+      ctx.fillText(line.text, line.x, line.y);
     }
     const dataUrl = canvas.toDataURL("image/png");
     // 先释放画布，再把结果交出去（见上方说明）
     canvas.width = 0;
     canvas.height = 0;
-    yield { dataUrl, width, height };
+    yield { dataUrl, width, height, lines };
   }
 }
 

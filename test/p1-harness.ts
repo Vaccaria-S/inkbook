@@ -648,17 +648,12 @@ async function C9b() {
   );
   pass(nb.length > 0, "C9b① 恢复提示=" + JSON.stringify(nb));
 
-  // 真实用户路径：点长条「仅阅读」按钮两次（进→出），再真的落笔
-  const btn = v.containerEl.querySelector(".mb-rail-read") as HTMLElement;
+  // 仅阅读模式已删除：只读恢复态本身就该拒绝落笔（不再有"按钮进出"这一步）
   const before = v.store.strokeCount;
-  btn?.click();
-  await sleep(150);
-  btn?.click();
-  await sleep(150);
   const editorLocked = (v.editor as any)?.readOnly;
   log(
-    "C9b 诊断：onclick=" + typeof (btn as any)?.onclick + "；reading=" + v.reading +
-      "；viewReadOnly=" + v.readOnly + "；editor.readOnly=" + editorLocked +
+    "C9b 诊断：viewReadOnly=" + v.readOnly +
+      "；editor.readOnly=" + editorLocked +
       "；本用例 Notice=" + JSON.stringify(caseNotices())
   );
   const drew = drawOnPage(v);
@@ -666,12 +661,11 @@ async function C9b() {
   const after = v.store.strokeCount;
   pass(
     after === before && editorLocked === true,
-    "C9b② 退出仅阅读后仍不可写：按钮=" + !!btn + "；落笔=" + drew + "；笔迹 " + before + "→" + after +
+    "C9b② 只读恢复态不可写：落笔=" + drew + "；笔迹 " + before + "→" + after +
       "；editor.readOnly=" + editorLocked
   );
-  // 关键词用「不会保存」：它对文案改词不敏感，但只在真的存在警告时成立
-  const warn = caseNotices().find((n) => n.includes("不会保存")) || "";
-  pass(warn.length > 0, "C9b② 有「改动不会保存」警告=" + (warn.length > 0) + "；文案=" + JSON.stringify(warn.slice(0, 50)));
+  // 仅阅读按钮已删除，原本靠「进出仅阅读」触发的只读提醒不再有入口；
+  // 只读本身仍由 editor.readOnly 硬拦截（上面 C9b② 已断言）。
   /*
    * 新行为：恢复后会另存一份 .recovered- 副本供用户接着写。
    * 所以"写盘=0"不再是正确期望——真正的不变量是**主文件与其 .bak 零写**，

@@ -169,7 +169,7 @@ async function main() {
   );
   pass(!!view.containerEl.querySelector(".mb-toprow"), "顶栏工具行已生成");
   pass(!!view.containerEl.querySelector(".mb-rail-side"), "顶栏侧栏开关已生成");
-  pass(!!view.containerEl.querySelector(".mb-rail-read"), "顶栏仅阅读按钮已生成");
+  pass(!view.containerEl.querySelector(".mb-rail-read"), "顶栏已无仅阅读按钮（功能已删）");
   pass(view.sideEl.textContent!.includes("笔盒"), "侧栏有笔盒");
   pass(view.sideEl.querySelectorAll(".mb-tpl").length === 6, "6 个纸张模板");
   pass(view.sideEl.querySelectorAll(".mb-paper-chip").length === 3, "3 种纸色");

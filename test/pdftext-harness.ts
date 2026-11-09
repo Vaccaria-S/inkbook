@@ -26,6 +26,8 @@
  */
 import { BookEditor, textFontStack } from "../src/editor";
 import { BookStore } from "../src/store";
+import { importWord } from "../src/importer";
+import { normalizeBook } from "../src/storage";
 import { createBook, createPage, type PageText } from "../src/types";
 import { exportBookPdf, pageHasUnsupportedChars } from "../src/export";
 import { chineseCharacterSet, chineseFontBytes } from "../src/fontasset";
@@ -506,6 +508,80 @@ async function main(): Promise<void> {
       }
     }
     page.cleanup();
+  }
+
+  /* ---------------- 真实 Word 导入 → 存档重读 → 导出文字可选 ---------------- */
+  {
+    const original = "墨本Word文字可选";
+    const xml = `<w:document><w:body><w:p><w:r><w:t>${original}</w:t></w:r></w:p></w:body></w:document>`;
+    const payload = new TextEncoder().encode(xml);
+    const name = new TextEncoder().encode("word/document.xml");
+    // 最小 ZIP（store method）：真实经过 readZipText/parse/layout/importWord 链路。
+    const zip = new Uint8Array(30 + name.length + payload.length + 46 + name.length + 22);
+    const view = new DataView(zip.buffer);
+    view.setUint32(0, 0x04034b50, true);
+    view.setUint16(8, 0, true);
+    view.setUint32(18, payload.length, true);
+    view.setUint32(22, payload.length, true);
+    view.setUint16(26, name.length, true);
+    zip.set(name, 30);
+    zip.set(payload, 30 + name.length);
+    const central = 30 + name.length + payload.length;
+    view.setUint32(central, 0x02014b50, true);
+    view.setUint16(central + 10, 0, true);
+    view.setUint32(central + 20, payload.length, true);
+    view.setUint32(central + 24, payload.length, true);
+    view.setUint16(central + 28, name.length, true);
+    zip.set(name, central + 46);
+    const end = central + 46 + name.length;
+    view.setUint32(end, 0x06054b50, true);
+    view.setUint16(end + 8, 1, true);
+    view.setUint16(end + 10, 1, true);
+    view.setUint32(end + 12, 46 + name.length, true);
+    view.setUint32(end + 16, central, true);
+
+    const assets = new Map<string, ArrayBuffer>();
+    assets.set("test.docx", zip.buffer);
+    const assetUrls = new Map<string, string>();
+    const wordAdapter = {
+      exists: async (p: string) => assets.has(p),
+      readBinary: async (p: string) => assets.get(p) ?? new ArrayBuffer(0),
+      writeBinary: async (p: string, buf: ArrayBuffer) => { assets.set(p, buf); },
+      remove: async (p: string) => { assets.delete(p); },
+      getResourcePath: (p: string) => {
+        if (!assetUrls.has(p)) assetUrls.set(p, URL.createObjectURL(new Blob([assets.get(p)!], { type: "image/png" })));
+        return assetUrls.get(p)!;
+      },
+    };
+    const wordApp = { vault: { adapter: wordAdapter, getAbstractFileByPath: () => true } } as any;
+    const imported = await importWord(wordApp, { path: "test.docx", name: "test.docx", basename: "test" } as any, "word.inkbook");
+    pass(imported.pages.length === 1 && imported.pages[0].texts?.[0]?.source === "word", "Word 导入产生 source=word 的文字行");
+    const wordBook = createBook("Word原文", "blank", "white");
+    wordBook.pages = imported.pages;
+    const restored = normalizeBook(JSON.parse(JSON.stringify(wordBook)), "Word原文");
+    pass(restored.pages[0].texts?.[0]?.source === "word", "Word 文字来源经存档规范化仍保留");
+    const wordStore = new BookStore(restored);
+    const [wordHost, wordCleanup] = makeHost();
+    const wordEditor = new BookEditor(wordHost, wordStore, { app: wordApp, smoothing: 0.5 });
+    const wordWritten = new Map<string, Uint8Array>();
+    const wordVault = { adapter: {
+      exists: async (p: string) => wordWritten.has(p),
+      writeBinary: async (p: string, buf: ArrayBuffer) => { wordWritten.set(p, new Uint8Array(buf)); },
+    } } as any;
+    const wordPath = await exportBookPdf(wordVault, wordEditor, { path: "word.inkbook", basename: "word", parent: { path: "" } } as any, 1);
+    const wordBytes = wordWritten.get(wordPath);
+    pass(!!wordBytes && wordBytes.length > 1000, "Word 底图页导出 PDF 文件");
+    if (wordBytes) {
+      const wordPdf = await pdfjs.getDocument({ data: wordBytes.slice() }).promise;
+      const wordPdfPage = await wordPdf.getPage(1);
+      const wordText = (await wordPdfPage.getTextContent()).items.map((item: any) => item.str).join("");
+      pass(wordText.includes(original), "Word 导出 PDF 的 getTextContent 能抽回完整原文");
+      wordPdfPage.cleanup();
+      await wordPdf.destroy();
+    }
+    wordEditor.destroy();
+    wordCleanup();
+    for (const url of assetUrls.values()) URL.revokeObjectURL(url);
   }
 
   log("");

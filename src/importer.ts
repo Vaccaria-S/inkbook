@@ -329,6 +329,20 @@ export async function importWord(
         height: fit.height,
         kind: "word",
       };
+      const sx = shot.width > 0 ? fit.width / shot.width : 1;
+      const sy = shot.height > 0 ? fit.height / shot.height : 1;
+      // 排版行是 794×1123 的页面单位；PNG 是 3x 像素尺寸。
+      const unitX = (shot.width / A4_WIDTH) * sx;
+      const unitY = (shot.height / A4_HEIGHT) * sy;
+      page.texts = shot.lines.map((line) => ({
+        id: uid("text"),
+        source: "word" as const,
+        x: fit.x + line.x * unitX,
+        y: fit.y + line.y * unitY,
+        size: Math.max(1, line.size * unitY),
+        text: line.text,
+        width: Math.max(0, line.width * unitX),
+      }));
       pages.push(page);
       /*
        * Word 的页数要渲染完才知道（每页文字量不同、分页是流式的），

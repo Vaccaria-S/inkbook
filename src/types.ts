@@ -28,15 +28,16 @@ export interface Stroke {
 /**
  * 页面上的一段文字。
  *
- * 两种来源合在一个数组里，渲染、选中、搜索、导出都走同一条链路：
+ * 三种来源合在一个数组里，渲染、选中、搜索、导出都走同一条链路：
  *   · `pdf`  —— 导入 PDF 时抽取的原文，只读，画成透明文字（视觉由底图承担）
+ *   · `word` —— 导入 Word 时排版的原文，只读，透明文字叠在 PNG 底图上
  *   · `user` —— 手动添加，可编辑、可删除，正常显示颜色
  *
  * 坐标是**页面坐标系**（A4 794×1123），与笔迹共用同一套，缩放时不用换算。
  */
 export interface PageText {
   id: string;
-  source: "pdf" | "user";
+  source: "pdf" | "word" | "user";
   /** 左端、基线位置（页面坐标） */
   x: number;
   y: number;
@@ -51,8 +52,8 @@ export interface PageText {
   /** 字重，仅 user 用 */
   bold?: boolean;
   /**
-   * 宽度（页面坐标），两种 source 含义不同：
-   * · pdf —— 从 PDF 抽出来的真实行宽，用于选中高亮对齐，比重新量一遍准；
+   * 宽度（页面坐标），导入原文与用户批注含义不同：
+   * · pdf / word —— 抽取或排版的真实行宽，用于选中高亮对齐；
    * · user —— 用户手动拖出来的折行宽度上限，决定「一行能放多少字」。
    * 老文件没有这个字段，渲染时按 x 到纸右缘自动算，不升版本、不迁移。
    */
@@ -112,7 +113,7 @@ export interface Page {
   /** 底图（导入的 PDF / Word）；没有就是普通纸 */
   background?: PageBackground;
   /**
-   * 页面上的文字：PDF 原文 + 手动添加的。
+   * 页面上的文字：PDF / Word 原文 + 手动添加的。
    * 可选——没有文字的页面不写这个字段，省体积。
    */
   texts?: PageText[];

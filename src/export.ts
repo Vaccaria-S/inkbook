@@ -276,15 +276,14 @@ function parseColor(hex?: string): RGB {
  * 这是有意的取舍：优先保证「能选中、能搜索」，字形一致度次之。
  */
 /**
- * 这一页有没有**真正会被画出来**的批注。
+ * 这一页有没有需要嵌入字体的文字（用户批注或 Word 原文）。
  *
- * 条件与 drawUserTextsPdf 里的过滤保持一致（source === "user" 且 trim 后非空）。
- * Notice 的「N 页的批注文字可选中」必须按这个算：以前是无条件按页累加，
- * 300 页的本子只有 2 页写了批注也会报「300 页」，用户会以为每页都有字。
+ * PDF 原文在 copyPages 路径中已是矢量，不额外叠加以免重复。
+ * Notice 的「N 页文字可选中」必须按这个算：只有实际有文字的页计数。
  */
 export function pageHasUserText(p?: Page): boolean {
   return (p?.texts || []).some(
-    (t) => t.source === "user" && (t.text || "").trim().length > 0
+    (t) => (t.source === "user" || t.source === "word") && (t.text || "").trim().length > 0
   );
 }
 
@@ -298,7 +297,7 @@ function drawUserTextsPdf(
   font: PDFFont,
   pageH: number
 ): boolean {
-  const texts = (src.texts || []).filter((t) => t.source === "user" && (t.text || "").trim());
+  const texts = (src.texts || []).filter((t) => (t.source === "user" || t.source === "word") && (t.text || "").trim());
   if (!texts.length) return false;
   let clipped = false;
   /*
@@ -309,6 +308,22 @@ function drawUserTextsPdf(
   const pageWUnits = page.getWidth() / PT_PER_UNIT;
   for (const t of texts) {
     const sizePt = (t.size || 14) * PT_PER_UNIT;
+    if (t.source === "word") {
+      /*
+       * Word 底图保留字以供屏幕清晰显示；PDF 中叠一层透明矢量字，只负责
+       * 选中与搜索，不让不同字体重画造成视觉重影。PNG 与文字层共用 layout
+       * 的行坐标；不能在这里重新折行或夹取，否则选中框会偏离底图里的字。
+       */
+      page.drawText(t.text, {
+        x: t.x * PT_PER_UNIT,
+        y: (pageH - t.y) * PT_PER_UNIT,
+        size: sizePt,
+        font,
+        color: rgb(0, 0, 0),
+        opacity: 0,
+      });
+      continue;
+    }
     const color = parseColor(t.color);
     /*
      * 折行 + 位置夹取都交给 layoutUserText。
@@ -484,7 +499,10 @@ async function exportBookPdfImpl(
    * 而不是只能靠"字体正常时侥幸没走到"来间接验证。
    */
   const hasUnsupported = (p: Page | undefined): boolean =>
-    pageHasUnsupportedChars(p?.texts, charset);
+    pageHasUnsupportedChars(p?.texts, charset) ||
+    (p?.texts || []).some(
+      (t) => t.source === "word" && [...t.text].some((ch) => !charset?.has(ch.codePointAt(0)!))
+    );
 
   /** 原 PDF 文件只解析一次（同一份 PDF 可能有很多页） */
   const srcDocs = new Map<string, PDFDocument | null>();
@@ -506,7 +524,7 @@ async function exportBookPdfImpl(
     const i = indices[k];
     const page = pages[i];
     const pdfRef = page?.background?.pdf;
-    /* 这一页的批注能不能写成矢量文字？写不了就烤进位图（内容不能丢） */
+    /* 批注或 Word 原文写不出时退回底图；Word PNG 本身已有完整字形。 */
     const vectorText = !!zhFont && !hasUnsupported(page);
     if (zhFont && !vectorText) fallbackPages += 1;
     const canvasWithText = !vectorText;
@@ -627,12 +645,12 @@ async function exportBookPdfImpl(
 
   const notes: string[] = [];
   if (vectorPages) notes.push(`${vectorPages} 页保留了 PDF 原文，可选中可搜索`);
-  if (textPages) notes.push(`${textPages} 页的批注文字可选中`);
+  if (textPages) notes.push(`${textPages} 页的文字可选中可搜索`);
   if (overflowPages) {
     notes.push(`${overflowPages} 页有文字超出纸面，未完整导出（原文没丢，调小字号或拖宽文字框后可重新导出）`);
   }
   if (fallbackPages) {
-    notes.push(`${fallbackPages} 页批注含生僻字，按图片导出（看得见但选不中）`);
+    notes.push(`${fallbackPages} 页文字含字体不支持的字符，按图片导出（看得见但选不中）`);
   }
   new Notice(
     `已导出：${folder}${name}` + (notes.length ? `（${notes.join("；")}）` : ""),
