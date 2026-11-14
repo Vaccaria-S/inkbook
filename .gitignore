@@ -7,3 +7,10 @@ tmp/
 
 test/*.js
 test/samples/
+
+# 内部开发文档，不公开
+HANDOFF.md
+交接文档.md
+需求与问题清单.md
+项目策划书.md
+方案-*.md
