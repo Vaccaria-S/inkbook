@@ -7,8 +7,8 @@ strokes, and your notes are saved directly inside the vault — so they sync wit
 Obsidian Sync / any cloud drive. The handwriting engine is built from scratch
 (Canvas + PointerEvent), with a focus on **how the pen feels**.
 
-> License: **personal, non-commercial use only**. Commercial use, resale or
-> re-charging are not allowed. See [LICENSE](LICENSE).
+> License: [MIT](LICENSE). Free to use, modify and distribute, including
+> commercially, as long as the copyright and license notice are kept.
 
 ---
 
@@ -119,6 +119,6 @@ Feel free to open an issue in [Issues](../../issues).
 
 ## License
 
-**Personal, non-commercial use.** You may freely use, modify and distribute it
-(keeping the license and copyright notice), but **no commercial use, resale or
-re-charging**. Full terms in [LICENSE](LICENSE).
+[MIT](LICENSE). Free to use, modify and distribute, including commercially,
+as long as the copyright and license notice are kept.
+Full terms in [LICENSE](LICENSE).

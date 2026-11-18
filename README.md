@@ -6,7 +6,7 @@ Obsidian 里的 **A4 手写笔记本**：用压感笔锋在笔记里写写画画
 跟着 Obsidian Sync / 网盘一起同步。手写内核为自研实现（Canvas + PointerEvent），
 重点放在**手写手感**上。
 
-> 许可：本项目仅供**个人非商业使用**。禁止商用、倒卖或二次收费，详见 [LICENSE](LICENSE)。
+> 许可：[MIT](LICENSE)。可自由使用、修改、分发，包括商业用途，只需保留版权与许可声明。
 
 ---
 
@@ -113,5 +113,5 @@ npm run build         # 产出 dist/inkbook/{main.js, manifest.json, styles.css}
 
 ## 许可
 
-**个人非商业使用**。可自由使用、修改、分发（需保留许可与版权声明），
-但**不得用于任何商业用途、不得倒卖或二次收费**。完整条款见 [LICENSE](LICENSE)。
+[MIT](LICENSE)。可自由使用、修改、分发，包括商业用途，
+只需在副本中保留版权声明与许可声明。完整条款见 [LICENSE](LICENSE)。
