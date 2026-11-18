@@ -1,5 +1,7 @@
 # 墨本 Inkbook
 
+[简体中文](README.md) | [English](README.en.md)
+
 Obsidian 里的 **A4 手写笔记本**：用压感笔锋在笔记里写写画画，笔迹直接存在库中，
 跟着 Obsidian Sync / 网盘一起同步。手写内核为自研实现（Canvas + PointerEvent），
 重点放在**手写手感**上。
