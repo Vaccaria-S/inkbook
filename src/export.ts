@@ -204,19 +204,43 @@ export async function exportPagePng(
   file: TFile,
   scale = 2
 ): Promise<string> {
-  await editor.waitBackgrounds([editor.getState().pageIndex], scale);
-  const canvas = editor.exportPageCanvas(editor.getState().pageIndex, scale);
+  return exportPagePngAt(vault, editor, file, editor.getState().pageIndex, scale, {
+    notice: true,
+  });
+}
+
+/**
+ * 导出**指定页**为 PNG，返回写盘后的相对路径。
+ *
+ * 分享要一次导出多页时逐页调用它；`notice:false` 时静默（不弹「已导出」
+ * 去刷屏），最后由分享流程统一提示。
+ */
+export async function exportPagePngAt(
+  vault: Vault,
+  editor: BookEditor,
+  file: TFile,
+  index: number,
+  scale = 2,
+  opts: { notice?: boolean } = {}
+): Promise<string> {
+  /*
+   * 手写批注是画进位图的（canvas drawText），字体没就绪就会画成 Noto。
+   * 这里等一次，保证导出的字形与屏幕上看到的一致。
+   */
+  await editor.waitFonts();
+  await editor.waitBackgrounds([index], scale);
+  const canvas = editor.exportPageCanvas(index, scale);
   const bytes = canvasBytes(canvas);
   const folder = file.parent && file.parent.path !== "/" ? file.parent.path + "/" : "";
   const base = safeName(file.basename);
-  const page = editor.getState().pageIndex + 1;
+  const page = index + 1;
   let name = `${base}-第${page}页.png`;
   let n = 1;
   while (await vault.adapter.exists(folder + name)) {
     name = `${base}-第${page}页 ${++n}.png`;
   }
   await vault.adapter.writeBinary(folder + name, bytes.buffer as ArrayBuffer);
-  new Notice(`已导出：${folder}${name}`, 6000);
+  if (opts.notice !== false) new Notice(`已导出：${folder}${name}`, 6000);
   return folder + name;
 }
 
@@ -428,6 +452,13 @@ async function exportBookPdfImpl(
   throwIfCancelled(signal);
   onProgress?.(0, count, "page");
 
+  /*
+   * 手写批注是画进位图的（canvas drawText），字体没就绪就会画成 Noto。
+   * 这里等一次，保证导出的字形与屏幕上看到的一致。
+   */
+  await editor.waitFonts();
+  throwIfCancelled(signal);
+
   const doc = await PDFDocument.create();
   const pages = editor.store.data.pages;
   const pageH = editor.store.data.height;
@@ -580,6 +611,9 @@ async function exportBookPdfImpl(
               width: bg.width * PT_PER_UNIT,
               height: bg.height * PT_PER_UNIT,
             });
+            // 矢量页不渲染底图，但插入的图片仍要画进叠加层，导出前先等它们加载好
+            await editor.waitInsertedImages([i]);
+            throwIfCancelled(signal);
             const overlay = editor.exportOverlayCanvas(i, scale, canvasWithText);
             const png = await doc.embedPng(overlay.toDataURL("image/png"));
             throwIfCancelled(signal);

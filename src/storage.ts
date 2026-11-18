@@ -1,6 +1,8 @@
 import {
   A4_HEIGHT,
   A4_WIDTH,
+  MAX_ZOOM,
+  MIN_ZOOM,
   createLayer,
   createPage,
   type InkBook,
@@ -63,6 +65,38 @@ export class CorruptError extends Error {
 export interface FileFingerprint {
   mtime: number;
   size: number;
+}
+
+/**
+ * 内容指纹（不是文件系统指纹）。
+ *
+ * 为什么需要它：`FileFingerprint` 只有 mtime + size，**无法区分「内容真的变了」
+ * 和「同步盘只把文件重写/摸了一下、字节没变」**。很多同步客户端（Obsidian Sync、
+ * iCloud、OneDrive、Syncthing…）会在下载/校验/回写时更新 mtime，哪怕正文
+ * 一个字节都没动；旧逻辑一看到 mtime 变了就判「文件被外部修改」，于是生成一对
+ * `-disk-` / `-mine-` 副本、停止写主文件——用户看到的就是「一写字就说同步/保存
+ * 失败，还多出备份文件」。
+ *
+ * 这里对**原始文本**做一次轻量哈希（FNV-1a 双 32 位 + 长度）：只要磁盘上的字节
+ * 和我们上次读到/写入的完全一致，就不是真正的冲突，可以把新 fingerprint 收下、
+ * 照常保存。真正的内容改动仍会因哈希不同而被识别。
+ *
+ * 用 64 位（两条 32 位车道）而不是单个 32 位，避免大文件上可预见的碰撞；
+ * 带上长度再多一层兜底。哈希只用于「是否与基线一致」，不承担加密用途。
+ */
+export function hashText(text: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x84222325;
+  const n = text.length;
+  for (let i = 0; i < n; i++) {
+    const c = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ c, 0x85ebca6b);
+  }
+  // 把长度搅进两条车道，避免「内容不同但前缀哈希相同」被长度掩盖
+  h1 = Math.imul(h1 ^ n, 0x01000193);
+  h2 = Math.imul(h2 ^ n, 0x85ebca6b);
+  return (h1 >>> 0).toString(16) + ":" + (h2 >>> 0).toString(16) + ":" + n;
 }
 
 /** 只用到 stat 的适配器（Obsidian 的 DataAdapter 满足；测试里可以没有） */
@@ -309,6 +343,69 @@ export function normalizeBook(raw: any, fallbackTitle: string): InkBook {
         }
       }
     }
+
+    /*
+     * 插入的图片（不升版本，与 Page.texts 同批做法）：
+     *   · 逐条白名单重建，只留 src 非空、四个坐标都是有限数、宽高为正的；
+     *   · 空数组不写回（没有图片的页不占体积）；有则保留，且清洗掉非法条目。
+     * 必须在这里重建：normalizeBook 是白名单，漏了这一步，第一次保存
+     * 就会把 images 整个字段删掉（打开旧文件"图没了"的经典坑）。
+     */
+    const imgs = Array.isArray(p?.images)
+      ? p.images
+          .filter(
+            (im: any) =>
+              im &&
+              typeof im.src === "string" &&
+              im.src.length > 0 &&
+              Number.isFinite(Number(im.x)) &&
+              Number.isFinite(Number(im.y)) &&
+              Number.isFinite(Number(im.width)) &&
+              Number.isFinite(Number(im.height)) &&
+              Number(im.width) > 0 &&
+              Number(im.height) > 0
+          )
+          .map((im: any) => {
+            const item: any = {
+              id: String(im.id || `img_${Math.random().toString(36).slice(2, 9)}`),
+              src: String(im.src),
+              x: Number(im.x),
+              y: Number(im.y),
+              width: Number(im.width),
+              height: Number(im.height),
+            };
+            /*
+             * 文件块源引用（不升版本，PageImage.source 可选）：
+             * 只认真实的库内路径 + 合法类型；mtime 只留有限数。
+             * 白名单必须显式带上它，否则第一次保存就把「文件块」降级成普通图片
+             * （打开旧文件后「打不开源文件 / 不能刷新」的经典坑）。
+             */
+            const s = im.source;
+            if (s && typeof s === "object" && typeof s.path === "string" && s.path.length > 0) {
+              const type =
+                s.type === "excalidraw"
+                  ? "excalidraw"
+                  : s.type === "markdown"
+                    ? "markdown"
+                    : s.type === "text"
+                      ? "text"
+                      : null;
+              if (type) {
+                const src: any = { path: String(s.path), type };
+                if (Number.isFinite(Number(s.mtime))) src.mtime = Number(s.mtime);
+                item.source = src;
+              }
+            }
+            return item;
+          })
+      : [];
+    if (imgs.length) page.images = imgs;
+    /*
+     * 收藏标记（不升版本，与 Page.images 同批做法）：只认真布尔 true，
+     * 没收藏的页不写这个字段，脏值一律当没收藏，免得把 `"false"` 写回去。
+     * 白名单重建必须显式带上它，否则打开旧文件后第一次保存就把收藏全清了。
+     */
+    if (p?.favorite === true) page.favorite = true;
     return page;
   });
 
@@ -366,7 +463,7 @@ export function normalizeBook(raw: any, fallbackTitle: string): InkBook {
   /*
    * 视图状态（zoom / scrollTop，不升版本，与 outlines 同批做法）：
    *   · zoom 只认真正的 number（字符串 "1.5"、null 一律当没写）并夹到
-   *     [0.3, 2.8]。夹取而不是丢弃——「用户手动缩放过」这个信息有价值，
+   *     [MIN_ZOOM, MAX_ZOOM]（0.3–3.5）。夹取而不是丢弃——「用户手动缩放过」这个信息有价值，
    *     不该因为一个脏数字就退回 fit；但也不能原样放行：99 倍 zoom 会让
    *     打开时先按 99 倍排一次版，可能直接把主线程卡死。
    *   · scrollTop / scrollLeft 只留正的有限值；0/负/NaN 当没写
@@ -375,7 +472,7 @@ export function normalizeBook(raw: any, fallbackTitle: string): InkBook {
    */
   const zoom = raw?.zoom;
   if (typeof zoom === "number" && Number.isFinite(zoom)) {
-    book.zoom = Math.max(0.3, Math.min(2.8, zoom));
+    book.zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom));
   }
   const scrollTop = raw?.scrollTop;
   if (typeof scrollTop === "number" && Number.isFinite(scrollTop) && scrollTop > 0) {
@@ -404,11 +501,24 @@ export function parseBook(raw: any, fallbackTitle: string): InkBook {
   return normalizeBook(raw, fallbackTitle);
 }
 
-export async function readBook(
+/** `readBookWithText` 的结果：书 + 读到的原始文本（冲突判定要用原始字节哈希） */
+export interface ReadBookResult {
+  book: InkBook;
+  text: string;
+}
+
+/**
+ * 读一本书，并把**原始文本**一起交回。
+ *
+ * 视图层拿它算 `hashText(text)` 作为「磁盘基线」，这样同步盘只改 mtime、
+ * 不改内容时就不会被误判成外部改动（见 hashText 注释）。其它调用方（嵌入、
+ * 索引、重命名校验）不关心原文，继续用 `readBook` 即可。
+ */
+export async function readBookWithText(
   adapter: ReadAdapter,
   path: string,
   fallbackTitle: string
-): Promise<InkBook> {
+): Promise<ReadBookResult> {
   if (!(await adapter.exists(path))) throw new Error("文件不存在");
   const text = await adapter.read(path);
   /*
@@ -444,7 +554,16 @@ export async function readBook(
       }
     }
   }
-  return book;
+  return { book, text };
+}
+
+/** 只要书、不要原文时的便捷入口（嵌入 / 索引 / 改名校验都用它） */
+export async function readBook(
+  adapter: ReadAdapter,
+  path: string,
+  fallbackTitle: string
+): Promise<InkBook> {
+  return (await readBookWithText(adapter, path, fallbackTitle)).book;
 }
 
 /** 同目录下有没有 `.bak`（探不到就当作没有，提示里不误导用户） */
@@ -502,13 +621,17 @@ async function backupIsFresh(adapter: WriteAdapter, bakPath: string): Promise<bo
  *   1. 备份：旧内容先抄到 `.bak`（复制失败就跳过，绝不能因此不写正文）
  *   2. 原子：先写 `.tmp`，再 rename 顶掉正文；不支持 rename 则直接写
  *   3. 自检：落盘前把页数/笔迹数记进 `integrity`，下次打开能核对
+ *
+ * `@returns` 真正写下去的 JSON 文本。调用方（view 的 saveNow）拿它算
+ * `hashText` 当作磁盘基线，下次保存就能分清「同步盘只摸了 mtime」和
+ * 「内容真被改了」。不关心原文的调用方直接忽略返回值即可。
  */
 export async function writeBook(
   adapter: WriteAdapter,
   path: string,
   book: InkBook,
   opts: { backup?: boolean } = {}
-): Promise<void> {
+): Promise<string> {
   book.updated = Date.now();
   book.integrity = bookStats(book);
   const json = JSON.stringify(book);
@@ -566,6 +689,7 @@ export async function writeBook(
   }
   // 3. 退路：直接写正文（tmp 完整时留着它，万一这次直写也失败还能人工救回）
   if (!atomicDone) await adapter.write(path, json);
+  return json;
 }
 
 /**

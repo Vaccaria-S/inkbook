@@ -217,7 +217,7 @@ function buildShape(stroke: Stroke): Path2D {
 /**
  * 笔画预测：根据最近几点的速度与加速度外推一小段，
  * 让墨迹"跑"在笔尖前面一点，落笔的跟手感立刻不一样。
- * 真笔迹 App（Apple Notes / GoodNotes / 享做）都有这一层。
+ * 真笔迹 App（Apple Notes / GoodNotes / 经典手写应用）都有这一层。
  */
 export function predictTail(
   points: Pt[],
@@ -312,7 +312,7 @@ export function drawStroke(ctx: CanvasRenderingContext2D, stroke: Stroke, alpha 
     ctx.lineJoin = "round";
     if (pts.length === 1) {
       // 同钢笔单点：屏幕空间下限，别让一个点缩没了
-      const r = Math.max(stroke.size / 2, 1.2 / deviceScaleOf(ctx));
+      const r = Math.max(stroke.size / 2, 2.4 / deviceScaleOf(ctx));
       ctx.beginPath();
       ctx.arc(pts[0][0], pts[0][1], r, 0, Math.PI * 2);
       ctx.fill();
@@ -338,9 +338,9 @@ export function drawStroke(ctx: CanvasRenderingContext2D, stroke: Stroke, alpha 
     /*
      * 单击点：几何半径 = 字号×0.46，但缩放 0.6 倍时直径只剩 1 个屏幕像素，
      * 用户看到的是「用钢笔点了一个点，它就是不显示」。加一个屏幕空间下限
-     * （直径 ≥ 2.4 设备像素），任何缩放下都看得见。
+     * （直径 ≥ 约 4.8 设备像素），任何缩放下都看得见。
      */
-    const r = Math.max(0.45, stroke.size * 0.46, 1.2 / deviceScaleOf(ctx));
+    const r = Math.max(0.45, stroke.size * 0.46, 2.4 / deviceScaleOf(ctx));
     ctx.beginPath();
     ctx.arc(pts[0][0], pts[0][1], r, 0, Math.PI * 2);
     ctx.fill();

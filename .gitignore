@@ -1,12 +1,17 @@
+# 依赖与构建产物
 node_modules/
 dist/
+main.js
+main.js.map
 tmp/
+
+# 浏览器调试产物
 .edge-*/
 *.log
-.DS_Store
 
-test/*.js
-test/samples/
+# 系统文件
+.DS_Store
+Thumbs.db
 
 # 内部开发文档，不公开
 HANDOFF.md

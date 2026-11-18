@@ -26,11 +26,9 @@ import {
 } from "./types";
 import { extractPdfText, fitBackground, openPdf, pdfPageSize, type PdfDoc } from "./pdf";
 import { parseDocxParagraphs, readZipText, renderDocxToPages } from "./word";
+import { ensureBookDataDir } from "./indexer";
 
 export type ImportKind = "pdf" | "word";
-
-/** 资源文件夹名（放在 .inkbook 同级） */
-const ASSET_DIR = ".inkbook-assets";
 
 function dataUrlToBytes(dataUrl: string): Uint8Array {
   const b64 = dataUrl.split(",")[1] || "";
@@ -43,6 +41,9 @@ function dataUrlToBytes(dataUrl: string): Uint8Array {
 /**
  * 把 PNG dataURL 存到库里。
  *
+ * 写到这本本子的数据叶子 `墨本文件/<token>.墨本/` 下（与它的索引页同目录），
+ * 这样插件生成的文件集中、按本子分文件夹不弄混。
+ *
  * `written` 传入时，路径会在**写盘之前**就记进去：调用方靠它做失败回滚。
  * 提前记的理由是「写到一半失败」——那时文件可能已经存在（半截），
  * 也必须被清掉。清不掉最多留个脏文件，比漏删好。
@@ -54,15 +55,7 @@ async function saveAsset(
   dataUrl: string,
   written?: string[]
 ): Promise<string> {
-  const folder = bookPath.includes("/") ? bookPath.slice(0, bookPath.lastIndexOf("/")) : "";
-  const dir = folder ? `${folder}/${ASSET_DIR}` : ASSET_DIR;
-  if (!app.vault.getAbstractFileByPath(dir)) {
-    try {
-      await app.vault.createFolder(dir);
-    } catch (_) {
-      await app.vault.adapter.mkdir(dir);
-    }
-  }
+  const dir = await ensureBookDataDir(app, bookPath);
   const fileName = `${name}.png`;
   let path = `${dir}/${fileName}`;
   let n = 1;
@@ -331,7 +324,8 @@ export async function importWord(
       };
       const sx = shot.width > 0 ? fit.width / shot.width : 1;
       const sy = shot.height > 0 ? fit.height / shot.height : 1;
-      // 排版行是 794×1123 的页面单位；PNG 是 3x 像素尺寸。
+      // 排版行是 794×1123 的页面单位；PNG 是 DOCX_RASTER_DPR 倍的像素尺寸。
+      // 两个坐标系靠 shot.width/A4_WIDTH 的比值换算，所以倍率再改也不用动这里。
       const unitX = (shot.width / A4_WIDTH) * sx;
       const unitY = (shot.height / A4_HEIGHT) * sy;
       page.texts = shot.lines.map((line) => ({

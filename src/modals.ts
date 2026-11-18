@@ -1,6 +1,15 @@
-import { Modal, Notice, Setting, type App, type TFile } from "obsidian";
-import { createBook, PAPERS, TEMPLATES, type PaperId, type TemplateId } from "./types";
+import { Modal, Notice, Setting, type App, type TextComponent, type TFile } from "obsidian";
+import { createBook, PAPERS, TEMPLATES, type PageFileSourceType, type PaperId, type TemplateId } from "./types";
 import { paintPaperPreview } from "./paper";
+import type { LinkTarget } from "./wikilinks";
+import { INCOMING_DIR } from "./indexer";
+import {
+  imageAcceptAttr,
+  isImageFileName,
+  measureImageBytes,
+  saveImageAsset,
+} from "./images";
+import { classifyFileBlock, fileBlockTypeLabel } from "./fileblocks";
 
 export function safeName(s: string): string {
   return String(s).replace(/[\\/:*?"<>|#^[\]]/g, "_").trim() || "未命名笔记";
@@ -164,7 +173,7 @@ export class NewBookModal extends Modal {
 
     const actions = contentEl.createDiv("mb-new-actions");
     if (this.onImport) {
-      const importBtn = actions.createEl("button", { text: "导入外部文档" });
+      const importBtn = actions.createEl("button", { text: "导入文档" });
       importBtn.onclick = () => {
         // 先关新建弹窗，再交给调用方打开选源弹窗，避免平板上两个 Modal 叠在一起。
         this.close();
@@ -707,20 +716,34 @@ export class ImportSourceModal extends Modal {
   /**
    * 把设备文件的字节写进库，返回可交给导入链路的 TFile。
    *
-   * 路径用 `.inkbook-assets/imported-<时间戳>-<原名>`：
-   *   · 放在隐藏的资源目录，不打扰用户的笔记列表（导入 PDF 的底图也在这里）；
+   * 路径用 `墨本文件/.incoming/imported-<时间戳>-<原名>`：
+   *   · 先落在「墨本文件」这个统一根下的临时区，不打扰笔记列表；
+   *     导入流程拿到目标本子后，会把它搬进那本的数据叶子
+   *     （见 view 里 adoptIncomingSource），不会再散到库根 `.inkbook-assets/`；
    *   · 时间戳保证同一份文件导两次也不会互相覆盖；
    *   · 万一同一毫秒内出现同名，再加序号兜底。
    *
-   * **写完不删**（清理策略）：PDF 页面是按路径懒渲染的
-   * （`page.background.pdf.path`），删了源文件，翻页时底图就没了；
-   * `source.path` 也可能被导出 / 排查问题用到。Word 导入后虽然不再读它，
-   * 但和 PDF 走同一条路、行为一致更好解释，磁盘代价只有导入的那一份。
+   * **写完不立刻删**：等导入流程搬进本子数据叶子后自然离开临时区；
+   * 用户中途关窗时文件留在 `.incoming`，下次清理或手工收拾都行，但绝不能
+   * 因为这次没导成而把用户刚选的原件弄丢。
    */
   private async writeDeviceFile(name: string, buf: ArrayBuffer): Promise<TFile> {
     const adapter = this.app.vault.adapter;
-    const dir = ".inkbook-assets";
+    const dir = INCOMING_DIR;
     if (!(await adapter.exists(dir))) {
+      // 先把父目录「墨本文件」建出来，再建 .incoming
+      const parent = dir.slice(0, dir.lastIndexOf("/"));
+      const parentExists =
+        typeof this.app.vault.getAbstractFileByPath === "function"
+          ? !!this.app.vault.getAbstractFileByPath(parent)
+          : await adapter.exists(parent);
+      if (parent && !parentExists) {
+        try {
+          await this.app.vault.createFolder(parent);
+        } catch (_) {
+          if (!(await adapter.exists(parent))) await adapter.mkdir(parent);
+        }
+      }
       try {
         await this.app.vault.createFolder(dir);
       } catch (_) {
@@ -739,7 +762,7 @@ export class ImportSourceModal extends Modal {
       return await this.app.vault.createBinary(path, buf);
     } catch (e) {
       /*
-       * 兜底：`.inkbook-assets` 是隐藏目录，个别 Obsidian 版本的
+       * 兜底：`.incoming` 是点开头的临时目录，个别 Obsidian 版本的
        * `vault.createBinary` 对隐藏路径不建索引 / 直接拒绝；老版本也可能
        * 没有这个方法。适配器直写在两条链路上都是可用的（导入链路本来就
        * 只要 `path`），所以补一个「手写 TFile」的最小对象。
@@ -776,6 +799,379 @@ export class ImportSourceModal extends Modal {
    */
   onClose(): void {
     this.closed = true;
+    this.contentEl.empty();
+  }
+}
+
+/**
+ * 「插入图片」弹窗：从设备选，或从库里已有的图片里选。
+ *
+ * 选中的图片会被复制进本子的数据叶子（`墨本文件/<token>.墨本/`），
+ * 本子从此自包含——用户以后删掉设备上的原图 / 挪动库里的原图，都不影响笔记。
+ * 回调给的是 (库内路径, 原始宽, 原始高)，由 view 交给 editor 决定摆放。
+ */
+export class InsertImageModal extends Modal {
+  private bookPath: string;
+  private onPick: (src: string, width: number, height: number) => void;
+  private listEl: HTMLElement | null = null;
+  private statusEl: HTMLElement | null = null;
+  private deviceBtn: HTMLButtonElement | null = null;
+  private fileInput: HTMLInputElement | null = null;
+  private busy = false;
+  private closed = false;
+
+  constructor(app: App, bookPath: string, onPick: (src: string, width: number, height: number) => void) {
+    super(app);
+    this.bookPath = bookPath;
+    this.onPick = onPick;
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    this.closed = false;
+    this.busy = false;
+    contentEl.addClass("mb-new-modal");
+    contentEl.createEl("h3", { text: "插入图片" });
+    contentEl.createEl("p", {
+      cls: "setting-item-description",
+      text: "选一张图片放到当前页，插入后可以拖动、四角缩放、删除。",
+    });
+
+    const deviceRow = contentEl.createDiv("mb-import-device");
+    this.deviceBtn = deviceRow.createEl("button", {
+      cls: "mod-cta mb-device-btn",
+      text: "从设备选择图片…",
+    });
+    const input = contentEl.createEl("input", {
+      cls: "mb-file-input",
+      attr: { type: "file", accept: imageAcceptAttr() },
+    });
+    // 视觉隐藏而非 display:none（与 ImportSourceModal 同因：部分 WebView 拒绝为隐藏元素弹选择器）
+    input.style.position = "absolute";
+    input.style.left = "-9999px";
+    input.style.top = "0";
+    input.style.width = "1px";
+    input.style.height = "1px";
+    input.style.opacity = "0";
+    input.style.pointerEvents = "none";
+    this.fileInput = input;
+    this.deviceBtn.onclick = () => {
+      if (this.busy) return;
+      try {
+        const picker = (input as any).showPicker;
+        if (typeof picker === "function") {
+          picker.call(input);
+          return;
+        }
+      } catch (_) {
+        /* 落到 click() */
+      }
+      input.click();
+    };
+    input.addEventListener("change", () => void this.onDeviceFile());
+    this.statusEl = contentEl.createDiv({ cls: "mb-import-status" });
+
+    const files = this.app.vault.getFiles().filter((f) => isImageFileName(f.name));
+    if (!files.length) {
+      contentEl.createEl("p", {
+        cls: "mb-error",
+        text: "库里还没有图片文件。用上面的按钮从设备选一张即可。",
+      });
+      return;
+    }
+    this.listEl = contentEl.createDiv("mb-import-list");
+    for (const f of files) {
+      const row = this.listEl.createDiv("mb-import-item");
+      const name = row.createSpan({ cls: "mb-import-name", text: f.name });
+      name.setAttribute("title", f.path);
+      row.createSpan({
+        cls: "mb-import-meta",
+        text: `${f.extension.toUpperCase()} · ${this.formatSize(f.stat.size)}`,
+      });
+      row.onclick = () => void this.onVaultFile(f);
+    }
+  }
+
+  /** 从设备选：读字节 → 量尺寸 → 复制进本子数据叶子 → 回调 */
+  private async onDeviceFile(): Promise<void> {
+    const input = this.fileInput;
+    const f = input?.files && input.files[0];
+    try {
+      if (input) input.value = "";
+    } catch (_) {
+      /* 某些 WebView 不让改 value */
+    }
+    if (!f || this.busy) return;
+    if (!isImageFileName(f.name)) {
+      this.setStatus(`「${f.name}」不是图片文件`);
+      new Notice(`只支持插入图片（PNG / JPG / WebP / GIF / BMP）：${f.name}`, 5000);
+      return;
+    }
+    this.busy = true;
+    if (this.deviceBtn) this.deviceBtn.disabled = true;
+    if (f.size > 20 * 1024 * 1024) {
+      new Notice(`图片较大（${this.formatSize(f.size)}），写入需要一点时间，请稍候…`, 6000);
+    }
+    this.setStatus(`正在读取「${f.name}」…（${this.formatSize(f.size)}）`);
+    try {
+      const buf = await readFileAsArrayBuffer(f);
+      this.setStatus("正在写入本子…");
+      const src = await saveImageAsset(this.app, this.bookPath, f.name, buf);
+      const size = await measureImageBytes(buf, this.mimeFor(f.name));
+      if (this.closed) return;
+      this.onPick(src, size?.width || 0, size?.height || 0);
+      this.close();
+    } catch (e: any) {
+      const msg = e && e.message ? e.message : String(e);
+      this.setStatus("插入失败：" + msg);
+      new Notice("插入图片失败：" + msg, 8000);
+      console.error("[inkbook] 插入图片失败", e);
+    } finally {
+      this.busy = false;
+      if (!this.closed && this.deviceBtn) this.deviceBtn.disabled = false;
+    }
+  }
+
+  /** 从库里选：读字节 → 复制进本子数据叶子（保留原件）→ 回调 */
+  private async onVaultFile(f: TFile): Promise<void> {
+    if (this.busy) return;
+    this.busy = true;
+    if (this.deviceBtn) this.deviceBtn.disabled = true;
+    this.setStatus(`正在读取「${f.name}」…`);
+    try {
+      const adapter = this.app.vault.adapter;
+      const buf = await adapter.readBinary(f.path);
+      const src = await saveImageAsset(this.app, this.bookPath, f.name, buf);
+      const size = await measureImageBytes(buf, this.mimeFor(f.name));
+      if (this.closed) return;
+      this.onPick(src, size?.width || 0, size?.height || 0);
+      this.close();
+    } catch (e: any) {
+      const msg = e && e.message ? e.message : String(e);
+      this.setStatus("插入失败：" + msg);
+      new Notice("插入图片失败：" + msg, 8000);
+      console.error("[inkbook] 插入库内图片失败", e);
+    } finally {
+      this.busy = false;
+      if (!this.closed && this.deviceBtn) this.deviceBtn.disabled = false;
+    }
+  }
+
+  private mimeFor(name: string): string {
+    const ext = (name.split(".").pop() || "").toLowerCase();
+    return `image/${ext === "jpg" ? "jpeg" : ext || "png"}`;
+  }
+
+  private setStatus(text: string): void {
+    if (this.statusEl) this.statusEl.setText(text);
+  }
+
+  private formatSize(n: number): string {
+    if (!Number.isFinite(n) || n < 0) return "未知大小";
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(0) + " KB";
+    return (n / 1024 / 1024).toFixed(1) + " MB";
+  }
+
+  onClose(): void {
+    this.closed = true;
+    this.contentEl.empty();
+  }
+}
+
+/**
+ * 收集库里所有可作为双链目标的文件（Markdown 或 `.inkbook`）。
+ *
+ * 「插入双链」弹窗与文字输入框里的 `[[` 自动补全共用同一份清单，
+ * 免得两处筛选规则不一致（比如补全能选到、弹窗里却没有）。
+ *
+ * 选 Markdown 用 basename（不含 .md，符合 Obsidian 习惯），
+ * 选 .inkbook 用带扩展名的全名（`本子.inkbook`），保证最短路径能解析到。
+ * 插件自己生成的索引 / 数据文件不列出来，免得用户链到派生文件。
+ */
+export function collectLinkTargets(app: App): LinkTarget[] {
+  return app.vault
+    .getFiles()
+    .filter((f) => {
+      const ext = (f.extension || "").toLowerCase();
+      if (ext !== "md" && ext !== "inkbook") return false;
+      // 跳过插件生成的索引 / 数据目录
+      if (/墨本文件\/|墨本索引\//.test(f.path)) return false;
+      if (/\.墨本(文字|索引)?\.md$/i.test(f.name)) return false;
+      return true;
+    })
+    .sort((a, b) => a.basename.localeCompare(b.basename))
+    .map((f) => {
+      const ext = (f.extension || "").toLowerCase();
+      return {
+        name: ext === "md" ? f.basename : f.name,
+        label: f.basename,
+        kind: ext === "inkbook" ? ("inkbook" as const) : ("note" as const),
+        path: f.path,
+      };
+    });
+}
+
+/**
+ * 「插入双链」弹窗：从库里选一篇笔记（Markdown 或 .inkbook），
+ * 回调给出要插进文字里的链接名（`[[笔记名]]` 里的那个名字）。
+ *
+ * 选 Markdown 用 basename（不含 .md，符合 Obsidian 习惯），
+ * 选 .inkbook 用带扩展名的全名（`本子.inkbook`），保证最短路径能解析到。
+ * 插件自己生成的索引 / 数据文件不列出来，免得用户链到派生文件。
+ */
+export class InsertLinkModal extends Modal {
+  private bookPath: string;
+  private onPick: (name: string) => void;
+  private listEl: HTMLElement | null = null;
+
+  constructor(app: App, bookPath: string, onPick: (name: string) => void) {
+    super(app);
+    this.bookPath = bookPath;
+    this.onPick = onPick;
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.addClass("mb-new-modal");
+    contentEl.createEl("h3", { text: "插入双链" });
+    contentEl.createEl("p", {
+      cls: "setting-item-description",
+      text: "选一篇笔记，在当前文字框里插入 [[笔记名]]，之后点它即可跳转到那篇笔记。",
+    });
+
+    const search = contentEl.createEl("input", {
+      cls: "mb-import-search",
+      attr: { type: "text", placeholder: "搜索笔记…" },
+    });
+    search.addEventListener("input", () => this.render(search.value));
+
+    this.listEl = contentEl.createDiv("mb-import-list");
+    this.render("");
+  }
+
+  private render(query: string): void {
+    const list = this.listEl;
+    if (!list) return;
+    list.empty();
+    const q = query.trim().toLowerCase();
+    const targets = collectLinkTargets(this.app).filter(
+      (t) => !q || t.label.toLowerCase().includes(q) || t.name.toLowerCase().includes(q)
+    );
+    if (!targets.length) {
+      list.createEl("p", {
+        cls: "mb-error",
+        text: q ? "没有匹配的笔记" : "库里还没有可链接的笔记",
+      });
+      return;
+    }
+    for (const t of targets.slice(0, 300)) {
+      const row = list.createDiv("mb-import-item");
+      row.createSpan({ cls: "mb-import-name", text: t.label });
+      row.createSpan({
+        cls: "mb-import-meta",
+        text: t.kind === "inkbook" ? "手写本" : "笔记",
+      });
+      row.setAttribute("title", t.path);
+      row.onclick = () => {
+        this.onPick(t.name);
+        this.close();
+      };
+    }
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+/**
+ * 「插入文件块」弹窗：从库里选一个 Excalidraw 导图 / 笔记 / 文本文件，
+ * 把它作为「文件块」（快照 + 源引用）放到当前页。
+ *
+ * 选中的是 TFile，真正的快照生成（Excalidraw 导出 / 文本排版）交给
+ * view 调 `makeFileBlockSnapshot`，因为那一步是异步、可能失败的。
+ */
+export class InsertFileBlockModal extends Modal {
+  private bookPath: string;
+  private onPick: (file: TFile) => void;
+  private listEl: HTMLElement | null = null;
+
+  constructor(app: App, bookPath: string, onPick: (file: TFile) => void) {
+    super(app);
+    this.bookPath = bookPath;
+    this.onPick = onPick;
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.addClass("mb-new-modal");
+    contentEl.createEl("h3", { text: "插入文件块" });
+    contentEl.createEl("p", {
+      cls: "setting-item-description",
+      text: "把一个 Excalidraw 导图 / 笔记 / 文本文件放到当前页，卡片里直接显示内容；可拖动、缩放，点「打开源文件」可跳转。导图按场景自绘，无需 Excalidraw 插件。",
+    });
+
+    const search = contentEl.createEl("input", {
+      cls: "mb-import-search",
+      attr: { type: "text", placeholder: "搜索文件…" },
+    });
+    search.addEventListener("input", () => this.render(search.value));
+
+    this.listEl = contentEl.createDiv("mb-import-list");
+    this.render("");
+  }
+
+  /** 优先用 metadataCache 的 frontmatter 认出存成普通 .md 的 Excalidraw 导图 */
+  private fileBlockType(f: TFile): PageFileSourceType | null {
+    const mc: any = this.app.metadataCache as any;
+    let fm: Record<string, unknown> | undefined;
+    try {
+      fm = mc?.getFileCache?.(f)?.frontmatter;
+    } catch (_) {
+      fm = undefined;
+    }
+    return classifyFileBlock(f.name, fm);
+  }
+
+  private render(query: string): void {
+    const list = this.listEl;
+    if (!list) return;
+    list.empty();
+    const q = query.trim().toLowerCase();
+    const files = this.app.vault
+      .getFiles()
+      .filter((f) => {
+        if (!this.fileBlockType(f)) return false;
+        // 跳过插件自己生成的索引 / 数据文件
+        if (/墨本文件\/|墨本索引\//.test(f.path)) return false;
+        if (/\.墨本(文字|索引)?\.md$/i.test(f.name)) return false;
+        if (q && !f.name.toLowerCase().includes(q)) return false;
+        return true;
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+    if (!files.length) {
+      list.createEl("p", {
+        cls: "mb-error",
+        text: q ? "没有匹配的文件" : "库里还没有可嵌入的文件（Excalidraw / Markdown / 文本）",
+      });
+      return;
+    }
+    for (const f of files.slice(0, 400)) {
+      const type = this.fileBlockType(f);
+      if (!type) continue;
+      const row = list.createDiv("mb-import-item");
+      row.createSpan({ cls: "mb-import-name", text: f.basename });
+      row.createSpan({ cls: "mb-import-meta", text: fileBlockTypeLabel(type) });
+      row.setAttribute("title", f.path);
+      row.onclick = () => {
+        this.onPick(f);
+        this.close();
+      };
+    }
+  }
+
+  onClose(): void {
     this.contentEl.empty();
   }
 }
@@ -880,6 +1276,132 @@ export class ImportRangeModal extends Modal {
   }
 
   /** 与其他 Modal 保持一致：关闭时清空，避免复用实例时残留两套 UI */
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+/** 分享格式：逐页图片 或 整本 PDF */
+export type ShareFormat = "png" | "pdf";
+
+export interface ShareChoice {
+  format: ShareFormat;
+  all: boolean;
+  from: number;
+  to: number;
+}
+
+/**
+ * 分享弹窗：选分享格式（图片 PNG / 整本 PDF）+ 分享哪些页（全部 / 指定范围）。
+ *
+ * 需求原话：「选择分享之后要能选具体页数、可以选择全部页，既能分享成图片，
+ * 也能分享成整本 PDF」。
+ */
+export class ShareModal extends Modal {
+  private total: number;
+  private onDone: (choice: ShareChoice) => void;
+  private format: ShareFormat = "png";
+  private all = true;
+  private from = 1;
+  private to: number;
+  private infoEl!: HTMLElement;
+  private fromText?: TextComponent;
+  private toText?: TextComponent;
+
+  constructor(app: App, total: number, onDone: (choice: ShareChoice) => void) {
+    super(app);
+    this.total = Math.max(1, total);
+    this.to = this.total;
+    this.onDone = onDone;
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.addClass("mb-new-modal");
+    contentEl.createEl("h3", { text: "分享" });
+    this.infoEl = contentEl.createEl("p", { cls: "setting-item-description" });
+
+    new Setting(contentEl)
+      .setName("分享格式")
+      .setDesc("图片为逐页 PNG；PDF 为整本合并")
+      .addDropdown((d) => {
+        d.addOption("png", "图片（PNG）");
+        d.addOption("pdf", "PDF");
+        d.setValue(this.format);
+        d.onChange((v) => {
+          this.format = v === "pdf" ? "pdf" : "png";
+          this.updateInfo();
+        });
+      });
+
+    new Setting(contentEl).setName("分享全部页").addToggle((t) =>
+      t.setValue(this.all).onChange((v) => {
+        this.all = v;
+        this.syncRangeEnabled();
+        this.updateInfo();
+      })
+    );
+
+    new Setting(contentEl).setName("起始页").addText((t) => {
+      this.fromText = t;
+      t.setValue(String(this.from)).onChange((v) => {
+        const n = parseInt(v, 10);
+        if (Number.isFinite(n)) this.from = this.clampPage(n);
+        this.updateInfo();
+      });
+    });
+
+    new Setting(contentEl).setName("结束页").addText((t) => {
+      this.toText = t;
+      t.setValue(String(this.to)).onChange((v) => {
+        const n = parseInt(v, 10);
+        if (Number.isFinite(n)) this.to = this.clampPage(n);
+        this.updateInfo();
+      });
+    });
+
+    const actions = contentEl.createDiv("mb-new-actions");
+    const cancel = actions.createEl("button", { text: "取消" });
+    cancel.onclick = () => this.close();
+    const ok = actions.createEl("button", { cls: "mod-cta", text: "分享" });
+    ok.onclick = () => this.finish();
+
+    this.syncRangeEnabled();
+    this.updateInfo();
+  }
+
+  private clampPage(n: number): number {
+    return Math.max(1, Math.min(this.total, Math.trunc(n)));
+  }
+
+  private syncRangeEnabled(): void {
+    const dis = this.all;
+    if (this.fromText) this.fromText.setDisabled(dis);
+    if (this.toText) this.toText.setDisabled(dis);
+  }
+
+  private updateInfo(): void {
+    const from = this.all ? 1 : Math.min(this.from, this.to);
+    const to = this.all ? this.total : Math.max(this.from, this.to);
+    const count = Math.max(0, to - from + 1);
+    this.infoEl.setText(
+      `共 ${this.total} 页，当前选择 ${from}–${to}（${count} 页）· ${
+        this.format === "pdf" ? "PDF" : "逐页图片"
+      }`
+    );
+  }
+
+  private finish(): void {
+    if (!this.all && this.to < this.from) {
+      new Notice("结束页不能小于起始页", 2500);
+      return;
+    }
+    const from = this.all ? 1 : this.from;
+    const to = this.all ? this.total : this.to;
+    this.onDone({ format: this.format, all: this.all, from, to });
+    this.close();
+  }
+
   onClose(): void {
     this.contentEl.empty();
   }

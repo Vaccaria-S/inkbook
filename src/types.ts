@@ -60,6 +60,53 @@ export interface PageText {
   width?: number;
 }
 
+/**
+ * 「文件块」的源引用（`PageImage.source`，可选，不升版本）。
+ *
+ * 文件块的形态是「一张生成好的快照图 + 记住它来自哪个文件」：
+ * `src` 是渲染 / 导出出来的快照 PNG，`source` 指回库里的原文件。
+ * 有了它，选中文件块时才能显示「打开源文件 / 刷新快照」，并在源文件
+ * mtime 变化时提示「源已更新」。
+ */
+export type PageFileSourceType = "excalidraw" | "markdown" | "text";
+
+export interface PageFileSource {
+  /** 源文件库内路径 */
+  path: string;
+  /** 源文件类型：Excalidraw 导图 / Markdown 笔记 / 纯文本 */
+  type: PageFileSourceType;
+  /** 生成快照时源文件的 mtime，用来判断「源已更新」；缺省 = 不判断 */
+  mtime?: number;
+}
+
+/**
+ * 页面上插入的一张图片。
+ *
+ * 与底图（`PageBackground`）区分：底图是"整页的 PDF / Word 原页"，
+ * 图片是用户自己插进来的一张图（贴纸 / 截图 / 照片），可以有任意多张、
+ * 任意位置大小，和笔迹一样能选中、拖动、缩放、删除、撤销。
+ *
+ * `src` 存的是**库内路径**（`墨本文件/<token>.墨本/xxx.png`），
+ * 和 Word 底板一样用 `adapter.getResourcePath` 加载；不把二进制塞进 JSON，
+ * 否则每敲一笔都要重写整张图，几百 KB 的图会让自动保存卡死。
+ * 坐标是页面坐标系（A4 794×1123），与笔迹共用同一套。
+ */
+export interface PageImage {
+  id: string;
+  /** 图片在库里的路径（相对 .inkbook 所在目录） */
+  src: string;
+  /** 左上角与大小（页面坐标） */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /**
+   * 文件块源引用。普通插入的图片没有这个字段；
+   * 文件块（Excalidraw / 笔记 / 文本）才有，用来打开源文件与刷新快照。
+   */
+  source?: PageFileSource;
+}
+
 export interface Layer {
   id: string;
   name: string;
@@ -117,6 +164,16 @@ export interface Page {
    * 可选——没有文字的页面不写这个字段，省体积。
    */
   texts?: PageText[];
+  /**
+   * 页面上插入的图片。
+   * 可选——没有图片的页面不写这个字段，省体积。
+   */
+  images?: PageImage[];
+  /**
+   * 这一页是否被收藏（左侧抽屉「收藏」标签里能直接看到 / 直接跳过去）。
+   * 可选——没收藏的页不写这个字段，省体积。
+   */
+  favorite?: boolean;
 }
 
 /**
@@ -173,7 +230,7 @@ export interface InkBook {
    */
   outlines?: Outline[];
   /**
-   * 用户显式设过的缩放比（0.3–2.8）。
+   * 用户显式设过的缩放比（0.3–3.5）。
    *
    * 可选字段，与 `outlines` 同为**不升版本**新增：老文件没有它，
    * 读出来是 undefined = 从未手动缩放过，打开时按窗口大小重新 fit。
@@ -224,11 +281,38 @@ export interface InkbookSettings {
   prediction: boolean;
   autosave: boolean;
   sidebarOpen: boolean;
+  /** 左侧缩略图面板每行显示几页（1–4，默认 4）。 */
+  thumbCols: number;
+  /** 收藏面板每行显示几页（1–4，默认 2）。 */
+  favoriteCols: number;
+  /**
+   * 钢笔笔尖粗细默认值。
+   *
+   * 用户要求「每种笔、每种形状各记各的粗细」，所以这里只保存**钢笔**的，
+   * 圆珠笔见 defaultBallpointSize，形状见 defaultShapeSizes。
+   */
   defaultPenSize: number;
+  /** 圆珠笔笔尖粗细默认值（与钢笔分开记忆，互不影响） */
+  defaultBallpointSize: number;
+  /**
+   * 形状线宽默认值：直线 / 箭头 / 矩形 / 椭圆**各记各的**。
+   *
+   * 老 data.json 没有这个字段时，loadSettings 会从 DEFAULT_SETTINGS 补齐。
+   */
+  defaultShapeSizes: Record<ShapeKind, number>;
   /** 荧光笔粗细默认值（侧栏「荧光 细/中/粗」选的会写回这里） */
   defaultHighlighterSize: number;
   lastPenColor: string;
   lastHighlighterColor: string;
+  /**
+   * 橡皮「记忆」：上次选的模式（整笔 / 局部）和大小。
+   *
+   * 用户要求：按下橡皮不再每次都弹调节框，而是沿用上次设置。光靠编辑器
+   * 实例字段只在同一次打开本子期间有效，切本 / 重启就丢；写进设置才能真的
+   * 「记住」，和笔色 / 粗细的做法一致。
+   */
+  lastEraserMode: "whole" | "part";
+  lastEraserSize: number;
   /**
    * 写字时屏蔽「左缘右滑弹出文件列表」。
    *
@@ -248,6 +332,17 @@ export interface InkbookSettings {
   /** 画完自动把笔直的笔迹拉直（只认直线） */
   straightLine: boolean;
   /**
+   * 一笔成型（移植自经典手写应用「开启后书写的笔迹会自动识别成相关图形」）。
+   * off = 关；lift = 画完立刻自动识别。只有开 / 关两态，开关放在每支笔的
+   * 弹出调节框里（钢笔 / 圆珠笔），默认关：老笔记的书写手感一点不变。
+   */
+  shapeSnap: "off" | "lift";
+  /**
+   * 激光笔（移植自经典手写应用「点状激光笔 / 线条激光笔」）。
+   * 打开后落笔只留一条会淡出的指示光迹，不写进本子、不进撤销栈、不导出。
+   */
+  laserPointer: boolean;
+  /**
    * 生成「文字索引」md，让 Obsidian 全局搜索能搜到本子里的文字。
    *
    * 索引文件与本子同目录、同名前缀（`数学.墨本文字.md`），
@@ -264,10 +359,44 @@ export interface InkbookSettings {
    * 关掉后跳转行为完全不变，只是不再闪这一下。
    */
   jumpHint: boolean;
+  /**
+   * 自定义快捷键覆盖（动作 id → 键位串，见 src/hotkeys.ts）。
+   *
+   * 只存**用户改过**的动作；缺省的动作用内置默认键位，所以老 data.json
+   * 没有这个字段也能正常工作（无需迁移）。值为空串表示「主动禁用该快捷键」。
+   * 动作清单与默认值统一放在 hotkeys.ts 的 HOTKEY_ACTIONS 里。
+   */
+  hotkeys?: Record<string, string>;
+  /**
+   * 是否已把旧版散落的插件生成物迁移进「墨本文件/」（一次性）。
+   *
+   * 老 data.json 没有这个字段 → 视为 false，启动时跑一次迁移后置 true。
+   * 之后不再全库读取每本本子，避免每次启动都重读大文件。
+   */
+  filesMigrated?: boolean;
 }
 
 export const A4_WIDTH = 794;
 export const A4_HEIGHT = 1123;
+
+/**
+ * 全插件共用的手动缩放上下限。
+ *
+ * 3.5 而不是 4.0：单个画布仍由 editor.ts 的 MAX_CANVAS_PIXELS 动态夹住 dpr，
+ * 但更高倍率会同时抬高 MIN_MOUNTED=2 的平板峰值内存，选 3.5 留出安全余量。
+ */
+export const MIN_ZOOM = 0.3;
+export const MAX_ZOOM = 3.5;
+
+/**
+ * data.json 里可能是旧版本 / 手改的野值，统一处理：
+ *   · "hold"（旧版「画线停留识别」）现在并入「开」= 画完立刻识别 → 回落 lift；
+ *     用户以前选过停留识别，升级后立刻生效，不再出现「打开了跟没打开一样」；
+ *   · "lift" 保留；其余一律 off。
+ */
+export function normalizeShapeSnap(v: unknown): InkbookSettings["shapeSnap"] {
+  return v === "lift" || v === "hold" ? "lift" : "off";
+}
 
 export const DEFAULT_SETTINGS: InkbookSettings = {
   defaultTemplate: "grid",
@@ -279,7 +408,11 @@ export const DEFAULT_SETTINGS: InkbookSettings = {
   prediction: true,
   autosave: true,
   sidebarOpen: true,
+  thumbCols: 4,
+  favoriteCols: 2,
   defaultPenSize: 2.8,
+  defaultBallpointSize: 2.8,
+  defaultShapeSizes: { line: 2.8, arrow: 2.8, rect: 2.8, ellipse: 2.8 },
   /**
    * 荧光笔粗细默认值（侧栏「荧光 细/中/粗」选的会写回这里）。
    * 取 HIGHLIGHTER_SIZES 的中间档（16/24/34），与老设置回落值一致。
@@ -287,11 +420,17 @@ export const DEFAULT_SETTINGS: InkbookSettings = {
   defaultHighlighterSize: 24,
   lastPenColor: "#1A1A1A",
   lastHighlighterColor: "#F6E05E",
+  lastEraserMode: "part",
+  lastEraserSize: 26,
   blockEdgeSwipe: true,
   blockCommandPalette: true,
   straightLine: false,
+  // 移植功能默认全关：升级后不改动任何既有书写 / 显示行为。
+  shapeSnap: "off",
+  laserPointer: false,
   searchIndex: true,
   jumpHint: true,
+  filesMigrated: false,
 };
 
 export const PEN_COLORS = [

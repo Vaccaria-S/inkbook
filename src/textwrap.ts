@@ -65,9 +65,27 @@ export function maxTextStartX(pageWidth: number): number {
   return Math.max(0, pageWidth - MIN_TEXT_WIDTH - TEXT_RIGHT_MARGIN);
 }
 
-/** 渲染时的 x 上限：至少保证 MIN_TEXT_WIDTH 的可用宽度还在纸内 */
-export function reserveTextX(pageWidth: number, x: number): number {
-  return Math.min(Math.max(0, x), Math.max(0, pageWidth - MIN_TEXT_WIDTH - PAGE_SAFE_INSET));
+/**
+ * 渲染时的 x 上限：保证「框右缘」还在纸内（留 PAGE_SAFE_INSET 物理安全边）。
+ *
+ * reserveWidth 是**这段字实际要占的框宽**：
+ *   · 自动排版（没手动拖过宽度）按 MIN_TEXT_WIDTH(120) 留白，x 最多到
+ *     pageWidth-120-8=666，免得贴着右边缘时折成「一行一个字」的窄柱；
+ *   · 用户把框拖窄以后不能再按 120 留白。40 宽的窄框在 x=666 时右缘才
+ *     到 706，离纸右缘还差 88——用户看到的就是「还有很长一段距离却拖不动了」。
+ *     窄框改按自己的宽度留白，能一直移到「框右缘贴着纸右缘」。
+ * 取 min(MIN_TEXT_WIDTH, reserveWidth)：只对窄框放松上限，宽框 / 自动排版
+ * 仍是原来的 666，不会把已有的宽框往左拽、也不会改变老文件的排版。
+ *
+ * 上限不能超过「物理安全边」：x 再大时 availableTextWidth 的 hardMax 会把
+ * wrapW 压得比框还窄，框就会突然缩成一条。这里的式子保证在 maxX 处
+ * availableTextWidth(pageWidth, maxX) 恰好等于 reserveWidth，框宽不变。
+ */
+export function reserveTextX(pageWidth: number, x: number, reserveWidth = MIN_TEXT_WIDTH): number {
+  const reserve = Number.isFinite(reserveWidth) && reserveWidth > 0
+    ? Math.min(MIN_TEXT_WIDTH, reserveWidth)
+    : MIN_TEXT_WIDTH;
+  return Math.min(Math.max(0, x), Math.max(0, pageWidth - reserve - PAGE_SAFE_INSET));
 }
 
 /** 一段批注排好版的样子 */
@@ -115,8 +133,6 @@ export function layoutUserText(
   measure: (s: string) => number
 ): TextLayout {
   const size = t.size > 0 ? t.size : 1;
-  const x = reserveTextX(pageWidth, t.x);
-  const avail = availableTextWidth(pageWidth, x);
   /*
    * 显式宽度优先，但仍要过纸面物理上限：
    * 用户把框拖到右边、或老数据 x 越界时，t.width 若超过 x 到纸右缘的余量，
@@ -125,7 +141,14 @@ export function layoutUserText(
    * 绝不把 0 喂给 wrapText（虽然它有兜底，但会退化成一行一个字）。
    */
   const custom = Number.isFinite(t.width) ? (t.width as number) : 0;
-  const wrapW = custom > 0 ? Math.min(Math.max(custom, MIN_BOX_WIDTH), avail) : avail;
+  const boxW = custom > 0 ? Math.max(custom, MIN_BOX_WIDTH) : 0;
+  /*
+   * 夹 x 之前先知道框有多宽：窄框按自己的宽度留白（见 reserveTextX），
+   * 才能一路拖到「框右缘贴着纸右缘」；自动排版仍按 MIN_TEXT_WIDTH。
+   */
+  const x = reserveTextX(pageWidth, t.x, boxW);
+  const avail = availableTextWidth(pageWidth, x);
+  const wrapW = boxW > 0 ? Math.min(boxW, avail) : avail;
   let lines = wrapText(t.text, wrapW, measure);
   const lineHeight = size * TEXT_LINE_HEIGHT;
   /*

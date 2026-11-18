@@ -1,15 +1,22 @@
-# assets/NotoSansSC-subset.ttf
+# 字体资源
 
-导出 PDF 时嵌入的中文字体子集。
+本目录放的是**构建期内联进 `main.js`** 的字体子集（esbuild 的 `dataurl` loader → base64）。
+Obsidian 移动端没有文件系统，插件目录里的独立字体文件读不到，所以把字体随包内联。
 
-- **来源**：Noto Sans SC Regular（Google Fonts 版，取自 npm 包 `@fontsource/noto-sans-sc`）
-- **许可**：SIL Open Font License 1.1（见 `NotoSansSC-LICENSE.txt`）
-- **生成**：构建期一次性子集化，产出约 1851KB。
-  ⚠️ 当时的生成脚本 `tools/mksubset.mjs` **没有入库**（现在仓库里不存在），
-  要重新生成需按下面的来源自己重写：`@fontsource/noto-sans-sc` 的
-  `noto-sans-sc-chinese-simplified-400-normal.woff2`（1.1MB）
-  → `subset-font`（harfbuzz wasm）+ GB2312 全字符集（8280 字）→ TTF。
-- **字符集**：GB2312 全字符（6763 汉字 + 符号，共 8280 字符）+ ASCII
+## `NotoSansSC-subset.ttf`
 
-只改这个文件的话不用动代码；扩大字符覆盖后 main.js 会跟着变大（base64 是 4/3 倍）。
-**不要再对这份 TTF 做二次子集化**（见 `技术约定-墨本.md` 的 INK-118）。
+导出 PDF 时嵌入的中文字体子集（批注要能选中 / 搜索，pdf-lib 只带西文）。
+
+- 来源：Noto Sans SC Regular（Google Fonts）
+- 许可：SIL Open Font License 1.1（见 `NotoSansSC-LICENSE.txt`）
+- 字符集：GB2312 全字符 + ASCII
+
+## `Xiaolai-subset.woff2`
+
+「手写」字体档在屏幕上用的字体（小赖 / Xiaolai），运行时由 `src/handfont.ts`
+经 `FontFace` 注册成家族名 `Inkbook Hand`。
+
+- 来源：[`lxgw/kose-font`](https://github.com/lxgw/kose-font) 的 `Xiaolai-Regular.ttf`
+- 许可：SIL Open Font License 1.1（见 `Xiaolai-LICENSE.txt`）
+
+两份字体均以 SIL OFL 1.1 授权，版权归各自作者所有，仅作为构建原料随本仓库分发。

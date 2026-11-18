@@ -1,8 +1,13 @@
 import {
   activeLayer,
+  normalizeShapeSnap,
+  MAX_ZOOM,
+  MIN_ZOOM,
   PEN_COLORS,
   type Page,
   type PageBackground,
+  type PageFileSource,
+  type PageImage,
   type PageText,
   type PaperId,
   type Pt,
@@ -15,6 +20,12 @@ import {
 } from "./types";
 import { BookStore, type HistoryEntry } from "./store";
 import { drawStroke, invalidateStroke, predictTail } from "./ink";
+import {
+  recognizeShape,
+  recognitionPoints,
+} from "./shaperec";
+import { bandLaserSamples, buildLaserGeometry } from "./lasertrail";
+import { InkPredictor, pressureResponse } from "./inkalgo";
 import { OneEuroFilter, shapePressure, speedWidthFactor, zoomNormalization } from "./filter";
 import { TouchArbiter, type PinchInfo, type PointerInfo, type TouchRole } from "./touch";
 import { drawPaper, paperBackground } from "./paper";
@@ -29,6 +40,8 @@ import {
 } from "./pdf";
 import {
   clamp,
+  invalidateStrokeBounds,
+  pointSegmentDistance,
   splitStrokeByEraser,
   straightenPoints,
   strokeBounds,
@@ -40,9 +53,19 @@ import {
   layoutUserText,
   maxTextStartX,
   MIN_BOX_WIDTH,
+  reserveTextX,
   TEXT_LINE_HEIGHT,
   type TextLayout,
 } from "./textwrap";
+import {
+  ensureHandFont,
+  ensureHandFontIdle,
+  HAND_FONT_FAMILY_CSS,
+  onHandFontReady,
+} from "./handfont";
+import { fitImageRect } from "./images";
+import { countMatchesBefore, findInText, type FindMatch } from "./find";
+import { findWikiLinks, stripWikiLinkSyntax, type LinkTarget } from "./wikilinks";
 
 export interface EditorState {
   pageIndex: number;
@@ -50,10 +73,15 @@ export interface EditorState {
   zoom: number;
   tool: ToolId;
   penColor: string;
+  /** 钢笔粗细 */
   penSize: number;
+  /** 圆珠笔粗细（与钢笔分开记忆） */
+  ballpointSize: number;
   highlighterColor: string;
   highlighterSize: number;
   shapeKind: ShapeKind;
+  /** 当前形状（shapeKind）自己的线宽；形状的粗细按种类各记各的 */
+  shapeSize: number;
   /** 新建文字用的字号 / 字体 / 颜色 */
   textSize: number;
   textFont: string;
@@ -95,6 +123,36 @@ interface ZoomAnchor {
   fy: number;
 }
 
+interface CachedTextLayer {
+  /** 已脱离 DOM、但保存着全部 span 的整层，可直接重新插入复用。 */
+  el: HTMLElement;
+  /** 内容/尺寸/字体时代的签名；变了就整层作废，绝不复用旧文字。 */
+  signature: string;
+}
+
+/**
+ * 脱离 DOM 的**主笔迹画布**缓存条目（INK-229 平板上下滑卡顿）。
+ *
+ * 为什么缓存整块 canvas 而不是位图：老实现每跨一页都要 `mount()` →
+ * `resizeRec()` —— 写 canvas.width/height 让浏览器重新分配整块 backing
+ * 并清空，随后 renderRec 全量重画该页所有笔迹 + renderOverlay。平板 dpr=2
+ * 时一页两块约 12–18MB，笔迹多的页一次重绘 10–30ms，跨越页边界就卡一下，
+ * 正是「每滑一页顿一下」的直接来源。
+ *
+ * 这里把卸载时已经画好的主画布整块留着；滚回来时若签名（backing 尺寸 +
+ * 内容 epoch）没变，直接重新插回 DOM，跳过重分配与全量重绘。
+ * 只缓存主 canvas：overlay（草稿 / 光标 / 选中框）依赖实时状态，每次挂载
+ * 都新建并 renderOverlay，绝不缓存（否则选中框 / 橡皮圈会显示过期内容）。
+ */
+interface CachedRaster {
+  /** 脱离 DOM、仍保存着整页笔迹像素的主画布。 */
+  canvas: HTMLCanvasElement;
+  /** backing 宽高（像素）与内容 epoch 的签名；不一致就作废，绝不复用旧像素。 */
+  signature: string;
+  /** 估算字节，用来按总预算做 LRU 淘汰。 */
+  bytes: number;
+}
+
 interface PageRec {
   index: number;
   wrap: HTMLElement;
@@ -117,7 +175,25 @@ interface PageRec {
   ioVisible: boolean;
 }
 
-type Gesture = "none" | "draw" | "shape" | "erase" | "pan" | "moveText" | "resizeText";
+type Gesture =
+  | "none"
+  | "draw"
+  | "shape"
+  | "erase"
+  | "pan"
+  | "moveText"
+  | "resizeText"
+  | "moveShape"
+  | "resizeShape"
+  | "moveImage"
+  | "resizeImage"
+  | "laser";
+
+/** 激光笔光迹存活时长（毫秒）：越老越淡，到点整段丢掉 */
+const LASER_FADE_MS = 850;
+
+/** 形状选框上的缩放手柄方位：四角 + 四条边中点 */
+type ShapeHandle = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w";
 
 /**
  * 文字可用字体。
@@ -167,22 +243,38 @@ export const TEXT_FONTS: Array<{ id: string; label: string; stack: string }> = [
     id: "hand",
     label: "手写",
     /*
-     * Excalidraw 那种手写风（Virgil）用系统字体栈模拟，不打包字体。
+     * 手写体（2026-11-09 用户要求；2026-11-10 修正，见 INK-224）。
      *
-     * **中文字体名必须写实际安装的名字**（2026-11-09 修）。上一版写的是
-     * `"Xingkai SC" / "STXingkai" / "行楷"` —— 那是 macOS / 旧版 Office 的
-     * 名字，Windows 上一个都匹配不上，于是整段中文静默回退到 Noto Sans SC，
-     * 用户切到「手写」看不出任何变化（真机反馈）。
+     * **首选是本插件自带的小赖（Xiaolai）子集**，由 src/handfont.ts 在运行时
+     * 经 `FontFace` 注册进 `document.fonts`，家族名 `"Inkbook Hand"`。
      *
-     * 现在按平台列全：
-     *   · Windows：方正行楷简体 / 楷体（实测本机都有）
-     *   · macOS：Xingkai SC / STKaiti / Kaiti SC
-     *   · 西文：Segoe Script（Win）/ Bradley Hand（mac）/ Ink Free（Win10+）
-     *     都比 Comic Sans 更像手写
+     * 上一版写的是 `"Excalifont", "Xiaolai"`，指望借用 Obsidian Excalidraw
+     * 插件注册的同名字体。这条路在真机上不成立：
+     *   · Excalifont 只有西文（7 个 woff2 分片共 63KB，一个汉字都没有）；
+     *   · Xiaolai 要 Excalidraw 打开「中文字体」开关（默认关闭）才会去加载
+     *     本地中文字体资源。
+     * 于是中文落到回退链尾部的 Noto Sans SC —— 用户看到的就是
+     * 「选了手写，字体没变」（INK-224）。
      *
-     * 尾部仍按 INK-193 的约定以导出同款 "Noto Sans SC", sans-serif 收尾：
-     * 上面几款都缺字时按字回落到与 PDF 导出相同的字宽，避免屏幕折行和
-     * 导出不一致。
+     * 现在字体随插件走，不依赖别的插件，也不依赖设备装没装。
+     * 后面两项仍保留同名字体：用户自己装了 Excalidraw 并开了中文字体、
+     * 或者系统里装了 Xiaolai，就用他那份（优先级更高，效果一致）。
+     * 尾部按 INK-193 以导出同款 "Noto Sans SC", sans-serif 收尾：
+     * 子集里缺的字（生僻字、emoji）按字回落到导出同款，量宽仍与导出一致。
+     */
+    stack: `${HAND_FONT_FAMILY_CSS}, "Excalifont", "Xiaolai", "Noto Sans SC", sans-serif`,
+  },
+  {
+    id: "xingkai",
+    label: "行楷",
+    /*
+     * 「行楷」单独成一档（2026-11-09 用户要求：原「手写」用的就是这套字体栈，
+     * 现在拆出来做独立选项）。
+     *
+     * **中文字体名必须写实际安装的名字**：Windows 方正行楷简体 / 楷体，
+     * macOS Xingkai SC / STKaiti / Kaiti SC；西文用 Segoe Script（Win）/
+     * Bradley Hand（mac）/ Ink Free（Win10+），都比 Comic Sans 更像手写。
+     * 尾部仍按 INK-193 以导出同款 "Noto Sans SC", sans-serif 收尾。
      */
     stack:
       '"方正行楷简体", "FZ Xingkai", "楷体", "KaiTi", "楷体_GB2312", "Xingkai SC", "STXingkai", "STKaiti", "Kaiti SC", "Segoe Script", "Bradley Hand", "Ink Free", "Comic Sans MS", cursive, "Noto Sans SC", sans-serif',
@@ -233,7 +325,7 @@ function measureContext(font: string): CanvasRenderingContext2D | null {
  *
  * 每页有两块画布（底图层 + 笔迹层），各自都是
  * `794×zoom×dpr` × `1123×zoom×dpr`。
- * 在 2.8 倍缩放 + 2x 屏上，这是 5558×7861 = 4370 万像素，
+ * 在旧上限 2.8 倍缩放 + 2x 屏上，这是 5558×7861 = 4370 万像素，
  * 单块就是 175MB——两页就能把平板的内存吃光。
  *
  * 所以要给 dpr 封顶：像素预算不够时自动降采样，
@@ -244,6 +336,10 @@ function measureContext(font: string): CanvasRenderingContext2D | null {
  * 否决过的方案。内存的乘数是「同时挂几页」，不是单块上限。
  * 真正的解是 P3 的 tile 渲染（只画视口内那几块瓦片，分辨率与缩放解耦），
  * 届时才动这里。
+ */
+/*
+ * 手动上限现为 3.5（不用 4.0 是为了少担平板内存风险）；renderDpr() 的
+ * 动态 dpr 夹取继续把单块画布钉在 16M 像素内，上面的测量值保留作旧基线。
  */
 export const MAX_CANVAS_PIXELS = 16_000_000;
 
@@ -288,12 +384,12 @@ export function inkRenderDpr(deviceDpr: number): number {
  * 超采样只在「日常书写倍率」生效，高倍时退回设备原生 dpr。
  *
  * 为什么要这一层（2026-11-07 补）：`inkRenderDpr` 无条件补到 1.25，
- * 在桌面**最大缩放 2.8 倍**时会把单页画布推到 83MB（两块 167MB），
+ * 在桌面旧上限 2.8 倍时会把单页画布推到 83MB（两块 167MB），
  * 超过 `MOUNT_BUDGET_BYTES`(160MB) —— 而 `MIN_MOUNTED=2` 是硬下限
  * （绝不能卸邻页，卸了滚过去是永久空白），所以预算被突破。
  * 原来的 dpr=1 在那一档只用 107MB，抬到 1.25 反而把安全余量吃掉了。
  *
- * 收益上也不值得：2.8 倍时笔画在屏幕上已经很粗（一笔约 8 个设备像素），
+ * 收益上也不值得：旧上限 2.8 倍时笔画在屏幕上已经很粗（一笔约 8 个设备像素），
  * 边缘的亚像素过渡本来就明显，超采样带来的相对改善远不如 0.8~1.25 倍。
  * 而 0.8~1.25 是用户**真正在写**的倍率，那里内存余量充足（38MB）。
  *
@@ -304,6 +400,35 @@ export function inkRenderDpr(deviceDpr: number): number {
  * 仍留 21MB 余量；取 1.5 会多出一档 1.3 倍的 144MB，余量只剩 16MB。
  */
 export const SUPERSAMPLE_MAX_ZOOM = 1.25;
+
+/**
+ * 导入文档页（PDF/Word 位图正文）在「日常书写倍率」档的**超采样目标 dpr**。
+ *
+ * 为什么普通手写页用 1.25、导入文档页要用到 3.0（2026-11-11，100% 清晰度专项）：
+ * 桌面 dpr=1、100% 缩放下，页面 CSS 宽 794，画布 backing 无论多少最后都要被
+ * 浏览器合成器缩到 794 设备像素。手写笔画是矢量，1.25 超采样已足够丝滑；
+ * 而导入文档的正文是一张位图（Word 底图 3335px 宽 / PDF 光栅），它的清晰度
+ * 取决于「源位图 → backing → 794」这条链上**中间 backing 保留了多少源细节**。
+ *
+ * 实测（真实 BookEditor + 真实 Word 位图 + Chromium 真机截图，dpr=1、100%、
+ * 量正文墨迹包围盒的拉普拉斯锐度 / 墨色均值，越低越黑）：
+ *   backing 993（1.25×）：锐度 129.7、墨色均值 152.6（现状）
+ *   1588（2.0×）：149.2 / 145.6
+ *   1985（2.5×）：215.4 / 119.3
+ *   2382（3.0×）：**272.1（+110%）/ 89.6（最黑）**  ← 甜点
+ *   2779（3.5×）：236.4 / 109.6   （继续加只在噪声区抖动，且更吃内存）
+ *   3335（4.2×=源宽）：248.8 / 104.2
+ * 结论：backing 越接近源宽，中间损失越小、字越清越黑；3.0× 是收益/内存的甜点。
+ *
+ * 平板（dpr=2）同样吃这条（2026-11-11 后续：用户反馈平板正文仍不够清）：
+ * 平板 backing 只有 794×zoom×2≈1588，源 Word/PDF 位图约 3335 宽，仍有 2 倍多
+ * 下采样损失；抬到 3.0×（backing≈2382）把源细节更多留在中间层，再交合成器
+ * 降到设备像素，小字更锐。>1.25 的高倍缩放仍退回原生（字够大）。
+ * 始终经 `inkEffectiveRenderDpr()` 的单块像素 + MIN_MOUNTED 页总字节两道预算夹取，
+ * 绝不越红线（3.0× 在 100% 时单页 backing 约 2382×3369≈8.0M px，两块画布两页
+ * 共约 128MB，仍在 160MiB 预算内）。
+ */
+export const DOCUMENT_READ_SUPERSAMPLE = 3.0;
 
 /**
  * 按缩放档决定最终渲染 dpr。
@@ -317,6 +442,29 @@ export function inkRenderDprForZoom(deviceDpr: number, zoom: number): number {
   if (raw >= 1.5) return raw;
   if (!(zoom > 0) || zoom > SUPERSAMPLE_MAX_ZOOM) return raw;
   return inkRenderDpr(raw);
+}
+
+/**
+ * 取证/回归用：临时关闭「导入文档页用 3.0× 超采样」这条改动，重现改动前的
+ * 1.25× 行为。与 `setDocxRasterDprForTest` 同款用意：Before / After 两张图必须跑
+ * **同一条真实渲染路径**、只有这一个变量不同。正常运行时没人调它，生产行为
+ * 永远等于「导入文档页用 DOCUMENT_READ_SUPERSAMPLE」。
+ */
+let documentSupersampleOverride: boolean | null = null;
+export function setDocumentSupersampleForTest(on: boolean | null): void {
+  documentSupersampleOverride = on;
+}
+
+/**
+ * 取证/调参用：临时覆盖「导入文档页超采样目标 dpr」的具体值。
+ *
+ * 用来在平板 dpr=2 上扫 2.5 / 3.0 / 3.5 找清晰度/内存甜点（见
+ * `test/textsharp-tablet-capture.mjs`）。正常运行没人调它，生产行为永远等于
+ * `DOCUMENT_READ_SUPERSAMPLE`。
+ */
+let documentReadSupersampleValue: number | null = null;
+export function setDocumentReadSupersampleForTest(v: number | null): void {
+  documentReadSupersampleValue = Number.isFinite(v) && (v as number) > 0 ? (v as number) : null;
 }
 
 /** 导出的底图位图宽度上限（设备像素） */
@@ -386,9 +534,11 @@ interface ThumbShot {
 /**
  * 同时挂载的所有画布总字节预算（不含 PDF 位图缓存）。
  *
- * 这是**软目标**，不是硬上界：实际挂载量会被 MIN_MOUNTED 抬到 2 页
- * （2.8 倍时 2×122 = 244MB）。预算真正的作用是削掉低倍率下的多余挂载
- * ——0.8 倍时一页才 17MB，不按字节算的话光看页数会挂满 12 页。
+ * 这是**软目标**，不是硬上界：IO 预挂范围内的页一票不卸，实际挂载量可能
+ * 比按字节算出的 limit 多几页。预算还同时驱动 `inkEffectiveRenderDpr()`：
+ * 高倍率时把 dpr 压到「MIN_MOUNTED=2 页也不超 160MiB」，避免旧实现靠软目标
+ * 兜不住硬下限。低倍率下它仍负责削掉多余挂载——0.8 倍时一页才 17MB，
+ * 不按字节算的话光看页数会挂满 12 页。
  *
  * 为什么不用它压死高倍率：高倍率下真正致命的不是内存超一点，
  * 而是「当前页没有画布」——那是一片永久空白（见 MIN_MOUNTED）。
@@ -404,7 +554,7 @@ const MAX_MOUNTED = 8;
 /**
  * 页数下限 2：当前页 + 一页预挂。
  *
- * 2.8 倍时预算只够 1 页，但绝不能把邻页卸掉——卸了滚过去就是整页空白：
+ * 旧上限 2.8 倍时预算只够 1 页，但绝不能把邻页卸掉——卸了滚过去就是整页空白：
  * IntersectionObserver 只在**跨越交叉阈值**时回调，邻页是「已进视口、
  * 又在本回调里被卸掉」，状态没变化，IO 不会再触发第二次；
  * 而 updateCurrentFromScroll() 只改 current 不挂画布。
@@ -412,6 +562,92 @@ const MAX_MOUNTED = 8;
  * 所以宁可超预算，也不留这个空洞。
  */
 const MIN_MOUNTED = 2;
+
+/**
+ * 脱离 DOM 主画布 LRU 的字节预算（INK-229 平板上下滑卡顿）。
+ *
+ * 缓存只是「滚回来时能秒复用」，不是常驻显存：总占用必须封顶，否则来回滑
+ * 几十页会把几十块高倍率画布全留在内存里，平板上直接闪退。
+ *
+ * 取 96MiB：dpr=2、1 倍时一页两块约 12–18MB，能留住 5–8 页「刚滑过去」的
+ * 近邻；高倍率（如 3.5 倍一页 83MB）时只留 1 页也会被预算淘汰，等于退回
+ * 老路径但不超支。它和 MOUNT_BUDGET_BYTES 互不叠加冲突：
+ * MOUNT_BUDGET_BYTES 管「此刻挂载」的页，本预算只管「已卸载待复用」的页。
+ */
+const RASTER_CACHE_BYTES = 96 * 1024 * 1024;
+
+/**
+ * 脱离 DOM 主画布 LRU 的**条数**上限（INK-229）。
+ *
+ * 只按字节封顶不够：低倍率下一页才 2MB，96MiB 能塞 40 多块画布，
+ * 几十个脱离 DOM 的 canvas 节点本身就是负担，还让 LRU 的 Map 越滚越长。
+ * 与文字层缓存对齐，同样取 MAX_MOUNTED=8：留住「刚滑过去」的近邻，
+ * 再往回滚就正常重画（那条路径本来就有，不空白、不卡死）。
+ */
+const MAX_RASTER_CACHED = MAX_MOUNTED;
+
+/**
+ * `renderDpr()` 与 feel.html 共用的**最终**渲染 dpr（含单块像素和挂载字节两道预算）。
+ *
+ * 为什么再加一道字节预算（2026-11-10）：手动上限抬到 3.5 倍后，
+ * `MAX_CANVAS_PIXELS` 只把 dpr 夹到 sqrt(16M/(794×1123×3.5²)) ≈ 1.210，
+ * 而桌面 dpr=1 的原策略本来就是 1。于是单页两块画布约 83.35MiB，
+ * `MIN_MOUNTED=2` 是硬下限、卸不掉邻页，总共 166.69MiB > 160MiB。
+ * 不能改 MIN_MOUNTED，也不能降 16M 单块红线；正确做法是按总预算反推 dpr：
+ *
+ *   MIN_MOUNTED × 2 块 × 4 字节 × (794×1123×zoom²×dpr²) ≤ MOUNT_BUDGET_BYTES
+ *   ⇒ dpr ≤ sqrt(BUDGET / (MIN_MOUNTED × 8 × 794×1123×zoom²))
+ *
+ * A4 在 3.5 倍时约 0.9798：比原来的 1 只低约 2%，仍远高于既有 0.75 地板，
+ * 低倍率、平板原生 dpr 与 `inkRenderDprForZoom()` 的策略完全不变。
+ *
+ * ⚠️ `resizeRec()` 会把 backing 宽高 `Math.round()`；直接用连续 dpr 反推预算，
+ * 整数向上舍入仍可能多出几 KB（实测 3.5 倍时 160.008MiB）。所以这里按**真实整数
+ * 画布尺寸**判据二分出不超过两道上界的最大 dpr，不塞任何魔数裕量；
+ * feel.html 也调用本函数并用同样的取整公式算内存，测的就是真实 renderDpr 路径。
+ */
+export function inkEffectiveRenderDpr(
+  deviceDpr: number,
+  zoom: number,
+  pageWidth = 794,
+  pageHeight = 1123,
+  wantOverride?: number
+): number {
+  // wantOverride：给「导入文档页」这类需要更高超采样的页面用；仍受下面两道预算夹取。
+  const want =
+    wantOverride && wantOverride > 0 ? wantOverride : inkRenderDprForZoom(deviceDpr, zoom);
+  const cssW = pageWidth * zoom;
+  const cssH = pageHeight * zoom;
+  const basePx = cssW * cssH;
+  if (!(cssW > 0 && cssH > 0) || !Number.isFinite(basePx) || !(want > 0)) {
+    return want;
+  }
+  const pixelCapDpr = Math.sqrt(MAX_CANVAS_PIXELS / basePx);
+  const budgetCapDpr = Math.sqrt(MOUNT_BUDGET_BYTES / (MIN_MOUNTED * basePx * 4 * 2));
+  const upper = Math.min(want, pixelCapDpr, budgetCapDpr);
+  // 与旧 clamp(x, 0.75, want) 一致：want 本身低于 0.75 时仍保留 want。
+  const floor = Math.min(0.75, want);
+  const fits = (d: number): boolean => {
+    const w = Math.round(cssW * d);
+    const h = Math.round(cssH * d);
+    if (!(w > 0 && h > 0)) return false;
+    const px = w * h;
+    return (
+      px <= MAX_CANVAS_PIXELS &&
+      MIN_MOUNTED * px * 4 * 2 <= MOUNT_BUDGET_BYTES
+    );
+  };
+  if (!fits(floor)) return floor; // 极端自定义纸张仍守住既有地板
+  if (fits(upper)) return upper;
+  let lo = floor;
+  let hi = upper;
+  for (let i = 0; i < 24; i++) {
+    const mid = (lo + hi) / 2;
+    if (fits(mid)) lo = mid;
+    else hi = mid;
+  }
+  return lo;
+}
 
 export interface EditorOptions {
   app?: unknown;
@@ -433,6 +669,13 @@ export interface EditorOptions {
    * 只对自由笔迹生效（荧光笔、圆珠笔、钢笔），不碰形状工具。
    */
   straighten?: boolean;
+  /**
+   * 一笔成型：off / lift（抬笔即识别）。只有开 / 关两态。
+   * 只作用于钢笔 / 圆珠笔；荧光笔的半透明叠加与形状工具都不参与。
+   */
+  shapeSnap?: "off" | "lift";
+  /** 激光笔：落笔只留会淡出的指示光迹，不写进本子 */
+  laserPointer?: boolean;
   onState?: () => void;
   onChange?: () => void;
   onPageChange?: (index: number) => void;
@@ -458,6 +701,27 @@ export interface EditorOptions {
    * 一致地"字不见了"）。原文不丢，但用户看不到就得告诉他。
    */
   onTextOverflow?: (hiddenLines: number) => void;
+  /**
+   * 点了文字里的 `[[双链]]`。由 view 负责解析目标并打开笔记
+   * （Markdown 走 workspace.openLinkText、.inkbook 走 openBookAt）。
+   * href 是「目标[#标题]」，page 只在 `.inkbook#数字` 时有值。
+   */
+  onOpenWikiLink?: (href: string, page: number | undefined, newTab: boolean) => void;
+  /**
+   * 文件块属性条上点了「打开源文件」：由 view 解析并打开源笔记 / Excalidraw 文件。
+   */
+  onOpenFileSource?: (path: string) => void;
+  /**
+   * 文件块属性条上点了「刷新快照」：由 view 重新生成快照，再调用
+   * `editor.updateFileBlockSnapshot` 替换。参数是当前选中的图片对象。
+   */
+  onRefreshFileBlock?: (image: PageImage) => void;
+  /**
+   * 文字输入框里打 `[[` 时，返回可链接的库内文件（像原生 Obsidian 的链接补全）。
+   * 由 view 提供（它拿得到 app.vault）；没有这个回调时自动补全整体不启用，
+   * 不影响手打 `[[...]]` 的原有行为。
+   */
+  getLinkTargets?: () => LinkTarget[];
 }
 
 /** 按住连调：第一次重复前的等待（先 400ms 再开始加速） */
@@ -568,11 +832,26 @@ export class BookEditor {
   tool: ToolId = "pen";
   penColor = "#1A1A1A";
   penSize = 2.8;
+  ballpointSize = 2.8;
   highlighterColor = "#F2C84B";
   highlighterSize = 24;
   shapeKind: ShapeKind = "rect";
+  /*
+   * 形状线宽：每种形状各记各的（用户要求「不同的形状不再共用同一个粗细」）。
+   * 用 Record 而不是单个字段，切换形状种类时线宽自动跟着那一类走。
+   */
+  shapeSizes: Record<ShapeKind, number> = { line: 2.8, arrow: 2.8, rect: 2.8, ellipse: 2.8 };
   /** 自动把直线画直的开关（由设置同步进来） */
   private straighten = false;
+  /** ========== 经典手写应用移植功能（默认关） ========== */
+  /** 一笔成型：off / lift（抬笔即识别），只有开 / 关两态 */
+  private shapeSnap: "off" | "lift" = "off";
+  /** 激光笔光迹：页面坐标 + 落点时刻，按时间淡出 */
+  private laserOn = false;
+  private laserTrail: Array<{ x: number; y: number; t: number }> = [];
+  private laserRaf = 0;
+  /** 光迹属于哪一页：滚动到别的页时别把光迹画错地方 */
+  private laserPage = -1;
   eraserMode: "whole" | "part" = "part";
   eraserSize = 26;
   zoom = 0.8;
@@ -582,6 +861,14 @@ export class BookEditor {
   private recs: PageRec[] = [];
   private observer: IntersectionObserver | null = null;
   private current = 0;
+  /**
+   * 程序化翻页锁：点「下一页/上一页」后页码已经先切到目标页，平滑滚动途中
+   * 探针仍停在旧页附近；这里在滚动到位（或超时）前压住 updateCurrentFromScroll，
+   * 免得页码被中间页改回去又跳回来（用户要的是「页码先到、页面再滑过去」）。
+   */
+  private navLockTarget: { top: number; until: number } | null = null;
+  /** 快滑结束后的收尾定时器：只在停稳后补挂当前页 / 广播一次页码 */
+  private scrollSettleTimer = 0;
   /** 落点提示（locatePage）的自动清理定时器；0 = 当前没有提示 */
   private locateTimer = 0;
   /** 当前打着落点提示的页：同一时刻只保留一个，新提示先收掉旧的 */
@@ -627,6 +914,23 @@ export class BookEditor {
    */
   private textEditStylePress = false;
   private textEditPointerHandler: ((e: PointerEvent) => void) | null = null;
+  /**
+   * 文字输入框里打 `[[` 后弹出的「链接到哪篇笔记」候选列表
+   * （类原生 Obsidian 的链接补全）。挂在 document.body 上、fixed 定位，
+   * 因为输入框在缩放容器里，挂在页面内会被 `.mb-textlayer` / 页面 overflow 裁掉。
+   */
+  private linkSuggestEl: HTMLElement | null = null;
+  /** 当前候选（已按已输入内容过滤），以及高亮项下标 */
+  private linkSuggestItems: LinkTarget[] = [];
+  private linkSuggestIndex = 0;
+  /** 触发 `[[` 在 textarea.value 里的起点；-1 = 当前没有补全 */
+  private linkSuggestStart = -1;
+  /** 候选列表贴着哪个输入框定位 */
+  private linkSuggestAnchor: HTMLTextAreaElement | null = null;
+  /** 打开期间监听滚动 / 尺寸变化，重新贴回输入框 */
+  private linkSuggestReposition: (() => void) | null = null;
+  /** 本次编辑会话的候选缓存（库文件在编辑期间基本不变，避免每次按键都全量扫描） */
+  private linkTargetsCache: LinkTarget[] | null = null;
   /** 正在补抽文字的页（防止重复触发） */
   private textExtracting = new Set<number>();
   /** 新建文字用的字号（页面坐标）；已有文字编辑时保持它自己的字号 */
@@ -656,6 +960,72 @@ export class BookEditor {
   } | null = null;
   /** 上一次点文字的时间，用来识别双击（双击进编辑） */
   private lastTextTap: { id: string; t: number } | null = null;
+  /**
+   * 当前选中的**形状**笔迹 id（选择工具下有意义）。
+   *
+   * 只针对 `tool === "shape"` 画出的矩形 / 椭圆 / 直线 / 箭头：用户明确要求
+   * 「选择功能能选中画出的形状并调整位置和大小」，普通笔迹仍不参与选择
+   * （与 INK-100 移除通用笔迹选区一致）。与 `selectedTextId` 互斥。
+   */
+  private selectedShapeId: string | null = null;
+  /** 正在拖动选中的形状（选择工具） */
+  private moveShape: {
+    rec: PageRec;
+    id: string;
+    startX: number;
+    startY: number;
+    /** 拖动起点时的原始采样点（只读，用来每帧从原点重算） */
+    origin: Pt[];
+    /** 拖动起点的包围盒（含笔宽外扩），用于把整块夹在纸内 */
+    origBox: Bounds;
+    /** 上一帧的包围盒，用来把「旧位置 + 新位置」并成一次局部重绘 */
+    prevBounds: Bounds | null;
+    moved: boolean;
+  } | null = null;
+  /** 正在拖动形状选框上的缩放手柄（选择工具） */
+  private resizeShape: {
+    rec: PageRec;
+    id: string;
+    handle: ShapeHandle;
+    startX: number;
+    startY: number;
+    origin: Pt[];
+    origBox: Bounds;
+    prevBounds: Bounds | null;
+    moved: boolean;
+  } | null = null;
+  /**
+   * 当前选中的**插入图片** id（选择工具下有意义）。
+   *
+   * 与 `selectedTextId` / `selectedShapeId` 三者互斥：一次只选中一个对象，
+   * 否则三个选框会叠在一起。图片是"贴纸"，选中后能拖动 / 四角缩放 / 删除。
+   */
+  private selectedImageId: string | null = null;
+  /** 正在拖动选中的图片（选择工具） */
+  private moveImage: {
+    rec: PageRec;
+    id: string;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+    prevBox: Bounds | null;
+    moved: boolean;
+  } | null = null;
+  /** 正在拖动图片选框的角手柄改大小（选择工具，保持长宽比） */
+  private resizeImage: {
+    rec: PageRec;
+    id: string;
+    handle: ShapeHandle;
+    startX: number;
+    startY: number;
+    origBox: Bounds;
+    aspect: number;
+    prevBox: Bounds | null;
+    moved: boolean;
+  } | null = null;
+  /** 选中图片后浮在图片上方的属性条（尺寸 + 删除） */
+  private imageBarEl: HTMLElement | null = null;
   /** 选中文字后浮在纸上方的属性条 */
   private textBarEl: HTMLElement | null = null;
   /**
@@ -706,6 +1076,12 @@ export class BookEditor {
   private lastPressure: number | null = null;
   /** 输入滤波：去掉手抖和采样噪声 */
   private smoother = new OneEuroFilter(1.4, 0.035, 1.0);
+  /**
+   * 实时笔迹预测器：自适应预测时长 + 拟合修正 + 限幅。
+   * 只在 overlay 预览里生成递细的贝塞尔尾巴，落笔数据仍是原始采样点，
+   * 抬笔后尾巴自动丢弃——存档格式不变。
+   */
+  private inkPredictor = new InkPredictor();
   /** 上一笔的速度（页面单位/秒），用于速度—粗细联动 */
   private lastSpeed = 0;
   private pan: { x: number; y: number; left: number; top: number } | null = null;
@@ -743,7 +1119,65 @@ export class BookEditor {
     last: number;
     /** rAF 句柄 */
     raf: number;
+    /**
+     * 本次惯性期间的最大可滚动距离（scrollHeight - clientHeight，px）。
+     *
+     * INK-229：原来每帧都读 `el.scrollHeight - el.clientHeight`，这是强制同步
+     * 布局；而惯性期间页 DOM 结构不变（只是挂/卸画布，不改变 scrollHeight），
+     * 所以起手时算一次就够，整个滑行复用。
+     */
+    max: number;
   } | null = null;
+  /** 快速滑动的尾部宽限期；IO 在这段时间内新挂的页先不建几百/几千个文字 span。 */
+  private fastScrollUntil = 0;
+  /**
+   * 快滑期间挂起的「软挂载预算」检查。
+   *
+   * IO 每跨一页都会回调，旧实现每次都遍历挂载页、读一堆 getBoundingClientRect
+   * 再排序卸载；平板快速上下滑动时这些强制同步布局和 mount/unmount 抖动正是
+   * 一卡一卡的来源。这里把软预算合并到一帧、快滑期直接延后到静止点；
+   * 只有 MAX_MOUNTED 页数硬上限仍立即兜底，当前页挂载与视觉内容不变。
+   */
+  private mountLimitPending = false;
+  /** 合并非快滑期多次 IO 回调的 rAF；0 = 没有排队。 */
+  private mountLimitRaf = 0;
+  /** 120ms 没有新的滑动帧就一次性补齐所有延后的文字层。 */
+  private textLayerIdleTimer = 0;
+  /** 快滑期间已挂载、尚未补建文字层的页（被卸载时自动移除）。 */
+  private deferredTextLayers = new Set<PageRec>();
+  /** 拆下来的文字层 LRU，最多 MAX_MOUNTED 条，避免重复 mount 重建大量 span。 */
+  private textLayerCache = new Map<string, CachedTextLayer>();
+  /**
+   * 「笔记内查找」当前的查询词与**当前那条**命中（其余命中只标普通高亮）。
+   *
+   * 只作为渲染态：不进 store、不写盘、不参与撤销。文字 span 是按页数据
+   * 重建的，所以查询词一变就要重画已挂载的文字层，并把旧缓存整批作废——
+   * 否则滚回来复用的还是上一轮带（或不带）高亮的那层 DOM。
+   */
+  private findQuery = "";
+  private findHit: FindMatch | null = null;
+  /**
+   * 拆下来的**主画布** LRU（INK-229 平板上下滑卡顿）。
+   *
+   * 卸载页时把已经画好的主 canvas 整块留着，滚回来签名一致就秒复用，
+   * 不再每跨一页重分配 backing + 全量重绘（这正是「每滑一页顿一下」的根因）。
+   * 按 **字节 + 条数** 双上限做 LRU（见 RASTER_CACHE_BYTES / MAX_RASTER_CACHED），
+   * 不是只按页数：高倍率下一页两块能到 83MB，按页数会爆显存。
+   * 条目里只放主画布，overlay 每次重画。
+   */
+  private rasterCache = new Map<string, CachedRaster>();
+  private rasterCacheBytes = 0;
+  /**
+   * 整本内容年代号：只在「多页像素一起变」（撤销重做 / 整本换模板 /
+   * 页对象重建）时 +1，rasterCache 里所有旧画布随之作废。
+   *
+   * 单页改动不走它：那些只把该页的缓存条目删掉（invalidateRaster），
+   * 不惊动其它页——否则 PDF/Word 笔记首轮滚动时逐页补抽文字会把刚画好
+   * 的画布一次次全清空。签名带上它，保证整本回滚后绝不复用旧像素。
+   */
+  private contentEpoch = 0;
+  /** 手写字体就绪会改变字宽，缓存里的旧 span 一律失效。 */
+  private handFontEpoch = 0;
   /**
    * 滚动速度采样。
    *
@@ -759,6 +1193,14 @@ export class BookEditor {
   /** 捏合期间 onState 的每帧合并（避免每帧刷整条工具栏） */
   private pinchStateRaf = 0;
   private destroyed = false;
+  /**
+   * 取消订阅「手写字体就绪」（见 src/handfont.ts）。
+   *
+   * 字体是异步解码的，第一屏文字往往在它到位之前就渲染完了：那时 span 的
+   * font-family 已经写了 `"Inkbook Hand"`，浏览器按字回落到 Noto，等字体
+   * 注册好**不会自动重排**。所以在构造时订阅一次，到位后重排文字层。
+   */
+  private offHandFont: (() => void) | null = null;
   private globalUp = (e: PointerEvent) => {
     if (this.gesture === "none" || this.pointerId !== e.pointerId) return;
     const rec = this.recs[this.current];
@@ -849,7 +1291,7 @@ export class BookEditor {
    * 侧栏缩略图专用的 PDF 位图缓存。
    *
    * 为什么不跟主视图共用一份：
-   *   主视图要的是"当前缩放下的清晰度"（放大到 2.8 倍时一张 2000px 宽、约 10MB），
+   *   主视图要的是"当前缩放下的清晰度"（放大到 3.5 倍时一张更大位图，旧上限 2.8 倍时约 2000px 宽、10MB），
    *   缩略图只要 160px 宽、约 150KB。共用同一个 LRU 的话，用户在侧栏
    *   翻上几十页就会把高清位图全挤出去，回到主视图又得重新光栅化、白闪一片。
    *   分开之后：缩略图浏览再狠也只吃自己那 32MB。
@@ -971,6 +1413,10 @@ export class BookEditor {
   private pinchNeedsRedraw = false;
   /** 手势结束后继续冻结页码判定的定时器（补偿还会再触发几帧 scroll） */
   private pinchReleaseTimer = 0;
+  /** 同一帧只保留最后一次绝对 PinchInfo，避免两根手指各发一次 move 就全量重排两次。 */
+  private pendingPinchInfo: PinchInfo | null = null;
+  /** 捏合合流帧；0 = 当前没有排队，测试可据此确认一帧至多一次 applyPinch。 */
+  private pinchFrameRaf = 0;
   /**
    * 锁定锚点时的 scrollTop。
    *
@@ -993,8 +1439,12 @@ export class BookEditor {
     this.current = clamp(store.data.activePage || 0, 0, store.pageCount - 1);
     this.arbiter = new TouchArbiter({
       onGestureStart: (info) => this.beginPinch(info),
-      onGestureMove: (info) => this.applyPinch(info),
-      onGestureEnd: () => this.endPinch(),
+      onGestureMove: (info) => this.queuePinch(info),
+      // 手势结束前必须先把这一帧的尾部坐标落下去，否则最终 zoom 会少一截。
+      onGestureEnd: () => {
+        this.flushPendingPinch();
+        this.endPinch();
+      },
     });
 
     this.host.classList.add("mb-host");
@@ -1076,6 +1526,8 @@ export class BookEditor {
 
     if (this.opts.edgeSwipeBlock !== false) this.installEdgeSwipeGuard();
     this.straighten = this.opts.straighten === true;
+    this.shapeSnap = normalizeShapeSnap(this.opts.shapeSnap);
+    this.laserOn = this.opts.laserPointer === true;
 
     if (typeof ResizeObserver !== "undefined") {
       this.resizeObserver = new ResizeObserver(() => {
@@ -1095,6 +1547,36 @@ export class BookEditor {
 
     this.renderPages();
     this.applyTouchAction();
+    /*
+     * 手写字体（INK-224）：注册是异步的（要解码 1.6MB base64 + 解析 woff2），
+     * 第一屏文字大概率在它到位之前就渲染完了。那时 span 的 font-family
+     * 已经写着 `"Inkbook Hand"`，浏览器按字回落到 Noto Sans SC ——
+     * 字体注册完成**不会**自动重排（CSS 只认家族名，不认加载状态）。
+     *
+     * 所以这里订阅一次：字体到位后重排所有已挂载页的文字层。
+     * 只重排文字层，不重画笔迹（笔迹与字体无关，重画是白烧一遍 CPU）。
+     */
+    ensureHandFontIdle();
+    this.offHandFont = onHandFontReady(() => {
+      if (this.destroyed) return;
+      // 手写字体改变字宽：拆下来的旧文字层绝不能再复用。
+      this.handFontEpoch += 1;
+      this.invalidateTextLayerCache();
+      for (const rec of this.recs) {
+        if (rec.mounted) this.renderTextLayer(rec);
+      }
+      /*
+       * 正在编辑的 textarea 也要跟着换字体：它是独立的 DOM 元素，
+       * 不跟着文字层走。用户在字体到位前就开始打字时能看到字形突然变化，
+       * 比"提交后跳一下"自然。
+       *
+       * 这里只改样式，不走 applyTextEditStyle —— 那个函数末尾会把焦点
+       * 抢回 textarea，而字体到位是**异步**的，可能发生在用户已经去点
+       * 侧栏的时候，抢焦点会打断他。
+       */
+      const ed = this.textEdit;
+      if (ed) ed.el.style.fontFamily = textFontStack(ed.font);
+    });
     requestAnimationFrame(() => {
       this.applyLayout();
       this.measurePageMetrics();
@@ -1168,7 +1650,11 @@ export class BookEditor {
   isInkBusy(): boolean {
     return (
       this.pointerId != null &&
-      (this.gesture === "draw" || this.gesture === "shape" || this.gesture === "erase")
+      (this.gesture === "draw" ||
+        this.gesture === "shape" ||
+        this.gesture === "erase" ||
+        this.gesture === "moveShape" ||
+        this.gesture === "resizeShape")
     );
   }
 
@@ -1183,6 +1669,15 @@ export class BookEditor {
    * 返回是否真的结束了一个墨水手势。
    */
   finishInkGesture(): boolean {
+    // 激光笔不改内容，失焦时只把光迹收掉，不能走「提交草稿」那条路
+    if (this.gesture === "laser") {
+      this.gesture = "none";
+      this.pointerId = null;
+      this.laserTrail = [];
+      this.stopLaserFade();
+      this.repaintOverlays();
+      return false;
+    }
     if (this.gesture === "draw" || this.gesture === "shape") {
       const rec = this.draftRec;
       // 先把手势状态清掉，再提交：commitDraft → changed → markDirty
@@ -1190,6 +1685,7 @@ export class BookEditor {
       this.gesture = "none";
       this.pointerId = null;
       this.smoother.reset();
+      this.inkPredictor.reset();
       if (rec) {
         this.commitDraft(rec);
       } else {
@@ -1210,6 +1706,10 @@ export class BookEditor {
       if (this.opts.onInkGestureEnd) this.opts.onInkGestureEnd();
       return true;
     }
+    if (this.gesture === "moveShape" || this.gesture === "resizeShape") {
+      this.finishShapeEdit();
+      return true;
+    }
     return false;
   }
 
@@ -1223,9 +1723,11 @@ export class BookEditor {
       tool: this.tool,
       penColor: this.penColor,
       penSize: this.penSize,
+      ballpointSize: this.ballpointSize,
       highlighterColor: this.highlighterColor,
       highlighterSize: this.highlighterSize,
       shapeKind: this.shapeKind,
+      shapeSize: this.shapeSizes[this.shapeKind] ?? this.penSize,
       textSize: this.textSizeValue,
       textFont: this.textFontValue,
       textColor: this.textColorValue,
@@ -1279,6 +1781,16 @@ export class BookEditor {
       this.textBarEl?.remove();
       this.textBarEl = null;
     }
+    // 形状选择同理：换了页 / 撤销 / 删除把笔迹去掉了，就丢掉这个 id
+    if (this.selectedShapeId && !this.selectedShape) {
+      this.selectedShapeId = null;
+    }
+    // 图片选择同理：换页 / 撤销 / 删除后当前页找不到它了，连属性条一起收掉
+    if (this.selectedImageId && !this.selectedImage) {
+      this.selectedImageId = null;
+      this.imageBarEl?.remove();
+      this.imageBarEl = null;
+    }
     if (this.opts.onState) this.opts.onState();
   }
 
@@ -1298,6 +1810,19 @@ export class BookEditor {
      */
     const page = this.store.page;
     if (page) this.invalidateThumb(page.id);
+    /*
+     * 内容变了 → 该页脱离 DOM 的旧主画布像素作废（INK-229）。
+     *
+     * 所有「改变某页像素」的入口（落笔 / 擦除 / 模板纸张 / 图层 / 撤销重做）
+     * 最后都会走到 changed()。这里只作废**当前页**那一条：
+     *   · 改动作用的就是 current 页，其余页像素没变，没有理由一起丢；
+     *   · 更关键的是首轮滚动——PDF/Word 笔记每页首次挂载都会异步补抽文字
+     *     并调一次 changed()，若这里全局清空，刚滑过去那几页已画好的画布
+     *     会被全部丢掉，「滚回去秒开」的复用机会一次都用不上。
+     * 多页一起变的路径（整本换模板 / 撤销重做 / 页对象重建 / 底图到位）
+     * 各自显式调 invalidateRasterCache()，绝不错画。
+     */
+    if (page) this.invalidateRaster(page.id);
     if (this.opts.onChange) this.opts.onChange();
   }
 
@@ -1324,6 +1849,8 @@ export class BookEditor {
 
   setPrediction(on: boolean): void {
     this.opts.prediction = on;
+    // 关掉再打开时不能接着上一笔的滑窗预测，否则尾巴会跳到旧位置
+    this.inkPredictor.reset();
   }
 
   setTool(tool: ToolId): void {
@@ -1336,6 +1863,10 @@ export class BookEditor {
     this.clearEraserPos();
     // 离开文字/选择工具就没有"选中文字"这回事了，属性条一并收掉
     if (tool !== "text" && tool !== "select") this.selectText(null);
+    // 形状选择只在「选择」工具下有意义：切到别的工具就取消
+    if (tool !== "select") this.selectShape(null);
+    // 图片选择同理：只在「选择」工具下有意义
+    if (tool !== "select") this.selectImage(null);
     this.applyTouchAction();
     this.emitState();
   }
@@ -1495,6 +2026,7 @@ export class BookEditor {
   selectText(id: string | null): void {
     if (this.selectedTextId === id) return;
     this.selectedTextId = id;
+    if (id) this.clearImageSelection();
     const rec = this.recs[this.current];
     if (rec) this.renderOverlay(rec);
     this.syncTextBar();
@@ -1563,6 +2095,726 @@ export class BookEditor {
     this.emitState();
   }
 
+  /* --------------------------- 选中形状对象 --------------------------- */
+
+  /** 当前页选中的形状笔迹；页面里找不到（或被撤销/删除）就是 null */
+  get selectedShape(): Stroke | null {
+    if (!this.selectedShapeId) return null;
+    const page = this.store.data.pages[this.current];
+    if (!page) return null;
+    const s = this.findStrokeById(page, this.selectedShapeId);
+    return s && s.tool === "shape" ? s : null;
+  }
+
+  /** 按 id 在整页各层里找一条笔迹 */
+  private findStrokeById(page: Page, id: string): Stroke | null {
+    for (const layer of page.layers) {
+      const s = layer.strokes.find((x) => x.id === id);
+      if (s) return s;
+    }
+    return null;
+  }
+
+  /**
+   * 选中 / 取消选中一条形状笔迹。
+   *
+   * 与 `selectText` 互斥：选中形状时先清掉文字选择，避免两个选框同时出现。
+   */
+  selectShape(id: string | null): void {
+    if (this.selectedShapeId === id) return;
+    this.selectedShapeId = id;
+    if (id) {
+      this.selectText(null);
+      this.clearImageSelection();
+    }
+    const rec = this.recs[this.current];
+    if (rec) this.renderOverlay(rec);
+    this.emitState();
+  }
+
+  /**
+   * 形状选框的几何：紧贴笔迹点集的包围盒（含笔宽/箭头外扩余量）。
+   *
+   * 画框、手柄命中都读这一份；缩放的坐标映射另用 `rawPointBounds`（不含
+   * 外扩），否则按含 padding 的框做比例映射会让没拖动的那条边也漂移几像素。
+   */
+  private shapeSelBox(s: Stroke): Bounds {
+    return strokeBounds(s);
+  }
+
+  /** 只按点集算的裸包围盒（不做笔宽外扩），缩放映射用 */
+  private rawPointBounds(s: Stroke): Bounds {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const p of s.points) {
+      if (p[0] < minX) minX = p[0];
+      if (p[1] < minY) minY = p[1];
+      if (p[0] > maxX) maxX = p[0];
+      if (p[1] > maxY) maxY = p[1];
+    }
+    if (!Number.isFinite(minX)) minX = minY = maxX = maxY = 0;
+    return { minX, minY, maxX, maxY };
+  }
+
+  /** 形状选框上的 8 个手柄位置（页面坐标） */
+  private shapeHandlePoints(b: Bounds): Array<{ h: ShapeHandle; x: number; y: number }> {
+    const mx = (b.minX + b.maxX) / 2;
+    const my = (b.minY + b.maxY) / 2;
+    return [
+      { h: "nw", x: b.minX, y: b.minY },
+      { h: "n", x: mx, y: b.minY },
+      { h: "ne", x: b.maxX, y: b.minY },
+      { h: "e", x: b.maxX, y: my },
+      { h: "se", x: b.maxX, y: b.maxY },
+      { h: "s", x: mx, y: b.maxY },
+      { h: "sw", x: b.minX, y: b.maxY },
+      { h: "w", x: b.minX, y: my },
+    ];
+  }
+
+  /** 命中了哪个缩放手柄（半径按屏幕像素反算，照顾手指） */
+  private hitShapeHandle(b: Bounds, px: number, py: number, hitR: number): ShapeHandle | null {
+    for (const hp of this.shapeHandlePoints(b)) {
+      if (Math.hypot(px - hp.x, py - hp.y) <= hitR) return hp.h;
+    }
+    return null;
+  }
+
+  /**
+   * 点是否落在某条形状笔迹的可选区域内。
+   *
+   * 矩形 / 椭圆的**内部**也算命中（形状是空心描边，只认边线的话很难点中）；
+   * 直线 / 箭头按到线段的距离判。容差按屏幕像素反算，缩放下手感一致。
+   */
+  private shapeStrokeHit(s: Stroke, x: number, y: number): boolean {
+    const pts = s.points;
+    if (pts.length < 2) return false;
+    const [x1, y1] = pts[0];
+    const [x2, y2] = pts[pts.length - 1];
+    const tol = Math.max(7 / this.zoom, s.size / 2 + 2);
+    const kind = s.shape ?? "rect";
+    const minX = Math.min(x1, x2);
+    const maxX = Math.max(x1, x2);
+    const minY = Math.min(y1, y2);
+    const maxY = Math.max(y1, y2);
+    const w = maxX - minX;
+    const h = maxY - minY;
+    if (kind === "rect" || kind === "ellipse") {
+      // 退化成一条线（宽或高≈0）时按线段判，否则点不到
+      if (w < 1 || h < 1) return pointSegmentDistance(x, y, x1, y1, x2, y2) <= tol;
+      if (kind === "rect") {
+        return x >= minX - tol && x <= maxX + tol && y >= minY - tol && y <= maxY + tol;
+      }
+      const cx = (minX + maxX) / 2;
+      const cy = (minY + maxY) / 2;
+      const rx = w / 2 + tol;
+      const ry = h / 2 + tol;
+      const nx = (x - cx) / rx;
+      const ny = (y - cy) / ry;
+      return nx * nx + ny * ny <= 1;
+    }
+    return pointSegmentDistance(x, y, x1, y1, x2, y2) <= tol;
+  }
+
+  /** 选择工具下，取点处最上层（后画）的形状笔迹 */
+  private hitShape(page: Page, x: number, y: number): Stroke | null {
+    for (let li = page.layers.length - 1; li >= 0; li--) {
+      const layer = page.layers[li];
+      if (!layer.visible) continue;
+      for (let si = layer.strokes.length - 1; si >= 0; si--) {
+        const s = layer.strokes[si];
+        if (s.tool !== "shape") continue;
+        if (this.shapeStrokeHit(s, x, y)) return s;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 按下形状选框、开始拖动/缩放。
+   *
+   * 历史在**第一次真正移动**时才 snapshot（点一下选中不该产生一条撤销记录），
+   * 拖动期间原地改 points 并做局部重绘，抬手时 touch() 结算成一条历史。
+   */
+  private beginShapeGesture(
+    rec: PageRec,
+    stroke: Stroke,
+    px: number,
+    py: number,
+    e: PointerEvent,
+    handle: ShapeHandle | null
+  ): void {
+    const origin = stroke.points.map((p) => [p[0], p[1], p[2]] as Pt);
+    const box = strokeBounds(stroke);
+    const raw = this.rawPointBounds(stroke);
+    this.pointerId = e.pointerId;
+    if (handle) {
+      this.gesture = "resizeShape";
+      this.resizeShape = {
+        rec,
+        id: stroke.id,
+        handle,
+        startX: px,
+        startY: py,
+        origin,
+        origBox: raw,
+        prevBounds: { ...box },
+        moved: false,
+      };
+      this.moveShape = null;
+    } else {
+      this.gesture = "moveShape";
+      this.moveShape = {
+        rec,
+        id: stroke.id,
+        startX: px,
+        startY: py,
+        origin,
+        origBox: { ...box },
+        prevBounds: { ...box },
+        moved: false,
+      };
+      this.resizeShape = null;
+    }
+    try {
+      rec.pageEl.setPointerCapture?.(e.pointerId);
+    } catch (_) {}
+    e.preventDefault();
+  }
+
+  /**
+   * 结束形状拖动/缩放：结算一条撤销记录并整页重画一次（收掉局部重绘可能
+   * 残留的半像素）。onUp / 切后台 / 笔落下打断都走这一处。
+   */
+  private finishShapeEdit(): void {
+    const m = this.moveShape ?? this.resizeShape;
+    const rec = m?.rec ?? null;
+    const moved = !!m?.moved;
+    if (this.gesture === "moveShape" || this.gesture === "resizeShape") this.gesture = "none";
+    this.pointerId = null;
+    this.moveShape = null;
+    this.resizeShape = null;
+    if (!moved || !rec) return;
+    this.store.touch();
+    this.changed();
+    this.renderRec(rec);
+    this.renderOverlay(rec);
+    this.emitState();
+    if (this.opts.onInkGestureEnd) this.opts.onInkGestureEnd();
+  }
+
+  /**
+   * 把裸包围盒按拖动的手柄、按位移量算成新包围盒。
+   *
+   * 用位移（dx/dy）而不是绝对坐标：手柄画在含笔宽外扩的选框上，而坐标映射
+   * 用的是裸点集，两者相差一个 padding；按位移改边就不会把那点 padding
+   * 带进结果，没被拖的边严格不动。
+   * 只动被拖的那条边 / 角；小于最小尺寸时绕中心撑开，最后夹在纸内。
+   */
+  private resizeRawBox(
+    ob: Bounds,
+    handle: ShapeHandle,
+    dx: number,
+    dy: number
+  ): Bounds {
+    let minX = ob.minX;
+    let maxX = ob.maxX;
+    let minY = ob.minY;
+    let maxY = ob.maxY;
+    if (handle.includes("w")) minX = ob.minX + dx;
+    if (handle.includes("e")) maxX = ob.maxX + dx;
+    if (handle.includes("n")) minY = ob.minY + dy;
+    if (handle.includes("s")) maxY = ob.maxY + dy;
+    let x0 = Math.min(minX, maxX);
+    let x1 = Math.max(minX, maxX);
+    let y0 = Math.min(minY, maxY);
+    let y1 = Math.max(minY, maxY);
+    const MIN = 6;
+    if (x1 - x0 < MIN) {
+      const c = (x0 + x1) / 2;
+      x0 = c - MIN / 2;
+      x1 = c + MIN / 2;
+    }
+    if (y1 - y0 < MIN) {
+      const c = (y0 + y1) / 2;
+      y0 = c - MIN / 2;
+      y1 = c + MIN / 2;
+    }
+    const W = this.store.data.width;
+    const H = this.store.data.height;
+    return {
+      minX: clamp(x0, 0, W),
+      minY: clamp(y0, 0, H),
+      maxX: clamp(x1, 0, W),
+      maxY: clamp(y1, 0, H),
+    };
+  }
+
+  /** 把两块包围盒并成一块（外扩 pad），用于拖动时一次局部重绘旧+新位置 */
+  private dirtyUnion(a: Bounds | null, b: Bounds, pad: number): Bounds {
+    if (!a) {
+      return { minX: b.minX - pad, minY: b.minY - pad, maxX: b.maxX + pad, maxY: b.maxY + pad };
+    }
+    return {
+      minX: Math.min(a.minX, b.minX) - pad,
+      minY: Math.min(a.minY, b.minY) - pad,
+      maxX: Math.max(a.maxX, b.maxX) + pad,
+      maxY: Math.max(a.maxY, b.maxY) + pad,
+    };
+  }
+
+  /** 删掉选中的形状（Delete / Backspace） */
+  deleteSelectedShape(): void {
+    if (this.readOnly) return;
+    const sel = this.selectedShape;
+    const rec = this.recs[this.current];
+    if (!sel || !rec) return;
+    this.store.removeStrokes(new Set([sel.id]), rec.index);
+    this.selectedShapeId = null;
+    this.changed();
+    this.renderRec(rec);
+    this.renderOverlay(rec);
+    this.emitState();
+  }
+
+  /* --------------------------- 插入图片对象 --------------------------- */
+
+  /** 当前页选中的图片；页面里找不到就是 null */
+  get selectedImage(): PageImage | null {
+    if (!this.selectedImageId) return null;
+    const page = this.store.data.pages[this.current];
+    return page?.images?.find((im) => im.id === this.selectedImageId) ?? null;
+  }
+
+  /** 只是把「选中图片」这个状态清掉（不重画，调用方自己会重画） */
+  private clearImageSelection(): void {
+    if (!this.selectedImageId && !this.imageBarEl) return;
+    this.selectedImageId = null;
+    this.imageBarEl?.remove();
+    this.imageBarEl = null;
+  }
+
+  /**
+   * 选中 / 取消选中一张图片。与文字、形状选择三者互斥。
+   */
+  selectImage(id: string | null): void {
+    if (this.selectedImageId === id) return;
+    this.selectedImageId = id;
+    if (id) {
+      this.selectText(null);
+      this.selectShape(null);
+    }
+    const rec = this.recs[this.current];
+    if (rec) this.renderOverlay(rec);
+    this.syncImageBar();
+    this.emitState();
+  }
+
+  /** 图片选框的几何：就是它自己的矩形 */
+  private imageSelBox(im: PageImage): Bounds {
+    return { minX: im.x, minY: im.y, maxX: im.x + im.width, maxY: im.y + im.height };
+  }
+
+  /**
+   * 图片选框的 4 个角手柄。
+   *
+   * 图片只给四个角（不给四条边中点）：缩放要保持长宽比，边中点拖起来
+   * 要么只能单向拉伸导致变形，要么语义含糊。四角 + 锁比例最直观。
+   */
+  private imageHandlePoints(b: Bounds): Array<{ h: ShapeHandle; x: number; y: number }> {
+    return [
+      { h: "nw", x: b.minX, y: b.minY },
+      { h: "ne", x: b.maxX, y: b.minY },
+      { h: "se", x: b.maxX, y: b.maxY },
+      { h: "sw", x: b.minX, y: b.maxY },
+    ];
+  }
+
+  private hitImageHandle(b: Bounds, px: number, py: number, hitR: number): ShapeHandle | null {
+    for (const hp of this.imageHandlePoints(b)) {
+      if (Math.hypot(px - hp.x, py - hp.y) <= hitR) return hp.h;
+    }
+    return null;
+  }
+
+  /** 选择工具下取点处最上层（后插入）的图片 */
+  private hitImage(page: Page, x: number, y: number): PageImage | null {
+    const imgs = page.images;
+    if (!imgs?.length) return null;
+    for (let i = imgs.length - 1; i >= 0; i--) {
+      const im = imgs[i];
+      if (x >= im.x && x <= im.x + im.width && y >= im.y && y <= im.y + im.height) return im;
+    }
+    return null;
+  }
+
+  /**
+   * 按下图片选框，开始拖动 / 缩放。
+   * 历史与形状一致：第一次真正移动才 snapshot，抬手时 touch() 结算成一条。
+   */
+  private beginImageGesture(
+    rec: PageRec,
+    im: PageImage,
+    px: number,
+    py: number,
+    e: PointerEvent,
+    handle: ShapeHandle | null
+  ): void {
+    this.pointerId = e.pointerId;
+    const box = this.imageSelBox(im);
+    if (handle) {
+      this.gesture = "resizeImage";
+      this.resizeImage = {
+        rec,
+        id: im.id,
+        handle,
+        startX: px,
+        startY: py,
+        origBox: box,
+        aspect: im.height > 0 ? im.width / im.height : 1,
+        prevBox: { ...box },
+        moved: false,
+      };
+      this.moveImage = null;
+    } else {
+      this.gesture = "moveImage";
+      this.moveImage = {
+        rec,
+        id: im.id,
+        startX: px,
+        startY: py,
+        originX: im.x,
+        originY: im.y,
+        prevBox: { ...box },
+        moved: false,
+      };
+      this.resizeImage = null;
+    }
+    try {
+      rec.pageEl.setPointerCapture?.(e.pointerId);
+    } catch (_) {}
+    e.preventDefault();
+  }
+
+  /** 结束图片拖动/缩放：结算一条撤销记录并整页重画一次 */
+  private finishImageEdit(): void {
+    const m = this.moveImage ?? this.resizeImage;
+    const rec = m?.rec ?? null;
+    const moved = !!m?.moved;
+    if (this.gesture === "moveImage" || this.gesture === "resizeImage") this.gesture = "none";
+    this.pointerId = null;
+    this.moveImage = null;
+    this.resizeImage = null;
+    if (!moved || !rec) return;
+    this.store.touch();
+    this.changed();
+    this.renderRec(rec);
+    this.renderOverlay(rec);
+    this.syncImageBar();
+    this.emitState();
+    if (this.opts.onInkGestureEnd) this.opts.onInkGestureEnd();
+  }
+
+  /**
+   * 四角缩放：保持长宽比，锚定对角，夹在纸内、最小 24px。
+   * 用位移（dx/dy）而不是绝对坐标，理由与形状缩放一致（手柄有外扩，
+   * 按位移改边才不会让没拖的那边漂移）。
+   */
+  private resizeImageBox(
+    orig: Bounds,
+    handle: ShapeHandle,
+    dx: number,
+    dy: number,
+    aspect: number
+  ): Bounds {
+    const W = this.store.data.width;
+    const H = this.store.data.height;
+    const ow = Math.max(1, orig.maxX - orig.minX);
+    const ratio = aspect > 0 ? aspect : ow / Math.max(1, orig.maxY - orig.minY);
+    const MIN = 24;
+    const anchorX = handle.includes("e") ? orig.minX : orig.maxX;
+    const anchorY = handle.includes("s") ? orig.minY : orig.maxY;
+    let newW = ow + (handle.includes("e") ? dx : -dx);
+    const maxWByPage = handle.includes("e") ? W - anchorX : anchorX;
+    const maxHByPage = handle.includes("s") ? H - anchorY : anchorY;
+    // 同时受页宽、页高约束（高度 = 宽 / 比例）
+    newW = Math.min(newW, maxWByPage, maxHByPage * ratio);
+    newW = Math.max(MIN, newW);
+    const newH = newW / ratio;
+    let x = handle.includes("e") ? anchorX : anchorX - newW;
+    let y = handle.includes("s") ? anchorY : anchorY - newH;
+    x = clamp(x, 0, Math.max(0, W - newW));
+    y = clamp(y, 0, Math.max(0, H - newH));
+    return { minX: x, minY: y, maxX: x + newW, maxY: y + newH };
+  }
+
+  /** 删掉选中的图片（Delete / 属性条上的「删除」）。图片文件保留：撤销要能找回来 */
+  deleteSelectedImage(): void {
+    if (this.readOnly) return;
+    const sel = this.selectedImage;
+    const rec = this.recs[this.current];
+    if (!sel || !rec) return;
+    const page = this.store.data.pages[rec.index];
+    if (!page?.images?.length) return;
+    this.store.snapshotPage(rec.index);
+    page.images = page.images.filter((im) => im.id !== sel.id);
+    if (!page.images.length) delete page.images;
+    this.store.touch();
+    this.changed();
+    this.selectedImageId = null;
+    this.imageBarEl?.remove();
+    this.imageBarEl = null;
+    this.renderRec(rec);
+    this.renderOverlay(rec);
+    this.emitState();
+  }
+
+  /** 当前页（可见区域中心）在页面坐标里的点，用来决定新图片落点 */
+  private pageViewportCenter(rec: PageRec): [number, number] {
+    const W = this.store.data.width;
+    const H = this.store.data.height;
+    try {
+      const r = rec.pageEl.getBoundingClientRect();
+      const sr = this.scrollEl?.getBoundingClientRect?.();
+      if (r.width > 0 && r.height > 0 && sr && sr.width > 0) {
+        const kx = W / r.width;
+        const ky = H / r.height;
+        const cx = (sr.left + sr.width / 2 - r.left) * kx;
+        const cy = (sr.top + sr.height / 2 - r.top) * ky;
+        if (Number.isFinite(cx) && Number.isFinite(cy)) {
+          return [clamp(cx, 0, W), clamp(cy, 0, H)];
+        }
+      }
+    } catch (_) {
+      /* 布局拿不到就退回纸中心 */
+    }
+    return [W / 2, H / 2];
+  }
+
+  /**
+   * 在当前页插入一张图片（对外入口：view 选好文件、量好尺寸后调用）。
+   *
+   * 落点默认在可见区域中心，按原始比例缩到页面的一小块里（见 fitImageRect）。
+   * 插入后立即选中它，用户切到「选择」工具就能直接拖动 / 缩放 / 删除。
+   * 走与文字/形状相同的 store.snapshotPage + touch：一次插入 = 一条撤销。
+   *
+   * `source` 非空时表示这是一块「文件块」（Excalidraw / 笔记 / 文本的快照），
+   * 选中后属性条会多出「打开源文件 / 刷新快照」。
+   */
+  insertImage(
+    src: string,
+    naturalWidth: number,
+    naturalHeight: number,
+    source?: PageFileSource
+  ): PageImage | null {
+    if (this.readOnly) return null;
+    const index = this.current;
+    const rec = this.recs[index];
+    const page = this.store.data.pages[index];
+    if (!rec || !page || !src) return null;
+    const W = this.store.data.width;
+    const H = this.store.data.height;
+    const [cx, cy] = this.pageViewportCenter(rec);
+    const rect = fitImageRect(naturalWidth, naturalHeight, W, H, cx, cy);
+    const img: PageImage = {
+      id: uid(),
+      src,
+      x: rect.x,
+      y: rect.y,
+      width: rect.width,
+      height: rect.height,
+    };
+    if (source) img.source = { ...source };
+    this.store.snapshotPage(index);
+    if (!page.images) page.images = [];
+    page.images.push(img);
+    this.store.touch();
+    this.changed();
+    this.renderRec(rec);
+    // 触发异步加载；加载完 loadBackground 的 onload 会重画这一页
+    this.loadBackground(src);
+    this.selectImage(img.id);
+    this.emitState();
+    return img;
+  }
+
+  /**
+   * 用一张新快照替换指定文件块的图片与尺寸（刷新用，一条撤销）。
+   *
+   * 源文件改了之后由 view 重新生成快照再调这里：替换 src / 宽高、更新
+   * `source.mtime`，让「源已更新」提示消失。旧快照从 bgImages 缓存里删掉避免残留。
+   */
+  updateFileBlockSnapshot(
+    id: string,
+    snap: { src: string; width: number; height: number; mtime?: number }
+  ): void {
+    if (this.readOnly) return;
+    const index = this.current;
+    const rec = this.recs[index];
+    const page = this.store.data.pages[index];
+    const img = page?.images?.find((im) => im.id === id);
+    if (!rec || !page || !img || !snap?.src) return;
+    const oldSrc = img.src;
+    this.store.snapshotPage(index);
+    img.src = snap.src;
+    if (snap.width > 0) img.width = snap.width;
+    if (snap.height > 0) img.height = snap.height;
+    if (img.source && Number.isFinite(Number(snap.mtime))) {
+      img.source = { ...img.source, mtime: Number(snap.mtime) };
+    }
+    this.store.touch();
+    this.changed();
+    if (oldSrc && oldSrc !== snap.src) this.bgImages.delete(oldSrc);
+    this.invalidateRaster(page.id);
+    this.loadBackground(snap.src);
+    this.renderRec(rec);
+    this.syncImageBar();
+    this.emitState();
+  }
+
+  /**
+   * 选中图片 / 文件块后浮在它上方的属性条。
+   *
+   * 普通图片：尺寸 + 删除。
+   * 文件块（有 `source`）：额外给「打开源文件」「刷新」「源已更新」提示。
+   */
+  private syncImageBar(): void {
+    this.imageBarEl?.remove();
+    this.imageBarEl = null;
+    const sel = this.selectedImage;
+    const rec = this.recs[this.current];
+    if (!sel || !rec || !rec.mounted || this.readOnly) return;
+
+    const bar = document.createElement("div");
+    bar.className = "mb-textbar mb-imagebar";
+    const eat = (e: Event) => e.stopPropagation();
+    for (const evName of ["pointerdown", "mousedown", "touchstart"]) {
+      bar.addEventListener(evName, eat, { passive: true });
+    }
+
+    const lbl = document.createElement("span");
+    lbl.className = "mb-tb-width mb-tb-imgsize";
+    lbl.title = sel.source ? "文件块大小（拖动四角手柄按比例缩放）" : "图片大小（拖动四角手柄按比例缩放）";
+    lbl.textContent = `${Math.round(sel.width)} × ${Math.round(sel.height)}`;
+    bar.appendChild(lbl);
+    bar.appendChild(this.textBarSep());
+
+    if (sel.source) {
+      const src = sel.source;
+      const openBtn = document.createElement("button");
+      openBtn.type = "button";
+      openBtn.className = "mb-tb-btn mb-fileblock-open";
+      openBtn.textContent = "打开源文件";
+      openBtn.title = `打开源文件：${src.path}`;
+      openBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.opts.onOpenFileSource?.(src.path);
+      });
+      bar.appendChild(openBtn);
+
+      const refreshBtn = document.createElement("button");
+      refreshBtn.type = "button";
+      refreshBtn.className = "mb-tb-btn mb-fileblock-refresh";
+      refreshBtn.textContent = "刷新";
+      refreshBtn.title = "源文件改了？点这里重新生成快照";
+      refreshBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.opts.onRefreshFileBlock?.(sel);
+      });
+      bar.appendChild(refreshBtn);
+
+      if (this.fileSourceStale(sel)) {
+        const hint = document.createElement("span");
+        hint.className = "mb-tb-stale";
+        hint.textContent = "源已更新";
+        hint.title = "源文件已改动，点「刷新」重新生成快照";
+        bar.appendChild(hint);
+      }
+      bar.appendChild(this.textBarSep());
+    }
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "mb-tb-btn is-danger";
+    del.textContent = "删除";
+    del.title = sel.source ? "删掉这个文件块（可撤销）" : "删掉这张图片（可撤销）";
+    del.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.deleteSelectedImage();
+    });
+    bar.appendChild(del);
+
+    rec.pageEl.appendChild(bar);
+    this.imageBarEl = bar;
+    this.positionImageBar();
+  }
+
+  /** 文件块的源文件 mtime 是否和快照记录的不一致（= 源已更新） */
+  private fileSourceStale(im: PageImage): boolean {
+    const src = im.source;
+    if (!src || src.mtime == null) return false;
+    const app: any = this.opts.app;
+    try {
+      const f = app?.vault?.getAbstractFileByPath?.(src.path);
+      const m = Number(f?.stat?.mtime);
+      return Number.isFinite(m) && m !== Number(src.mtime);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /** 属性条跟着图片走：优先放在图片上方，顶到页眉就翻到下方 */
+  private positionImageBar(): void {
+    const bar = this.imageBarEl;
+    const sel = this.selectedImage;
+    if (!bar || !sel) return;
+    const z = this.zoom;
+    const pageW = this.store.data.width * z;
+    const w = bar.offsetWidth || 160;
+    const h = bar.offsetHeight || 32;
+    const left = Math.max(4, Math.min(sel.x * z, pageW - w - 4));
+    const above = sel.y * z - h - 8;
+    const below = (sel.y + sel.height) * z + 8;
+    const top = above >= 4 ? above : below;
+    bar.style.left = `${left}px`;
+    bar.style.top = `${top}px`;
+  }
+
+  /**
+   * 把一页里的插入图片画进 ctx（屏幕、缩略图、导出、嵌入共用）。
+   *
+   * 层序：纸面 → 底图 → **图片** → 笔迹。图片压在笔迹下面，这样在图片上
+   * 写字的笔迹永远盖在图上（批注照片的直觉）；文字（DOM 层）本来就在最上面。
+   * 图片是异步加载的：没加载完先画一层淡灰占位（避免整块消失让人以为图没了），
+   * 同时触发加载，加载完由 loadBackground 回调重画。
+   */
+  private drawInsertedImages(ctx: CanvasRenderingContext2D, page: Page): void {
+    const imgs = page.images;
+    if (!imgs?.length) return;
+    for (const im of imgs) {
+      if (!(im.width > 0) || !(im.height > 0)) continue;
+      const img = this.bgImages.get(im.src);
+      if (!img) this.loadBackground(im.src);
+      if (img && img.complete && img.naturalWidth > 0) {
+        ctx.save();
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(img, im.x, im.y, im.width, im.height);
+        ctx.restore();
+      } else {
+        ctx.save();
+        ctx.fillStyle = "rgba(0,0,0,0.05)";
+        ctx.fillRect(im.x, im.y, im.width, im.height);
+        ctx.restore();
+      }
+    }
+  }
+
   /**
    * 选中文字上方那一条属性工具。
    *
@@ -1624,7 +2876,7 @@ export class BookEditor {
 
     // 字体
     const fontSel = document.createElement("select");
-    fontSel.className = "mb-tb-font";
+    fontSel.className = "mb-tb-font dropdown";
     fontSel.title = "字体";
     fontSel.dataset.mbTextStyle = "1";
     for (const f of TEXT_FONTS) {
@@ -1863,6 +3115,8 @@ export class BookEditor {
     ta.style.height = "auto";
     ta.style.height = `${ta.scrollHeight}px`;
     this.updateTextEditBar();
+    // 缩放时输入框尺寸 / 位置都变了，候选列表要重新贴过去
+    if (this.linkSuggestEl) this.positionLinkSuggest();
   }
 
   /** 样式值变了以后同步高亮与位置（不重建 DOM，避免点按钮时把它自己换掉） */
@@ -1935,6 +3189,17 @@ export class BookEditor {
 
   setPenSize(size: number, silent = false): void {
     this.penSize = size;
+    if (!silent) this.emitState();
+  }
+
+  setBallpointSize(size: number, silent = false): void {
+    this.ballpointSize = size;
+    if (!silent) this.emitState();
+  }
+
+  /** 设定某一类形状自己的线宽（不影响别的形状，也不影响笔） */
+  setShapeSize(kind: ShapeKind, size: number, silent = false): void {
+    this.shapeSizes[kind] = size;
     if (!silent) this.emitState();
   }
 
@@ -2101,8 +3366,12 @@ export class BookEditor {
          * 1:1 跟手 + 采样速度，抬手时由 globalUp 起算惯性。
          */
         if (this.gesture === "pan" && this.pan && e.pointerId === this.pointerId) {
-          this.scrollEl.scrollLeft = this.pan.left - (e.clientX - this.pan.x);
-          this.scrollEl.scrollTop = this.pan.top - (e.clientY - this.pan.y);
+          this.markFastScroll();
+          const nextLeft = this.pan.left - (e.clientX - this.pan.x);
+          const nextTop = this.pan.top - (e.clientY - this.pan.y);
+          this.scrollEl.scrollLeft = nextLeft;
+          this.scrollEl.scrollTop = nextTop;
+          // 速度采样读真实 scrollTop（夹到边界后的值），理由见 onMove pan 分支
           this.pushVelSample(
             this.scrollEl.scrollTop,
             e.timeStamp || performance.now()
@@ -2214,6 +3483,9 @@ export class BookEditor {
     this.gesture = "none";
     this.pointerId = null;
     this.eraserPos = null;
+    // 页面整批重建：光迹坐标属于旧 rec，一起作废
+    this.laserTrail = [];
+    this.stopLaserFade();
     this.hoverPos = null;
     this.moveText = null;
     this.resizeText = null;
@@ -2222,6 +3494,7 @@ export class BookEditor {
     // 新页 mount 时会按当前 zoom 自己 resizeRec，不会残留糊图。
     // 页码冻结 / 定时器也一并收掉，否则手势的残留状态会压住新页。
     this.pinch = null;
+    this.clearPendingPinch();
     this.pinchNeedsRedraw = false;
     this.pinchActive = false;
     window.clearTimeout(this.pinchReleaseTimer);
@@ -2233,6 +3506,11 @@ export class BookEditor {
     // 页对象重建了，旧的 ioVisible 状态随 rec 一起作废
     this.recs = [];
     this.docEl.innerHTML = "";
+    // 页对象整批换新：旧脱离 DOM 的文字层不再有复用价值。
+    this.textLayerCache.clear();
+    this.deferredTextLayers.clear();
+    // 页对象整批换新 / 页 id 可能复用：脱离 DOM 的主画布一律作废（INK-229）
+    this.invalidateRasterCache();
     this.store.data.pages.forEach((page, i) => {
       const rec = this.createPageRec(i, page);
       this.recs.push(rec);
@@ -2304,6 +3582,7 @@ export class BookEditor {
     this.docEl.style.setProperty("--mb-zoom", String(this.zoom));
     // 属性条是按像素定位的，缩放后得重算一次
     this.positionTextBar();
+    this.positionImageBar();
     // 新建输入框上方的样式条同理（页面坐标 × zoom）
     this.positionTextEditBar();
     /*
@@ -2355,7 +3634,7 @@ export class BookEditor {
 
   setZoom(z: number): void {
     this.fitMode = false;
-    this.zoom = clamp(z, 0.3, 2.8);
+    this.zoom = clamp(z, MIN_ZOOM, MAX_ZOOM);
     this.applyLayout();
     this.refreshCurrentAfterZoom();
   }
@@ -2386,7 +3665,7 @@ export class BookEditor {
   restoreViewState(view: { zoom?: number; scrollTop?: number; scrollLeft?: number }): void {
     if (typeof view.zoom === "number" && Number.isFinite(view.zoom)) {
       this.fitMode = false;
-      this.zoom = clamp(view.zoom, 0.3, 2.8);
+      this.zoom = clamp(view.zoom, MIN_ZOOM, MAX_ZOOM);
     }
     if (
       typeof view.scrollTop === "number" &&
@@ -2510,7 +3789,7 @@ export class BookEditor {
     // 缩放和惯性滚动不能同时进行
     this.stopFling();
     const before = this.zoom;
-    const after = clamp(before * factor, 0.3, 2.8);
+    const after = clamp(before * factor, MIN_ZOOM, MAX_ZOOM);
     if (after === before) return;
     this.fitMode = false;
 
@@ -2804,6 +4083,7 @@ export class BookEditor {
    * 补清晰度的同时把页码冻结放开，否则 pinchActive 会一直压着 current。
    */
   private abortPinch(): void {
+    this.clearPendingPinch();
     if (!this.pinch && !this.pinchNeedsRedraw) return;
     this.pinch = null;
     this.pinchActive = false;
@@ -2899,13 +4179,47 @@ export class BookEditor {
    * 中心移动了多少，内容就跟着平移了多少 ——
    * 这正是双指平移应有的语义。
    */
+  /**
+   * 把一个绝对 PinchInfo 合并进下一帧。
+   *
+   * 每根手指的 pointermove 都会触发仲裁器回调；一帧内可能来十几次。
+   * 这里只保留最新绝对量，rAF 里至多调用一次 applyPinch —— 手势仍按最终
+   * 两指位置收敛，CSS fast 路径和固定锚点都不变。
+   */
+  private queuePinch(info: PinchInfo): void {
+    this.pendingPinchInfo = info;
+    if (this.pinchFrameRaf) return;
+    this.pinchFrameRaf = requestAnimationFrame(() => {
+      this.pinchFrameRaf = 0;
+      this.flushPendingPinch();
+    });
+  }
+
+  /** 手势收尾 / 帧回调：把暂存的最后一组坐标真正应用一次。 */
+  private flushPendingPinch(): void {
+    if (this.pinchFrameRaf) {
+      cancelAnimationFrame(this.pinchFrameRaf);
+      this.pinchFrameRaf = 0;
+    }
+    const info = this.pendingPinchInfo;
+    this.pendingPinchInfo = null;
+    if (info && this.pinch) this.applyPinch(info);
+  }
+
+  /** 页重建 / 失焦时丢弃过期手势帧，避免旧坐标打到新页对象上。 */
+  private clearPendingPinch(): void {
+    if (this.pinchFrameRaf) cancelAnimationFrame(this.pinchFrameRaf);
+    this.pinchFrameRaf = 0;
+    this.pendingPinchInfo = null;
+  }
+
   private applyPinch(info: PinchInfo): void {
     const pinch = this.pinch;
     if (!pinch) return;
 
     const scale = info.dist / pinch.baseDist;
     const before = this.zoom;
-    const after = clamp(pinch.baseZoom * scale, 0.3, 2.8);
+    const after = clamp(pinch.baseZoom * scale, MIN_ZOOM, MAX_ZOOM);
     /*
      * **zoom 没变也要走 restoreAnchor**（INK-191）。
      *
@@ -2913,7 +4227,7 @@ export class BookEditor {
      * 都会跳过下面的 `restoreAnchor`。而它不只是"缩放后对锚点"——
      * **两指等距平移（scale 恰好 = 1）时页面靠它跟随手指移动**，
      * 这是 touchDraw 开着时双指滚页的主要方式。早退的结果就是
-     * 「两指并排滑动，页面完全不动」；缩放到 0.3/2.8 极限后同理。
+     * 「两指并排滑动，页面完全不动」；缩放到 0.3/3.5 极限后同理。
      */
     const zoomChanged = Math.abs(after - before) > 1e-9;
     if (zoomChanged) {
@@ -3007,7 +4321,9 @@ export class BookEditor {
     if (Math.abs(vel) < 0.05) return;
 
     const gain = BookEditor.FLING_GAIN[pointerType] ?? 1;
-    this.fling = { vel: vel * gain, last: upT, raf: 0 };
+    // 起手时算一次可滚动上限，整个滑行复用（避免每帧强制布局，INK-229）
+    const max = Math.max(0, this.scrollEl.scrollHeight - this.scrollEl.clientHeight);
+    this.fling = { vel: vel * gain, last: upT, raf: 0, max };
     this.fling.raf = requestAnimationFrame(this.stepFling);
   }
 
@@ -3021,6 +4337,8 @@ export class BookEditor {
   private stepFling = (): void => {
     const f = this.fling;
     if (!f) return;
+    // 惯性帧里 IO 会连续跨页：打点让新页文字层只排一次队。
+    this.markFastScroll();
 
     const now = performance.now();
     const dt = Math.min(64, now - f.last); // 卡顿时钳一下，别一帧跳太远
@@ -3042,7 +4360,8 @@ export class BookEditor {
     f.vel *= decay;
 
     const el = this.scrollEl;
-    const max = el.scrollHeight - el.clientHeight;
+    const max = f.max;
+    // 仍读真实 scrollTop：滑行中若被外部跳转 / 拖滚动条改了位置，必须跟着走
     let next = el.scrollTop + f.vel * dt;
 
     // 撞到边界就停
@@ -3072,6 +4391,9 @@ export class BookEditor {
     if (!f) return;
     this.fling = null;
     if (f.raf) cancelAnimationFrame(f.raf);
+    // 滑行真的结束：把快滑期间攒下的文字层一次性补齐，不留空层。
+    this.fastScrollUntil = 0;
+    this.flushDeferredTextLayers(true);
   }
 
   /** 手势打断了正在写的笔画：整笔撤销，不留半截线 */
@@ -3082,6 +4404,7 @@ export class BookEditor {
       this.gesture = "none";
       this.pointerId = null;
       this.smoother.reset();
+      this.inkPredictor.reset();
       const rec = this.recs[this.current];
       if (rec) this.renderOverlay(rec);
       // 手势结束要通知 view：避让中的自动保存该恢复排程了
@@ -3091,7 +4414,9 @@ export class BookEditor {
 
   private resizeRec(rec: PageRec): void {
     if (!rec.canvas || !rec.overlay) return;
-    const dpr = this.renderDpr();
+    // 导入文档页按页取更高超采样 dpr（把源位图细节更多留在 backing 里），
+    // 手写页/空白页照旧。backing 与下面 repaintEraseRegion 的 transform 必须同源。
+    const dpr = this.renderDprFor(this.store.data.pages[rec.index]);
     const w = Math.round(this.store.data.width * this.zoom * dpr);
     const h = Math.round(this.store.data.height * this.zoom * dpr);
     for (const c of [rec.canvas, rec.overlay]) {
@@ -3109,11 +4434,285 @@ export class BookEditor {
     this.renderOverlay(rec);
   }
 
+  /** 文字层的内容签名：文字、画布尺寸或手写字体时代一变，旧 span 就不可复用。 */
+  private textLayerSignature(page: Page): string {
+    /*
+     * 查找高亮也是渲染产物：查询词 / 当前命中变了，缓存里那一层就已经过期。
+     * 不带进签名的话，滚走再滚回来会复用旧 DOM（高亮不跟手或关不掉）。
+     */
+    const hit = this.findHit;
+    const find = this.findQuery
+      ? `|find:${this.findQuery}|${hit ? `${hit.page}:${hit.textId}:${hit.start}-${hit.end}` : ""}`
+      : "";
+    return `${this.store.data.width}x${this.store.data.height}|${this.handFontEpoch}|${JSON.stringify(page.texts ?? [])}${find}`;
+  }
+
+  /** 取回同页的脱离 DOM 文字层；签名不一致时直接丢弃。 */
+  private takeTextLayer(page: Page): HTMLElement | null {
+    const hit = this.textLayerCache.get(page.id);
+    if (!hit) return null;
+    this.textLayerCache.delete(page.id);
+    if (hit.signature !== this.textLayerSignature(page) || hit.el.dataset.textRendered !== "1") {
+      return null;
+    }
+    return hit.el;
+  }
+
+  /** 卸载时保留整层 span；LRU 条数不超过 MAX_MOUNTED，平板内存可控。 */
+  private cacheTextLayer(rec: PageRec): void {
+    const layer = rec.textLayer;
+    const page = this.store.data.pages[rec.index];
+    if (!layer || !page || layer.dataset.textRendered !== "1") return;
+    this.textLayerCache.delete(page.id);
+    this.textLayerCache.set(page.id, {
+      el: layer,
+      signature: this.textLayerSignature(page),
+    });
+    while (this.textLayerCache.size > MAX_MOUNTED) {
+      const oldest = this.textLayerCache.keys().next().value;
+      if (!oldest) break;
+      this.textLayerCache.delete(oldest);
+    }
+  }
+
+  /** 内容/字体变化后作废旧层，避免回滚时显示旧文字。 */
+  private invalidateTextLayerCache(pageId?: string): void {
+    if (pageId) this.textLayerCache.delete(pageId);
+    else this.textLayerCache.clear();
+  }
+
+  /* ---------------- 脱离 DOM 主画布 LRU（INK-229 平板上下滑卡顿） ---------------- */
+
+  /**
+   * 主画布的复用签名。
+   *
+   * 必须含 backing 尺寸（zoom 或 renderDpr 一变，宽高就变，旧像素尺寸对不上）
+   * 和内容 epoch（内容一变，旧像素就是错的）。两者都命中才敢复用。
+   */
+  private rasterSignature(page: Page, w: number, h: number): string {
+    return `${page.id}|${w}x${h}|${this.contentEpoch}`;
+  }
+
+  /**
+   * 取回同页可复用的主画布。
+   *
+   * 命中就把条目从缓存里摘出并减掉字节计数（调用方负责插回 DOM 复用）；
+   * 签名不一致则直接丢弃、返回 null，走正常重建路径。绝不复用旧像素。
+   */
+  private takeRaster(rec: PageRec, w: number, h: number): HTMLCanvasElement | null {
+    const page = this.store.data.pages[rec.index];
+    if (!page) return null;
+    const hit = this.rasterCache.get(page.id);
+    if (!hit) return null;
+    this.rasterCache.delete(page.id);
+    this.rasterCacheBytes -= hit.bytes;
+    if (hit.signature !== this.rasterSignature(page, w, h)) return null;
+    return hit.canvas;
+  }
+
+  /**
+   * 卸载时把已经画好的主画布留着，按字节预算做 LRU。
+   *
+   * 只收：mounted 且有 canvas、backing 尺寸与当前一致（否则留着也用不上）、
+   * 且当前不在被 force 销毁的路径上。overlay 不收（每页重画）。
+   */
+  private cacheRaster(rec: PageRec): void {
+    const canvas = rec.canvas;
+    const page = this.store.data.pages[rec.index];
+    if (!canvas || !page) return;
+    if (canvas.width <= 0 || canvas.height <= 0) return;
+    // 尺寸必须是「按当前 zoom/dpr 应有的尺寸」，否则滚回来签名也不匹配，别占地方。
+    // 必须用 renderDprFor(page)：INK-228 起导入文档页会按页超采样到 3.0×，
+    // 用统一的 renderDpr() 会算错 backing 尺寸，导致导入文档笔记整本缓存不上。
+    const dpr = this.renderDprFor(page);
+    const w = Math.round(this.store.data.width * this.zoom * dpr);
+    const h = Math.round(this.store.data.height * this.zoom * dpr);
+    if (canvas.width !== w || canvas.height !== h) return;
+    const bytes = w * h * 4;
+    this.rasterCache.delete(page.id);
+    this.rasterCache.set(page.id, {
+      canvas,
+      signature: this.rasterSignature(page, w, h),
+      bytes,
+    });
+    this.rasterCacheBytes += bytes;
+    while (
+      (this.rasterCacheBytes > RASTER_CACHE_BYTES && this.rasterCache.size > 1) ||
+      (this.rasterCache.size > MAX_RASTER_CACHED && this.rasterCache.size > 1)
+    ) {
+      const oldest = this.rasterCache.keys().next().value;
+      if (!oldest) break;
+      const dropped = this.rasterCache.get(oldest);
+      this.rasterCache.delete(oldest);
+      if (dropped) this.rasterCacheBytes -= dropped.bytes;
+    }
+  }
+
+  /**
+   * 只作废某一页脱离 DOM 的旧主画布（单页内容改动用）。
+   *
+   * 缓存里只有「已卸载」的页；改动当前页时它正挂载着、本来就没有缓存条目，
+   * 这一下几乎总是空操作，但能兜住「改到某张恰好已卸载的页」的边界。
+   * 关键是不做全局清空：PDF/Word 笔记首次滚过时 `ensurePageTexts()` 会对每页
+   * 异步补抽文字并调一次 `changed()`，若每页都全局清空，整个首轮滑动的
+   * 复用机会会被全部抹掉——而文字只在 DOM 文字层里，根本不改变画布像素。
+   */
+  private invalidateRaster(pageId: string): void {
+    const hit = this.rasterCache.get(pageId);
+    if (!hit) return;
+    this.rasterCache.delete(pageId);
+    this.rasterCacheBytes -= hit.bytes;
+  }
+
+  /**
+   * 整本 / 全局内容变了：让所有脱离 DOM 的旧主画布作废（epoch +1 并清空）。
+   *
+   * 撤销重做、整本换模板纸张、页对象重建等会改动**多页**像素的地方必须
+   * 调它，否则复用旧像素会错画。单页改动 / 单页底图到位走
+   * invalidateRaster(pageId)，只丢那一条。清空 Map 只丢引用，JS 自行回收
+   * backing，无需逐块置零。宁可多失效几次，绝不错画。
+   */
+  private invalidateRasterCache(): void {
+    this.contentEpoch += 1;
+    this.rasterCache.clear();
+    this.rasterCacheBytes = 0;
+  }
+
+  /** 手势拖页、惯性帧与 120ms 宽限期都算「快滑中」。 */
+  private isFastScrolling(): boolean {
+    return !!this.fling || this.gesture === "pan" || performance.now() < this.fastScrollUntil;
+  }
+
+  /** 快滑活动打点：每次都把一次性补画推到最后一个活动之后。 */
+  private markFastScroll(): void {
+    this.fastScrollUntil = performance.now() + 120;
+    this.scheduleDeferredTextFlush();
+  }
+
+  /**
+   * 安排「静止点」补画文字层。
+   *
+   * INK-229：原来是**每次** pointermove / 惯性帧都 `clearTimeout` + `setTimeout`
+   * 重建一个定时器——一秒钟上百次定时器的创建与销毁。现在改成幂等：
+   * 已有定时器就让打点只延长 `fastScrollUntil`，等它到点再看还剩多少宽限期，
+   * 按剩余时间重排；没有滑动就打点重排、到点补画。行为不变，任务数大幅下降。
+   */
+  private scheduleDeferredTextFlush(): void {
+    if (this.textLayerIdleTimer) return;
+    this.armTextLayerIdleFlush(Math.max(0, this.fastScrollUntil - performance.now()) || 120);
+  }
+
+  private armTextLayerIdleFlush(delay: number): void {
+    this.textLayerIdleTimer = window.setTimeout(() => {
+      this.textLayerIdleTimer = 0;
+      // destroy() 之后不再补画、也不再重排定时器（页面关闭时编辑器已失效）
+      if (this.destroyed) return;
+      const remain = this.fastScrollUntil - performance.now();
+      if (remain > 0) {
+        // 滑动仍在继续（又被打了点）：按剩余宽限期再等，别在滑动中补文字层
+        this.armTextLayerIdleFlush(remain);
+        return;
+      }
+      this.flushDeferredTextLayers();
+    }, Math.max(0, delay));
+  }
+
+  /** 滑行停止或短空闲后，把仍挂载的延后文字层一次性补齐。 */
+  private flushDeferredTextLayers(force = false): void {
+    if (!force && this.isFastScrolling()) {
+      this.scheduleDeferredTextFlush();
+      return;
+    }
+    if (this.deferredTextLayers.size) {
+      const pending = [...this.deferredTextLayers];
+      this.deferredTextLayers.clear();
+      for (const rec of pending) {
+        if (rec.mounted && rec.textLayer) this.renderTextLayer(rec);
+      }
+    }
+    // 软预算检查复用同一个静止点，不另起定时器；文字层为空时也要补跑。
+    this.flushPendingMountLimit(force);
+  }
+
+  /**
+   * IO 回调只排队挂载预算检查，不在滑动帧里直接量布局。
+   *
+   * 软预算只卸「IO 预挂范围外」的离屏页，晚一帧/等到静止再卸没有视觉差别；
+   * 但 `MAX_MOUNTED` 页数硬上限是显存红线，超了仍立即执行（且只跑硬上限，
+   * 跳过软预算那轮 getBoundingClientRect 排序）。当前页挂载完全不受影响。
+   */
+  private queueMountLimitEnforcement(): void {
+    if (this.destroyed) return;
+    this.mountLimitPending = true;
+    let mounted = 0;
+    for (const rec of this.recs) if (rec.mounted) mounted++;
+    if (mounted > MAX_MOUNTED) this.enforceMountLimit(true);
+    if (this.isFastScrolling()) {
+      // markFastScroll() 已排了 120ms 静止点；这里只防它意外缺失。
+      if (!this.textLayerIdleTimer) this.scheduleDeferredTextFlush();
+      return;
+    }
+    this.scheduleMountLimitFrame();
+  }
+
+  /** 非快滑期把一帧内的多次 IO 回调合并成一次软预算检查。 */
+  private scheduleMountLimitFrame(): void {
+    if (this.destroyed || this.mountLimitRaf) return;
+    this.mountLimitRaf = requestAnimationFrame(() => {
+      this.mountLimitRaf = 0;
+      if (this.destroyed || !this.mountLimitPending) return;
+      if (this.isFastScrolling()) {
+        if (!this.textLayerIdleTimer) this.scheduleDeferredTextFlush();
+        return;
+      }
+      this.mountLimitPending = false;
+      this.enforceMountLimit();
+    });
+  }
+
+  /** 滑行停止 / 120ms 静止点：把挂起的软预算检查补跑一次。 */
+  private flushPendingMountLimit(force = false): void {
+    if (!this.mountLimitPending) return;
+    if (!force && this.isFastScrolling()) return;
+    this.mountLimitPending = false;
+    if (this.mountLimitRaf) cancelAnimationFrame(this.mountLimitRaf);
+    this.mountLimitRaf = 0;
+    if (!this.destroyed) this.enforceMountLimit();
+  }
+
   private mount(rec: PageRec): void {
     if (rec.mounted) return;
     const page = this.store.data.pages[rec.index];
     if (!page) return;
-    const canvas = document.createElement("canvas");
+    /*
+     * 先看有没有可复用的主画布（INK-229 平板上下滑卡顿）。
+     *
+     * 命中：直接插回已画好像素的 canvas，跳过 resizeRec 的 backing 重分配
+     * 与 renderRec 的全量重绘——这正是「每滑一页顿一下」的主要来源。
+     * overlay 永远新建（依赖实时草稿 / 光标 / 选中），命中路径也会 renderOverlay。
+     *
+     * 期望 backing 尺寸必须与 resizeRec 同源：INK-228 起导入文档页按页超采样，
+     * 所以这里也用 renderDprFor(page)，否则签名永远对不上、导入笔记缓存不命中。
+     */
+    const dpr = this.renderDprFor(page);
+    const bw = Math.round(this.store.data.width * this.zoom * dpr);
+    const bh = Math.round(this.store.data.height * this.zoom * dpr);
+    const reused = this.takeRaster(rec, bw, bh);
+
+    let canvas: HTMLCanvasElement;
+    let ctx: CanvasRenderingContext2D | null;
+    let reusedRaster = false;
+    if (reused) {
+      canvas = reused;
+      ctx = canvas.getContext("2d");
+      // 同一元素的 context 还在，但 zoom 已可能变过：重设变换保证页面坐标正确
+      const k = dpr * this.zoom;
+      ctx?.setTransform(k, 0, 0, k, 0, 0);
+      reusedRaster = true;
+    } else {
+      canvas = document.createElement("canvas");
+      ctx = null;
+    }
     canvas.className = "mb-canvas";
     const overlay = document.createElement("canvas");
     overlay.className = "mb-overlay";
@@ -3125,7 +4724,8 @@ export class BookEditor {
      *     放到下面会被整块盖住；
      *   · 必须在 overlay 之前——overlay 是草稿与光标，要压在文字上面。
      */
-    const textLayer = document.createElement("div");
+    const cachedLayer = this.takeTextLayer(page);
+    const textLayer = cachedLayer ?? document.createElement("div");
     textLayer.className = "mb-textlayer";
     // 层的尺寸跟着页面数据走（A4 是 794×1123，但别把这个数字写死两遍）
     textLayer.style.width = `${this.store.data.width}px`;
@@ -3134,12 +4734,35 @@ export class BookEditor {
     rec.textLayer = textLayer;
     rec.canvas = canvas;
     rec.overlay = overlay;
+    rec.ctx = ctx;
     rec.mounted = true;
-    this.renderTextLayer(rec);
+    /*
+     * 快滑跨页不建几百/几千个透明 span：画布与笔迹仍同步创建、当前页不空白，
+     * 文字层留在松手后的一次性补画里；缓存命中则连补画都不需要。
+     */
+    if (!cachedLayer) {
+      if (this.isFastScrolling()) this.deferredTextLayers.add(rec);
+      else this.renderTextLayer(rec);
+    }
     this.ensurePageTexts(rec);
-    this.resizeRec(rec);
+    if (reusedRaster) {
+      /*
+       * 主画布像素已经在缓存里，只需重建 overlay（依赖实时状态，不缓存）。
+       * 注意：跳过 resizeRec 后它原本负责的 octx / overlay 变换要在这里补上，
+       * 否则 renderOverlay 因 octx=null 直接返回、选中框 / 橡皮圈 / 草稿全不显示。
+       */
+      rec.octx = overlay.getContext("2d");
+      const k = dpr * this.zoom;
+      rec.octx?.setTransform(k, 0, 0, k, 0, 0);
+      this.renderOverlay(rec);
+    } else {
+      this.resizeRec(rec);
+    }
     // 页面重新挂载（卸载过又滚回来）时，选中还在就把属性条挂回去
-    if (rec.index === this.current) this.syncTextBar();
+    if (rec.index === this.current) {
+      this.syncTextBar();
+      this.syncImageBar();
+    }
   }
 
   private unmount(rec: PageRec, force = false): void {
@@ -3152,6 +4775,10 @@ export class BookEditor {
       this.textBarEl?.remove();
       this.textBarEl = null;
     }
+    this.deferredTextLayers.delete(rec);
+    this.cacheTextLayer(rec);
+    // 主画布留作复用（overlay / 文字层照常丢弃）；force 销毁不收
+    if (!force) this.cacheRaster(rec);
     rec.canvas?.remove();
     rec.textLayer?.remove();
     rec.overlay?.remove();
@@ -3181,10 +4808,10 @@ export class BookEditor {
           if (entry.isIntersecting) this.mount(rec);
           else this.unmount(rec);
         }
-        // 兜底：挂载数要压回预算内。
-        // enforceMountLimit() 只削「已经滚出预挂范围」的页，
-        // 绝不碰 ioVisible 的那些（见 PageRec.ioVisible）。
-        this.enforceMountLimit();
+        // 兜底：挂载数要压回预算内，但快滑时不逐回调强制量布局。
+        // 软预算检查合并/延后到静止点；它只削「已经滚出预挂范围」的页，
+        // 绝不碰 ioVisible 的那些（见 PageRec.ioVisible），所以没有视觉变化。
+        this.queueMountLimitEnforcement();
       },
       { root: this.scrollEl, rootMargin: "600px 0px" }
     );
@@ -3210,11 +4837,11 @@ export class BookEditor {
    *   - 1.0 倍：一页 27MB → limit 5
    *   - 0.8 倍及以下：一页 ≤18MB → 撞页数硬上限 8
    *
-   * 只在 IntersectionObserver 回调里调，不在滚动帧里——算一次很便宜，
+   * 只在 IO 合并帧或快滑静止点调，不在滑动帧里逐回调算——算一次很便宜，
    * 没必要加缓存，加了反而要和 zoom / dpr 的变化手动同步。
    */
   private mountLimit(): number {
-    const dpr = this.renderDpr();
+    const dpr = this.mountBudgetDpr();
     const w = this.store.data.width * this.zoom * dpr;
     const h = this.store.data.height * this.zoom * dpr;
     const perPage = w * h * 4 * 2; // 两块画布，4 字节/像素
@@ -3224,14 +4851,31 @@ export class BookEditor {
   }
 
   /**
+   * 估挂载预算时用的每页 dpr。
+   *
+   * 书里只要有导入文档页，就按文档页可能用到的更高超采样 dpr（3.0×）估每页字节：
+   * 否则按手写页的 1.25 估、放过 8 页，实际每页 3.0× 会越过挂载预算。
+   * 纯手写书（没有文档页）仍按 1.25 估，不因这条降低预挂页数。
+   * `documentRenderDpr()` 已按 MIN_MOUNTED=2 页夹取过，所以这里反推的 limit 必 ≥2。
+   */
+  private mountBudgetDpr(): number {
+    const hasDoc = this.store.data.pages.some((p) => this.pageIsImportedDoc(p));
+    if (!hasDoc) return this.renderDpr();
+    return Math.max(this.renderDpr(), this.documentRenderDpr());
+  }
+
+  /**
    * 保证同时挂载的页数尽量不超预算。
    *
    * 削减顺序按**离视口矩形的像素距离**排，远的先卸。
    * 索引距离不够用：回滚时 current 两侧的页索引差会打平，
    * 稳定排序正好把「下一屏就要看的那页」牺牲掉。
+   *
+   * `hardCapOnly`：快滑帧只立即守住 MAX_MOUNTED 页数硬上限，
+   * 不去算软预算 / 读 rect；静止后由 queueMountLimitEnforcement 再跑完整版。
    */
-  private enforceMountLimit(): void {
-    const limit = this.mountLimit();
+  private enforceMountLimit(hardCapOnly = false): void {
+    const limit = hardCapOnly ? MAX_MOUNTED : this.mountLimit();
     if (this.recs.length <= limit) return;
     const mounted = this.recs.filter((r) => r.mounted);
     if (mounted.length <= limit) return;
@@ -3313,6 +4957,9 @@ export class BookEditor {
     }
     if (!img.complete || img.naturalWidth === 0) return;
     ctx.save();
+    // 导入本子已有高分辨率底图：缩小显示时用高质量降采样，避免 Word/PDF 小字发糊。
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
     ctx.drawImage(img, bg.x, bg.y, bg.width, bg.height);
     ctx.restore();
   }
@@ -3324,8 +4971,9 @@ export class BookEditor {
    *   - 画布 backing store：794×zoom×dpr
    *   - PDF 位图宽度：bg.width×zoom×dpr
    *
-   * 上限按「单张画布的像素预算」算。缩放很大时 dpr 自动下降，
-   * 宁可略微软一点，也不能让内存爆掉。
+   * 上限同时按「单张画布 16M 像素」和「MIN_MOUNTED 页的 160MiB 总预算」算。
+   * 后者由下面调用的 `inkEffectiveRenderDpr()` 负责：3.5 倍时单块 16M 没超，
+   * 但两页仍超总预算，只降约 2% 的 dpr 即可；宁可略微软一点，也不留空白页或爆内存。
    *
    * ── 桌面端（devicePixelRatio = 1）超采样到 1.25 ──
    *
@@ -3356,13 +5004,60 @@ export class BookEditor {
    *   单块 0.89M px 远小于 MAX_CANVAS_PIXELS(16M)，红线未动。
    */
   private renderDpr(): number {
-    const raw = Math.min(window.devicePixelRatio || 1, 2);
-    // 超采样只在小倍率生效（高倍时内存会超 MOUNT_BUDGET_BYTES，见该函数注释）
-    const want = inkRenderDprForZoom(raw, this.zoom);
-    const perZoom = this.store.data.width * this.store.data.height * this.zoom * this.zoom;
-    if (perZoom <= 0) return want;
-    const maxDpr = Math.sqrt(MAX_CANVAS_PIXELS / perZoom);
-    return clamp(Math.min(want, maxDpr), 0.75, want);
+    // 策略与测试共用同一个纯函数：单块像素 + MIN_MOUNTED 页总字节都在这里夹取。
+    return inkEffectiveRenderDpr(
+      window.devicePixelRatio || 1,
+      this.zoom,
+      this.store.data.width,
+      this.store.data.height
+    );
+  }
+
+  /**
+   * 这一页是不是「导入文档页」——正文是位图（PDF 光栅图 / Word 渲染出来的 PNG）。
+   * 这类页面的正文清晰度靠提高 backing 超采样来保（见 DOCUMENT_READ_SUPERSAMPLE），
+   * 手写页/空白页没有位图正文，不需要额外超采样。
+   */
+  private pageIsImportedDoc(page: Page | undefined): boolean {
+    const bg = page?.background;
+    return !!(bg && (bg.pdf || bg.src));
+  }
+
+  /**
+   * 导入文档页在「日常书写倍率」档的目标超采样 dpr（经两道内存上限夹取）。
+   *
+   * 桌面（dpr=1）与平板（dpr=2）都要抬到 `DOCUMENT_READ_SUPERSAMPLE`：
+   * 导入文档正文是一张位图，清晰度取决于「源位图 → backing → 屏幕」这条链上
+   * **中间 backing 保留了多少源细节**。平板虽然原生 2×，但 backing 只有
+   * 794×zoom×2≈1588，源 Word/PDF 位图约 3335 宽，仍有 2 倍多的下采样损失；
+   * 抬到 3.0× 让 backing 到约 2382、把源细节更多留在中间层，再交给合成器
+   * 降到设备像素，小字更锐更黑（平板实测见 PR 证据）。
+   *
+   * 只在 zoom ≤ SUPERSAMPLE_MAX_ZOOM（日常阅读/书写倍率）时抬；>1.25 的高倍
+   * 缩放字已经够大，退回原生、也不吃内存。返回值已经过 `inkEffectiveRenderDpr`
+   * 的单块像素 + MIN_MOUNTED 页总字节两道预算，绝不越红线；zoom 偏高时自动夹低。
+   */
+  private documentRenderDpr(): number {
+    if (documentSupersampleOverride === false) return this.renderDpr();
+    const zoom = this.zoom;
+    if (!(zoom > 0) || zoom > SUPERSAMPLE_MAX_ZOOM) return this.renderDpr();
+    const target = documentReadSupersampleValue ?? DOCUMENT_READ_SUPERSAMPLE;
+    return inkEffectiveRenderDpr(
+      window.devicePixelRatio || 1,
+      zoom,
+      this.store.data.width,
+      this.store.data.height,
+      target
+    );
+  }
+
+  /**
+   * 某页最终渲染 dpr：导入文档页用 `documentRenderDpr()`（可能抬到 3.0×），
+   * 手写页/空白页照旧用 `renderDpr()`。`resizeRec`、`repaintEraseRegion` 都走它，
+   * 保证「画布 backing / 擦除局部重绘」用同一个 dpr。
+   */
+  private renderDprFor(page: Page | undefined): number {
+    return this.pageIsImportedDoc(page) ? this.documentRenderDpr() : this.renderDpr();
   }
 
   /**
@@ -3379,6 +5074,9 @@ export class BookEditor {
     const bmp = this.bgBitmaps.get(key);
     if (bmp) {
       ctx.save();
+      // PDF 位图长期超采样，落到当前画布常是缩小：显式开高质量采样。
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
       ctx.drawImage(bmp, bg.x, bg.y, bg.width, bg.height);
       ctx.restore();
       // 缓存里的分辨率不够（用户又放大了）→ 升级渲染
@@ -3422,7 +5120,9 @@ export class BookEditor {
    */
   private pdfTargetWidth(bg: PageBackground): number {
     // 设备像素 / 页面单位 = 缩放 × 渲染像素比
-    return pdfTargetWidthPx(bg.width, this.zoom * this.renderDpr());
+    // 用 documentRenderDpr()：PDF 页是导入文档页，画布 backing 可能被抬到 3.0×，
+    // 目标位图必须同步跟着抬，否则底图比 backing 小 → 被放大反而更糊。
+    return pdfTargetWidthPx(bg.width, this.zoom * this.documentRenderDpr());
   }
 
   /**
@@ -3520,7 +5220,16 @@ export class BookEditor {
         this.bgDirty.clear();
         for (const i of dirty) {
           const rec = this.recs[i];
-          if (!rec || !rec.mounted) continue;
+          if (!rec) continue;
+          /*
+           * 底图到位只改变这一页的像素（INK-229）：逐页作废它脱离 DOM 的
+           * 旧主画布，避免下次滚回来复用「还没画上底图」的旧像素。
+           * 不全局清空——连续滑 PDF 时位图一张接一张到位，全局清空会把
+           * 刚滑过去那几页的复用机会全抹掉。
+           */
+          const page = this.store.data.pages[rec.index];
+          if (page) this.invalidateRaster(page.id);
+          if (!rec.mounted) continue;
           this.renderRec(rec);
           this.renderOverlay(rec);
         }
@@ -3546,18 +5255,35 @@ export class BookEditor {
     }
   }
 
-  /** 异步加载底图，加载完重画所在页 */
+  /**
+   * 异步加载一张图（底图或插入的图片），加载完重画所有引用它的页。
+   *
+   * 两者共用一个 `bgImages` 缓存：都是"库内路径 → HTMLImageElement"，
+   * 用同一个 key（src 路径）不会冲突；共用还能让同一张图既当底图又被插入时
+   * 只解码一次。
+   */
+  private pageUsesImageSrc(page: Page, src: string): boolean {
+    if (page?.background?.src === src) return true;
+    return !!page?.images?.some((im) => im.src === src);
+  }
+
   private loadBackground(src: string): void {
     if (this.bgLoading.has(src) || this.bgImages.has(src)) return;
     this.bgLoading.add(src);
     const img = new Image();
-    // 底图存在库里，用 app:// 协议读
+    // 图片存在库里，用 app:// 协议读
     img.onload = () => {
       this.bgLoading.delete(src);
       this.bgImages.set(src, img);
       for (const rec of this.recs) {
         const page = this.store.data.pages[rec.index];
-        if (page?.background?.src === src) {
+        if (this.pageUsesImageSrc(page, src)) {
+          /*
+           * 底图到位改变这一页的像素：只作废这一页脱离 DOM 的旧主画布
+           * （INK-229）。逐页作废而非全局清空——导入文档里多页共用同一张
+           * 底图时，别把刚滑过去那几页已经画好的画布一起丢掉。
+           */
+          this.invalidateRaster(page.id);
           this.renderRec(rec);
           this.renderOverlay(rec);
         }
@@ -3566,7 +5292,7 @@ export class BookEditor {
       const thumbCb = this.opts.onThumbNeedsRedraw;
       if (thumbCb) {
         for (let i = 0; i < this.store.data.pages.length; i += 1) {
-          if (this.store.data.pages[i].background?.src === src) thumbCb(i);
+          if (this.pageUsesImageSrc(this.store.data.pages[i], src)) thumbCb(i);
         }
       }
     };
@@ -3590,11 +5316,19 @@ export class BookEditor {
 
   renderRec(rec: PageRec): void {
     const page = this.store.data.pages[rec.index];
+    /*
+     * 兜底（INK-229）：只要重画了某页，它脱离 DOM 的旧主画布就一律作废。
+     * 绝大多数调用时该页正挂载、本来没有缓存条目（纯 O(1) 空查），
+     * 但能挡住任何将来新增的「改了内容却忘了清缓存」的路径，避免错画。
+     * 必须放在 `!rec.ctx` 之前：底图异步到位时对未挂载页也会走到这里。
+     */
+    if (page) this.invalidateRaster(page.id);
     if (!page || !rec.ctx) return;
     const ctx = rec.ctx;
     ctx.clearRect(0, 0, this.store.data.width, this.store.data.height);
     drawPaper(ctx, page.template, page.paper, this.store.data.width, this.store.data.height, 1);
     this.drawBackground(ctx, page);
+    this.drawInsertedImages(ctx, page);
     for (const layer of page.layers) {
       if (!layer.visible) continue;
       for (const stroke of layer.strokes) drawStroke(ctx, stroke, layer.opacity);
@@ -3626,7 +5360,7 @@ export class BookEditor {
     const w = this.store.data.width;
     const h = this.store.data.height;
     // 画布变换是 resizeRec 设的等比缩放；拿实际值，别用可能已经变过的 this.zoom
-    let k = this.zoom * this.renderDpr();
+    let k = this.zoom * this.renderDprFor(page);
     try {
       const m = ctx.getTransform?.();
       const km = m ? Math.hypot(m.a, m.b) : 0;
@@ -3646,9 +5380,10 @@ export class BookEditor {
     ctx.rect(x0, y0, x1 - x0, y1 - y0);
     ctx.clip();
     ctx.setTransform(k, 0, 0, k, 0, 0);
-    // 顺序必须和 renderRec 一致：纸面 → 底图 → 各层笔迹
+    // 顺序必须和 renderRec 一致：纸面 → 底图 → 插入图片 → 各层笔迹
     drawPaper(ctx, page.template, page.paper, w, h, 1);
     this.drawBackground(ctx, page);
+    this.drawInsertedImages(ctx, page);
     for (const layer of page.layers) {
       if (!layer.visible) continue;
       for (const stroke of layer.strokes) {
@@ -3691,7 +5426,15 @@ export class BookEditor {
     if (this.opts.prediction === false) return draft;
     if (draft.tool === "highlighter" || draft.tool === "shape") return draft;
     if (draft.points.length < 2) return draft;
-    const tail = predictTail(draft.points, 3, 0.7, 24);
+    /*
+     * 经典手写应用等价预测器预热完就用它：按速度/转角自适应时长、三次拟合修正、
+     * 8 段二次贝塞尔 + 递细压力。起笔前几帧（预热）沿用旧的三点外推，
+     * 免得第一笔完全看不到预览尾巴。tail 只在 push 时算一次，
+     * 这里一帧里被 renderOverlay 反复调用也不会累加预测状态。
+     */
+    const tail = this.inkPredictor.ready
+      ? this.inkPredictor.tail
+      : predictTail(draft.points, 3, 0.7, 24);
     if (!tail.length) return draft;
     return { ...draft, points: draft.points.concat(tail) };
   }
@@ -3760,6 +5503,67 @@ export class BookEditor {
       ctx.restore();
     }
 
+    /*
+     * 经典手写应用「点状激光笔 / 线条激光笔」移植：一条按时间淡出的红色光迹 +
+     * 笔尖光点。和橡皮圈一样放在 current 判定之前：激光可能指在非当前页上。
+     * 只画在 overlay 上，抬手后光迹自然消散，不进 store、不进撤销、不进导出。
+     * 点的透明度按 (1 - age/寿命) 逐段算，尾端先灭，视觉上像尾迹。
+     */
+    if (this.laserTrail.length && this.laserPage === rec.index) {
+      const now = performance.now();
+      // 先把原始采样点平滑成一条曲线、按年龄算好剩余生命（lasertrail.ts）。
+      const geo = buildLaserGeometry(this.laserTrail, now, LASER_FADE_MS);
+      const bands = bandLaserSamples(geo.samples, 10);
+      const tracePath = (pts: Array<{ x: number; y: number }>) => {
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+      };
+      if (bands.length) {
+        ctx.save();
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        // 外层柔光：淡、略宽，兜住本体让整条 alpha 平稳（不糊成一坨）
+        for (const band of bands) {
+          if (band.points.length < 2) continue;
+          tracePath(band.points);
+          ctx.strokeStyle = `rgba(255,66,66,${(0.16 * band.life).toFixed(3)})`;
+          ctx.lineWidth = (5 + 6 * band.life) / this.zoom;
+          ctx.stroke();
+        }
+        // 激光本体：饱和红、够亮够实。不再叠一根亚像素细白芯——那种亚像素
+        // 描边采样出来是一串毛刺（亮珠），只叠「外发光 + 本体」两层最干净。
+        for (const band of bands) {
+          if (band.points.length < 2) continue;
+          tracePath(band.points);
+          ctx.strokeStyle = `rgba(255,60,60,${(0.85 * band.life).toFixed(3)})`;
+          ctx.lineWidth = (2 + 2.8 * band.life) / this.zoom;
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
+      // 头部光点：小而亮的白芯红晕，像激光笔落在纸上那一点
+      const head = geo.head;
+      if (head) {
+        const r = (2.2 + 1.6 * head.life) / this.zoom;
+        const g = ctx.createRadialGradient(head.x, head.y, 0, head.x, head.y, r * 2.0);
+        g.addColorStop(0, `rgba(255,255,255,${(0.98 * head.life).toFixed(3)})`);
+        g.addColorStop(0.35, `rgba(255,120,120,${(0.85 * head.life).toFixed(3)})`);
+        g.addColorStop(1, "rgba(255,50,50,0)");
+        ctx.save();
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(head.x, head.y, r * 2.0, 0, Math.PI * 2);
+        ctx.fill();
+        // 中心实心亮点：任何底色上都留一点锐利的白，指向感更强
+        ctx.fillStyle = `rgba(255,255,255,${(0.95 * head.life).toFixed(3)})`;
+        ctx.beginPath();
+        ctx.arc(head.x, head.y, Math.max(0.8, r * 0.5), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
     if (rec.index !== this.current) return;
 
     if (this.draft && this.draftRec === rec) {
@@ -3770,7 +5574,16 @@ export class BookEditor {
 
     if (this.hoverPos && this.gesture === "none") {
       const h = this.hoverPos;
-      const r = Math.max(3, (this.penSize * (0.35 + h.p * 0.65)) / 2);
+      // 笔尖预览点也跟着当前这支笔 / 这类形状自己的粗细走
+      const tip =
+        this.tool === "highlighter"
+          ? this.highlighterSize
+          : this.tool === "ballpoint"
+            ? this.ballpointSize
+            : this.tool === "shape"
+              ? this.shapeSizes[this.shapeKind] ?? this.penSize
+              : this.penSize;
+      const r = Math.max(3, (tip * (0.35 + h.p * 0.65)) / 2);
       ctx.save();
       ctx.beginPath();
       ctx.arc(h.x, h.y, r, 0, Math.PI * 2);
@@ -3804,10 +5617,12 @@ export class BookEditor {
       ctx.restore();
 
       /*
-       * 改宽手柄只在选择工具下画：文字工具的第一下必须是「新建」，
-       * 画了手柄就会被 handleTextPointer 当成空白处，反而弹一个空输入框。
+       * 改宽手柄在选择 / 文字工具下都画：用户输入完文字后（还停在文字工具）
+       * 选中它也要能拖右下角的圆点改框宽——之前只在「选择」工具画，文字
+       * 工具里选中文字看不到圆点，用户以为这个功能没了。文字工具里点手柄
+       * 会被下面的 handleTextPointer 优先判成 resizeText，不会误开新输入框。
        */
-      if (this.tool === "select") {
+      if (this.tool === "select" || this.tool === "text") {
         ctx.save();
         ctx.beginPath();
         ctx.arc(g.handleX, g.handleY, g.handleR, 0, Math.PI * 2);
@@ -3818,6 +5633,65 @@ export class BookEditor {
         ctx.stroke();
         ctx.restore();
       }
+    }
+
+    /*
+     * 选中形状的虚线选框 + 8 个缩放手柄。
+     *
+     * 和文字选框一样画在 overlay 上：overlay 已按页面坐标缩放好，缩放、
+     * 滚动都不用管。手柄画成白色小方块 + 紫色描边，和文字那个圆点手柄区分。
+     */
+    const selShape = this.tool === "select" ? this.selectedShape : null;
+    if (selShape) {
+      const b = this.shapeSelBox(selShape);
+      ctx.save();
+      ctx.strokeStyle = "#6C5CE7";
+      ctx.lineWidth = 1.4 / this.zoom;
+      ctx.setLineDash([5 / this.zoom, 4 / this.zoom]);
+      ctx.strokeRect(b.minX, b.minY, Math.max(1, b.maxX - b.minX), Math.max(1, b.maxY - b.minY));
+      ctx.restore();
+
+      const hr = 4.5 / this.zoom;
+      ctx.save();
+      for (const hp of this.shapeHandlePoints(b)) {
+        ctx.beginPath();
+        ctx.rect(hp.x - hr, hp.y - hr, hr * 2, hr * 2);
+        ctx.fillStyle = "#FFFFFF";
+        ctx.fill();
+        ctx.strokeStyle = "#6C5CE7";
+        ctx.lineWidth = 1.6 / this.zoom;
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    /*
+     * 选中图片的虚线选框 + 4 个角手柄。
+     * 只有「选择」工具能选中图片（切工具时 selectImage(null) 已清），
+     * 所以这里按 selectedImage 有无判断即可。
+     */
+    const selImg = this.selectedImage;
+    if (selImg) {
+      const b = this.imageSelBox(selImg);
+      ctx.save();
+      ctx.strokeStyle = "#6C5CE7";
+      ctx.lineWidth = 1.4 / this.zoom;
+      ctx.setLineDash([5 / this.zoom, 4 / this.zoom]);
+      ctx.strokeRect(b.minX, b.minY, Math.max(1, b.maxX - b.minX), Math.max(1, b.maxY - b.minY));
+      ctx.restore();
+
+      const hr = 4.5 / this.zoom;
+      ctx.save();
+      for (const hp of this.imageHandlePoints(b)) {
+        ctx.beginPath();
+        ctx.rect(hp.x - hr, hp.y - hr, hr * 2, hr * 2);
+        ctx.fillStyle = "#FFFFFF";
+        ctx.fill();
+        ctx.strokeStyle = "#6C5CE7";
+        ctx.lineWidth = 1.6 / this.zoom;
+        ctx.stroke();
+      }
+      ctx.restore();
     }
   }
 
@@ -3835,10 +5709,17 @@ export class BookEditor {
   private renderTextLayer(rec: PageRec): void {
     const layer = rec.textLayer;
     if (!layer) return;
-    layer.textContent = "";
     const page = this.store.data.pages[rec.index];
+    const signature = page ? this.textLayerSignature(page) : "";
+    if (layer.dataset.textSig !== signature) this.invalidateTextLayerCache(page?.id);
+    layer.dataset.textSig = signature;
+    layer.dataset.textRendered = "1";
+    layer.textContent = "";
     const texts = page?.texts;
-    if (!texts || !texts.length) return;
+    if (!texts || !texts.length) {
+      layer.classList.remove("has-find-hits");
+      return;
+    }
 
     for (const t of texts) {
       const el = document.createElement("span");
@@ -3849,7 +5730,7 @@ export class BookEditor {
        * 不会自动插入分隔符，不补就成了 "第一行第二行" 一长串。
        * 用户文字不补——它自己的 \n 就是用户想要的换行。
        */
-      el.textContent = t.text + (t.source !== "user" ? "\n" : "");
+      let content = t.text + (t.source !== "user" ? "\n" : "");
       el.dataset.id = t.id;
       el.style.left = `${t.x}px`;
       el.style.top = `${t.y}px`;
@@ -3879,7 +5760,7 @@ export class BookEditor {
          * 断点，又保住整段文字的可选性。
          */
         const l = this.textLayout(t);
-        el.textContent = l.lines.join("\n");
+        content = l.lines.join("\n");
         el.style.whiteSpace = "pre";
         el.style.left = `${l.x}px`;
         el.style.top = `${l.y}px`;
@@ -3911,8 +5792,384 @@ export class BookEditor {
           layer.appendChild(more);
         }
       }
+      if (t.source === "user" && !this.findQuery) {
+        this.fillUserTextWithLinks(el, content);
+      } else {
+        this.fillTextSpanContent(el, content, rec.index, t);
+      }
       layer.appendChild(el);
     }
+    /*
+     * 有命中时整层与画布正片叠底：浅色高光只染白纸，canvas 上导入文档的
+     * 深色字仍透在最上面（视觉上就是「高光在文字底下」）。文字层带 transform，
+     * 合成组必须挂 class 到这一层；挂在单个 <mark> 上碰不到下面的 canvas。
+     */
+    layer.classList.toggle("has-find-hits", !!layer.querySelector("mark.mb-find-hit"));
+  }
+
+  /**
+   * 把用户批注的文字写进 span，并把其中的 `[[双链]]` 包成可点击的
+   * `<span class="mb-wikilink">`（强调色 + 下划线，见 styles.css）。
+   *
+   * 为什么不用 innerHTML：链接目标来自用户任意输入，拼字符串会既破坏排版
+   * 又落入 XSS。这里只用 createTextNode / createElement，纯文本进文本节点。
+   *
+   * 文字层整体 `pointer-events: none`（写字要穿透），只给链接 span 单独
+   * `pointer-events: auto`：其余文字照常穿透给画布，链接才接得到点击。
+   * 链接 span 的 pointerdown 必须 stopPropagation，否则会冒泡到 docEl 的
+   * 委托、被当成落笔/选择。
+   */
+  private fillUserTextWithLinks(el: HTMLElement, content: string): void {
+    const links = findWikiLinks(content);
+    if (!links.length) {
+      el.textContent = content;
+      return;
+    }
+    el.textContent = "";
+    let cursor = 0;
+    for (const link of links) {
+      if (link.start > cursor) {
+        el.appendChild(document.createTextNode(content.slice(cursor, link.start)));
+      }
+      const a = document.createElement("span");
+      a.className = "mb-wikilink";
+      // 像原生 Obsidian：非编辑态隐藏两边的 [[ ]]，只显示链接文字（有别名的用别名）；
+      // 编辑态是输入框里的原文，仍保留完整 [[...]] 语法。
+      a.textContent = link.display;
+      a.dataset.wikilinkHref = link.href;
+      if (link.page != null) a.dataset.wikilinkPage = String(link.page);
+      a.title = `打开笔记：${link.label}`;
+      a.addEventListener("pointerdown", (e) => {
+        // 别让画布把手势判成落笔 / 选择
+        e.stopPropagation();
+      });
+      a.addEventListener("click", (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        const page = a.dataset.wikilinkPage ? Number(a.dataset.wikilinkPage) : undefined;
+        const newTab = !!(e.metaKey || e.ctrlKey || e.button === 1);
+        this.openWikiLink(a.dataset.wikilinkHref || "", page, newTab);
+      });
+      el.appendChild(a);
+      cursor = link.end;
+    }
+    if (cursor < content.length) {
+      el.appendChild(document.createTextNode(content.slice(cursor)));
+    }
+  }
+
+  /** 转发给 view：解析 + 打开目标笔记。解析依赖 app / 本子路径，放在 view 更合适。 */
+  private openWikiLink(href: string, page: number | undefined, newTab: boolean): void {
+    if (this.opts.onOpenWikiLink) this.opts.onOpenWikiLink(href, page, newTab);
+  }
+
+  /**
+   * 「插入双链」：把一个 `[[名字]]` 插到正在编辑的输入框光标处；
+   * 没有打开的输入框时，在当前页新建一个文字框并写入。
+   *
+   * 只在用户从「插入双链」选择器选了目标后调用；手动直接打 `[[...]]`
+   * 也走同一条渲染/点击链路，不需要这个入口。
+   */
+  insertWikiLink(name: string): void {
+    const clean = String(name ?? "").trim();
+    if (!clean) return;
+    const snippet = `[[${clean}]]`;
+    const ed = this.textEdit;
+    if (ed) {
+      const ta = ed.el;
+      ta.focus();
+      const v = ta.value;
+      const s = typeof ta.selectionStart === "number" ? ta.selectionStart : v.length;
+      const e = typeof ta.selectionEnd === "number" ? ta.selectionEnd : s;
+      ta.value = v.slice(0, s) + snippet + v.slice(e);
+      const pos = s + snippet.length;
+      try {
+        ta.setSelectionRange(pos, pos);
+      } catch (_) {
+        /* 某些 WebView 上 setSelectionRange 偶发抛错，忽略即可 */
+      }
+      ta.dispatchEvent(new Event("input", { bubbles: true }));
+      return;
+    }
+    const rec = this.recs[this.current];
+    if (!rec || !rec.mounted) return;
+    const px = Math.min(this.store.data.width * 0.1, maxTextStartX(this.store.data.width));
+    const py = this.textSizeValue * 1.2 + 16;
+    this.beginTextEdit(rec, px, py, { initialText: snippet });
+  }
+
+  /* ---------------- `[[` 链接自动补全（类原生 Obsidian） ---------------- */
+
+  /** 编辑框输入变化 / 光标移动后，重新判断要不要弹、弹哪些候选。 */
+  private updateLinkSuggest(ta: HTMLTextAreaElement): void {
+    if (!this.opts.getLinkTargets || this.textEditComposing) {
+      this.hideLinkSuggest();
+      return;
+    }
+    const value = ta.value;
+    const caret = typeof ta.selectionStart === "number" ? ta.selectionStart : value.length;
+    const before = value.slice(0, caret);
+    // 从光标往回找最近的 `[[`；它到光标之间若是 `]]`、换行、`|`、`#`，
+    // 说明这段双链已经写完或在改别名/锚点，不再弹候选，别打断输入。
+    const open = before.lastIndexOf("[[");
+    if (open < 0) {
+      this.hideLinkSuggest();
+      return;
+    }
+    const inner = before.slice(open + 2);
+    if (/[\]\n|#]/.test(inner)) {
+      this.hideLinkSuggest();
+      return;
+    }
+    // `[[` 前还紧贴一个 `[`（如 `[[[`）不算双链起点
+    if (open > 0 && before[open - 1] === "[") {
+      this.hideLinkSuggest();
+      return;
+    }
+    const query = inner.trim().toLowerCase();
+    let all = this.linkTargetsCache;
+    if (all === null) {
+      try {
+        all = this.opts.getLinkTargets() || [];
+      } catch (_) {
+        all = [];
+      }
+      this.linkTargetsCache = all;
+    }
+    const items = (
+      query
+        ? all.filter(
+            (t) => t.label.toLowerCase().includes(query) || t.name.toLowerCase().includes(query)
+          )
+        : all
+    ).slice(0, 60);
+    this.linkSuggestStart = open;
+    this.linkSuggestAnchor = ta;
+    this.linkSuggestItems = items;
+    // 每次输入变化都回到第一项（过滤后旧的选中位置已无意义）
+    this.linkSuggestIndex = 0;
+    this.renderLinkSuggest();
+  }
+
+  /** 补全列表当前是否展开（键盘处理用）。 */
+  private linkSuggestOpen(): boolean {
+    return !!this.linkSuggestEl;
+  }
+
+  private renderLinkSuggest(): void {
+    const ta = this.linkSuggestAnchor;
+    if (!ta) {
+      this.hideLinkSuggest();
+      return;
+    }
+    let el = this.linkSuggestEl;
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "mb-link-suggest";
+      el.setAttribute("data-mb-link-suggest", "");
+      el.setAttribute("role", "listbox");
+      document.body.appendChild(el);
+      this.linkSuggestEl = el;
+      this.installLinkSuggestReposition();
+    }
+    el.textContent = "";
+    const items = this.linkSuggestItems;
+    if (!items.length) {
+      const empty = document.createElement("div");
+      empty.className = "mb-link-suggest-empty";
+      empty.textContent = "没有匹配的笔记";
+      el.appendChild(empty);
+    } else {
+      items.forEach((t, i) => {
+        const row = document.createElement("div");
+        row.className = "mb-link-suggest-item";
+        row.setAttribute("role", "option");
+        /*
+         * 点候选时不能让输入框失焦提交（blur → commit 会把编辑框和候选一起拆掉），
+         * 否则点击根本落不到 click 上。
+         *
+         *   · pointerdown 只 stopPropagation：别让画布把手势当落笔；
+         *   · mousedown 才 preventDefault：桌面端保住 textarea 焦点，且 click 照常触发。
+         * 不用 pointerdown.preventDefault —— 平板上它可能把后续 click 一并取消，
+         * 主场景反而点不中。
+         */
+        row.addEventListener("pointerdown", (e) => e.stopPropagation());
+        row.addEventListener("mousedown", (e) => e.preventDefault());
+        const name = document.createElement("span");
+        name.className = "mb-link-suggest-name";
+        name.textContent = t.label;
+        const kind = document.createElement("span");
+        kind.className = "mb-link-suggest-kind";
+        kind.textContent = t.kind === "inkbook" ? "手写本" : "笔记";
+        row.appendChild(name);
+        row.appendChild(kind);
+        row.title = t.path;
+        row.addEventListener("mousemove", () => {
+          if (this.linkSuggestIndex !== i) {
+            this.linkSuggestIndex = i;
+            this.syncLinkSuggestActive();
+          }
+        });
+        row.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          this.applyLinkSuggestion(ta, t);
+        });
+        el!.appendChild(row);
+      });
+    }
+    this.syncLinkSuggestActive();
+    this.positionLinkSuggest();
+  }
+
+  private syncLinkSuggestActive(): void {
+    const el = this.linkSuggestEl;
+    if (!el) return;
+    const rows = el.querySelectorAll<HTMLElement>(".mb-link-suggest-item");
+    rows.forEach((row, i) => {
+      const on = i === this.linkSuggestIndex;
+      row.classList.toggle("is-active", on);
+      row.setAttribute("aria-selected", on ? "true" : "false");
+    });
+  }
+
+  /** 候选列表贴着输入框显示：优先在下方，放不下就翻到上方。 */
+  private positionLinkSuggest(): void {
+    const el = this.linkSuggestEl;
+    const ta = this.linkSuggestAnchor;
+    if (!el || !ta || !ta.isConnected) return;
+    const r = ta.getBoundingClientRect();
+    const gap = 4;
+    const w = Math.max(200, Math.min(340, Math.max(r.width, 200)));
+    el.style.width = `${Math.round(w)}px`;
+    let left = r.left;
+    const maxLeft = window.innerWidth - w - 8;
+    if (left > maxLeft) left = maxLeft;
+    if (left < 8) left = 8;
+    const h = el.offsetHeight;
+    let top = r.bottom + gap;
+    if (top + h > window.innerHeight - 8) {
+      const above = r.top - h - gap;
+      top = above >= 8 ? above : Math.max(8, window.innerHeight - h - 8);
+    }
+    el.style.left = `${Math.round(left)}px`;
+    el.style.top = `${Math.round(top)}px`;
+  }
+
+  private installLinkSuggestReposition(): void {
+    if (this.linkSuggestReposition) return;
+    const fn = () => this.positionLinkSuggest();
+    this.linkSuggestReposition = fn;
+    this.scrollEl.addEventListener("scroll", fn, { passive: true });
+    window.addEventListener("resize", fn);
+    // 捕获阶段：Obsidian 里滚动容器可能不是 scrollEl，捕获能兜住内层滚动
+    window.addEventListener("scroll", fn, true);
+  }
+
+  private removeLinkSuggestReposition(): void {
+    const fn = this.linkSuggestReposition;
+    if (!fn) return;
+    this.linkSuggestReposition = null;
+    this.scrollEl.removeEventListener("scroll", fn);
+    window.removeEventListener("resize", fn);
+    window.removeEventListener("scroll", fn, true);
+  }
+
+  private hideLinkSuggest(): void {
+    this.removeLinkSuggestReposition();
+    this.linkSuggestEl?.remove();
+    this.linkSuggestEl = null;
+    this.linkSuggestItems = [];
+    this.linkSuggestIndex = 0;
+    this.linkSuggestStart = -1;
+    this.linkSuggestAnchor = null;
+  }
+
+  /** 键盘上下移动时把高亮项滚进可视区。 */
+  private moveLinkSuggest(delta: number): void {
+    const n = this.linkSuggestItems.length;
+    if (!n) return;
+    this.linkSuggestIndex = (this.linkSuggestIndex + delta + n) % n;
+    this.syncLinkSuggestActive();
+    const el = this.linkSuggestEl;
+    const active = el?.querySelector<HTMLElement>(".mb-link-suggest-item.is-active");
+    active?.scrollIntoView({ block: "nearest" });
+  }
+
+  /**
+   * 选中一个候选：把光标所在的 `[[查询` 替换成 `[[链接名]]`。
+   *
+   * 若光标后已经跟着 `]]`（用户在括号中间选），一并吃掉，避免变成 `]]]]`。
+   */
+  private applyLinkSuggestion(ta: HTMLTextAreaElement, target: LinkTarget): void {
+    const start = this.linkSuggestStart;
+    if (start < 0) return;
+    const value = ta.value;
+    const caret = typeof ta.selectionStart === "number" ? ta.selectionStart : value.length;
+    let end = caret;
+    if (value.slice(end, end + 2) === "]]") end += 2;
+    else if (value.slice(end, end + 1) === "]") end += 1;
+    const snippet = `[[${target.name}]]`;
+    ta.value = value.slice(0, start) + snippet + value.slice(end);
+    const pos = start + snippet.length;
+    ta.focus();
+    try {
+      ta.setSelectionRange(pos, pos);
+    } catch (_) {
+      /* 某些 WebView 上 setSelectionRange 偶发抛错，忽略即可 */
+    }
+    this.hideLinkSuggest();
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  /**
+   * 往一个文字 span 里写内容；正在「笔记内查找」时把命中处包成 `<mark>`。
+   *
+   * 用 textContent / 文本节点拼，而不是 innerHTML：查询词和原文都可能带
+   * `<`、`&`，拼字符串会既破坏排版又落入 XSS。`<mark>` 只影响外观，
+   * 复制、拖选、导出都不读它（导出走 canvas / pdf-lib 重画）。
+   *
+   * PDF / Word 原文是**透明字**（视觉由底图承担），CSS 里对这一种 mark
+   * 也保持透明，只留底色。整层用正片叠底把底色放到视觉字后面，既不会
+   * 把底图上的字重影成黑字，也不会遮住它们。
+   *
+   * `content` 是屏幕上真正显示的那串字：用户批注被 `wrapText` 插过换行，
+   * 与 `t.text` 的字符下标不一定一一对应。所以「当前命中」按**第几个**
+   * 出现来认（数原文里排在它前面的命中数），而不是直接拿 start 去切
+   * 屏幕字符串——这样跨折行的命中也能稳定对上。
+   */
+  private fillTextSpanContent(
+    el: HTMLElement,
+    content: string,
+    pageIndex: number,
+    t: PageText
+  ): void {
+    const query = this.findQuery;
+    if (!query) {
+      el.textContent = content;
+      return;
+    }
+    const ranges = findInText(content, query);
+    if (!ranges.length) {
+      el.textContent = content;
+      return;
+    }
+    let activeOrdinal = -1;
+    const hit = this.findHit;
+    if (hit && hit.page === pageIndex && hit.textId === t.id) {
+      activeOrdinal = countMatchesBefore(t.text, query, hit.start);
+    }
+    el.textContent = "";
+    let cursor = 0;
+    ranges.forEach((r, i) => {
+      if (r.start > cursor) el.appendChild(document.createTextNode(content.slice(cursor, r.start)));
+      const mark = document.createElement("mark");
+      mark.className = "mb-find-hit" + (i === activeOrdinal ? " is-active" : "");
+      mark.textContent = content.slice(r.start, r.end);
+      el.appendChild(mark);
+      cursor = r.end;
+    });
+    if (cursor < content.length) el.appendChild(document.createTextNode(content.slice(cursor)));
   }
 
   /**
@@ -3953,7 +6210,12 @@ export class BookEditor {
           width: Math.max(0, l.width * sx),
         }));
         const live = this.recs[rec.index];
-        if (live) this.renderTextLayer(live);
+        // PDF 文字抽完会让签名变化：旧缓存作废，快滑中则并进末尾的一次性补画。
+        this.invalidateTextLayerCache();
+        if (live?.mounted) {
+          if (this.isFastScrolling()) this.deferredTextLayers.add(live);
+          else this.renderTextLayer(live);
+        }
         this.store.touch();
         this.changed();
       } catch (_) {
@@ -4001,12 +6263,15 @@ export class BookEditor {
     if (!ctx) {
       // 没有离屏 canvas 时也要返回同一套宽度语义，否则退化路径和正常路径会折得不一样
       const lines = String(t.text ?? "").split("\n");
-      const avail = availableTextWidth(this.store.data.width, t.x);
       const custom = Number.isFinite(t.width) ? (t.width as number) : 0;
-      const width = custom > 0 ? Math.min(Math.max(custom, MIN_BOX_WIDTH), avail) : avail;
+      const boxW = custom > 0 ? Math.max(custom, MIN_BOX_WIDTH) : 0;
+      // x 的夹取也跟 layoutUserText 同一套（窄框按框宽留白、能贴到纸右缘）
+      const x = reserveTextX(this.store.data.width, t.x, boxW);
+      const avail = availableTextWidth(this.store.data.width, x);
+      const width = boxW > 0 ? Math.min(boxW, avail) : avail;
       // hidden: 0 —— 这条退化路径量不了宽、也就排不了版，谈不上裁行；
       // 补上字段只为让返回类型和正常路径一致（调用方统一读 l.hidden）
-      return { x: t.x, y: t.y, lines, lineHeight: t.size * TEXT_LINE_HEIGHT, width, hidden: 0 };
+      return { x, y: t.y, lines, lineHeight: t.size * TEXT_LINE_HEIGHT, width, hidden: 0 };
     }
     return layoutUserText(
       t,
@@ -4124,34 +6389,102 @@ export class BookEditor {
       }
     }
 
+    /*
+     * 形状缩放手柄：选中形状后，四角/四边的手柄优先级最高，
+     * 否则它们会被「拖动形状」的包围盒命中吃掉，永远拉不动大小。
+     */
+    const shape0 = this.selectedShape;
+    if (shape0 && !this.pinchActive) {
+      const b = this.shapeSelBox(shape0);
+      const h = this.hitShapeHandle(b, px, py, 10 / this.zoom);
+      if (h) {
+        this.beginShapeGesture(rec, shape0, px, py, e, h);
+        return;
+      }
+    }
+
+    /*
+     * 图片缩放角手柄：选中图片后优先级最高，否则会被「拖动图片」的
+     * 矩形命中吃掉，角手柄永远拉不动。
+     */
+    const img0 = this.selectedImage;
+    if (img0 && !this.pinchActive) {
+      const b = this.imageSelBox(img0);
+      const h = this.hitImageHandle(b, px, py, 10 / this.zoom);
+      if (h) {
+        this.beginImageGesture(rec, img0, px, py, e, h);
+        return;
+      }
+    }
+
     const hit = this.hitText(page.texts ?? [], px, py);
 
-    if (!hit) {
-      this.selectText(null);
+    if (hit) {
+      // 选中文字时清掉形状选择（两者互斥，避免两个选框同时出现）
+      this.selectShape(null);
+      this.selectText(hit.id);
+      this.gesture = "moveText";
+      this.pointerId = e.pointerId;
+      /*
+       * 拖动起点用**屏幕上看到的位置**（排版后的 x/y），不是数据里的原值：
+       * 越界的老批注渲染时已经被夹回纸内，如果按数据的 x 起算，
+       * 一开始拖就会"往回跳"或者几像素内完全不动。
+       */
+      const l = this.textLayout(hit);
+      this.moveText = {
+        rec,
+        id: hit.id,
+        startX: px,
+        startY: py,
+        originX: l.x,
+        originY: l.y,
+        moved: false,
+      };
+      try {
+        rec.pageEl.setPointerCapture?.(e.pointerId);
+      } catch (_) {}
+      e.preventDefault();
       return;
     }
-    this.selectText(hit.id);
-    this.gesture = "moveText";
-    this.pointerId = e.pointerId;
+
     /*
-     * 拖动起点用**屏幕上看到的位置**（排版后的 x/y），不是数据里的原值：
-     * 越界的老批注渲染时已经被夹回纸内，如果按数据的 x 起算，
-     * 一开始拖就会"往回跳"或者几像素内完全不动。
+     * 已经选中某个形状，且点还在它的选框内 → 直接拖动这个形状。
+     * 这样选中后随手一拖就能移动，不用精确点回边线上。
      */
-    const l = this.textLayout(hit);
-    this.moveText = {
-      rec,
-      id: hit.id,
-      startX: px,
-      startY: py,
-      originX: l.x,
-      originY: l.y,
-      moved: false,
-    };
-    try {
-      rec.pageEl.setPointerCapture?.(e.pointerId);
-    } catch (_) {}
-    e.preventDefault();
+    if (shape0 && !this.pinchActive) {
+      const b = this.shapeSelBox(shape0);
+      const pad = 6 / this.zoom;
+      if (px >= b.minX - pad && px <= b.maxX + pad && py >= b.minY - pad && py <= b.maxY + pad) {
+        this.selectText(null);
+        this.beginShapeGesture(rec, shape0, px, py, e, null);
+        return;
+      }
+    }
+
+    // 命中一个形状 → 选中并开始拖动
+    const shapeHit = this.hitShape(page, px, py);
+    if (shapeHit) {
+      this.selectText(null);
+      this.selectImage(null);
+      this.selectShape(shapeHit.id);
+      this.beginShapeGesture(rec, shapeHit, px, py, e, null);
+      return;
+    }
+
+    // 命中一张图片 → 选中并开始拖动
+    const imgHit = this.hitImage(page, px, py);
+    if (imgHit) {
+      this.selectText(null);
+      this.selectShape(null);
+      this.selectImage(imgHit.id);
+      this.beginImageGesture(rec, imgHit, px, py, e, null);
+      return;
+    }
+
+    // 点空白：取消所有选中
+    this.selectText(null);
+    this.selectShape(null);
+    this.selectImage(null);
   }
 
   /**
@@ -4162,10 +6495,27 @@ export class BookEditor {
    *   · 点在没选中的文字上 → **只选中**，浮出属性条（改字号/字体/颜色/删除）
    *   · 点在已选中的文字上 → 进入编辑（第二下才是改内容，避免一点就弹框）
    */
-  private handleTextPointer(rec: PageRec, px: number, py: number): void {
+  private handleTextPointer(rec: PageRec, px: number, py: number, e?: PointerEvent): void {
     if (this.readOnly) return;
     const page = this.store.data.pages[rec.index];
     if (!page) return;
+    // 改宽手柄优先（和「选择」工具一致）：文字工具下选中文字后也能拖圆点改宽
+    const sel0 = this.selectedText;
+    if (sel0 && e && !this.pinchActive) {
+      const g = this.textSelGeom(sel0);
+      const hitR = 10 / this.zoom;
+      if (Math.hypot(px - g.handleX, py - g.handleY) <= hitR) {
+        const l = this.textLayout(sel0);
+        this.gesture = "resizeText";
+        this.pointerId = e.pointerId;
+        this.resizeText = { rec, id: sel0.id, startX: px, originW: l.width, moved: false };
+        try {
+          rec.pageEl.setPointerCapture?.(e.pointerId);
+        } catch (_) {}
+        e.preventDefault();
+        return;
+      }
+    }
     const hit = this.hitText(page.texts ?? [], px, py);
 
     if (!hit) {
@@ -4192,9 +6542,16 @@ export class BookEditor {
     this.selectText(hit.id);
   }
 
-  private beginTextEdit(rec: PageRec, px: number, py: number): void {
+  private beginTextEdit(
+    rec: PageRec,
+    px: number,
+    py: number,
+    opts?: { initialText?: string }
+  ): void {
     if (this.readOnly) return;
     this.commitTextEdit();
+    // 新的编辑会话：重新取一次库文件清单（编辑期间可能新建了笔记）
+    this.linkTargetsCache = null;
     const page = this.store.data.pages[rec.index];
     if (!page) return;
 
@@ -4230,7 +6587,7 @@ export class BookEditor {
      * 它的字号/颜色继承 textarea 的当前样式，正好用来预览。
      */
     ta.placeholder = "请输入";
-    ta.value = hit?.text ?? "";
+    ta.value = opts?.initialText != null ? opts.initialText : hit?.text ?? "";
     ta.style.fontFamily = textFontStack(font);
     ta.style.fontSize = `${size * this.zoom}px`;
     ta.style.lineHeight = String(TEXT_LINE_HEIGHT);
@@ -4312,6 +6669,37 @@ export class BookEditor {
        */
       const composing = (e as any).isComposing || e.keyCode === 229;
       if (composing) return;
+      /*
+       * `[[` 补全展开时，方向键 / Enter / Tab / Esc 先归候选列表：
+       * 否则回车会把编辑框直接提交，Esc 会关掉编辑框而不是收起列表。
+       */
+      if (this.linkSuggestOpen()) {
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          this.moveLinkSuggest(1);
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          this.moveLinkSuggest(-1);
+          return;
+        }
+        // Shift+Enter 保留为换行，不抢去选候选
+        if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+          if (this.linkSuggestItems.length) {
+            e.preventDefault();
+            e.stopPropagation();
+            const t = this.linkSuggestItems[this.linkSuggestIndex];
+            if (t) this.applyLinkSuggestion(ta, t);
+            return;
+          }
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          this.hideLinkSuggest();
+          return;
+        }
+      }
       if (e.key === "Escape") {
         e.preventDefault();
         finish(false);
@@ -4332,7 +6720,9 @@ export class BookEditor {
     this.textEditStylePress = false;
     const markStylePress = (ev: PointerEvent) => {
       const el = ev.target as HTMLElement | null;
-      this.textEditStylePress = !!el?.closest?.("[data-mb-text-style]");
+      this.textEditStylePress = !!el?.closest?.(
+        "[data-mb-text-style], [data-mb-link-suggest]"
+      );
     };
     document.addEventListener("pointerdown", markStylePress, true);
     this.textEditPointerHandler = markStylePress;
@@ -4352,7 +6742,11 @@ export class BookEditor {
     ta.addEventListener("input", () => {
       ta.style.height = "auto";
       ta.style.height = `${ta.scrollHeight}px`;
+      // 输入内容变化时重判 `[[` 补全（继续打字即过滤候选）
+      this.updateLinkSuggest(ta);
     });
+    // 鼠标 / 手指点了输入框内某处，光标可能移到别的位置：重新判断触发区间
+    ta.addEventListener("click", () => this.updateLinkSuggest(ta));
 
     requestAnimationFrame(() => {
       ta.focus();
@@ -4361,7 +6755,11 @@ export class BookEditor {
        * 用户点开旧批注只是想补一句，一打字就把整段覆盖掉是最恼人的。
        * 新建空框无所谓（没有内容可选），保持全选行为一致。
        */
-      if (hit) {
+      if (opts?.initialText != null) {
+        // 插入双链新建的框：光标放到片段末尾，别全选（否则一按键盘就把链接覆盖掉）
+        const end = ta.value.length;
+        ta.setSelectionRange(end, end);
+      } else if (hit) {
         const end = ta.value.length;
         ta.setSelectionRange(end, end);
       } else {
@@ -4448,6 +6846,9 @@ export class BookEditor {
    * 继续组字，写半截拼音比丢掉这次未上屏的输入更糟。
    */
   private commitTextEdit(save = true): void {
+    // 提交 / Esc / 翻页重建时，候选列表与输入框同生共死，不能留下孤儿节点
+    this.hideLinkSuggest();
+    this.linkTargetsCache = null;
     // 样式条与输入框同生共死：提交、Esc、翻页重建都不能留下孤儿节点
     this.textEditBarEl?.remove();
     this.textEditBarEl = null;
@@ -4569,7 +6970,12 @@ export class BookEditor {
       const l = this.textLayout(t);
       for (let i = 0; i < l.lines.length; i++) {
         if (!l.lines[i]) continue;
-        ctx.fillText(l.lines[i], l.x, l.y + i * l.lineHeight);
+        /*
+         * 双链在非编辑态隐藏 `[[ ]]`（与屏幕 DOM 同一份显示规则），
+         * 导出/缩略图/嵌入预览里也不会再冒出完整语法。画布只负责外观，
+         * 原文字（含括号）仍完整存在 PageText.text 里。
+         */
+        ctx.fillText(stripWikiLinkSyntax(l.lines[i]), l.x, l.y + i * l.lineHeight);
       }
       ctx.restore();
     }
@@ -4665,6 +7071,13 @@ export class BookEditor {
     const rawSens = this.opts.pressure ?? 1;
     const sens = Number.isFinite(rawSens) ? clamp(rawSens, 0.3, 1.5) : 1;
     raw = shapePressure(raw, sens);
+
+    /*
+     * 经典手写应用 手写引擎 getPressureWidth 的 p^1.6 压感响应：轻的更轻、重的更重。
+     * shapePressure 自身已做过一次对比拉伸，这里只按 0.3 权重混入，
+     * 避免两次放大把中间调压扁；p=0.5 时系数恒为 1，平均粗细不变。
+     */
+    raw *= 0.7 + 0.3 * pressureResponse(raw);
 
     // 速度—粗细联动：快笔收窄，避免飞白成一团
     raw *= speedWidthFactor(speed);
@@ -4815,6 +7228,51 @@ export class BookEditor {
     this.straighten = on;
   }
 
+  /* --------------------- 经典手写应用移植功能 --------------------- */
+
+  /** 一笔成型开关：只有开 / 关两态（开 = 抬笔立刻识别） */
+  setShapeSnap(mode: "off" | "lift"): void {
+    this.shapeSnap = normalizeShapeSnap(mode);
+  }
+
+  /** 激光笔开关：关掉时把光迹与帧循环一起收干净 */
+  setLaserPointer(on: boolean): void {
+    this.laserOn = on;
+    if (!on) {
+      this.laserTrail = [];
+      this.stopLaserFade();
+      this.repaintOverlays();
+    }
+  }
+
+  private repaintOverlays(): void {
+    if (this.destroyed) return;
+    for (const rec of this.recs) {
+      if (rec.mounted) this.renderOverlay(rec);
+    }
+  }
+
+  /** 激光笔光迹淡出：帧循环只在有迹可画时跑，结束后自动停 */
+  private armLaserFade(): void {
+    if (this.laserRaf) return;
+    const step = () => {
+      this.laserRaf = 0;
+      if (this.destroyed) return;
+      const now = performance.now();
+      this.laserTrail = this.laserTrail.filter((p) => now - p.t < LASER_FADE_MS);
+      // 拖动期间可能滑到相邻页：每帧按当前 laserPage 找 rec，别抓着旧的
+      const rec = this.recs[this.laserPage];
+      if (rec) this.renderOverlay(rec);
+      if (this.laserTrail.length) this.laserRaf = requestAnimationFrame(step);
+    };
+    this.laserRaf = requestAnimationFrame(step);
+  }
+
+  private stopLaserFade(): void {
+    if (this.laserRaf) cancelAnimationFrame(this.laserRaf);
+    this.laserRaf = 0;
+  }
+
   private applyTouchAction(): void {
     // 用 docEl 上的 data 属性统一控制工具态，CSS 里靠继承生效——
     // 逐页写的话几百页时每次切换工具都要几百次样式写入。
@@ -4902,6 +7360,29 @@ export class BookEditor {
       e.preventDefault();
       return;
     }
+    /*
+     * 激光笔（经典手写应用移植）：只指示、不落墨，所以放在只读判定之前，
+     * 也放在 pan 之前 —— 单指/单键都得能指一指，双指缩放仍然优先。
+     * 不走 draft、不走 store、不走撤销栈，也不改 current 页。
+     */
+    if (
+      this.laserOn &&
+      this.gesture === "none" &&
+      (e.pointerType !== "mouse" || e.button === 0)
+    ) {
+      e.preventDefault();
+      this.pointerId = e.pointerId;
+      this.gesture = "laser";
+      this.laserPage = rec.index;
+      const lp = this.pointFromEvent(e, rec);
+      this.laserTrail = [{ x: lp[0], y: lp[1], t: performance.now() }];
+      try {
+        rec.pageEl.setPointerCapture(e.pointerId);
+      } catch (_) {}
+      this.armLaserFade();
+      this.renderOverlay(rec);
+      return;
+    }
     if (role === "pan") {
       // 单指：默认滚动页面（touch-action 已放开）
       if (this.arbiter.touchCountNow >= 2) return;
@@ -4939,7 +7420,7 @@ export class BookEditor {
         const p = this.pointFromEvent(e, rec);
         this.current = rec.index;
         this.store.setPage(rec.index);
-        this.handleTextPointer(rec, p[0], p[1]);
+        this.handleTextPointer(rec, p[0], p[1], e);
         e.preventDefault();
         return;
       }
@@ -5025,6 +7506,23 @@ export class BookEditor {
       this.gesture = "none";
       this.pointerId = null;
     }
+    /*
+     * 形状拖动/缩放同样可能被笔落下打断：先把这次拖动结算成一条撤销记录，
+     * 再让笔接管去写字，否则 `gesture !== "none"` 会把第一笔丢掉。
+     */
+    if (
+      e.pointerType === "pen" &&
+      (this.gesture === "moveShape" || this.gesture === "resizeShape")
+    ) {
+      this.finishShapeEdit();
+    }
+    // 图片拖动/缩放被笔落下打断：同样先结算再让笔接管
+    if (
+      e.pointerType === "pen" &&
+      (this.gesture === "moveImage" || this.gesture === "resizeImage")
+    ) {
+      this.finishImageEdit();
+    }
 
     if (this.gesture !== "none") return;
 
@@ -5071,7 +7569,7 @@ export class BookEditor {
 
     if (this.tool === "text") {
       const tp = this.pointFromEvent(e, rec);
-      this.handleTextPointer(rec, tp[0], tp[1]);
+      this.handleTextPointer(rec, tp[0], tp[1], e);
       return;
     }
 
@@ -5133,6 +7631,9 @@ export class BookEditor {
     } catch (_) {}
 
     this.smoother.reset();
+    // 每一笔都从干净的预测状态开始：滑窗、速度跟踪、预热计数全清。
+    this.inkPredictor.reset();
+    this.inkPredictor.setScale(zoomNormalization(this.zoom));
     const p = this.filteredPoint(e, rec);
     this.lastPoint = { x: p[0], y: p[1], t: e.timeStamp || performance.now() };
     this.lastPressure = null;
@@ -5161,7 +7662,7 @@ export class BookEditor {
         id: uid("draft"),
         tool: "shape",
         color: this.penColor,
-        size: this.penSize,
+        size: this.shapeSizes[this.shapeKind] ?? this.penSize,
         opacity: 1,
         points: [
           [p[0], p[1], 0.5],
@@ -5181,14 +7682,33 @@ export class BookEditor {
       id: uid("draft"),
       tool: highlighter ? "highlighter" : ballpoint ? "ballpoint" : "pen",
       color: highlighter ? this.highlighterColor : this.penColor,
-      size: highlighter ? this.highlighterSize : this.penSize,
+      size: highlighter
+        ? this.highlighterSize
+        : ballpoint
+          ? this.ballpointSize
+          : this.penSize,
       opacity: highlighter ? 0.32 : 1,
       points: [[p[0], p[1], this.pressureFor(e, 0, 16)]],
     };
+    if (!highlighter) {
+      const first = this.draft.points[0];
+      this.inkPredictor.push(first[0], first[1], e.timeStamp || performance.now(), first[2]);
+    }
     this.scheduleOverlay(rec);
   }
 
   private onMove(e: PointerEvent, rec: PageRec): void {
+    /* 激光笔：只往光迹里加页面坐标，别的分支一概不碰 */
+    if (this.gesture === "laser" && e.pointerId === this.pointerId) {
+      e.preventDefault();
+      const lp = this.pointFromEvent(e, rec);
+      this.laserPage = rec.index;
+      this.laserTrail.push({ x: lp[0], y: lp[1], t: performance.now() });
+      if (this.laserTrail.length > 240) this.laserTrail.shift();
+      this.armLaserFade();
+      this.renderOverlay(rec);
+      return;
+    }
     /* 拖动文字：每帧改坐标，重建文字层（文字条数很少，重建比逐节点改省心） */
     if (this.gesture === "moveText" && this.moveText) {
       /*
@@ -5264,6 +7784,130 @@ export class BookEditor {
       // 每帧只改宽度标签的文字，不重建整条属性条（重建十几个节点会拖平板手感）
       const lbl = this.textBarEl?.querySelector(".mb-tb-width");
       if (lbl) lbl.textContent = `宽 ${Math.round(this.textLayout(target).width)}`;
+      e.preventDefault();
+      return;
+    }
+
+    /* 拖动选中的形状：原点 + 位移重算两点，局部重绘旧/新位置 */
+    if (this.gesture === "moveShape" && this.moveShape) {
+      if (e.pointerId !== this.pointerId) return;
+      const m = this.moveShape;
+      const p = this.pointFromEvent(e, m.rec);
+      let dx = p[0] - m.startX;
+      let dy = p[1] - m.startY;
+      if (!m.moved && Math.hypot(dx, dy) < 3) return;
+      const target = this.store.data.pages[m.rec.index]
+        ? this.findStrokeById(this.store.data.pages[m.rec.index], m.id)
+        : null;
+      if (!target) return;
+      if (!m.moved) {
+        this.store.snapshotPage(m.rec.index);
+        m.moved = true;
+      }
+      // 夹取：整块包围盒不出纸，避免拖丢
+      dx = clamp(dx, -m.origBox.minX, this.store.data.width - m.origBox.maxX);
+      dy = clamp(dy, -m.origBox.minY, this.store.data.height - m.origBox.maxY);
+      for (let i = 0; i < target.points.length && i < m.origin.length; i++) {
+        target.points[i][0] = m.origin[i][0] + dx;
+        target.points[i][1] = m.origin[i][1] + dy;
+      }
+      invalidateStrokeBounds(target);
+      invalidateStroke(target);
+      const nb = strokeBounds(target);
+      this.repaintEraseRegion(m.rec, this.dirtyUnion(m.prevBounds, nb, this.strokeExtraPad(target)));
+      m.prevBounds = nb;
+      this.renderOverlay(m.rec);
+      e.preventDefault();
+      return;
+    }
+
+    /* 拖形状选框的手柄改大小：按手柄算出新包围盒，再把原始点按比例映射进去 */
+    if (this.gesture === "resizeShape" && this.resizeShape) {
+      if (e.pointerId !== this.pointerId) return;
+      const m = this.resizeShape;
+      const p = this.pointFromEvent(e, m.rec);
+      if (!m.moved && Math.hypot(p[0] - m.startX, p[1] - m.startY) < 3) return;
+      const target = this.store.data.pages[m.rec.index]
+        ? this.findStrokeById(this.store.data.pages[m.rec.index], m.id)
+        : null;
+      if (!target) return;
+      if (!m.moved) {
+        this.store.snapshotPage(m.rec.index);
+        m.moved = true;
+      }
+      const nb = this.resizeRawBox(m.origBox, m.handle, p[0] - m.startX, p[1] - m.startY);
+      const ob = m.origBox;
+      const ow = ob.maxX - ob.minX;
+      const oh = ob.maxY - ob.minY;
+      for (let i = 0; i < target.points.length && i < m.origin.length; i++) {
+        const fx = ow > 1e-6 ? (m.origin[i][0] - ob.minX) / ow : 0.5;
+        const fy = oh > 1e-6 ? (m.origin[i][1] - ob.minY) / oh : 0.5;
+        target.points[i][0] = nb.minX + fx * (nb.maxX - nb.minX);
+        target.points[i][1] = nb.minY + fy * (nb.maxY - nb.minY);
+      }
+      invalidateStrokeBounds(target);
+      invalidateStroke(target);
+      const cb = strokeBounds(target);
+      this.repaintEraseRegion(m.rec, this.dirtyUnion(m.prevBounds, cb, this.strokeExtraPad(target)));
+      m.prevBounds = cb;
+      this.renderOverlay(m.rec);
+      e.preventDefault();
+      return;
+    }
+
+    /* 拖动选中的图片：整块夹在纸内，局部重绘旧/新位置 */
+    if (this.gesture === "moveImage" && this.moveImage) {
+      if (e.pointerId !== this.pointerId) return;
+      const m = this.moveImage;
+      const p = this.pointFromEvent(e, m.rec);
+      const dx = p[0] - m.startX;
+      const dy = p[1] - m.startY;
+      if (!m.moved && Math.hypot(dx, dy) < 3) return;
+      const target = this.store.data.pages[m.rec.index]?.images?.find((im) => im.id === m.id);
+      if (!target) return;
+      if (!m.moved) {
+        this.store.snapshotPage(m.rec.index);
+        m.moved = true;
+      }
+      const cdx = clamp(dx, -m.originX, this.store.data.width - target.width - m.originX);
+      const cdy = clamp(dy, -m.originY, this.store.data.height - target.height - m.originY);
+      target.x = m.originX + cdx;
+      target.y = m.originY + cdy;
+      const nb = this.imageSelBox(target);
+      this.repaintEraseRegion(m.rec, this.dirtyUnion(m.prevBox, nb, 2));
+      m.prevBox = nb;
+      this.renderOverlay(m.rec);
+      this.positionImageBar();
+      const lbl = this.imageBarEl?.querySelector(".mb-tb-imgsize");
+      if (lbl) lbl.textContent = `${Math.round(target.width)} × ${Math.round(target.height)}`;
+      e.preventDefault();
+      return;
+    }
+
+    /* 拖图片角手柄改大小（保持长宽比）：按手柄算出新框，锚定对角 */
+    if (this.gesture === "resizeImage" && this.resizeImage) {
+      if (e.pointerId !== this.pointerId) return;
+      const m = this.resizeImage;
+      const p = this.pointFromEvent(e, m.rec);
+      if (!m.moved && Math.hypot(p[0] - m.startX, p[1] - m.startY) < 3) return;
+      const target = this.store.data.pages[m.rec.index]?.images?.find((im) => im.id === m.id);
+      if (!target) return;
+      if (!m.moved) {
+        this.store.snapshotPage(m.rec.index);
+        m.moved = true;
+      }
+      const nb = this.resizeImageBox(m.origBox, m.handle, p[0] - m.startX, p[1] - m.startY, m.aspect);
+      target.x = nb.minX;
+      target.y = nb.minY;
+      target.width = nb.maxX - nb.minX;
+      target.height = nb.maxY - nb.minY;
+      const cb = this.imageSelBox(target);
+      this.repaintEraseRegion(m.rec, this.dirtyUnion(m.prevBox, cb, 2));
+      m.prevBox = cb;
+      this.renderOverlay(m.rec);
+      this.positionImageBar();
+      const lbl = this.imageBarEl?.querySelector(".mb-tb-imgsize");
+      if (lbl) lbl.textContent = `${Math.round(target.width)} × ${Math.round(target.height)}`;
       e.preventDefault();
       return;
     }
@@ -5346,13 +7990,25 @@ export class BookEditor {
       return;
     }
 
-    const p = this.pointFromEvent(e, rec);
-
     if (this.gesture === "pan" && this.pan) {
-      // 手指拖动：直接跟随手指滚动（比"抓取"更符合平板直觉）
-      this.scrollEl.scrollLeft = this.pan.left - (e.clientX - this.pan.x);
-      this.scrollEl.scrollTop = this.pan.top - (e.clientY - this.pan.y);
-      // 采样滚动速度，抬手时用来起算惯性
+      /*
+       * 手指拖动：直接跟随手指滚动（比"抓取"更符合平板直觉）。
+       *
+       * INK-229：这里原来有一句 `const p = this.pointFromEvent(e, rec)`——
+       * pan 分支根本用不到它，却每一个 pointermove 都强制一次
+       * `getBoundingClientRect()`（同步布局），跟着手指滚动时每帧都掐住主线程，
+       * 是「拖动一顿一顿」的隐藏元凶，已删除。
+       *
+       * 速度采样仍读**真实**的 scrollTop（浏览器夹到边界后的值），不能用
+       * 上面算出的 nextTop：手指拖出内容边界时两者会差很远，惯性初速会被
+       * 算得过大；而且外部如果改了 scrollTop（跳转 / 恢复位置），速度样本
+       * 必须跟着实际位置走，否则会甩出一段错误的滑行。
+       */
+      this.markFastScroll();
+      const nextLeft = this.pan.left - (e.clientX - this.pan.x);
+      const nextTop = this.pan.top - (e.clientY - this.pan.y);
+      this.scrollEl.scrollLeft = nextLeft;
+      this.scrollEl.scrollTop = nextTop;
       this.pushVelSample(this.scrollEl.scrollTop, e.timeStamp || performance.now());
       return;
     }
@@ -5400,7 +8056,26 @@ export class BookEditor {
     if (this.gesture === "draw" || this.gesture === "shape") {
       const raw =
         typeof e.getCoalescedEvents === "function" ? e.getCoalescedEvents() || [] : [];
-      const events = raw.length ? raw : [e];
+      const events = raw.length ? raw.slice() : [e];
+      /*
+       * 一定要把**派发事件本身** e 也算进去。
+       *
+       * 规范只说 `getCoalescedEvents()` 返回"被合并进来的指针事件"，没保证
+       * 它一定包含/结尾就是当前这次 e —— 各浏览器实现有差异（有的实现里
+       * 列表是"之前合并的若干子事件"，不含 e 本身）。漏掉 e 的后果是：每帧
+       * 最新的那个真实位置没进笔迹，快速书写时墨迹永远差笔尖一截，
+       * 用户感觉「不跟手、笔划到过的地方没墨」。这里缺了就在末尾补上 e。
+       */
+      if (raw.length) {
+        const lastRaw = events[events.length - 1];
+        if (
+          !lastRaw ||
+          Math.abs(lastRaw.clientX - e.clientX) > 0.01 ||
+          Math.abs(lastRaw.clientY - e.clientY) > 0.01
+        ) {
+          events.push(e);
+        }
+      }
       for (const ev of events) this.appendPoint(ev, rec);
       this.scheduleOverlay(rec);
     }
@@ -5412,22 +8087,7 @@ export class BookEditor {
     const now = e.timeStamp || performance.now();
 
     if (this.draft.tool === "shape") {
-      let x = p[0];
-      let y = p[1];
-      const start = this.draft.points[0];
-      if (e.shiftKey) {
-        if (this.draft.shape === "line" || this.draft.shape === "arrow") {
-          const ang = Math.atan2(y - start[1], x - start[0]);
-          const snapped = Math.round(ang / (Math.PI / 4)) * (Math.PI / 4);
-          const len = Math.hypot(x - start[0], y - start[1]);
-          x = start[0] + Math.cos(snapped) * len;
-          y = start[1] + Math.sin(snapped) * len;
-        } else {
-          const size = Math.max(Math.abs(x - start[0]), Math.abs(y - start[1]));
-          x = start[0] + Math.sign(x - start[0] || 1) * size;
-          y = start[1] + Math.sign(y - start[1] || 1) * size;
-        }
-      }
+      const [x, y] = this.shapeEndFromPoint(e, p);
       this.draft.points[1] = [x, y, 0.5];
       invalidateStroke(this.draft);
       return;
@@ -5450,6 +8110,72 @@ export class BookEditor {
       this.draft.tool === "highlighter" ? 0.5 : this.pressureFor(e, dist, Math.max(1, dt));
     this.draft.points.push([p[0], p[1], pressure]);
     invalidateStroke(this.draft);
+    // shape 分支在函数开头就 return 了，这里只剩 pen / ballpoint / highlighter
+    if (this.draft.tool !== "highlighter") {
+      this.inkPredictor.push(p[0], p[1], now, pressure);
+    }
+    this.lastPoint = { x: p[0], y: p[1], t: now };
+  }
+
+  /**
+   * 形状第二个点的落点（含 Shift 吸附）。appendPoint 与 appendFinalPoint 共用，
+   * 保证「拖动中」和「抬手补最后一点」用同一套几何规则。
+   */
+  private shapeEndFromPoint(e: PointerEvent, p: Pt): [number, number] {
+    const start = this.draft!.points[0];
+    let x = p[0];
+    let y = p[1];
+    if (e.shiftKey && this.draft!.tool === "shape") {
+      if (this.draft!.shape === "line" || this.draft!.shape === "arrow") {
+        const ang = Math.atan2(y - start[1], x - start[0]);
+        const snapped = Math.round(ang / (Math.PI / 4)) * (Math.PI / 4);
+        const len = Math.hypot(x - start[0], y - start[1]);
+        x = start[0] + Math.cos(snapped) * len;
+        y = start[1] + Math.sin(snapped) * len;
+      } else {
+        const size = Math.max(Math.abs(x - start[0]), Math.abs(y - start[1]));
+        x = start[0] + Math.sign(x - start[0] || 1) * size;
+        y = start[1] + Math.sign(y - start[1] || 1) * size;
+      }
+    }
+    return [x, y];
+  }
+
+  /**
+   * 抬手前把**指针最终所在的原始位置**补进草稿。
+   *
+   * 为什么必须补：
+   *   · 书写预览会带预测尾巴（画在 overlay），但提交用的是草稿点本身；
+   *     若抬手点没补进来，抬笔那一刻墨迹会从预览位置「缩回去」；
+   *   · 1€ 滤波在快速运笔时会滞后——最后一个 pointermove 的滤波点明显
+   *     落后于笔尖。若只提交到那个滤波点，笔画尾端就停在笔尖后面，
+   *     用户看到「笔明明划过那里，却没有笔迹」。
+   * 这里取**未滤波的原始点**收尾，保证墨迹终于笔尖实际抬起的位置，
+   * 把过滤波滞后丢掉的那一段补回来。只在真正的 pointerup 补，
+   * pointercancel 没有可靠坐标（有的实现给 0,0），补了会拉出一条到原点的线。
+   *
+   * 距离过近（点一下/微抖）就不补，保留单点，交给 drawStroke 画成圆点；
+   * 否则会变成两个几乎重合的点，perfect-freehand 反而渲染成一小团看不见的东西。
+   */
+  private appendFinalPoint(rec: PageRec, e: PointerEvent): void {
+    if (!this.draft) return;
+    if (e.type !== "pointerup") return;
+    const p = this.pointFromEvent(e, rec);
+    if (this.draft.tool === "shape") {
+      const [x, y] = this.shapeEndFromPoint(e, p);
+      this.draft.points[1] = [x, y, 0.5];
+      invalidateStroke(this.draft);
+      return;
+    }
+    const last = this.draft.points[this.draft.points.length - 1];
+    const dist = last ? Math.hypot(p[0] - last[0], p[1] - last[1]) : 0;
+    if (dist < 0.75) return;
+    const now = e.timeStamp || performance.now();
+    const dt = this.lastPoint ? now - this.lastPoint.t : 16;
+    const pressure =
+      this.draft.tool === "highlighter" ? 0.5 : this.pressureFor(e, dist, Math.max(1, dt));
+    this.draft.points.push([p[0], p[1], pressure]);
+    invalidateStroke(this.draft);
     this.lastPoint = { x: p[0], y: p[1], t: now };
   }
 
@@ -5465,6 +8191,13 @@ export class BookEditor {
     this.gesture = "none";
     this.pointerId = null;
     this.pan = null;
+
+    // 激光笔：抬手后光迹继续淡出，不提交任何内容、不触发墨水手势回调
+    if (gesture === "laser") {
+      this.armLaserFade();
+      this.emitState();
+      return;
+    }
 
     /*
      * 抬手时起算惯性。
@@ -5518,8 +8251,20 @@ export class BookEditor {
         this.changed();
         this.emitState();
       }
+    } else if (gesture === "moveShape" || gesture === "resizeShape") {
+      this.finishShapeEdit();
+    } else if (gesture === "moveImage" || gesture === "resizeImage") {
+      this.finishImageEdit();
     } else if (gesture === "draw" || gesture === "shape") {
-      this.commitDraft(rec);
+      /*
+       * 用 draftRec 而不是 onUp 拿到的 rec：globalUp 用 `recs[current]` 调进来，
+       * 若书写期间 current 变了（滚动/翻页），按 current 提交会把这一笔记到别的页、
+       * 而用户写字的那页上就「没有笔迹」。draftRec 才是这笔真正落下的页。
+       */
+      const draftRec = this.draftRec ?? rec;
+      // 抬手点补进草稿：让墨迹终于笔尖实际抬起处，弥合滤波滞后 / 漏掉最后一段
+      this.appendFinalPoint(draftRec, e);
+      this.commitDraft(draftRec);
     } else if (gesture === "erase") {
       /*
        * 鼠标抬手后仍悬停在纸上：圈要留在抬手处继续当光标，
@@ -5589,7 +8334,32 @@ export class BookEditor {
     } else {
       if (!draft.points.length) return;
       let stroke: Stroke = { ...draft, id: uid("stroke") };
-      if (this.straighten) {
+      /*
+       * 一笔成型（经典手写应用「画完立刻自动识别」移植）：只剩开 / 关两态，
+       * 开 = 抬笔这一刻立刻把自由笔迹换成规整图形（不再有「停留识别」）。
+       * 只作用于自由笔迹：形状工具本来就是规整图形，荧光笔的半透明叠加
+       * 换成 shape 会变实心，也不参与。
+       * 识别失败一律保留原笔迹；下面原有的自动拉直只在没成型时生效。
+       */
+      let snapped = false;
+      if (
+        this.shapeSnap !== "off" &&
+        (draft.tool === "pen" || draft.tool === "ballpoint")
+      ) {
+        const found = recognizeShape(stroke.points);
+        if (found) {
+          stroke = {
+            ...stroke,
+            tool: "shape",
+            shape: found.kind,
+            opacity: 1,
+            points: recognitionPoints(found),
+          };
+          snapped = true;
+        }
+      }
+      // 已经成型就不必再拉直：两个端点本来就是直的
+      if (!snapped && this.straighten) {
         const straight = straightenPoints(stroke.points);
         if (straight) stroke = { ...stroke, points: straight };
       }
@@ -5918,6 +8688,7 @@ export class BookEditor {
     const target = rec.index === 0 ? 0 : Math.max(0, top);
     // 已经在目标位置（差值 ≤1px）就别写：scrollTo 同值也会派发 scroll
     if (Math.abs(target - this.scrollEl.scrollTop) > 1) {
+      if (smooth) this.navLockTarget = { top: target, until: performance.now() + 600 };
       this.scrollEl.scrollTo({
         top: target,
         behavior: smooth ? "smooth" : "auto",
@@ -5931,6 +8702,63 @@ export class BookEditor {
     // 翻页前先落库：编辑框里没提交的文字不能跟着页面一起被晾着
     this.commitTextEdit();
     this.scrollToPage(index, smooth);
+  }
+
+  /**
+   * 设置「笔记内查找」的高亮。
+   *
+   * `query` 为空即清除。高亮只改文字层 DOM：不碰 store、不写盘、不进撤销，
+   * 也不影响画布 / 导出 / 嵌入（它们都按页面数据重画，不读这层 mark）。
+   *
+   * 所有**已挂载**页里出现的查询词都标普通高亮，当前那条命中标得更醒目，
+   * 跟 Obsidian 文件内搜索「全文标色 + 当前项加深」的观感一致；没挂载的页
+   * 等滚到时由 `renderTextLayer` 按同一份 `findQuery` 自己补上。
+   */
+  setFindHighlight(query: string, hit: FindMatch | null): void {
+    this.findQuery = String(query ?? "");
+    this.findHit = this.findQuery ? hit : null;
+    // 旧层带着上一轮的高亮（或没有高亮），一律不能复用
+    this.invalidateTextLayerCache();
+    for (const rec of this.recs) {
+      if (!rec.mounted || !rec.textLayer) continue;
+      this.deferredTextLayers.delete(rec);
+      rec.textLayer.dataset.textSig = "";
+      this.renderTextLayer(rec);
+    }
+    if (this.findHit) this.revealFindHit(this.findHit);
+  }
+
+  /** 收起查找框时调用：清掉全部高亮。 */
+  clearFindHighlight(): void {
+    this.setFindHighlight("", null);
+  }
+
+  /**
+   * 把当前命中滚进视口。
+   *
+   * 只补一段纵向偏移：调用方通常已经 `goToPage` 翻到那一页了，但一页
+   * A4 有 1123 个页面单位，命中可能在纸的下半截；停在那里用户还是看不见。
+   */
+  private revealFindHit(hit: FindMatch): void {
+    const rec = this.recs[hit.page];
+    if (!rec) return;
+    if (!rec.mounted) this.mount(rec);
+    const layer = rec.textLayer;
+    if (!layer) return;
+    let span: HTMLElement | null = null;
+    for (const child of Array.from(layer.children)) {
+      if ((child as HTMLElement).dataset?.id === hit.textId) {
+        span = child as HTMLElement;
+        break;
+      }
+    }
+    if (!span) return;
+    const er = span.getBoundingClientRect();
+    const sr = this.scrollEl.getBoundingClientRect();
+    if (!er.height || !sr.height) return;
+    if (er.top >= sr.top + 48 && er.bottom <= sr.bottom - 48) return;
+    const delta = er.top - sr.top - Math.max(48, (sr.height - er.height) / 2);
+    this.scrollEl.scrollBy({ top: delta, behavior: "auto" });
   }
 
   /**
@@ -6018,6 +8846,12 @@ export class BookEditor {
 
   private updateCurrentFromScroll(quiet = false): void {
     if (!this.recs.length) return;
+    if (this.navLockTarget) {
+      const { top, until } = this.navLockTarget;
+      const near = Math.abs(this.scrollEl.scrollTop - top) <= 2;
+      if (!near && performance.now() < until) return; // 平滑滚动途中：页码保持目标页
+      this.navLockTarget = null;
+    }
     const n = this.recs.length;
     const pageH = this.store.data.height * this.zoom;
     if (pageH <= 0) return;
@@ -6037,6 +8871,7 @@ export class BookEditor {
       else hi = midIdx - 1;
     }
     const best = lo;
+    const fast = this.isFastScrolling();
 
     if (best !== this.current) {
       this.current = best;
@@ -6048,6 +8883,16 @@ export class BookEditor {
        * 正常滚动路径仍走完整的兜底挂载。
        */
       if (quiet) return;
+      /*
+       * 快滑中先不逐页 mount / 广播：fling 时一帧跨好几页，每跨一页都挂画布 +
+       * emitState -> 重建侧栏/刷新页码，主线程被塞满就会「一卡一卡」。
+       * 页码 / 当前页在停稳后由 armScrollSettle 统一补一次；滚动中文本层
+       * 也已经按快滑规则延后。慢速翻页仍走下面的即时路径，行为不变。
+       */
+      if (fast) {
+        this.armScrollSettle();
+        return;
+      }
       /*
        * 兜底挂载：翻页时保证当前页一定有画布。
        *
@@ -6061,6 +8906,35 @@ export class BookEditor {
       this.emitState();
       if (this.opts.onPageChange) this.opts.onPageChange(best);
     }
+  }
+
+  /**
+   * 快滑停稳后补一次「当前页挂载 + 页码广播」。
+   *
+   * 快滑期间 updateCurrentFromScroll 只更新 current / store，不每页 mount、
+   * 不 emitState；这里等 isFastScrolling() 彻底结束（宽限期也过了）再补，
+   * 用户看到的是滚动顺滑、停稳后页码和画布一次到位。
+   */
+  private armScrollSettle(): void {
+    if (this.scrollSettleTimer) return;
+    const tick = () => {
+      this.scrollSettleTimer = 0;
+      if (this.destroyed) return;
+      if (this.isFastScrolling()) {
+        this.armScrollSettle();
+        return;
+      }
+      // 程序化翻页（上一页/下一页）还在平滑滚动途中：别用中间页覆盖页码
+      if (this.navLockTarget) {
+        this.armScrollSettle();
+        return;
+      }
+      if (!this.recs.length) return;
+      this.mount(this.recs[this.current]);
+      this.emitState();
+      if (this.opts.onPageChange) this.opts.onPageChange(this.current);
+    };
+    this.scrollSettleTimer = window.setTimeout(tick, 160);
   }
 
   /* ------------------------------- 撤销 ------------------------------- */
@@ -6247,6 +9121,17 @@ export class BookEditor {
       bgReady = !!img && img.complete && img.naturalWidth > 0;
       this.drawBackground(ctx, page);
     }
+    // 插入的图片也是异步加载：没加载完就画淡灰占位，且这张缩略图不进缓存
+    if (page.images?.length) {
+      for (const im of page.images) {
+        const im2 = this.bgImages.get(im.src);
+        if (!(im2 && im2.complete && im2.naturalWidth > 0)) {
+          bgReady = false;
+          this.loadBackground(im.src);
+        }
+      }
+      this.drawInsertedImages(ctx, page);
+    }
     for (const layer of page.layers) {
       if (!layer.visible) continue;
       for (const s of layer.strokes) drawStroke(ctx, s, layer.opacity);
@@ -6274,17 +9159,45 @@ export class BookEditor {
     // 1.4 倍余量：缩略图在 hover / 窄侧栏里会有几像素的尺寸浮动
     const want = clamp(Math.round(cssW * dpr * 1.4), 96, 384);
 
-    // 先看缩略图自己的缓存，再借主视图的（主视图那份通常更清晰）
-    const bmp = this.thumbBitmaps.get(key) ?? this.bgBitmaps.get(key);
-    if (bmp) {
+    /*
+     * 取最清晰的一张：缩略图专用位图 or 主视图位图，谁宽用谁。
+     * 以前是 `thumbBitmaps ?? bgBitmaps`——若缩略图位图比主视图那张小，
+     * 就会宁可画更糊的；改成取更大的那张。
+     */
+    const thumbEntry = this.thumbBitmaps.getEntry(key);
+    const mainEntry = this.bgBitmaps.getEntry(key);
+    let best: ImageBitmap | null = null;
+    let bestW = 0;
+    if (thumbEntry && thumbEntry.width > bestW) {
+      best = thumbEntry.bitmap;
+      bestW = thumbEntry.width;
+    }
+    if (mainEntry && mainEntry.width > bestW) {
+      best = mainEntry.bitmap;
+      bestW = mainEntry.width;
+    }
+
+    if (best && bestW >= want * 0.8) {
       ctx.save();
-      ctx.drawImage(bmp, bg.x, bg.y, bg.width, bg.height);
+      ctx.drawImage(best, bg.x, bg.y, bg.width, bg.height);
       ctx.restore();
       return true;
     }
 
+    if (best) {
+      /*
+       * 有图但不够清：先画这张当过渡（比灰块好看），同时请求更清晰的。
+       * 返回 false → 这一张不进快照缓存，等高清就绪后 notifyThumb 会重画。
+       */
+      ctx.save();
+      ctx.drawImage(best, bg.x, bg.y, bg.width, bg.height);
+      ctx.restore();
+      this.requestPdfThumb(pdf.path, pdf.page, key, want);
+      return false;
+    }
+
     /*
-     * 位图还没好：画一层浅灰。
+     * 完全没图：画一层浅灰。
      *
      * 用 #F0EDE8 而不是纸白，是为了和"空白的纸"区分开——
      * 一眼能看出这页有底图，只是还在渲染。
@@ -6367,6 +9280,14 @@ export class BookEditor {
   private clearThumbShots(): void {
     for (const key of Array.from(this.thumbShots.keys())) this.dropThumbShot(key);
     this.thumbShotBytes = 0;
+    /*
+     * 整本范围改动同时作废所有脱离 DOM 的主画布（INK-229）。
+     *
+     * 这里是「多页像素可能一起变」的唯一集中点：全部换模板 / 纸张、
+     * 撤销重做恢复整本快照都走它。单页改动不走这里（见 changed() 的
+     * 按页作废），所以首轮滚动时逐页补抽文字不会把复用机会全抹掉。
+     */
+    this.invalidateRasterCache();
   }
 
   /**
@@ -6381,10 +9302,15 @@ export class BookEditor {
     key: string,
     want: number
   ): void {
-    const have = this.thumbBitmaps.getEntry(key)?.width ?? 0;
-    // 已经够清晰（或主视图缓存里有更大的）就不重复渲染
-    if (have >= want * 0.8) return;
-    if (this.bgBitmaps.getEntry(key)) return;
+    const haveThumb = this.thumbBitmaps.getEntry(key)?.width ?? 0;
+    const haveMain = this.bgBitmaps.getEntry(key)?.width ?? 0;
+    // 已经够清晰就不重复渲染。主视图那张只要够大也算数。
+    if (Math.max(haveThumb, haveMain) >= want * 0.8) return;
+    /*
+     * 注意：**不再**「有 bgBitmap 就 return」。
+     * 主视图那张可能比缩略图需要的还小（例如缩小状态渲的），
+     * 这时仍要渲一张缩略图专用的高清位图，否则缩略图会一直低清（真机「糊成一片」）。
+     */
     if (this.thumbRendering.has(key) || this.thumbQueued.has(key)) return;
     /*
      * 队列封顶 20 条：侧栏快速滚动时，用户早就滑过去的那些页还会往队列里排。
@@ -6410,8 +9336,9 @@ export class BookEditor {
       void (async () => {
         try {
           const doc = await this.openPdfDoc(job.pdfPath);
-          const nowHave = this.thumbBitmaps.getEntry(job.key)?.width ?? 0;
-          if (nowHave >= job.want * 0.8 || this.bgBitmaps.getEntry(job.key)) return;
+          const nowThumb = this.thumbBitmaps.getEntry(job.key)?.width ?? 0;
+          const nowMain = this.bgBitmaps.getEntry(job.key)?.width ?? 0;
+          if (Math.max(nowThumb, nowMain) >= job.want * 0.8) return;
           const rendered = await renderPdfPage(doc, job.pageNo, job.want);
           const cached = this.thumbBitmaps.set(job.key, rendered.bitmap, rendered.bitmap.width);
           if (!cached) {
@@ -6463,6 +9390,8 @@ export class BookEditor {
     drawPaper(ctx, page.template, page.paper, this.store.data.width, this.store.data.height, 1);
     // 底图也要导出，否则导入的 PDF/Word 内容会丢失
     this.drawBackground(ctx, page);
+    // 插入的图片同样要导出（导出前 waitBackgrounds 已把图加载好）
+    this.drawInsertedImages(ctx, page);
     for (const layer of page.layers) {
       if (!layer.visible) continue;
       for (const s of layer.strokes) drawStroke(ctx, s, layer.opacity);
@@ -6501,6 +9430,8 @@ export class BookEditor {
       1,
       false
     );
+    // 插入的图片是用户内容，必须在透明叠加层上一起导出（PDF 矢量页也一样）
+    this.drawInsertedImages(ctx, page);
     for (const layer of page.layers) {
       if (!layer.visible) continue;
       for (const s of layer.strokes) drawStroke(ctx, s, layer.opacity);
@@ -6563,11 +9494,53 @@ export class BookEditor {
   }
 
   /**
+   * 等「手写」字体就绪（导出/嵌入前需要）。
+   *
+   * `drawUserTexts` 是把字**画进 canvas**：canvas 的 `font` 一旦解析不到
+   * 某个家族就直接用回退字体，而字体是异步解码的 —— 不等它，导出的 PNG/PDF
+   * 里手写批注会变成 Noto（黑体），屏幕上却是手写，导出件与屏幕不一致。
+   *
+   * 失败/环境不支持时也只是不等待（`ensureHandFont` 自己吞掉异常），
+   * 导出不会因此失败——顶多是手写档回落到 Noto，和屏幕上的回退一致。
+   */
+  async waitFonts(): Promise<void> {
+    try {
+      await ensureHandFont();
+      /*
+       * 注册完还要等**浏览器真正解码到可用**：`document.fonts.add()` 之后
+       * `FontFace.load()` 已经 await 过了，但 canvas 侧要等 `document.fonts.ready`
+       * 才保证 measureText/drawText 用的是新字体而不是回退字体。
+       */
+      await document.fonts?.ready;
+    } catch (e) {
+      console.warn("[inkbook] 等待手写字体失败，导出可能回落到 Noto", e);
+    }
+  }
+
+  /**
    * 底图是否都已加载完（导出前需要）。
    *
    * PDF 页是按需渲染的，所以这里要**主动等它渲染完**——
    * 否则导出的 PDF 会缺底图内容。
    */
+  /**
+   * 导出前**只**等「插入的图片」加载好。
+   *
+   * 给矢量 PDF 页用：那条路径刻意不渲染底图（省内存），但插入的图片仍要画到
+   * 透明叠加层上，所以这里单独等它们，不牵连 PDF 位图。
+   */
+  async waitInsertedImages(indexes: number[]): Promise<void> {
+    const pending: Promise<unknown>[] = [];
+    for (const i of indexes) {
+      const imgs = this.store.data.pages[i]?.images;
+      if (!imgs?.length) continue;
+      for (const im of imgs) {
+        if (im?.src && !this.bgImages.has(im.src)) pending.push(this.waitStaticImage(im.src));
+      }
+    }
+    await Promise.all(pending);
+  }
+
   async waitBackgrounds(indexes: number[], exportScale = 2): Promise<void> {
     const pending: Promise<unknown>[] = [];
     for (const i of indexes) {
@@ -6628,47 +9601,54 @@ export class BookEditor {
       }
 
       const src = bg.src;
-      if (!src) continue;
-      if (this.bgImages.has(src)) continue;
-      pending.push(
-        /*
-         * **必须带超时**（INK-181）。
-         *
-         * 这里等的是导出前的底图，`img.onload` / `onerror` 一个都不来
-         * （同步盘卡住、资源被删但 URL 还挂着、宿主拦截了资源加载）时
-         * 这个 Promise 永不 resolve → `Promise.all` 永不返回 →
-         * **整个导出卡死**，用户看到进度条停在「准备导出」不动，
-         * 连取消都没用（取消检查在页循环里，这里还没进循环）。
-         *
-         * 与 embed.ts 的 `withTimeout` 同一思路：超时当「取不到」处理
-         * （resolve 而非 reject），导出照常继续，这一页底图画灰块。
-         * 宁可导出一份缺底图的 PDF，也不能让用户卡在那里没法收场。
-         */
-        new Promise<void>((resolve) => {
-          const img = new Image();
-          let settled = false;
-          const done = () => {
-            if (settled) return;
-            settled = true;
-            window.clearTimeout(timer);
-            resolve();
-          };
-          const timer = window.setTimeout(() => {
-            if (settled) return;
-            console.warn("[inkbook] 导出等待底图超时，这一页按无底图导出", src);
-            done();
-          }, bgWaitTimeoutMs);
-          img.onload = () => {
-            if (settled) return;
-            this.bgImages.set(src, img);
-            done();
-          };
-          img.onerror = () => done();
-          img.src = this.resolveAssetUrl(src);
-        })
-      );
+      if (src && !this.bgImages.has(src)) pending.push(this.waitStaticImage(src));
+    }
+
+    /*
+     * 插入的图片也要在导出前加载好，否则导出的 PNG / PDF 里会缺图。
+     * 单独一轮扫所有页（包括只有图片、没有底图的页），去重后等它加载完。
+     */
+    for (const i of indexes) {
+      const imgs = this.store.data.pages[i]?.images;
+      if (!imgs?.length) continue;
+      for (const im of imgs) {
+        if (im?.src && !this.bgImages.has(im.src)) pending.push(this.waitStaticImage(im.src));
+      }
     }
     await Promise.all(pending);
+  }
+
+  /**
+   * 导出一张静态图片（底图或插入图片）并等它加载完，带超时。
+   *
+   * **必须带超时**（INK-181 / 本功能沿用）：`img.onload` / `onerror` 一个都不来
+   * （同步盘卡住、资源被删但 URL 还挂着、宿主拦截了资源加载）时，这个 Promise
+   * 永不 resolve → `Promise.all` 永不返回 → 整个导出卡死。超时当「取不到」
+   * 处理（resolve 而非 reject），导出照常继续，这一张按占位导出。
+   */
+  private waitStaticImage(src: string): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const img = new Image();
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        resolve();
+      };
+      const timer = window.setTimeout(() => {
+        if (settled) return;
+        console.warn("[inkbook] 导出等待图片超时，这一张按占位导出", src);
+        done();
+      }, bgWaitTimeoutMs);
+      img.onload = () => {
+        if (settled) return;
+        this.bgImages.set(src, img);
+        done();
+      };
+      img.onerror = () => done();
+      img.src = this.resolveAssetUrl(src);
+    });
   }
 
   destroy(): void {
@@ -6677,7 +9657,14 @@ export class BookEditor {
      * 内容再也读不到。force：等不到 compositionend，组字中只提交已上屏部分。
      */
     this.commitTextEditNow(true);
+    // commitTextEditNow 在没有编辑框时会提前返回，这里再兜一次，确保候选列表不残留
+    this.hideLinkSuggest();
+    this.linkTargetsCache = null;
     this.stopFling();
+    if (this.scrollSettleTimer) {
+      window.clearTimeout(this.scrollSettleTimer);
+      this.scrollSettleTimer = 0;
+    }
     /*
      * 停掉步进按钮的连调 timer：手指还按着按钮时切文件 / 关标签页，
      * DOM 已拆、pointerup 可能永远等不到，不停的话 timer 会一路按到底，
@@ -6686,7 +9673,12 @@ export class BookEditor {
     for (const stop of this.stepBtnStoppers) stop();
     this.stepBtnStoppers = [];
     this.destroyed = true;
+    // 字体到位回调里会重排文字层，销毁后那些 rec 已经没意义了
+    this.offHandFont?.();
+    this.offHandFont = null;
     this.uninstallEdgeSwipeGuard();
+    this.laserTrail = [];
+    this.stopLaserFade();
     window.removeEventListener("pointerup", this.globalUp, true);
     window.removeEventListener("pointercancel", this.globalUp, true);
     window.removeEventListener("blur", this.onWindowBlur);
@@ -6728,6 +9720,17 @@ export class BookEditor {
     this.pdfDocs.clear();
     window.clearTimeout(this.pinchReleaseTimer);
     this.pinchReleaseTimer = 0;
+    this.clearPendingPinch();
+    window.clearTimeout(this.textLayerIdleTimer);
+    this.textLayerIdleTimer = 0;
+    if (this.mountLimitRaf) cancelAnimationFrame(this.mountLimitRaf);
+    this.mountLimitRaf = 0;
+    this.mountLimitPending = false;
+    this.deferredTextLayers.clear();
+    // 释放脱离 DOM 的主画布缓存（INK-229）；textLayerCache 同理（旧版漏了）
+    this.rasterCache.clear();
+    this.rasterCacheBytes = 0;
+    this.textLayerCache.clear();
     this.clearLocateHint();
     this.moveText = null;
     this.resizeText = null;

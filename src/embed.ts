@@ -19,6 +19,7 @@
 import { drawStroke } from "./ink";
 import { drawPaper } from "./paper";
 import { textFontStack } from "./editor";
+import { ensureHandFont } from "./handfont";
 import { openPdf, renderPdfPage, type PdfDoc } from "./pdf";
 import { readBook } from "./storage";
 import { layoutUserText } from "./textwrap";
@@ -549,6 +550,8 @@ export async function renderEmbedPage(
 
   if (page) {
     await drawEmbedBackground(ctx, page, pageW, cssW, dpr);
+    // 插入的图片：与主编辑器同层序（底图之上、笔迹之下）
+    await drawEmbedImages(ctx, page);
 
     for (const layer of page.layers ?? []) {
       if (layer.visible === false) continue;
@@ -556,6 +559,13 @@ export async function renderEmbedPage(
       for (const stroke of layer.strokes ?? []) drawStroke(ctx, stroke, alpha);
     }
 
+    /*
+     * 手写批注要等自带字体就绪再画（INK-224）：canvas 的 font 解析不到
+     * `"Inkbook Hand"` 就直接用回退字体，笔记里那块嵌入图会显示成黑体，
+     * 而点进本子里是手写 —— 同一段字两个样子。
+     * 等不到（老环境 / 字体坏了）也只是回落到 Noto，不影响出图。
+     */
+    await ensureHandFont();
     drawUserTexts(ctx, page, pageW, pageH);
   }
 
@@ -592,7 +602,12 @@ async function drawEmbedBackground(
         10000,
         "PDF 页渲染"
       );
+      ctx.save();
+      // 嵌入 PDF 位图通常比栏宽大：高质量降采样让既有导入本子无需迁移就变清楚。
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
       ctx.drawImage(rendered.bitmap, bg.x, bg.y, bg.width, bg.height);
+      ctx.restore();
       rendered.bitmap.close?.();
       return;
     } catch (e) {
@@ -613,7 +628,41 @@ async function drawEmbedBackground(
     fillBgPlaceholder(ctx, page);
     return;
   }
+  ctx.save();
+  // Word 静态底图按原分辨率加载，缩到嵌入宽度时显式走高质量采样。
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
   ctx.drawImage(img, bg.x, bg.y, bg.width, bg.height);
+  ctx.restore();
+}
+
+/**
+ * 画页面上插入的图片（层序与主编辑器一致：底图之上、笔迹之下）。
+ *
+ * 每张图异步加载、带超时；单张取不到就跳过（不阻塞其余内容，也不影响
+ * 笔迹和批注）。用 loadImage 的单张 `.catch(() => null)` 把「超时 reject」
+ * 也当成取不到，避免一张坏图把整块嵌入渲染带崩。
+ */
+async function drawEmbedImages(ctx: CanvasRenderingContext2D, page: Page): Promise<void> {
+  const imgs = page.images;
+  if (!imgs?.length) return;
+  const loaded = await Promise.all(
+    imgs.map((im) =>
+      im && im.src && im.width > 0 && im.height > 0
+        ? loadImage(resolveAssetUrl(im.src)).catch(() => null)
+        : Promise.resolve(null)
+    )
+  );
+  ctx.save();
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  imgs.forEach((im, i) => {
+    const img = loaded[i];
+    if (img && img.naturalWidth > 0 && im.width > 0 && im.height > 0) {
+      ctx.drawImage(img, im.x, im.y, im.width, im.height);
+    }
+  });
+  ctx.restore();
 }
 
 /** 批注的 CSS font 串（与 editor 的 textFontCss 同一套规则） */

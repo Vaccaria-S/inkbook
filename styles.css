@@ -303,86 +303,6 @@
   transform: scale(0.93);
 }
 
-/*
- * 顶栏的「当前笔」chip：一枚色点 + 粗细数值。
- *
- * 侧栏收起时（平板默认如此）顶栏只有工具图标亮着，看不出当前笔色 / 粗细。
- * 这枚小 chip 挂在工具组右侧：高 30px、宽约 40px，不把顶栏塞满；
- * 点它开合侧栏，等于把调参入口也放到手边。
- *
- * 单独一套类名，故意**不带 .mb-topbtn**：那一套是 30×30 的方按钮，
- * 也用于测试里数顶栏动作按钮的个数（8 笔 + 3 动作 = 11）。
- */
-.mb-pen-chip {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  flex: 0 0 auto;
-  height: 30px;
-  min-width: 0;
-  margin: 0;
-  padding: 0 6px;
-  border: none;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--text-muted, var(--text-normal, #666));
-  font-size: 10px;
-  line-height: 1;
-  font-variant-numeric: tabular-nums;
-  cursor: pointer;
-  box-shadow: none;
-  transition:
-    background 0.16s ease,
-    color 0.16s ease;
-}
-
-.mb-pen-chip:hover {
-  background: var(--background-modifier-hover);
-  color: var(--text-normal);
-}
-
-.mb-pen-chip:active {
-  transform: scale(0.95);
-}
-
-/* text / select / hand 没有笔参数：整枚收起，别留一个空壳 */
-.mb-pen-chip.is-hidden {
-  display: none;
-}
-
-.mb-pen-chip-dot {
-  flex: 0 0 auto;
-  width: 14px;
-  height: 14px;
-  box-sizing: border-box;
-  border-radius: 50%;
-  border: 1px solid var(--background-modifier-border);
-  /* 浅色（米黄 / 浅绿）在白底上也能看出边界 */
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.35);
-}
-
-/* 橡皮没有颜色：用虚线圈表示「当前参数是模式 + 大小」 */
-.mb-pen-chip-dot.is-eraser {
-  background: transparent;
-  border: 1.5px dashed var(--text-faint, #999);
-  box-shadow: none;
-}
-
-/* 平板上跟着顶栏按钮放大一档，手指点得准 */
-.mb-tablet .mb-toprow .mb-pen-chip {
-  height: 42px;
-  gap: 7px;
-  padding: 0 11px;
-  border-radius: 11px;
-  font-size: 13px;
-}
-
-.mb-tablet .mb-toprow .mb-pen-chip-dot {
-  width: 18px;
-  height: 18px;
-}
-
 /* ====================== 顶栏笔按钮的快捷笔盒浮层 ======================
  *
  * 已经在某支笔上再点一下笔按钮，在按钮正下方弹出。
@@ -396,69 +316,378 @@
   z-index: 1000;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px 12px;
+  gap: 6px;
+  padding: 8px 10px;
   box-sizing: border-box;
   max-width: calc(100vw - 16px);
-  background: var(--background-primary);
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 10px;
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.22);
+  /*
+   * iPhone 风「高级磨砂玻璃」：更厚更浓的一层。半透明底 + 更强的背景模糊 /
+   * 提饱和 / 轻微提亮，再叠一道从左上到右下的高光渐变 + 极细亮边 + 多层柔和
+   * 投影，看上去像一块有厚度的磨砂玻璃片，而不是半透明色块。
+   *
+   * 关键：这一层只负责「玻璃材质」，**不参与缩放**（见下面的动画注释）。
+   * 磨砂用最终尺寸一次性渲染，打开过程中始终清晰，不会又糊一下再变清。
+   * 颜色全走 Obsidian 主题变量，亮 / 暗主题都适配。
+   */
+  background-color: color-mix(in srgb, var(--background-primary) 60%, transparent);
+  background-image:
+    radial-gradient(
+      130% 90% at 16% -6%,
+      rgba(255, 255, 255, 0.42) 0%,
+      rgba(255, 255, 255, 0.1) 34%,
+      rgba(255, 255, 255, 0) 62%
+    ),
+    linear-gradient(
+      152deg,
+      rgba(255, 255, 255, 0.26) 0%,
+      rgba(255, 255, 255, 0.06) 42%,
+      rgba(255, 255, 255, 0.02) 70%,
+      rgba(255, 255, 255, 0.12) 100%
+    );
+  backdrop-filter: blur(30px) saturate(1.9) brightness(1.04);
+  -webkit-backdrop-filter: blur(30px) saturate(1.9) brightness(1.04);
+  border: 1px solid color-mix(in srgb, var(--text-normal) 15%, transparent);
+  border-radius: 16px;
+  box-shadow:
+    0 22px 60px -20px rgba(0, 0, 0, 0.55),
+    0 6px 18px -8px rgba(0, 0, 0, 0.24),
+    0 1px 2px rgba(0, 0, 0, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.55),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.06);
+  /* 缩放原点由 view.ts 按锚点按钮中心写进这两个变量，内层内容从这里长出来 */
+  transform-origin: var(--mb-pop-origin-x, 50%) var(--mb-pop-origin-y, 0px);
+}
+
+/*
+ * 内层内容容器：所有控件都放进它里面。放大动画只作用在它身上，外层玻璃
+ * 不缩放，从而绕开「backdrop-filter 跟着缩放 → 初始几帧被按小尺寸栅格化、
+ * 再放大 → 打开时一片模糊」的渲染问题。
+ */
+.mb-pen-pop-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transform-origin: var(--mb-pop-origin-x, 50%) var(--mb-pop-origin-y, 0px);
 }
 
 .mb-pen-pop-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .mb-pen-pop-colors {
-  /* 8 个 40px 色点在窄屏（竖屏平板/手机）会自动换行，不会被裁 */
+  /* 色点在窄屏会自动换行，不会被裁 */
   flex-wrap: wrap;
   max-width: 100%;
 }
 
 .mb-pen-pop-dot {
   flex: 0 0 auto;
-  width: 40px;
-  height: 40px;
+  width: 30px;
+  height: 30px;
   padding: 0;
   box-sizing: border-box;
   border-radius: 50%;
-  border: 1px solid rgba(0, 0, 0, 0.18);
+  border: 1px solid rgba(0, 0, 0, 0.16);
   cursor: pointer;
-  box-shadow: none;
+  /* 玻璃珠质感：顶部一层高光、底部一圈暗边、外面一点投影 */
+  box-shadow:
+    inset 0 1px 2px rgba(255, 255, 255, 0.55),
+    inset 0 -2px 3px rgba(0, 0, 0, 0.14),
+    0 1px 3px rgba(0, 0, 0, 0.22);
+  transition: transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1), box-shadow 0.16s ease;
+}
+.mb-pen-pop-dot:hover {
+  transform: scale(1.08);
+  box-shadow:
+    inset 0 1px 2px rgba(255, 255, 255, 0.65),
+    inset 0 -2px 3px rgba(0, 0, 0, 0.16),
+    0 2px 6px rgba(0, 0, 0, 0.28);
+}
+.mb-pen-pop-dot:active {
+  transform: scale(0.92);
 }
 
-/* 荧光笔色点用圆角方块，跟侧栏的 .mb-swatch-hl 保持一致 */
-.mb-pen-pop-dot.is-hl {
+/* 所有色点（含荧光笔 .is-hl）都沿用基础的正圆；圆角方块会让同一浮层
+ * 出现两种形状，平板高优先级规则也要求统一为 50%。 */
+.mb-pen-pop-dot.is-active {
+  box-shadow:
+    0 0 0 2px color-mix(in srgb, var(--background-primary) 85%, transparent),
+    0 0 0 3.5px var(--interactive-accent),
+    inset 0 1px 2px rgba(255, 255, 255, 0.55);
+}
+
+/* 粗细 / 形状按钮：半透明玻璃片 + 顶部高光 + 轻微投影，hover 提亮、按下回弹。
+ * 不用 backdrop-filter：小块按钮上收益很小、开销不小，且它们在内层缩放时
+ * 也会被一起放大，反而可能闪；用渐变高光就能有玻璃片的观感。 */
+.mb-pen-pop-size,
+.mb-pen-pop-shape {
+  flex: 0 0 auto;
+  height: 30px;
+  border: 1px solid color-mix(in srgb, var(--text-normal) 13%, transparent);
+  border-radius: 9px;
+  background-color: color-mix(in srgb, var(--background-primary) 42%, transparent);
+  background-image: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.3) 0%,
+    rgba(255, 255, 255, 0.04) 46%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.5),
+    0 1px 3px rgba(0, 0, 0, 0.1);
+  transition:
+    background-color 0.16s ease,
+    color 0.16s ease,
+    box-shadow 0.16s ease,
+    transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+.mb-pen-pop-size {
+  min-width: 38px;
+  padding: 0 9px;
+}
+.mb-pen-pop-shape {
+  min-width: 46px;
+  padding: 0 10px;
+}
+.mb-pen-pop-size:hover,
+.mb-pen-pop-shape:hover {
+  background-color: color-mix(in srgb, var(--background-primary) 58%, transparent);
+  color: var(--text-normal);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.6),
+    0 2px 6px rgba(0, 0, 0, 0.14);
+}
+.mb-pen-pop-size:active,
+.mb-pen-pop-shape:active {
+  transform: scale(0.95);
+}
+
+.mb-pen-pop-size.is-active,
+.mb-pen-pop-shape.is-active {
+  background-color: var(--interactive-accent);
+  background-image: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.32) 0%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  color: var(--text-on-accent);
+  border-color: transparent;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.4),
+    0 2px 7px -1px color-mix(in srgb, var(--interactive-accent) 75%, transparent);
+}
+
+/*
+ * 细/中/粗、字号、形状种类这几排改用和「切换各个笔」一样的滑动高亮片
+ * （view.ts 里 mountSegPill 挂 SlidePill）。选中项把紫底让给高亮片，
+ * 自己只留反白文字，否则亮片滑过去时按钮先「蹦」一块紫底＝双重高亮。
+ */
+.mb-pen-pop .mb-slide-pill {
+  border-radius: 9px;
+}
+.mb-seg-row.mb-slide-host > .mb-pen-pop-size.is-active,
+.mb-seg-row.mb-slide-host > .mb-pen-pop-shape.is-active {
+  background: transparent;
+  background-image: none;
+  color: var(--text-on-accent);
+  border-color: transparent;
+  box-shadow: none;
+}
+.mb-seg-row.mb-slide-host > .mb-pen-pop-size.is-active:hover,
+.mb-seg-row.mb-slide-host > .mb-pen-pop-shape.is-active:hover {
+  background: transparent;
+  background-image: none;
+  color: var(--text-on-accent);
+}
+
+/* 形状选项：矩形 / 椭圆 / 直线 / 箭头 一排按钮（窄屏自动换行） */
+.mb-pen-pop-shapes {
+  flex-wrap: wrap;
+}
+
+/* 文字/橡皮浮层里的字体下拉与粗细滑杆尺寸 */
+.mb-pen-pop-font {
+  min-width: 84px;
+  height: 30px;
+  font-size: 12px;
+  /* 用户：字体名「黑体」和下拉箭头图标重合。给箭头留出右侧空间并允许省略号。 */
+  box-sizing: border-box;
+  padding: 0 24px 0 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.mb-pen-pop-range {
+  width: 128px;
+  max-width: 56vw;
+}
+
+/* 具体粗细滑杆行：滑杆 + 数值标签一行排开 */
+.mb-pen-pop-thickness {
+  gap: 8px;
+  padding-top: 2px;
+}
+
+/*
+ * 弹出调节框的进出场动画：从锚点按钮里「弹」出来，收起时缩回去。
+ *
+ * 分两层，这是修「打开时先糊一下」的关键：
+ *   · 外层 .mb-pen-pop 只做透明度淡入 / 淡出（mb-pen-pop-in / -out），
+ *     **不做 transform: scale**。bearer 磨砂玻璃的那层一旦被缩放，Chrome 会
+ *     按初始小尺寸把整层（含 backdrop-filter 的模糊结果和文字）栅格化，再放大
+ *     到最终尺寸 → 打开的前一两百毫秒看起来一片模糊，动画结束才重新栅格化变清
+ *     （用户原话：「一开始很模糊，得加载一下才能变成那种质感」）。
+ *   · 内层 .mb-pen-pop-inner 负责从锚点按钮中心弹性放大（scale 0.66→1.02→1），
+ *     它不含 backdrop-filter，浏览器每帧按最终比例重栅格化内容，所以色点 / 按钮
+ *     / 文字始终清晰。缩放原点钉在按钮中心（positionPenPop 写入的
+ *     --mb-pop-origin-x/y），看上去仍是从那枚方形按钮里「长」出来。
+ *
+ * 出场：外层 200ms 淡入 + 内层 300ms 回弹（q 弹：冲过 1 再回弹两次）；收起：170ms 缩回并淡出
+ * （closePenPop 播完再摘 DOM）。类由 view.ts 临时加上，动画结束即摘除。
+ * 注意：**不要给这两层加 will-change: transform**，那会把图层固定在小尺寸上
+ * 再放大，反而把上面的模糊问题做回来。
+ */
+@keyframes mb-pen-pop-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes mb-pen-pop-out {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+@keyframes mb-pen-pop-inner-in {
+  0%   { opacity: 0; transform: scale(0.6); }
+  45%  { opacity: 1; transform: scale(1.06); }
+  68%  { transform: scale(0.985); }
+  85%  { transform: scale(1.012); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes mb-pen-pop-inner-out {
+  0%   { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(0.74); }
+}
+.mb-pen-pop.mb-pen-pop-anim {
+  animation: mb-pen-pop-in 200ms ease both;
+}
+.mb-pen-pop.mb-pen-pop-anim .mb-pen-pop-inner {
+  /* q 弹：0.6 → 冲过 1.06 → 回 0.985 → 1.012 → 1，像果冻弹出来 */
+  animation: mb-pen-pop-inner-in 300ms cubic-bezier(0.22, 0.9, 0.3, 1) both;
+}
+.mb-pen-pop.mb-pen-pop-anim-out {
+  animation: mb-pen-pop-out 170ms ease both;
+  pointer-events: none;
+}
+.mb-pen-pop.mb-pen-pop-anim-out .mb-pen-pop-inner {
+  animation: mb-pen-pop-inner-out 170ms cubic-bezier(0.4, 0, 0.75, 0.35) both;
+}
+
+/*
+ * 平板：浮层挂在 document.body，够不到 .mb-root.is-tablet 里的宿主 padding
+ * 覆写。真机 `.is-tablet button:not(.clickable-icon){padding:4px 20px}` (0,2,1)
+ * 会把色点拉成横椭圆；下面用 (0,4,1) 的选择器把尺寸、padding、圆角一次压回，
+ * 不改桌面规则。22px 是触摸目标底线，::before 再把可点热区扩到约 26px。
+ */
+.mb-pen-pop.mb-pen-pop-tablet button.mb-pen-pop-dot[class] {
+  box-sizing: border-box;
+  position: relative;
+  width: 22px;
+  height: 22px;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  aspect-ratio: 1;
+  flex: 0 0 auto;
+  border-radius: 50%;
+}
+
+.mb-pen-pop.mb-pen-pop-tablet button.mb-pen-pop-dot[class]::before {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border-radius: 50%;
+}
+
+/*
+ * 紧凑 4+4 两行：8 个 22px 色点占 94px 宽，比原来一整排 26px 色点
+ * （且被宿主 padding 撑宽）窄得多；行距、浮层内边距同步收紧，高度也更小。
+ */
+.mb-pen-pop.mb-pen-pop-tablet {
+  gap: 2px;
+  padding: 4px 5px;
+  /* 老 Electron 不认 min() 时先退到 132px；平板视口远宽于此，JS 仍会夹回视口 */
+  max-width: 132px;
+  max-width: min(132px, calc(100vw - 16px));
   border-radius: 9px;
 }
 
-.mb-pen-pop-dot.is-active {
-  box-shadow:
-    0 0 0 2px var(--background-primary),
-    0 0 0 4px var(--interactive-accent);
+.mb-pen-pop.mb-pen-pop-tablet .mb-pen-pop-row {
+  gap: 2px;
 }
 
-.mb-pen-pop-size {
-  flex: 0 0 auto;
-  min-width: 44px;
-  height: 40px;
-  padding: 0 12px;
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 8px;
-  background: transparent;
-  color: var(--text-muted);
-  font-size: 13px;
-  cursor: pointer;
-  box-shadow: none;
+/* 平板浮层整体紧凑：内层内容容器的间距跟着收（外层玻璃不再承载行间距） */
+.mb-pen-pop.mb-pen-pop-tablet .mb-pen-pop-inner {
+  /* 用户：细/中/粗那排离色板太近，再拉开。色板两行之间也拉到和横向一样的 9px。 */
+  gap: 9px;
 }
 
-.mb-pen-pop-size.is-active {
-  background: var(--interactive-accent);
-  color: var(--text-on-accent);
-  border-color: transparent;
+.mb-pen-pop.mb-pen-pop-tablet .mb-pen-pop-colors {
+  display: grid;
+  grid-template-columns: repeat(4, 22px);
+  /*
+   * 用户：每个颜色横向、纵向都再拉开一些，纵向和横向一样远。
+   * 4×22 + 3×9 = 115px，仍在 132px 浮层内；上下两行也留 9px。
+   */
+  column-gap: 9px;
+  row-gap: 9px;
+  width: max-content;
+  max-width: calc(100vw - 26px);
+  flex-wrap: nowrap;
+}
+
+.mb-pen-pop.mb-pen-pop-tablet .mb-pen-pop-font {
+  min-width: 84px;
+  height: 22px;
+  font-size: 10.5px;
+}
+
+/*
+ * Obsidian 自带的 select.dropdown 会给右侧箭头留固定内边距（实测 computed
+ * 只有 22px/6px），字体名长一点（「黑体」「思源宋体」）仍会顶到箭头上。
+ * 用更高特异性 + !important 明确加宽右侧留白，确保文字和图标不再重叠。
+ */
+.mb-pen-pop .mb-pen-pop-font,
+.mb-pen-pop.mb-pen-pop-tablet .mb-pen-pop-font {
+  padding-left: 8px !important;
+  padding-right: 30px !important;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
+  background-position: right 6px center;
+}
+
+.mb-pen-pop.mb-pen-pop-tablet .mb-pen-pop-size {
+  min-width: 28px;
+  width: 28px;
+  height: 22px;
+  padding: 0 4px;
+  font-size: 10.5px;
+}
+
+.mb-pen-pop.mb-pen-pop-tablet .mb-pen-pop-shape {
+  min-width: 36px;
+  height: 22px;
+  padding: 0 4px;
+  font-size: 10.5px;
+}
+
+.mb-pen-pop.mb-pen-pop-tablet .mb-pen-pop-range {
+  width: 96px;
 }
 
 
@@ -492,7 +721,8 @@
   cursor: default;
 }
 
-.mb-rail-side.is-active {
+.mb-rail-side.is-active,
+.mb-rail-dock.is-active {
   background: var(--interactive-accent);
   border-color: color-mix(in srgb, var(--interactive-accent) 70%, #000);
   color: var(--text-on-accent);
@@ -662,6 +892,105 @@
   .mb-toprow .mb-topbtn:active {
     transform: none;
   }
+  /* 面板滑入 / 滑出也让用户关掉动画：直接切换，不播动画 */
+  .mb-side.mb-slide-in,
+  .mb-pagedock-body.mb-slide-in,
+  .mb-side.mb-slide-out,
+  .mb-pagedock-body.mb-slide-out {
+    animation: none !important;
+  }
+  /* 弹出调节框同理：直接显示 / 收起，不播进出场动画（内层放大也一起关掉） */
+  .mb-pen-pop.mb-pen-pop-anim,
+  .mb-pen-pop.mb-pen-pop-anim-out,
+  .mb-pen-pop.mb-pen-pop-anim .mb-pen-pop-inner,
+  .mb-pen-pop.mb-pen-pop-anim-out .mb-pen-pop-inner {
+    animation: none !important;
+  }
+  /* 「跳到第几页」浮层同理：直接出现，不播缩放回弹 */
+  .mb-pagepick.mb-pagepick-pop {
+    animation: none !important;
+  }
+}
+
+/* ----------------------- 面板展开：从侧边滑入 ----------------------- */
+/*
+ * 打开右侧栏 / 左侧缩略图抽屉时，从对应的侧边缓缓滑出，别再「凭空出现」。
+ *
+ * 关键：**只动 transform**。宽度仍由 .is-open / .is-hidden 瞬时切到最终值，
+ * 缩略图网格从第一帧就按最终宽度排版、光栅化，不会每帧重排、也不会被
+ * 按中途的窄尺寸量到而糊掉（见 .mb-pagedock-body 上方那段注释）。
+ * transform 走 GPU 合成、不触发布局，纸面 / 编辑区尺寸不会跟着抖。
+ *
+ * 类由 view.ts 的 playPanelSlideIn() 只在**用户点开**时临时加上，动画结束
+ * 即摘除：首次渲染、平板模式切换、程序化改状态都不会误播，也不留 transform
+ * 影响之后的尺寸测量。
+ */
+/*
+ * 只「弹一下」：从侧边滑入到位时轻轻冲过头一点就回正——不再来回弹好几下
+ * （用户反馈「弹太多次了，弹一下就够」）。只在 transform 上做（GPU 合成，
+ * 不触发布局）。关键帧 300ms，与 view.ts 的 playPanelSlide 320ms 摘类兜底对齐。
+ */
+@keyframes mb-side-in {
+  0%   { transform: translateX(102%); }
+  60%  { transform: translateX(-1.5%); }
+  100% { transform: translateX(0); }
+}
+@keyframes mb-pagedock-in {
+  0%   { transform: translateX(-102%); }
+  60%  { transform: translateX(1.5%); }
+  100% { transform: translateX(0); }
+}
+.mb-side.mb-slide-in {
+  animation: mb-side-in 300ms cubic-bezier(0.22, 0.7, 0.3, 1);
+  will-change: transform;
+}
+.mb-pagedock-body.mb-slide-in {
+  animation: mb-pagedock-in 300ms cubic-bezier(0.22, 0.7, 0.3, 1);
+  will-change: transform;
+}
+
+/* --------------------- 面板收起：从侧边缓缓滑出 --------------------- */
+/*
+ * 与展开对称：点「收起」时，面板保持最终尺寸、只把 transform 从 0 滑到侧边外。
+ * 状态类（is-hidden / 非 is-open）在点击瞬间就已切好（很多断言依赖这一点），
+ * 这里用更高优先级把「收起态」的隐藏规则临时压回可见，只在这 240ms 内有效；
+ * 动画结束由 view.ts 摘掉 mb-slide-out，立刻回到真正的隐藏态。
+ *
+ * animation-fill-mode: forwards：动画结束到摘类之间还有 ~80ms 兜底窗口，
+ * 靠它把面板钉在滑出去的位置，避免又弹回 0 露一下。
+ */
+@keyframes mb-side-out {
+  from { transform: translateX(0); }
+  to   { transform: translateX(100%); }
+}
+@keyframes mb-pagedock-out {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-100%); }
+}
+.mb-side.mb-slide-out {
+  animation: mb-side-out 240ms cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
+  pointer-events: none;
+  will-change: transform;
+}
+.mb-pagedock-body.mb-slide-out {
+  animation: mb-pagedock-out 240ms cubic-bezier(0.22, 0.61, 0.36, 1) forwards;
+  pointer-events: none;
+  will-change: transform;
+}
+/* 收起态隐藏规则在动画期间压回可见（保持最终宽度，只滑 transform） */
+.mb-side.is-hidden.mb-slide-out {
+  display: flex;
+}
+.mb-pagedock:not(.is-open) .mb-pagedock-body.mb-slide-out {
+  width: 240px;
+  border-right-color: var(--background-modifier-border);
+  box-shadow: 6px 0 18px -12px rgba(0, 0, 0, 0.35);
+}
+.mb-root.is-tablet .mb-pagedock:not(.is-open) .mb-pagedock-body.mb-slide-out {
+  width: min(280px, 62vw);
+}
+.mb-pagedock:not(.is-open) .mb-pagedock-body.mb-slide-out > * {
+  visibility: visible;
 }
 
 /* -------------------------------- 主体 -------------------------------- */
@@ -671,6 +1000,8 @@
   display: flex;
   min-height: 0;
   overflow: hidden;
+  /* 侧栏改为绝对定位浮在纸面上（见 .mb-side），需要这个定位基准 */
+  position: relative;
 }
 
 /*
@@ -749,6 +1080,14 @@
   border-color: color-mix(in srgb, var(--interactive-accent) 55%, transparent);
 }
 
+/*
+ * 缩略图开关已移到顶栏（和钢笔同一排，仿 Obsidian 原生 PDF 阅读器）。
+ * 左上角的浮动手柄隐藏；DOM 保留，aria-expanded 与测试仍可用。
+ */
+.mb-pagedock-handle {
+  display: none;
+}
+
 /* 抽屉主体：收起时宽度 0，展开时 240px（绝对定位，盖在纸面左侧） */
 .mb-pagedock-body {
   pointer-events: auto;
@@ -763,17 +1102,21 @@
   min-height: 0;
   border-right: 1px solid transparent;
   background: var(--background-primary);
-  transition:
-    width 0.18s cubic-bezier(0.2, 0.9, 0.3, 1),
-    border-color 0.18s ease;
+  /*
+   * 不要做宽度动画：宽度每变一帧，4 列缩略图网格就重排一次；而且网格在
+   * 动画中途被按「窄尺寸」量到并光栅化，动画结束后画布没按最终尺寸重画，
+   * CSS 一拉就糊（电脑端「加载慢 + 加载完还是糊」就是它：桌面这条动画一直
+   * 保留着，平板之前已去掉）。瞬时展开直接按最终宽度渲染，又快又清晰。
+   */
+  transition: none;
 }
 
 .mb-pagedock.is-open .mb-pagedock-body {
   width: 240px;
   border-right-color: var(--background-modifier-border);
   box-shadow: 6px 0 18px -12px rgba(0, 0, 0, 0.35);
-  /* 抽屉盖住把手时，把标签往下让出把手的高度 */
-  padding-top: 48px;
+  /* 手柄已移到顶栏、不再浮在抽屉上方，标签无需再让位 */
+  padding-top: 0;
 }
 
 /* 收起时内部不参与布局，避免 0 宽容器里还去量尺寸 */
@@ -787,6 +1130,21 @@
 }
 
 /*
+ * 两个面板的容器：让自绘滑动条（.mb-pane-sb）能相对它定位、且不随内容滚走。
+ */
+.mb-side-panes {
+  flex: 1 1 auto;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+.mb-pane-sb {
+  z-index: 14;
+}
+
+/*
  * 面板本身就是滚动容器：updatePageWindow 需要「视口 rect 与列表 rect
  * 不是同一个元素」才能算出可见行范围（两者相同则差值恒 0，窗口化失效）。
  */
@@ -797,6 +1155,30 @@
   flex-direction: column;
   overflow-y: auto;
   padding: 0 6px 8px;
+}
+
+/*
+ * 缩略图面板右缘那条滑动条是我们自己画的（.mb-sb.mb-pane-sb）。
+ * 但面板本身还是 overflow-y:auto，会再画一条系统滚动条——两条叠在一起，
+ * 一条盖在另一条上面、底下那条还露得出来，用户一眼看出「怎么有两个」。
+ * 这里把系统滚动条藏掉，只留自绘那条。
+ *
+ * 只作用在「缩略图」面板（.mb-side-pane-thumbs）：只有它挂了自绘滑块；
+ * 目录面板（.mb-side-pane-outlines）没有自绘滑块，必须保留系统滚动条。
+ *
+ * 选择器不要写成 `::-webkit-scrollbar:vertical`——`::-webkit-scrollbar:vertical`
+ * 在 Chromium 里不生效（计算值恒为空），系统条照样占 15px。`::-webkit-scrollbar`
+ * 配 `width:0; height:0` 才能真的把滚动条宽度归零（已在无头 Chromium 实测）。
+ * `scrollbar-width:none` 给支持该属性的版本兜底；两条规则并存，谁生效都行。
+ * overflow 仍在，滚轮 / 触摸 / 拖滑块都照常能滚，只是不再画系统那条。
+ */
+.mb-pagedock-body .mb-side-pane-thumbs {
+  scrollbar-width: none;
+}
+
+.mb-pagedock-body .mb-side-pane-thumbs::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 .mb-pagedock-body .mb-side-pane.is-hidden {
@@ -815,6 +1197,7 @@
   border-radius: 11px;
 }
 
+/* 平板：抽屉宽度（比桌面宽一点，手指好点） */
 .mb-root.is-tablet .mb-pagedock.is-open .mb-pagedock-body {
   width: min(280px, 62vw);
 }
@@ -923,15 +1306,34 @@
   top: 0;
   width: 12px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--text-muted) 78%, transparent);
-  box-shadow: 0 1px 4px -1px rgba(0, 0, 0, 0.35);
+  /*
+   * 用户：缩略图里那条上下滑动条不要「不摁时透明、摁下才紫」，任何时候都要
+   * 紫色玻璃条；纸面右缘那条也统一成同一套外观（纸面那条仍按 INK-133
+   * 只在滚动/拖动时淡入，避免掌根误触，但一出现就是同样的紫玻璃）。
+   */
+  background-color: color-mix(in srgb, var(--interactive-accent) 46%, transparent);
+  background-image:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.66) 0%, rgba(255, 255, 255, 0.16) 46%, rgba(255, 255, 255, 0.04) 100%);
+  border: 1px solid color-mix(in srgb, var(--interactive-accent) 58%, rgba(255, 255, 255, 0.5));
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.75),
+    inset 0 -1px 2px rgba(0, 0, 0, 0.14),
+    0 2px 7px -2px color-mix(in srgb, var(--interactive-accent) 55%, transparent);
+  backdrop-filter: blur(7px) saturate(1.5);
+  -webkit-backdrop-filter: blur(7px) saturate(1.5);
   pointer-events: none;
   will-change: transform;
-  transition: background 0.12s ease;
+  transition:
+    background-color 0.12s ease,
+    box-shadow 0.12s ease;
 }
 
 .mb-sb.is-drag .mb-sb-thumb {
-  background: var(--interactive-accent);
+  background-color: color-mix(in srgb, var(--interactive-accent) 70%, transparent);
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.82),
+    0 0 0 3px color-mix(in srgb, var(--interactive-accent) 26%, transparent),
+    0 3px 9px -2px color-mix(in srgb, var(--interactive-accent) 60%, transparent);
 }
 
 /* 拖动时跟着滑块走的页码 */
@@ -1102,6 +1504,34 @@
 }
 
 /*
+ * 文字里的 [[双链]]：强调色 + 下划线，点一下打开目标笔记。
+ *
+ * 文字层整体 pointer-events:none（写字时事件要穿透给画布），只有链接
+ * 单独打开 pointer-events，点击才落得到链接上；链接的 pointerdown 在 JS
+ * 里 stopPropagation，不会被画布的委托当成落笔/选择。文本仍可像普通文字
+ * 一样拖选复制（user-select）。
+ */
+.mb-wikilink {
+  color: var(--link-color, var(--text-accent, #6c5ce7));
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.18em;
+  cursor: pointer;
+  pointer-events: auto;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* 文字工具浮层里的「插入双链」按钮（其余行都是字号/字体/色点，这里单独一颗） */
+.mb-pen-pop-link {
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+
+/*
  * 纵向裁行的可见提示（INK-192）：装不下的行不再静默掉到页底之外，
  * 「还有 N 行未显示」必须让用户看见。
  *
@@ -1167,6 +1597,63 @@
   opacity: 0.38;
 }
 
+/* -------------------- 输入 `[[` 的链接补全候选 --------------------
+ *
+ * 挂在 document.body 上、fixed 定位（不是页面内），因为输入框在缩放容器里，
+ * 放页面内会被文字层 / 页面 overflow 裁掉。位置由 JS 按输入框的屏幕矩形算，
+ * 优先贴在下方，放不下翻到上方。层级高于属性条与浮标，低于 Obsidian 弹窗。
+ */
+.mb-link-suggest {
+  position: fixed;
+  z-index: 60;
+  box-sizing: border-box;
+  min-width: 200px;
+  max-width: 340px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 4px;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border, #e3e3e6);
+  background: var(--background-primary, #fff);
+  box-shadow: 0 10px 28px -10px rgba(0, 0, 0, 0.4);
+  color: var(--text-normal, #1a1a1a);
+  font-size: 13px;
+  line-height: 1.4;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.mb-link-suggest-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.mb-link-suggest-item.is-active {
+  background: var(--background-modifier-hover, rgba(108, 92, 231, 0.12));
+}
+
+.mb-link-suggest-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mb-link-suggest-kind {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-muted, #666);
+}
+
+.mb-link-suggest-empty {
+  padding: 6px 8px;
+  color: var(--text-muted, #666);
+}
+
 /* -------------------- 选中文字的属性条 --------------------
  *
  * 选中一段文字后浮在它上方：字号 −/＋、字体、颜色、编辑、删除。
@@ -1230,13 +1717,23 @@
   color: var(--text-muted);
 }
 
+/* 文件块：源文件已改动时的提示（选中后点「刷新」重新生成快照） */
+.mb-tb-stale {
+  padding: 0 6px;
+  font-size: 12px;
+  line-height: 24px;
+  white-space: nowrap;
+  color: var(--text-warning, #b07d1f);
+}
+
 .mb-tb-font {
+  /* 同上：Obsidian 原生下拉样式（.dropdown 提供箭头） */
   height: 24px;
-  max-width: 76px;
-  padding: 0 4px;
+  max-width: 84px;
+  padding: 0 20px 0 6px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 6px;
-  background: var(--background-primary);
+  border-radius: var(--input-radius, 6px);
+  background-color: var(--background-modifier-form-field, var(--background-primary));
   color: var(--text-normal);
   font-size: 12px;
 }
@@ -1266,12 +1763,18 @@
 
 /* 侧栏里：文字字体下拉 + 文字/形状共用的小色点行 */
 .mb-font-sel {
+  /*
+   * 字体选择 = Obsidian 原生下拉：加 .dropdown 类复用宿主的箭头 / 外观，
+   * 这里只补尺寸与原生表单配色（用 --input-radius / --background-modifier-form-field，
+   * 和设置页里的下拉一致）。以前是自绘的小方框，跟 Obsidian 其他选择框不同款。
+   */
   width: 100%;
   margin: 4px 0;
   height: 26px;
+  padding: 0 22px 0 6px;
   border: 1px solid var(--background-modifier-border);
-  border-radius: 6px;
-  background: var(--background-primary);
+  border-radius: var(--input-radius, 6px);
+  background-color: var(--background-modifier-form-field, var(--background-primary));
   color: var(--text-normal);
   font-size: 12px;
 }
@@ -1447,23 +1950,6 @@
 .mb-root.is-tablet .mb-texteditbar button.mb-tb-sizestep {
   box-sizing: border-box;
   padding: 0 3px;
-}
-
-/*
- * 顶栏「当前笔」chip 在 containerEl 上（不在 .mb-root 内），
- * 基础 padding 0 6、平板 0 11（随 42px 高的按钮一起放大）。
- * 用 [class] 把特异性抬到 (0,3,0)，才压得过宿主的 (0,2,1)；
- * 平板那条写在后，赢在源顺序。
- */
-.mb-toprow .mb-pen-chip[class],
-.mb-topbar .mb-pen-chip[class] {
-  box-sizing: border-box;
-  padding: 0 6px;
-}
-.mb-tablet .mb-toprow .mb-pen-chip,
-.mb-tablet .mb-topbar .mb-pen-chip {
-  box-sizing: border-box;
-  padding: 0 11px;
 }
 
 /* 纸面底部「添加一页」：保住自己的 9px 22px 设计值 */
@@ -1857,17 +2343,43 @@
 /* -------------------------------- 侧栏 -------------------------------- */
 
 .mb-side {
+  /*
+   * 电脑端侧栏**浮在纸面上**，不再作为 flex 列挤压编辑区。
+   *
+   * 之前它是 flex 子项（宽度 258px），一展开编辑区就变窄 → fit 重新算缩放 →
+   * 整张纸和笔迹跟着放大缩小 / 左右平移（用户：「打开侧边栏会把笔记挤到一边，
+   * 不要笔记的位置移动」）。改成绝对定位后，编辑区 / 纸面宽度始终不变，
+   * 开合侧栏只覆盖右缘、不推动笔记。平板端本来就是这么盖在纸上的（见下面的
+   * `.mb-root.is-tablet .mb-side`），两边行为一致。
+   */
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 35;
   width: 258px;
-  flex: 0 0 258px;
   display: flex;
   flex-direction: column;
   border-left: 1px solid var(--background-modifier-border);
   background: var(--background-primary);
+  box-shadow: -6px 0 22px -16px rgba(0, 0, 0, 0.4);
   min-height: 0;
 }
 
 .mb-side.is-hidden {
   display: none;
+}
+
+/*
+ * 电脑端侧栏展开时，把它右缘原本的浮标（右下翻页/缩放）往左让开侧栏宽度，
+ * 免得被盖住点不到。平板端不套用（那里侧栏更宽、另有布局）。
+ *
+ * 注意：**不挪动纸面自绘滚动条 .mb-sb**。它贴着滚动区右缘是既有约定（套件里
+ * 有断言；也是用户拖页的习惯位置），挪开反而破坏。侧栏是浮层，滚动条落在它
+ * 盖住的一小条里也不影响：滚轮 / 触控板 / 拖滚动条在侧栏收起后照常可用。
+ */
+.mb-root:not(.is-tablet) .mb-body.mb-side-open .mb-float {
+  right: calc(14px + 258px);
 }
 
 .mb-side-head {
@@ -1927,11 +2439,11 @@
   background: var(--background-primary);
 }
 
-/* ---------------------------- 缩略图 / 目录 标签页 ---------------------------- */
+/* ------------------------ 缩略图 / 目录 / 收藏 标签页 ------------------------ */
 
 /*
- * 缩略图和目录共用一个面板（用户要的是「像 Obsidian 原生 PDF 阅读器
- * 那样，点一下就把缩略图翻出来」）。顶部两枚标签切换，同一时间只显示一个。
+ * 三个标签共用一个面板（用户要的是「像 Obsidian 原生 PDF 阅读器
+ * 那样，点一下就把缩略图翻出来」）。顶部标签切换，同一时间只显示一个。
  */
 .mb-side-tabs {
   display: flex;
@@ -1973,6 +2485,110 @@
 
 .mb-side-pane.is-hidden {
   display: none;
+}
+
+/* 三个标签平分窄抽屉：稍微收一点内边距，中文标签仍完整 */
+.mb-pagedock-body .mb-side-tabs {
+  gap: 3px;
+}
+.mb-pagedock-body .mb-side-tab {
+  padding: 0 3px;
+  font-size: 11px;
+}
+
+/* ------------------------------ 收藏面板 ------------------------------ */
+
+.mb-fav-current {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
+}
+.mb-fav-current .mb-ic {
+  width: 13px;
+  height: 13px;
+}
+.mb-fav-current.is-active {
+  color: var(--interactive-accent);
+}
+.mb-fav-current.is-active .mb-ic {
+  fill: currentColor;
+}
+
+.mb-fav-empty {
+  margin: 8px 2px 10px;
+  padding: 10px 8px;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: 8px;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+.mb-fav-empty.is-hidden {
+  display: none;
+}
+
+.mb-favorites {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+.mb-fav-card {
+  position: relative;
+  aspect-ratio: 794 / 1123;
+  overflow: hidden;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+  box-shadow: 0 2px 7px -5px rgba(0, 0, 0, 0.45);
+}
+.mb-fav-card.is-active {
+  border-color: var(--interactive-accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--interactive-accent) 65%, transparent);
+}
+.mb-fav-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.mb-fav-num {
+  position: absolute;
+  right: 4px;
+  bottom: 3px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--background-primary) 78%, transparent);
+  color: var(--text-muted);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+.mb-fav-remove {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--background-primary) 82%, transparent);
+  color: var(--interactive-accent);
+  cursor: pointer;
+  box-shadow: 0 1px 4px -2px rgba(0, 0, 0, 0.5);
+}
+.mb-fav-remove .mb-ic {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+}
+.mb-root.is-tablet .mb-fav-remove {
+  width: 30px;
+  height: 30px;
 }
 
 /* 标签已经说明了内容，面板里的标题别再往下顶一大截 */
@@ -2081,6 +2697,26 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: text;
+}
+
+.mb-side-title:hover {
+  color: var(--text-normal);
+  text-decoration: underline;
+  text-decoration-style: dotted;
+}
+
+.mb-side-title-edit {
+  width: 100%;
+  min-width: 80px;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border: 1px solid var(--interactive-accent);
+  border-radius: 6px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  box-sizing: border-box;
 }
 
 .mb-side-sub {
@@ -2132,6 +2768,52 @@
 
 .mb-link:hover {
   color: var(--interactive-accent);
+}
+
+/* 缩略图面板顶部「每行几张」切换（1/2/3/4） */
+.mb-thumb-cols-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 6px 0 7px;
+}
+
+.mb-thumb-cols-label {
+  font-size: 10px;
+  color: var(--text-faint);
+  margin-right: 2px;
+}
+
+.mb-thumb-cols-btn {
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  font-size: 11px;
+  line-height: 1;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.mb-thumb-cols-btn:hover {
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
+}
+
+.mb-thumb-cols-btn.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: transparent;
+}
+
+/* 平板：手指好点，按钮放大 */
+.mb-root.is-tablet .mb-thumb-cols-btn {
+  min-width: 30px;
+  height: 30px;
+  font-size: 12px;
 }
 
 .mb-pen-row {
@@ -2533,9 +3215,9 @@
   position: absolute;
   top: 2px;
   display: none;
-  width: 17px;
-  height: 17px;
-  min-width: 17px;
+  width: 16px;
+  height: 16px;
+  min-width: 16px;
   padding: 0;
   border: none;
   border-radius: 50%;
@@ -2545,16 +3227,30 @@
 }
 
 .mb-thumb-act .mb-ic {
-  width: 11px;
-  height: 11px;
+  width: 10px;
+  height: 10px;
+}
+
+/* 三枚按钮在 4 列窄格里也排得下：16px 宽、间隔 1px，最左不越出格宽 */
+.mb-thumb-del {
+  right: 1px;
 }
 
 .mb-thumb-dup {
-  right: 21px;
+  right: 18px;
 }
 
-.mb-thumb-del {
-  right: 2px;
+/* 收藏小星标：排在最左，和复制 / 删除并排；已收藏时实心、金色 */
+.mb-thumb-fav {
+  right: 35px;
+}
+
+.mb-thumb-fav.is-on {
+  color: #ffcf3f;
+}
+
+.mb-thumb-fav.is-on .mb-ic {
+  fill: currentColor;
 }
 
 /*
@@ -2575,7 +3271,8 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 4px;
+  gap: 2px;
+  overflow-y: auto;
   background: rgba(20, 20, 20, 0.62);
   cursor: default;
 }
@@ -2599,8 +3296,8 @@
 }
 
 .mb-root.is-tablet .mb-thumb-menu-btn {
-  padding: 3px 0;
-  font-size: 12px;
+  padding: 1px 0;
+  font-size: 10px;
 }
 
 /*
@@ -3028,6 +3725,17 @@
 }
 
 /*
+ * 平板：带文字的「导入 / 导出」按钮要按内容自适应宽度。
+ * 上面 `.mb-root.is-tablet .mb-ib{width:46px}` 优先级更高，会把带字按钮的
+ * `width:auto` 压回 46px，而「图标+文字」要约 78px → 文字溢出框外。
+ * 这里提高优先级恢复自适应，只保底最小触摸高度。
+ */
+.mb-root.is-tablet .mb-ib.mb-ib-labeled {
+  width: auto;
+  min-width: 46px;
+}
+
+/*
  * 平板上的侧栏：从右缘盖过来。
  *
  * 现在长条是编辑区里的**一列**（不再浮在纸上），
@@ -3062,15 +3770,15 @@
 }
 
 /*
- * 平板侧栏展开时，纸面列让出右侧一条（INK-217）。
+ * 平板侧栏展开：**不再**把纸面列往左挤。
  *
- * 侧栏是绝对定位盖在纸面上的，展开会压掉右侧约 340px；而 fit 出来的纸
- * 本来就不宽于视口，横向没有可滚空间 —— 被盖的那部分既看不见也够不着。
- * 这里把编辑区右侧收进同等宽度，让 fit 按**真正可见的区域**算缩放。
- * 宽度必须与 .mb-root.is-tablet .mb-side 保持一致，改一处要同步另一处。
+ * 曾经（INK-217）为了让 paper 按「真正可见区域」refit，给编辑区加了
+ * margin-right 把右侧 340px 让出来——但那会让整张纸跟着往左移、缩放也跳一下，
+ * 用户明确说不喜欢「文件被挤到没有侧栏的一边」。现在改成侧栏直接浮在纸面
+ * 右上角盖过去，纸面保持原位（宽高都不动），关掉侧栏后也不会跳。
  */
 .mb-root.is-tablet .mb-body.mb-side-open .mb-editor {
-  margin-right: min(340px, calc(100vw - 24px));
+  margin-right: 0;
 }
 
 /* 底部留出空间，别挡住最后一页 */
@@ -3101,30 +3809,14 @@
   font-size: 14px;
 }
 
-/* 平板无可靠 hover：按钮常显。窄缩略图里竖排，中心距 38px，避免复制误触删除。 */
+/*
+ * 平板：复制/删除不再常显，收进「长按菜单」。
+ * 之前放大到 30px、上下叠在缩略图正中，而抽屉里缩略图只有约 52–62px 宽，
+ * 几乎盖住整个可点区，挡住了「点缩略图跳页」。这里直接隐藏常显按钮，
+ * 复制/删除改由长按菜单提供（见 view.ts 的 openThumbMenu）。
+ */
 .mb-root.is-tablet .mb-thumb-act {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  left: 50%;
-  right: auto;
-  width: min(30px, calc(100% - 4px));
-  height: 30px;
-  min-width: 0;
-  transform: translateX(-50%);
-}
-
-.mb-root.is-tablet .mb-thumb-dup {
-  top: 2px;
-}
-
-.mb-root.is-tablet .mb-thumb-del {
-  top: 40px;
-}
-
-.mb-root.is-tablet .mb-thumb-act .mb-ic {
-  width: 16px;
-  height: 16px;
+  display: none;
 }
 
 /* 纸张模板预览也放大 */
@@ -3133,7 +3825,7 @@
   gap: 10px;
 }
 
-/* 侧栏标签页（缩略图 / 目录）在平板上放大热区 */
+/* 侧栏标签页（缩略图 / 目录 / 收藏）在平板上放大热区 */
 .mb-root.is-tablet .mb-side-tab {
   height: 40px;
   font-size: 14px;
@@ -3526,4 +4218,2039 @@
 .notice .mb-export-cancel:disabled {
   cursor: default;
   opacity: 0.6;
+}
+
+/* ---------------------------- 沉浸（全屏记笔记） ---------------------------- */
+/* 已按用户要求移除：沉浸模式占用空间反而更大，恢复原界面。 */
+
+/* ---------------------------- 底部点页码直接跳 ---------------------------- */
+/* 点底部页码弹出的浮层：直接列页码，点哪个跳哪个，屏幕跟随滚动。 */
+.mb-pagepick {
+  position: fixed;
+  z-index: 80;
+  width: min(280px, 78vw);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  background: var(--background-primary);
+  box-shadow: 0 12px 32px -12px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+  /* 从右下角锚点（页码按钮）方向弹出来 */
+  transform-origin: bottom right;
+}
+
+/* 「跳到第几页」网格浮层：和其它弹出框同款 q 弹出场（缩放 + 轻微上浮回弹） */
+@keyframes mb-pagepick-in {
+  0%   { opacity: 0; transform: scale(0.88) translateY(8px); }
+  58%  { opacity: 1; transform: scale(1.03) translateY(0); }
+  78%  { transform: scale(0.99); }
+  100% { opacity: 1; transform: scale(1); }
+}
+.mb-pagepick.mb-pagepick-pop {
+  animation: mb-pagepick-in 280ms cubic-bezier(0.22, 0.9, 0.3, 1) both;
+}
+
+.mb-pagepick-head {
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+/* 用户要求：点页码不再弹「选页码网格」，而是直接一个输入框 + 跳转按钮 */
+.mb-pagepick-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+}
+.mb-pagepick-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+  height: 38px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+  box-sizing: border-box;
+}
+.mb-pagepick-input:focus {
+  outline: none;
+  border-color: var(--interactive-accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--interactive-accent) 30%, transparent);
+}
+.mb-pagepick-go {
+  flex: 0 0 auto;
+  height: 38px;
+  padding: 0 14px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  font-size: 13px;
+  cursor: pointer;
+}
+.mb-pagepick-go:hover {
+  filter: brightness(1.05);
+}
+
+.mb-pagepick-grid {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(44px, 1fr));
+  gap: 6px;
+  padding: 10px;
+  overflow-y: auto;
+  touch-action: manipulation;
+}
+
+.mb-pagepick-num {
+  height: 40px;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.mb-pagepick-num:hover {
+  background: var(--background-modifier-hover);
+}
+
+.mb-pagepick-num.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: transparent;
+}
+
+/* ============================================================================
+ * 磨砂玻璃质感统一（2026-11-11）
+ *
+ * 用户要求：把「能看到、能点到」的按钮 / 控件都统一成和笔弹出框一样的
+ * iPhone 磨砂玻璃质感与进出 / 按压动效，而且要比之前更明显。
+ *
+ * 约定：
+ *   · 只加 背景渐变 / 内高光 / 投影 / hover 提亮 / 按下回弹，**不改宽高、
+ *     不改 padding、不改边框宽度**，避免动到既有布局（dock 有硬宽度断言）。
+ *   · 大块浮层（弹出框、菜单、模态）用 backdrop-filter 真正做磨砂；
+ *     小按钮不用 backdrop-filter（小块收益小、开销大，且会随内层缩放而闪），
+ *     改用「半透明底 + 顶部高光 + 细投影」的玻璃片观感。
+ *   · 动画只走 transform / opacity / box-shadow / background-color，
+ *     不触发布局；尊重 prefers-reduced-motion（见文件上方那段统一关动画）。
+ * ========================================================================== */
+
+/* ---- 顶栏：工具 / 保存 / 侧栏 / 抽屉按钮 ---- */
+.mb-toprow .mb-topbtn {
+  transition:
+    background-color 0.16s ease,
+    background-image 0.16s ease,
+    color 0.16s ease,
+    box-shadow 0.16s ease,
+    transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+.mb-toprow .mb-topbtn:hover {
+  background-color: color-mix(in srgb, var(--background-primary) 55%, transparent);
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.24), rgba(255, 255, 255, 0.02));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.38),
+    0 1px 4px rgba(0, 0, 0, 0.1);
+}
+.mb-toprow .mb-topbtn:active {
+  transform: scale(0.92);
+}
+
+/* ---- 侧栏图标按钮 ---- */
+.mb-ib {
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.3),
+    0 1px 3px rgba(0, 0, 0, 0.08);
+  transition:
+    background-color 0.16s ease,
+    background-image 0.16s ease,
+    color 0.16s ease,
+    box-shadow 0.16s ease,
+    transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+.mb-ib:hover {
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.3), rgba(255, 255, 255, 0.04));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.4),
+    0 2px 8px rgba(0, 0, 0, 0.14);
+}
+.mb-ib.is-active {
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.28), rgba(255, 255, 255, 0));
+}
+
+/* ---- 侧栏分段控件（字号四档等） ---- */
+.mb-seg {
+  background: color-mix(in srgb, var(--background-modifier-hover) 45%, transparent);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+.mb-seg-btn {
+  transition: background-color 0.14s ease, color 0.14s ease;
+}
+
+/* ---- 小按钮 / 链接式按钮 ---- */
+.mb-mini-btn {
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3);
+  transition: background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease, transform 0.12s ease;
+}
+.mb-mini-btn:hover {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4), 0 1px 4px rgba(0, 0, 0, 0.12);
+}
+.mb-mini-btn:active {
+  transform: scale(0.95);
+}
+.mb-link {
+  transition: color 0.15s ease;
+}
+
+/* ---- 纸面文字样式条按钮 ---- */
+.mb-tb-btn {
+  transition: background-color 0.14s ease, color 0.14s ease, box-shadow 0.14s ease, transform 0.12s ease;
+}
+.mb-tb-btn:hover {
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.28), rgba(255, 255, 255, 0.03));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3);
+}
+
+/* ---- 缩略图长按菜单：玻璃按钮 ---- */
+.mb-thumb-menu-btn {
+  background-image: linear-gradient(180deg, #ffffff, #eef0f4);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.9),
+    0 1px 2px rgba(0, 0, 0, 0.28);
+  transition: transform 0.12s cubic-bezier(0.2, 0.9, 0.3, 1), box-shadow 0.14s ease;
+}
+.mb-thumb-menu-btn:hover:not(:disabled) {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.95),
+    0 2px 6px rgba(0, 0, 0, 0.32);
+}
+.mb-thumb-menu-btn:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+/* ---- 弹窗 / 模态里的按钮：按下回弹（外观交给 Obsidian 原生） ---- */
+.modal .mb-new-modal button,
+.modal .mb-new-actions button {
+  transition: transform 0.12s cubic-bezier(0.2, 0.9, 0.3, 1), box-shadow 0.16s ease;
+}
+.modal .mb-new-modal button:active,
+.modal .mb-new-actions button:active {
+  transform: scale(0.96);
+}
+
+/* ---- 选页九宫格 / 添加一页 ---- */
+.mb-pagepick-num {
+  transition: background-color 0.14s ease, color 0.14s ease, transform 0.12s ease, box-shadow 0.14s ease;
+}
+.mb-pagepick-num:active {
+  transform: scale(0.95);
+}
+.mb-add-page {
+  transition: color 0.15s ease, border-color 0.15s ease, background-color 0.15s ease, transform 0.12s ease;
+}
+.mb-add-page:active {
+  transform: scale(0.98);
+}
+
+/* ---- 大面板（右侧栏 / 左侧页面抽屉）也做成磨砂玻璃，和浮层同一套质感 ----
+ * 半透明 + 背景模糊，让底下的纸面 / 画面在面板后面晕开，像一整片毛玻璃。
+ * 在 78~80% 不透明度的基色上叠模糊，既保留玻璃感，文字对比度又够用。 */
+.mb-side {
+  background: color-mix(in srgb, var(--background-primary) 78%, transparent);
+  backdrop-filter: blur(26px) saturate(1.6);
+  -webkit-backdrop-filter: blur(26px) saturate(1.6);
+}
+.mb-pagedock.is-open .mb-pagedock-body {
+  background: color-mix(in srgb, var(--background-primary) 80%, transparent);
+  backdrop-filter: blur(24px) saturate(1.5);
+  -webkit-backdrop-filter: blur(24px) saturate(1.5);
+}
+
+/* ============================================================================
+ * iPhone 式透明玻璃全面化（2026-11-11）
+ *
+ * 用户要求：不只是笔弹出框，侧边栏背景、缩略图背景，以及插件里所有能点到的
+ * 按钮，都要统一成 iPhone 那种透明玻璃质感，并且按钮要有精致的高光 / 投影 /
+ * hover 提亮 / 按下回弹。
+ *
+ * 做法：
+ *   · 用一组 --mb-glass-* 变量统一材质；亮 / 暗主题各调一次，控件只引用变量。
+ *   · 大面板 / 浮层用 backdrop-filter 真正折射背后的纸面；小按钮仍以半透明底 +
+ *     顶部镜面高光 + 细内描边 + 柔和投影做出玻璃片，避免几十个小元素同时开模糊。
+ *   · 所有动画只走 transform / opacity / background-color / box-shadow，不触发布局；
+ *     不改任何控件的宽高、padding 和布局尺寸，避免破坏已有排版断言。
+ *   · 选中态一律保留主题强调色，只叠一层玻璃高光；颜色点 / 色块保持本色，
+ *     用内高光和投影做成“玻璃珠”，不把用户选的颜色洗掉。
+ * ========================================================================== */
+
+.mb-root,
+.mb-toprow,
+.mb-pen-pop,
+.mb-pagepick,
+.notice,
+.mb-hotkey-btn,
+.modal .mb-new-modal {
+  --mb-glass-bg: color-mix(in srgb, var(--background-primary) 68%, transparent);
+  --mb-glass-bg-strong: color-mix(in srgb, var(--background-primary) 82%, transparent);
+  --mb-glass-button: color-mix(in srgb, var(--background-primary) 46%, transparent);
+  --mb-glass-button-hover: color-mix(in srgb, var(--background-primary) 68%, transparent);
+  --mb-glass-line: color-mix(in srgb, var(--text-normal) 13%, transparent);
+  --mb-glass-line-hi: rgba(255, 255, 255, 0.55);
+  --mb-glass-sheen:
+    radial-gradient(125% 82% at 12% -8%, rgba(255, 255, 255, 0.44) 0%, rgba(255, 255, 255, 0.1) 34%, rgba(255, 255, 255, 0) 64%),
+    linear-gradient(152deg, rgba(255, 255, 255, 0.24) 0%, rgba(255, 255, 255, 0.045) 46%, rgba(255, 255, 255, 0.14) 100%);
+  --mb-glass-btn-sheen:
+    radial-gradient(120% 100% at 14% 0%, rgba(255, 255, 255, 0.48) 0%, rgba(255, 255, 255, 0.08) 42%, rgba(255, 255, 255, 0) 72%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.3) 0%, rgba(255, 255, 255, 0.06) 48%, rgba(255, 255, 255, 0.02) 100%);
+  --mb-glass-inset:
+    inset 0 1px 0 rgba(255, 255, 255, 0.58),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.04);
+  --mb-glass-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.06),
+    0 7px 18px -14px rgba(0, 0, 0, 0.46);
+}
+
+body.dark .mb-root,
+body.dark .mb-toprow,
+body.dark .mb-pen-pop,
+body.dark .mb-pagepick,
+body.dark .notice,
+body.dark .mb-hotkey-btn,
+body.dark .modal .mb-new-modal {
+  --mb-glass-bg: color-mix(in srgb, var(--background-primary) 72%, transparent);
+  --mb-glass-bg-strong: color-mix(in srgb, var(--background-primary) 86%, transparent);
+  --mb-glass-button: color-mix(in srgb, var(--background-primary) 56%, transparent);
+  --mb-glass-button-hover: color-mix(in srgb, var(--background-primary) 76%, transparent);
+  --mb-glass-line: color-mix(in srgb, var(--text-normal) 18%, transparent);
+  --mb-glass-line-hi: rgba(255, 255, 255, 0.24);
+  --mb-glass-sheen:
+    radial-gradient(125% 82% at 12% -8%, rgba(255, 255, 255, 0.2) 0%, rgba(255, 255, 255, 0.05) 36%, rgba(255, 255, 255, 0) 66%),
+    linear-gradient(152deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0.015) 48%, rgba(255, 255, 255, 0.06) 100%);
+  --mb-glass-btn-sheen:
+    radial-gradient(120% 100% at 14% 0%, rgba(255, 255, 255, 0.22) 0%, rgba(255, 255, 255, 0.04) 44%, rgba(255, 255, 255, 0) 74%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.13) 0%, rgba(255, 255, 255, 0.025) 50%, rgba(255, 255, 255, 0.01) 100%);
+  --mb-glass-inset:
+    inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.2);
+  --mb-glass-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.22),
+    0 8px 20px -14px rgba(0, 0, 0, 0.65);
+}
+
+/* ---- 侧边栏 / 缩略图抽屉：整块透明玻璃，边缘有镜面反光 ---- */
+.mb-side,
+.mb-pagedock.is-open .mb-pagedock-body {
+  background-color: var(--mb-glass-bg);
+  background-image: var(--mb-glass-sheen);
+  border-color: var(--mb-glass-line);
+  backdrop-filter: blur(32px) saturate(1.85) brightness(1.03);
+  -webkit-backdrop-filter: blur(32px) saturate(1.85) brightness(1.03);
+}
+.mb-side {
+  border-left: 1px solid var(--mb-glass-line);
+  border-radius: 20px 0 0 20px;
+  overflow: hidden;
+  box-shadow:
+    -18px 0 48px -28px rgba(0, 0, 0, 0.52),
+    inset 1px 0 0 var(--mb-glass-line-hi),
+    inset 0 1px 0 var(--mb-glass-line-hi);
+}
+.mb-pagedock.is-open .mb-pagedock-body {
+  border-right: 1px solid var(--mb-glass-line);
+  border-radius: 0 20px 20px 0;
+  box-shadow:
+    22px 0 52px -30px rgba(0, 0, 0, 0.5),
+    inset -1px 0 0 var(--mb-glass-line-hi),
+    inset 0 1px 0 var(--mb-glass-line-hi);
+}
+.mb-side-head {
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0.015));
+  border-bottom-color: var(--mb-glass-line);
+}
+.mb-side-status {
+  background: transparent;
+  border-top-color: var(--mb-glass-line);
+}
+.mb-side-body {
+  background: transparent;
+}
+.mb-pagedock-body .mb-side-pane-thumbs {
+  background-image: radial-gradient(110% 30% at 18% 0%, rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0) 72%);
+}
+
+/* 侧栏 / 抽屉顶部的分段标签也做成一条小玻璃槽 */
+.mb-side-tabs {
+  background-color: color-mix(in srgb, var(--background-primary) 30%, transparent);
+  background-image: var(--mb-glass-btn-sheen);
+  box-shadow:
+    inset 0 0 0 1px var(--mb-glass-line),
+    inset 0 1px 2px rgba(0, 0, 0, 0.06),
+    inset 0 1px 0 rgba(255, 255, 255, 0.42);
+}
+.mb-side-tab.is-active {
+  background-color: var(--mb-glass-bg-strong);
+  background-image: var(--mb-glass-btn-sheen);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.62),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.22),
+    0 1px 3px rgba(0, 0, 0, 0.12);
+}
+
+/* ---- 缩略图：每个页卡是一块小玻璃托板，页面本身仍是白纸 ---- */
+.mb-thumb {
+  border-color: color-mix(in srgb, var(--text-normal) 14%, transparent);
+  border-radius: 8px;
+  background-color: color-mix(in srgb, var(--background-primary) 70%, transparent);
+  background-image: var(--mb-glass-btn-sheen);
+  box-shadow:
+    0 5px 16px -11px rgba(0, 0, 0, 0.48),
+    inset 0 1px 0 rgba(255, 255, 255, 0.62),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+  transition:
+    transform 0.16s cubic-bezier(0.2, 0.9, 0.3, 1),
+    box-shadow 0.18s ease,
+    border-color 0.18s ease;
+}
+.mb-thumb:hover {
+  transform: translateY(-1px);
+  box-shadow:
+    0 9px 22px -12px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.72),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.2);
+}
+.mb-thumb.is-active {
+  border-color: var(--interactive-accent);
+  box-shadow:
+    0 0 0 2px var(--interactive-accent),
+    0 9px 22px -12px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.72);
+}
+.mb-thumb.mb-thumb-add {
+  border-style: dashed;
+  background-color: color-mix(in srgb, var(--background-primary) 40%, transparent);
+}
+.mb-thumb-canvas {
+  border-radius: 6px;
+}
+.mb-thumb-num {
+  background: rgba(255, 255, 255, 0.62);
+  color: var(--text-muted);
+  backdrop-filter: blur(10px) saturate(1.4);
+  -webkit-backdrop-filter: blur(10px) saturate(1.4);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.8),
+    0 1px 3px rgba(0, 0, 0, 0.16);
+}
+.mb-thumb-act {
+  box-sizing: border-box;
+  border: 1px solid rgba(255, 255, 255, 0.46);
+  background: rgba(24, 24, 28, 0.38);
+  backdrop-filter: blur(12px) saturate(1.5);
+  -webkit-backdrop-filter: blur(12px) saturate(1.5);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.52),
+    0 2px 7px rgba(0, 0, 0, 0.3);
+  transition:
+    transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1),
+    background-color 0.14s ease,
+    box-shadow 0.14s ease;
+}
+.mb-thumb-act:hover {
+  background: rgba(18, 18, 22, 0.58);
+  transform: scale(1.08);
+}
+.mb-thumb-act:active {
+  transform: scale(0.9);
+}
+.mb-thumb-menu {
+  background:
+    radial-gradient(120% 70% at 20% 0%, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0) 62%),
+    rgba(22, 22, 26, 0.38);
+  backdrop-filter: blur(18px) saturate(1.45);
+  -webkit-backdrop-filter: blur(18px) saturate(1.45);
+}
+.mb-thumb-menu-btn {
+  box-sizing: border-box;
+  border: 1px solid rgba(255, 255, 255, 0.52);
+  border-radius: 6px;
+  background-color: rgba(255, 255, 255, 0.62);
+  background-image: var(--mb-glass-btn-sheen);
+  backdrop-filter: blur(10px) saturate(1.35);
+  -webkit-backdrop-filter: blur(10px) saturate(1.35);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.92),
+    0 2px 7px rgba(0, 0, 0, 0.3);
+}
+
+/* ---- 所有普通按钮：半透明玻璃片 + 顶部镜面高光 + 细内描边 ---- */
+.mb-root button:where(:not(.mb-swatch):not(.mb-tcolor):not(.mb-tb-dot):not(.mb-pen-pop-dot):not(.mod-cta):not(.mod-warning):not(.mb-thumb-act):not(.mb-thumb-menu-btn)),
+.mb-pen-pop button:where(:not(.mb-pen-pop-dot):not(.mb-pen-pop-size):not(.mb-pen-pop-shape)),
+.mb-pagepick button,
+.modal .mb-new-modal button:where(:not(.mod-cta):not(.mod-warning)),
+.modal .mb-new-actions button:where(:not(.mod-cta):not(.mod-warning)),
+.modal .mb-import-all {
+  background-color: var(--mb-glass-button);
+  background-image: var(--mb-glass-btn-sheen);
+  border-color: var(--mb-glass-line);
+  box-shadow: var(--mb-glass-inset), var(--mb-glass-shadow);
+  transition:
+    background-color 0.16s ease,
+    background-image 0.16s ease,
+    color 0.16s ease,
+    border-color 0.16s ease,
+    box-shadow 0.16s ease,
+    transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+
+/* 顶栏的图标按钮既有 <button> 也有宿主 addAction 给的 <div>，按类统一补底 */
+.mb-toprow .mb-topbtn {
+  background-color: var(--mb-glass-button);
+  background-image: var(--mb-glass-btn-sheen);
+  box-shadow: var(--mb-glass-inset), var(--mb-glass-shadow);
+  transition:
+    background-color 0.16s ease,
+    background-image 0.16s ease,
+    color 0.16s ease,
+    box-shadow 0.16s ease,
+    transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+
+/* hover：只提亮、不改变尺寸；选中 / 禁用保持原样 */
+.mb-root button:where(:not(.mb-swatch):not(.mb-tcolor):not(.mb-tb-dot):not(.mb-pen-pop-dot):not(.mod-cta):not(.mod-warning):not(.mb-thumb-act):not(.mb-thumb-menu-btn)):hover:not(:disabled):not(.is-disabled):not(.is-active),
+.mb-pen-pop button:where(:not(.mb-pen-pop-dot):not(.mb-pen-pop-size):not(.mb-pen-pop-shape)):hover:not(:disabled):not(.is-disabled):not(.is-active),
+.mb-pagepick button:hover:not(:disabled):not(.is-disabled):not(.is-active),
+.modal .mb-new-modal button:where(:not(.mod-cta):not(.mod-warning)):hover:not(:disabled):not(.is-disabled),
+.modal .mb-new-actions button:where(:not(.mod-cta):not(.mod-warning)):hover:not(:disabled):not(.is-disabled),
+.modal .mb-import-all:hover:not(:disabled),
+.mb-toprow .mb-topbtn:hover:not(.is-active) {
+  /* 关键：悬停时必须继续用同一套玻璃高光。老样式里不少 :hover 用
+   * `background:` 简写或单层 linear-gradient，会把 --mb-glass-btn-sheen
+   * （径向镜面高光 + 线性渐变）清掉 —— 鼠标一放上去玻璃质感就没了。 */
+  background-image: var(--mb-glass-btn-sheen);
+  background-color: var(--mb-glass-button-hover);
+  color: var(--text-normal);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.7),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.03),
+    0 10px 24px -16px rgba(0, 0, 0, 0.55);
+}
+
+/* 按下回弹：只缩一点点，所有普通按钮一致 */
+.mb-root button:where(:not(.mb-swatch):not(.mb-tcolor):not(.mb-tb-dot):not(.mb-pen-pop-dot)):active:not(:disabled):not(.is-disabled):not(.is-held),
+.mb-pen-pop button:where(:not(.mb-pen-pop-dot)):active:not(:disabled),
+.mb-pagepick button:active:not(:disabled),
+.modal .mb-new-modal button:active:not(:disabled),
+.modal .mb-new-actions button:active:not(:disabled),
+.mb-toprow .mb-topbtn:active {
+  transform: scale(0.94);
+}
+
+/* 链接式按钮：做成很小的玻璃胶囊；负 margin 抵掉内边距，不改原有占位 */
+.mb-root .mb-link {
+  padding: 2px 7px;
+  margin: -2px -7px;
+  border-radius: 7px;
+  background-color: color-mix(in srgb, var(--background-primary) 34%, transparent);
+  background-image: var(--mb-glass-btn-sheen);
+  box-shadow:
+    inset 0 0 0 1px var(--mb-glass-line),
+    inset 0 1px 0 rgba(255, 255, 255, 0.46);
+}
+.mb-root .mb-link:hover {
+  color: var(--interactive-accent);
+  background-color: var(--mb-glass-button-hover);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--interactive-accent) 34%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.64),
+    0 4px 12px -10px rgba(0, 0, 0, 0.5);
+}
+
+/* 侧栏 / 纸面样式条里的字号 −/＋ 步进按钮：体量小，但也要有玻璃底 */
+.mb-root .mb-text-tools .mb-size-step:not(.is-held),
+.mb-root .mb-texteditbar .mb-tb-sizestep:not(.is-held) {
+  background-color: var(--mb-glass-button);
+  background-image: var(--mb-glass-btn-sheen);
+  border-color: var(--mb-glass-line);
+  box-shadow: var(--mb-glass-inset), var(--mb-glass-shadow);
+  border-radius: 4px;
+  transition:
+    background-color 0.16s ease,
+    background-image 0.16s ease,
+    color 0.16s ease,
+    border-color 0.16s ease,
+    box-shadow 0.16s ease,
+    transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+.mb-root .mb-text-tools .mb-size-step:not(.is-held):hover,
+.mb-root .mb-texteditbar .mb-tb-sizestep:not(.is-held):hover {
+  background-color: var(--mb-glass-button-hover);
+  color: var(--text-normal);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.7),
+    0 5px 12px -10px rgba(0, 0, 0, 0.5);
+}
+.mb-root .mb-text-tools .mb-size-step:not(.is-held):active,
+.mb-root .mb-texteditbar .mb-tb-sizestep:not(.is-held):active {
+  transform: scale(0.9);
+}
+
+/* 颜色点 / 色块：保留本色，加玻璃珠高光和投影 */
+.mb-root .mb-swatch,
+.mb-root .mb-tcolor,
+.mb-root .mb-tb-dot,
+.mb-pen-pop .mb-pen-pop-dot {
+  border-color: rgba(255, 255, 255, 0.54);
+  box-shadow:
+    inset 0 1px 2px rgba(255, 255, 255, 0.58),
+    inset 0 -2px 3px rgba(0, 0, 0, 0.16),
+    0 2px 6px -2px rgba(0, 0, 0, 0.3);
+  transition:
+    transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1),
+    box-shadow 0.16s ease;
+}
+.mb-root .mb-swatch:hover:not(.is-active),
+.mb-root .mb-tcolor:hover:not(.is-active),
+.mb-root .mb-tb-dot:hover:not(.is-active),
+.mb-pen-pop .mb-pen-pop-dot:hover:not(.is-active) {
+  transform: scale(1.1);
+  box-shadow:
+    inset 0 1px 2px rgba(255, 255, 255, 0.68),
+    inset 0 -2px 3px rgba(0, 0, 0, 0.18),
+    0 4px 10px -3px rgba(0, 0, 0, 0.36);
+}
+.mb-root .mb-swatch:active,
+.mb-root .mb-tcolor:active,
+.mb-root .mb-tb-dot:active,
+.mb-pen-pop .mb-pen-pop-dot:active {
+  transform: scale(0.9);
+}
+
+/* 强调色按钮 / 模态主按钮：本体仍用主题色，只叠玻璃反光 */
+.mb-root button.mod-cta,
+.mb-root button.mod-warning,
+.modal button.mod-cta,
+.modal button.mod-warning {
+  background-image: var(--mb-glass-btn-sheen);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.42),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.08),
+    0 3px 10px -6px rgba(0, 0, 0, 0.45);
+  transition:
+    background-image 0.16s ease,
+    box-shadow 0.16s ease,
+    transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+.mb-root button.mod-cta:active,
+.mb-root button.mod-warning:active,
+.modal button.mod-cta:active,
+.modal button.mod-warning:active {
+  transform: scale(0.96);
+}
+
+/* 选中态里，把顶栏两个开关（保存 / 侧栏 / 抽屉）的强调色保住 */
+.mb-toprow .mb-topbtn.mb-rail-side.is-active,
+.mb-toprow .mb-topbtn.mb-rail-dock.is-active {
+  background-color: var(--interactive-accent);
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0));
+  color: var(--text-on-accent);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.38),
+    0 3px 10px -6px color-mix(in srgb, var(--interactive-accent) 80%, transparent);
+}
+
+/* 选中态也保留玻璃反光：强调色底 + 顶部细高光，不会变成一块死板实色 */
+.mb-toprow .mb-top-tool.is-active,
+.mb-root button.is-active:where(:not(.mb-swatch):not(.mb-tcolor):not(.mb-tb-dot):not(.mb-pen-pop-dot)),
+.mb-pen-pop button.is-active:where(:not(.mb-pen-pop-dot)),
+.mb-pagepick button.is-active {
+  background-image: var(--mb-glass-btn-sheen);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.42),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.08),
+    0 3px 10px -6px rgba(0, 0, 0, 0.38);
+}
+
+/* 纸面文字样式条 / 新建样式条 / 选页浮层：整块浮框也用同一套玻璃 */
+.mb-textbar,
+.mb-texteditbar,
+.mb-pagepick {
+  background-color: var(--mb-glass-bg);
+  background-image: var(--mb-glass-sheen);
+  border-color: var(--mb-glass-line);
+  backdrop-filter: blur(28px) saturate(1.8) brightness(1.03);
+  -webkit-backdrop-filter: blur(28px) saturate(1.8) brightness(1.03);
+  box-shadow:
+    0 18px 48px -24px rgba(0, 0, 0, 0.55),
+    0 4px 14px -8px rgba(0, 0, 0, 0.22),
+    inset 0 1px 0 var(--mb-glass-line-hi),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.05);
+}
+.mb-texteditbar {
+  border-radius: 10px;
+}
+.mb-pagepick {
+  border-radius: 16px;
+}
+
+/* 右下角翻页 / 缩放浮标：玻璃再润一层 */
+.mb-float {
+  /*
+   * 用户：底下这个「上一页 / 页码 / 下一页」的框，透明度正好，但玻璃质感不够。
+   * 加重磨砂 + 左上镜面反光 + 一圈内高光 / 细内描边，并适度提高不透明度到 66%
+   * （仍能透出纸面），像一枚有厚度的 iPhone 玻璃浮岛。尺寸 / padding 不动。
+   */
+  background-color: color-mix(in srgb, var(--background-primary) 54%, transparent);
+  background-image:
+    radial-gradient(130% 150% at 16% -18%, rgba(255, 255, 255, 0.5) 0%, rgba(255, 255, 255, 0.12) 36%, rgba(255, 255, 255, 0) 68%),
+    var(--mb-glass-sheen);
+  border-color: var(--mb-glass-line);
+  backdrop-filter: blur(30px) saturate(1.85) brightness(1.05);
+  -webkit-backdrop-filter: blur(30px) saturate(1.85) brightness(1.05);
+  box-shadow:
+    0 14px 36px -18px rgba(0, 0, 0, 0.55),
+    0 4px 12px -8px rgba(0, 0, 0, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.72),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.06),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+  opacity: 0.66;
+}
+.mb-float:hover {
+  opacity: 1;
+}
+
+/* 可点击的卡片 / 列表行也吃到同一套玻璃边框和按压反馈 */
+.mb-tpl,
+.mb-paper-chip,
+.mb-new-tpl,
+.mb-new-paper,
+.mb-import-item {
+  transition:
+    transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1),
+    border-color 0.16s ease,
+    box-shadow 0.16s ease,
+    background-color 0.16s ease;
+}
+.mb-tpl:hover,
+.mb-paper-chip:hover,
+.mb-new-tpl:hover,
+.mb-new-paper:hover,
+.mb-import-item:hover {
+  box-shadow:
+    0 6px 16px -12px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.55);
+}
+.mb-tpl:active,
+.mb-paper-chip:active,
+.mb-new-tpl:active,
+.mb-new-paper:active,
+.mb-import-item:active {
+  transform: scale(0.975);
+}
+
+/* 设置页的快捷键录制按钮、导出进度 Notice 的「取消」：同样补玻璃底 */
+.mb-hotkey-btn,
+.notice .mb-export-cancel {
+  background-color: var(--mb-glass-button);
+  background-image: var(--mb-glass-btn-sheen);
+  border: 1px solid var(--mb-glass-line);
+  box-shadow: var(--mb-glass-inset), var(--mb-glass-shadow);
+  transition:
+    background-color 0.16s ease,
+    background-image 0.16s ease,
+    color 0.16s ease,
+    border-color 0.16s ease,
+    box-shadow 0.16s ease,
+    transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+.mb-hotkey-btn:hover,
+.notice .mb-export-cancel:hover:not(:disabled) {
+  background-color: var(--mb-glass-button-hover);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.7),
+    0 7px 18px -14px rgba(0, 0, 0, 0.5);
+}
+.mb-hotkey-btn:active,
+.notice .mb-export-cancel:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+/* 系统减少动态效果：全面关闭这一层的位移 / 缩放，只留静态玻璃质感 */
+@media (prefers-reduced-motion: reduce) {
+  .mb-root button,
+  .mb-pen-pop button,
+  .mb-pagepick button,
+  .mb-toprow .mb-topbtn,
+  .mb-thumb,
+  .mb-thumb-act,
+  .mb-tpl,
+  .mb-paper-chip,
+  .mb-new-tpl,
+  .mb-new-paper,
+  .mb-import-item {
+    transition-duration: 0.01ms !important;
+  }
+  .mb-root button:active,
+  .mb-pen-pop button:active,
+  .mb-pagepick button:active,
+  .mb-toprow .mb-topbtn:active,
+  .mb-thumb:active,
+  .mb-thumb-act:active,
+  .mb-tpl:active,
+  .mb-paper-chip:active,
+  .mb-new-tpl:active,
+  .mb-new-paper:active,
+  .mb-import-item:active {
+    transform: none !important;
+  }
+}
+
+/* ============================================================================
+ * 滑动高亮片（工具行 / 缩略图-目录-收藏标签 / 每行页数 1-4）
+ *
+ * 用户 2026-11-11：切工具（钢笔→橡皮）时，紫色选中框要「滑」到橡皮上，
+ * 而不是「蹦」过去；缩略图/目录/收藏三个标签、每行页数 1/2/3/4 也要同样的动效。
+ *
+ * 做法见 view.ts 的 SlidePill：容器里放一枚绝对定位的紫色玻璃片，JS 算好
+ * 当前选中按钮的位置后写 transform / 宽高，这里只管外观与过渡。选中按钮
+ * 自身改为透明底 + 反白，亮片统一提供高亮，才能连续滑动而非双重闪一下。
+ * ========================================================================== */
+
+.mb-slide-host {
+  position: relative;
+}
+/* 按钮压在玻璃亮片之上（缩略图/标签按钮默认 static，必须显式定位） */
+.mb-slide-host > button {
+  position: relative;
+  z-index: 1;
+}
+
+.mb-slide-pill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 0;
+  display: block;
+  box-sizing: border-box;
+  border-radius: 8px;
+  background-color: var(--interactive-accent);
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.32), rgba(255, 255, 255, 0) 58%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.5),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.06),
+    0 3px 10px -4px color-mix(in srgb, var(--interactive-accent) 72%, transparent);
+  pointer-events: none;
+  opacity: 0;
+  will-change: transform;
+  transition:
+    transform 0.30s cubic-bezier(0.22, 1, 0.36, 1),
+    width 0.30s cubic-bezier(0.22, 1, 0.36, 1),
+    height 0.30s cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 0.16s ease;
+}
+
+.mb-thumb-cols-row .mb-slide-pill,
+.mb-side-tabs .mb-slide-pill {
+  border-radius: 6px;
+}
+.mb-tablet .mb-top-tools .mb-slide-pill,
+.mb-root.is-tablet .mb-thumb-cols-row .mb-slide-pill,
+.mb-root.is-tablet .mb-side-tabs .mb-slide-pill {
+  border-radius: 11px;
+}
+
+/*
+ * 选中项：把按钮自己的强调色底让给高亮片（否则切过去时按钮先「蹦」出一块
+ * 紫底、亮片再滑过去，等于双重高亮）。文字 / 图标改成反白。
+ */
+.mb-top-tools.mb-slide-host > .mb-top-tool.is-active,
+.mb-thumb-cols-row.mb-slide-host > .mb-thumb-cols-btn.is-active,
+.mb-side-tabs.mb-slide-host > .mb-side-tab.is-active {
+  background: transparent;
+  background-image: none;
+  color: var(--text-on-accent);
+  box-shadow: none;
+}
+.mb-top-tools.mb-slide-host > .mb-top-tool.is-active:hover,
+.mb-thumb-cols-row.mb-slide-host > .mb-thumb-cols-btn.is-active:hover,
+.mb-side-tabs.mb-slide-host > .mb-side-tab.is-active:hover {
+  background: transparent;
+  background-image: none;
+  color: var(--text-on-accent);
+}
+/* 侧栏标签选中时原本是白底 + 主色文字，这里统一成反白（亮片是紫底） */
+.mb-side-tabs.mb-slide-host > .mb-side-tab.is-active {
+  font-weight: 600;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mb-slide-pill {
+    transition: none !important;
+  }
+}
+
+/* ============================================================================
+ * 玻璃细节补齐（2026-11-11 第二批）
+ *
+ * 本单只补交互材质，不动尺寸/布局：颜色选中改为滑动的玻璃框；所有粗细/透明度
+ * 滑杆换成半透明玻璃轨道 + 玻璃珠滑块；侧栏与缩略图抽屉用更透的模糊玻璃背板；
+ * 文件名输入框原地覆盖标题；缩略图抽屉滑动条缩短并改成浅色玻璃。
+ * ========================================================================== */
+
+/* 面板专用玻璃参数：比通用 .mb-glass-bg 更透，背后纸面/内容要透得出来。 */
+.mb-root {
+  --mb-panel-glass-bg: color-mix(in srgb, var(--background-primary) 46%, transparent);
+  --mb-panel-glass-sheen:
+    radial-gradient(120% 78% at 10% -4%, rgba(255, 255, 255, 0.28) 0%, rgba(255, 255, 255, 0.07) 40%, rgba(255, 255, 255, 0) 70%),
+    linear-gradient(152deg, rgba(255, 255, 255, 0.14) 0%, rgba(255, 255, 255, 0.025) 52%, rgba(255, 255, 255, 0.09) 100%);
+}
+body.dark .mb-root {
+  --mb-panel-glass-bg: color-mix(in srgb, var(--background-primary) 58%, transparent);
+  --mb-panel-glass-sheen:
+    radial-gradient(120% 78% at 10% -4%, rgba(255, 255, 255, 0.18) 0%, rgba(255, 255, 255, 0.04) 42%, rgba(255, 255, 255, 0) 72%),
+    linear-gradient(152deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.012) 52%, rgba(255, 255, 255, 0.05) 100%);
+}
+
+/* 侧栏 / 缩略图抽屉：真正让底层透上来的模糊玻璃背板 */
+.mb-side,
+.mb-pagedock.is-open .mb-pagedock-body {
+  background-color: var(--mb-panel-glass-bg);
+  background-image: var(--mb-panel-glass-sheen);
+  backdrop-filter: blur(40px) saturate(1.95) brightness(1.06);
+  -webkit-backdrop-filter: blur(40px) saturate(1.95) brightness(1.06);
+}
+.mb-side-head {
+  background-color: color-mix(in srgb, var(--background-primary) 34%, transparent);
+  background-image: var(--mb-glass-btn-sheen);
+  border-bottom-color: var(--mb-glass-line);
+}
+.mb-pagedock-body .mb-side-pane-thumbs {
+  background-image:
+    radial-gradient(130% 85% at 50% -8%, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0) 68%);
+}
+
+/* --------------------------- 颜色点：滑动的玻璃框 -------------------------- */
+.mb-color-glass-pill {
+  border-radius: 999px;
+  background-color: transparent;
+  background-image:
+    radial-gradient(circle at 50% 44%, rgba(255, 255, 255, 0.02) 40%, rgba(255, 255, 255, 0.2) 66%, rgba(255, 255, 255, 0.05) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.8);
+  box-shadow:
+    0 0 0 1.5px color-mix(in srgb, var(--interactive-accent) 62%, transparent),
+    0 0 0 4px color-mix(in srgb, var(--interactive-accent) 16%, transparent),
+    inset 0 1px 1px rgba(255, 255, 255, 0.85),
+    inset 0 -2px 4px rgba(0, 0, 0, 0.08),
+    0 4px 12px -4px rgba(0, 0, 0, 0.42);
+  backdrop-filter: blur(7px) saturate(1.5);
+  -webkit-backdrop-filter: blur(7px) saturate(1.5);
+}
+/* 框由玻璃片提供后，色点自身不要再画一圈静态描边/阴影，否则会叠成双框 */
+.mb-color-glass-host > .mb-pen-pop-dot.is-active,
+.mb-color-glass-host > .mb-tcolor.is-active {
+  outline: none;
+  box-shadow:
+    inset 0 1px 2px rgba(255, 255, 255, 0.58),
+    inset 0 -2px 3px rgba(0, 0, 0, 0.16),
+    0 2px 6px -2px rgba(0, 0, 0, 0.3);
+}
+.mb-color-glass-host > .mb-pen-pop-dot.is-active:hover,
+.mb-color-glass-host > .mb-tcolor.is-active:hover {
+  transform: none;
+}
+
+/* ------------------------------- 玻璃滑杆 ------------------------------- */
+.mb-root input.mb-range[type="range"],
+.mb-root input.mb-layer-op-range[type="range"],
+.mb-pen-pop input.mb-pen-pop-range[type="range"] {
+  --mb-range-track: 6px;
+  --mb-range-thumb: 14px;
+  --mb-range-thumb-margin: -4px;
+  /* 用户反馈下压 5px 后球体「还是偏上、再往下调一调」：几何居中后整体下压 7px */
+  --mb-range-thumb-nudge: 7px;
+  -webkit-appearance: none;
+  appearance: none;
+  box-sizing: border-box;
+  display: block;
+  vertical-align: middle;
+  height: var(--mb-range-input-h, 16px);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.mb-pen-pop input.mb-pen-pop-range[type="range"] {
+  --mb-range-input-h: 16px;
+}
+.mb-root input.mb-range[type="range"]::-webkit-slider-runnable-track,
+.mb-root input.mb-layer-op-range[type="range"]::-webkit-slider-runnable-track,
+.mb-pen-pop input.mb-pen-pop-range[type="range"]::-webkit-slider-runnable-track {
+  -webkit-appearance: none;
+  appearance: none;
+  box-sizing: border-box;
+  height: var(--mb-range-track);
+  border-radius: 999px;
+  /*
+   * 不用 border：border 会把轨道的盒高撑成 height+2px，某些引擎（旧 WebView /
+   * 平板 WebView）按 border-box 垂直居中可拖拽轨道，就比按 height 居中高 1px
+   * ——用户看到的就是「球体在条的偏上位置」。改用 inset 描边（不占盒模型），
+   * 轨道外高严格等于 --mb-range-track，滑块 margin-top=(track-thumb)/2 才精确居中。
+   */
+  border: 0;
+  background-color: var(--mb-glass-button);
+  background-image:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.62) 0%, rgba(255, 255, 255, 0.13) 45%, rgba(0, 0, 0, 0.06) 100%);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--text-normal) 11%, transparent),
+    inset 0 1px 1px rgba(255, 255, 255, 0.72),
+    inset 0 -1px 2px rgba(0, 0, 0, 0.12),
+    0 2px 7px -4px rgba(0, 0, 0, 0.34);
+}
+/*
+ * 用户：所有「调笔粗细」的滑杆要紫色磨砂玻璃才显眼。
+ * .mb-range = 橡皮/粗细（动态侧栏），.mb-pen-pop-range = 笔盒/形状粗细；
+ * 图层透明度 .mb-layer-op-range 保持中性玻璃，不跟着变紫。
+ */
+.mb-root input.mb-range[type="range"]::-webkit-slider-runnable-track,
+.mb-pen-pop input.mb-pen-pop-range[type="range"]::-webkit-slider-runnable-track {
+  background-color: color-mix(in srgb, var(--interactive-accent) 52%, transparent);
+  background-image:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.55) 0%, rgba(255, 255, 255, 0.12) 48%, rgba(0, 0, 0, 0.12) 100%);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--interactive-accent) 62%, rgba(255, 255, 255, 0.35)),
+    inset 0 1px 1px rgba(255, 255, 255, 0.7),
+    inset 0 -1px 2px rgba(0, 0, 0, 0.18),
+    0 2px 7px -4px color-mix(in srgb, var(--interactive-accent) 60%, rgba(0, 0, 0, 0.2));
+}
+
+.mb-root input.mb-range[type="range"]::-webkit-slider-thumb,
+.mb-root input.mb-layer-op-range[type="range"]::-webkit-slider-thumb,
+.mb-pen-pop input.mb-pen-pop-range[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  box-sizing: border-box;
+  width: var(--mb-range-thumb);
+  height: var(--mb-range-thumb);
+  margin-top: calc((var(--mb-range-track) - var(--mb-range-thumb)) / 2 + var(--mb-range-thumb-nudge, 0px));
+  border-radius: 50%;
+  border: 1px solid var(--mb-glass-line-hi);
+  background-color: var(--mb-glass-bg-strong);
+  background-image:
+    radial-gradient(circle at 44% 36%, rgba(255, 255, 255, 0.95) 0%, rgba(255, 255, 255, 0.4) 38%, rgba(255, 255, 255, 0.08) 74%);
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.9),
+    inset 0 -2px 4px rgba(0, 0, 0, 0.14),
+    0 2px 7px -2px rgba(0, 0, 0, 0.42);
+  transition: transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1), box-shadow 0.14s ease;
+}
+.mb-root input.mb-range[type="range"]:active::-webkit-slider-thumb,
+.mb-root input.mb-layer-op-range[type="range"]:active::-webkit-slider-thumb,
+.mb-pen-pop input.mb-pen-pop-range[type="range"]:active::-webkit-slider-thumb {
+  transform: scale(1.12);
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.95),
+    0 0 0 3px color-mix(in srgb, var(--interactive-accent) 28%, transparent),
+    0 3px 9px -2px rgba(0, 0, 0, 0.42);
+}
+.mb-root input.mb-range[type="range"]::-moz-range-track,
+.mb-root input.mb-layer-op-range[type="range"]::-moz-range-track,
+.mb-pen-pop input.mb-pen-pop-range[type="range"]::-moz-range-track {
+  box-sizing: border-box;
+  height: var(--mb-range-track);
+  border-radius: 999px;
+  border: 0;
+  background-color: var(--mb-glass-button);
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.62), rgba(255, 255, 255, 0.1));
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--text-normal) 11%, transparent),
+    inset 0 1px 1px rgba(255, 255, 255, 0.7),
+    inset 0 -1px 2px rgba(0, 0, 0, 0.12);
+}
+.mb-root input.mb-range[type="range"]::-moz-range-track,
+.mb-pen-pop input.mb-pen-pop-range[type="range"]::-moz-range-track {
+  background-color: color-mix(in srgb, var(--interactive-accent) 52%, transparent);
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.55), rgba(255, 255, 255, 0.12) 48%, rgba(0, 0, 0, 0.12));
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--interactive-accent) 62%, rgba(255, 255, 255, 0.35)),
+    inset 0 1px 1px rgba(255, 255, 255, 0.7),
+    inset 0 -1px 2px rgba(0, 0, 0, 0.18);
+}
+
+.mb-root input.mb-range[type="range"]::-moz-range-thumb,
+.mb-root input.mb-layer-op-range[type="range"]::-moz-range-thumb,
+.mb-pen-pop input.mb-pen-pop-range[type="range"]::-moz-range-thumb {
+  box-sizing: border-box;
+  width: var(--mb-range-thumb);
+  height: var(--mb-range-thumb);
+  border-radius: 50%;
+  border: 1px solid var(--mb-glass-line-hi);
+  margin-top: var(--mb-range-thumb-nudge, 0px);
+  background-color: var(--mb-glass-bg-strong);
+  background-image: radial-gradient(circle at 32% 24%, rgba(255, 255, 255, 0.95), rgba(255, 255, 255, 0.12));
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.9), 0 2px 7px -2px rgba(0, 0, 0, 0.42);
+}
+.mb-root.is-tablet input.mb-range[type="range"],
+.mb-root.is-tablet input.mb-layer-op-range[type="range"],
+.mb-pen-pop.mb-pen-pop-tablet input.mb-pen-pop-range[type="range"] {
+  --mb-range-track: 8px;
+  --mb-range-thumb: 20px;
+  --mb-range-thumb-margin: -6px;
+}
+.mb-root.is-tablet input.mb-range[type="range"] {
+  --mb-range-input-h: 30px;
+}
+/* 图层透明度滑杆在平板上也按同一套尺寸：给 20px 玻璃珠留出 26px 触摸高度，
+ * 避免原来被 16px 输入高度夹住、玻璃珠上下各溢出 2px 看着发飘。 */
+.mb-root.is-tablet input.mb-layer-op-range[type="range"] {
+  --mb-range-input-h: 26px;
+}
+/* 平板笔盒粗细滑杆：20px 玻璃珠放进 16px 输入框会上下各溢 2px，容易被行内裁掉
+ * 一半、看起来「球偏上」。给到 22px 让玻璃珠完整露出、上下留 1px 呼吸。 */
+.mb-pen-pop.mb-pen-pop-tablet input.mb-pen-pop-range[type="range"] {
+  --mb-range-input-h: 22px;
+}
+
+/* --------------------------- 标题原地重命名输入框 -------------------------- */
+.mb-side-headtext {
+  position: relative;
+}
+.mb-side .mb-side-title-edit {
+  position: absolute;
+  box-sizing: border-box;
+  width: auto;
+  min-width: 0;
+  margin: 0;
+  padding: 0 6px;
+  border-radius: 8px;
+  border: 1px solid var(--mb-glass-line-hi);
+  background-color: var(--mb-glass-button);
+  background-image: var(--mb-glass-btn-sheen);
+  color: var(--text-normal);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.2;
+  box-shadow:
+    var(--mb-glass-inset),
+    0 0 0 2px color-mix(in srgb, var(--interactive-accent) 32%, transparent),
+    0 4px 12px -6px rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(14px) saturate(1.5);
+  -webkit-backdrop-filter: blur(14px) saturate(1.5);
+  outline: none;
+}
+.mb-side .mb-side-title-edit:focus {
+  border-color: color-mix(in srgb, var(--interactive-accent) 72%, transparent);
+  box-shadow:
+    var(--mb-glass-inset),
+    0 0 0 2.5px color-mix(in srgb, var(--interactive-accent) 48%, transparent),
+    0 4px 12px -6px rgba(0, 0, 0, 0.4);
+}
+
+/* ------------------------- 缩略图抽屉：短玻璃滑动条 ------------------------ */
+.mb-pane-sb {
+  top: 22%;
+  bottom: 22%;
+  right: 3px;
+  width: 12px;
+}
+.mb-pane-sb .mb-sb-track,
+.mb-pane-sb .mb-sb-thumb {
+  width: 7px;
+}
+.mb-pane-sb .mb-sb-thumb {
+  /* 用户：缩略图里这条上下滑动条不要「不摁时透明、摁下才紫」，任何时候都做成紫色玻璃条 */
+  border: 1px solid color-mix(in srgb, var(--interactive-accent) 58%, rgba(255, 255, 255, 0.5));
+  background-color: color-mix(in srgb, var(--interactive-accent) 46%, transparent);
+  background-image:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.62) 0%, rgba(255, 255, 255, 0.14) 52%, rgba(255, 255, 255, 0.04) 100%);
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.82),
+    inset 0 -2px 4px rgba(0, 0, 0, 0.12),
+    0 3px 10px -3px color-mix(in srgb, var(--interactive-accent) 55%, transparent);
+  backdrop-filter: blur(10px) saturate(1.5);
+  -webkit-backdrop-filter: blur(10px) saturate(1.5);
+}
+/* 视觉只有 7px，但透明热区上下左右加 6px，手指仍好拖 */
+.mb-pane-sb .mb-sb-thumb::before {
+  content: "";
+  position: absolute;
+  inset: -6px;
+  border-radius: 999px;
+}
+.mb-pane-sb.is-drag .mb-sb-thumb {
+  background-color: color-mix(in srgb, var(--interactive-accent) 70%, transparent);
+  background-image: var(--mb-glass-btn-sheen);
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.85),
+    0 0 0 3px color-mix(in srgb, var(--interactive-accent) 24%, transparent),
+    0 3px 10px -3px color-mix(in srgb, var(--interactive-accent) 60%, transparent);
+}
+.mb-root.is-tablet .mb-sb.mb-pane-sb {
+  top: 22%;
+  bottom: 22%;
+  right: 2px;
+}
+.mb-root.is-tablet .mb-sb.mb-pane-sb .mb-sb-track,
+.mb-root.is-tablet .mb-sb.mb-pane-sb .mb-sb-thumb {
+  width: 8px;
+}
+
+/* ============================================================================
+ * 侧栏背板 → iPhone 式「晶莹玻璃」(2026-11-12)
+ *
+ * 用户：侧栏背板「确实是稍微有点透明」，但想要 iPhone 玻璃背板那种「晶莹剔透」。
+ * 原有面板是重度磨砂（blur 40px + 46% 白），背景被磨成一团奶白，观感更像「半透明
+ * 色块」而不是清澈的玻璃。晶莹玻璃的关键不是更白，而是：看得清（少磨砂）+ 镜面
+ * 高光/反光条 + 边缘的玻璃厚度感。
+ *
+ * 只改背板材质，不动任何尺寸 / padding / 布局：
+ *   · 磨砂减弱、通透增强：亮色 blur 40px → 13px、白底 46% → 43%；暗色 → 15px、
+ *     58% → 47%，并把亮度抬到 1.1，背后纸面 / 内容「透得清楚」。
+ *   · 叠一条斜向镜面反光带 + 左上角反光晕 + 上亮下暗的厚度渐变，做出玻璃湿漉漉的高光。
+ *   · 顶部 / 左侧亮描边 + 右侧 / 底部细内暗边，做出玻璃片的厚度（双色边缘）。
+ * ========================================================================== */
+.mb-root {
+  --mb-crystal-bg: color-mix(in srgb, var(--background-primary) 43%, transparent);
+  --mb-crystal-sheen:
+    linear-gradient(118deg, rgba(255, 255, 255, 0) 6%, rgba(255, 255, 255, 0.95) 19%, rgba(255, 255, 255, 0.2) 30%, rgba(255, 255, 255, 0) 45%),
+    radial-gradient(80% 55% at 5% -10%, rgba(255, 255, 255, 1) 0%, rgba(255, 255, 255, 0.3) 42%, rgba(255, 255, 255, 0) 72%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.45) 0%, rgba(255, 255, 255, 0.05) 40%, rgba(150, 168, 192, 0.06) 62%, rgba(150, 168, 192, 0.15) 100%),
+    radial-gradient(130% 120% at 50% 46%, rgba(255, 255, 255, 0) 50%, rgba(120, 140, 168, 0.12) 100%);
+}
+body.dark .mb-root {
+  --mb-crystal-bg: color-mix(in srgb, var(--background-primary) 47%, transparent);
+  --mb-crystal-sheen:
+    linear-gradient(118deg, rgba(255, 255, 255, 0) 6%, rgba(255, 255, 255, 0.38) 20%, rgba(255, 255, 255, 0.05) 31%, rgba(255, 255, 255, 0) 46%),
+    radial-gradient(80% 55% at 5% -10%, rgba(255, 255, 255, 0.38) 0%, rgba(255, 255, 255, 0.1) 42%, rgba(255, 255, 255, 0) 72%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.16) 0%, rgba(255, 255, 255, 0.02) 46%, rgba(0, 0, 0, 0.1) 100%);
+}
+
+/* 侧栏背板：更清澈的玻璃（比上一轮 40px 磨砂透得多） */
+.mb-side {
+  background-color: var(--mb-crystal-bg);
+  background-image: var(--mb-crystal-sheen);
+  backdrop-filter: blur(13px) saturate(2.1) brightness(1.05);
+  -webkit-backdrop-filter: blur(13px) saturate(2.1) brightness(1.05);
+}
+body.dark .mb-side {
+  backdrop-filter: blur(15px) saturate(1.92) brightness(1.1);
+  -webkit-backdrop-filter: blur(15px) saturate(1.92) brightness(1.1);
+}
+
+/* 玻璃片边缘：顶部 / 左侧亮描边，右侧 / 底部细内暗边 → 厚度与折射感 */
+.mb-side {
+  box-shadow:
+    -20px 0 54px -30px rgba(0, 0, 0, 0.5),
+    inset 1px 0 0 rgba(255, 255, 255, 0.9),
+    inset 0 1px 0 rgba(255, 255, 255, 0.92),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.16),
+    inset -1px 0 0 rgba(0, 0, 0, 0.06),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.05);
+}
+.mb-root.is-tablet .mb-side {
+  box-shadow:
+    -8px 0 30px rgba(0, 0, 0, 0.22),
+    inset 1px 0 0 rgba(255, 255, 255, 0.9),
+    inset 0 1px 0 rgba(255, 255, 255, 0.92),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.16),
+    inset -1px 0 0 rgba(0, 0, 0, 0.06),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.05);
+}
+body.dark .mb-side {
+  box-shadow:
+    -20px 0 54px -30px rgba(0, 0, 0, 0.66),
+    inset 1px 0 0 rgba(255, 255, 255, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.42),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.07),
+    inset -1px 0 0 rgba(0, 0, 0, 0.28),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.22);
+}
+body.dark .mb-root.is-tablet .mb-side {
+  box-shadow:
+    -8px 0 30px rgba(0, 0, 0, 0.4),
+    inset 1px 0 0 rgba(255, 255, 255, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.42),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.07),
+    inset -1px 0 0 rgba(0, 0, 0, 0.28),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.22);
+}
+
+/* ============================================================================
+ * 侧栏 / 缩略图抽屉背板 → 晶莹剔透的真·玻璃（2026-11-13 重做）
+ *
+ * 用户：上一版侧栏（blur 13px + 43% 白）和缩略图抽屉（blur 40px + 46% 白）背板
+ * 「还不是想要的那种晶莹剔透的玻璃背板」，要求重做。
+ * 真正通透的关键不是加白，而是：几乎不磨砂（看得见背后）+ 底色很淡 + 再靠
+ * 镜面反光条 / 亮边 / 厚度暗边把「一块玻璃」的形立起来。
+ *
+ * 本次把侧栏和缩略图抽屉统一成同一套材质，并把通透度再降一档：
+ *   · 底色调淡：亮色 43%/46% → 26%，暗色 47%/58% → 32%；
+ *   · 磨砂大幅减弱：亮色 13/40px → 8px、暗色 15/40px → 9px，几乎只剩一层薄雾；
+ *   · 反光更利落：一条更窄更亮的斜向镜面反光 + 左上角高光晕 + 上亮下冷的厚度
+ *     渐变 + 四周极淡冷色收边，做出清亮玻璃的折射感；
+ *   · 边缘：顶 / 侧亮描边 + 一圈细玻璃壁 + 另一侧 / 底部细暗边 = 玻璃厚度。
+ * 尺寸 / padding / 布局零改动，只换背板材质。
+ * ========================================================================== */
+.mb-root {
+  --mb-crystal2-bg: color-mix(in srgb, var(--background-primary) 26%, transparent);
+  --mb-crystal2-sheen:
+    linear-gradient(115deg, rgba(255, 255, 255, 0) 2%, rgba(255, 255, 255, 0.85) 14%, rgba(255, 255, 255, 0.12) 25%, rgba(255, 255, 255, 0) 38%),
+    radial-gradient(85% 55% at 5% -12%, rgba(255, 255, 255, 0.95) 0%, rgba(255, 255, 255, 0.26) 44%, rgba(255, 255, 255, 0) 74%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.3) 0%, rgba(255, 255, 255, 0.03) 40%, rgba(160, 178, 206, 0.05) 64%, rgba(120, 142, 172, 0.12) 100%),
+    radial-gradient(135% 120% at 50% 44%, rgba(255, 255, 255, 0) 55%, rgba(110, 132, 162, 0.1) 100%);
+}
+body.dark .mb-root {
+  --mb-crystal2-bg: color-mix(in srgb, var(--background-primary) 32%, transparent);
+  --mb-crystal2-sheen:
+    linear-gradient(115deg, rgba(255, 255, 255, 0) 2%, rgba(255, 255, 255, 0.36) 14%, rgba(255, 255, 255, 0.05) 25%, rgba(255, 255, 255, 0) 38%),
+    radial-gradient(85% 55% at 5% -12%, rgba(255, 255, 255, 0.32) 0%, rgba(255, 255, 255, 0.07) 44%, rgba(255, 255, 255, 0) 74%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.14) 0%, rgba(255, 255, 255, 0.02) 44%, rgba(0, 0, 0, 0.14) 100%);
+}
+
+/* 侧栏 + 缩略图抽屉：同一块清澈玻璃背板 */
+.mb-side,
+.mb-pagedock.is-open .mb-pagedock-body {
+  background-color: var(--mb-crystal2-bg);
+  background-image: var(--mb-crystal2-sheen);
+  backdrop-filter: blur(8px) saturate(1.7) brightness(1.06);
+  -webkit-backdrop-filter: blur(8px) saturate(1.7) brightness(1.06);
+  border-color: rgba(255, 255, 255, 0.45);
+}
+body.dark .mb-side,
+body.dark .mb-pagedock.is-open .mb-pagedock-body {
+  backdrop-filter: blur(9px) saturate(1.45) brightness(1.14);
+  -webkit-backdrop-filter: blur(9px) saturate(1.45) brightness(1.14);
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
+/* 玻璃片边缘：亮描边 + 玻璃壁 + 细暗边，做出厚度与折射（右侧栏：亮边在左/上） */
+.mb-side {
+  box-shadow:
+    -20px 0 54px -30px rgba(0, 0, 0, 0.46),
+    inset 1px 0 0 rgba(255, 255, 255, 0.96),
+    inset 0 1px 0 rgba(255, 255, 255, 0.98),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.24),
+    inset -1px 0 0 rgba(0, 0, 0, 0.05),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.06);
+}
+.mb-root.is-tablet .mb-side {
+  box-shadow:
+    -8px 0 30px rgba(0, 0, 0, 0.2),
+    inset 1px 0 0 rgba(255, 255, 255, 0.96),
+    inset 0 1px 0 rgba(255, 255, 255, 0.98),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.24),
+    inset -1px 0 0 rgba(0, 0, 0, 0.05),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.06);
+}
+/* 缩略图抽屉（左侧）：亮边在右/上，暗边在左/底 */
+.mb-pagedock.is-open .mb-pagedock-body {
+  box-shadow:
+    22px 0 52px -30px rgba(0, 0, 0, 0.42),
+    inset -1px 0 0 rgba(255, 255, 255, 0.96),
+    inset 0 1px 0 rgba(255, 255, 255, 0.98),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.24),
+    inset 1px 0 0 rgba(0, 0, 0, 0.05),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.06);
+}
+body.dark .mb-side {
+  box-shadow:
+    -20px 0 54px -30px rgba(0, 0, 0, 0.66),
+    inset 1px 0 0 rgba(255, 255, 255, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.5),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.1),
+    inset -1px 0 0 rgba(0, 0, 0, 0.28),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.24);
+}
+body.dark .mb-root.is-tablet .mb-side {
+  box-shadow:
+    -8px 0 30px rgba(0, 0, 0, 0.38),
+    inset 1px 0 0 rgba(255, 255, 255, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.5),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.1),
+    inset -1px 0 0 rgba(0, 0, 0, 0.28),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.24);
+}
+body.dark .mb-pagedock.is-open .mb-pagedock-body {
+  box-shadow:
+    22px 0 52px -30px rgba(0, 0, 0, 0.6),
+    inset -1px 0 0 rgba(255, 255, 255, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.5),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.1),
+    inset 1px 0 0 rgba(0, 0, 0, 0.28),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.24);
+}
+
+/* 侧栏标题栏别做成一条实心奶白带：跟背板一起透，只留极淡高光 + 最底分隔 */
+.mb-side-head {
+  background-color: transparent;
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0));
+  border-bottom-color: color-mix(in srgb, var(--text-normal) 12%, transparent);
+}
+body.dark .mb-side-head {
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0));
+  border-bottom-color: rgba(255, 255, 255, 0.08);
+}
+
+/* 缩略图抽屉内容层只叠一道很淡的顶部反光，别在玻璃上再糊一层白 */
+.mb-pagedock-body .mb-side-pane-thumbs {
+  background-image:
+    radial-gradient(130% 85% at 50% -10%, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0) 66%);
+}
+
+/* ============================================================================
+ * 2026-11-13 第三轮：再降磨砂、更通透——把「磨砂奶白」压下去，只留清澈的玻璃高光
+ *
+ * 用户觉得前两版「还是不够晶莹剔透，有点太磨砂了，再做的透明一些」。回看材质：
+ * 底色虽只有 20% / 26%，但叠了六层大面积白色反光（顶部 0.95 白带、112° 0.92 反光条、
+ * 底部 0.26 白雾……）再配 saturate 1.9 / brightness 1.06，实测背板亮度被抬到近纯白
+ * （暗色主题比背后纸面亮约 28），看起来是一层「奶白磨砂」，而不是清玻璃。
+ *
+ * 本轮只做减法：大幅降低磨砂与白雾，让背后纸面 / 内容真正透出来：
+ *   · 底色再淡：亮 20% → 9%，暗 26% → 12%（几乎只剩一层薄玻璃）。
+ *   · 磨砂大降：亮 9px → 2.5px、暗 11px → 3px，saturate / brightness 一并收小，
+ *     背后内容清晰透过，只留极轻微的柔化。
+ *   · 白雾几乎去掉，只保留一条很窄的顶部亮边 + 一条窄斜向镜面反光 + 极淡的角落高光
+ *     与底部冷色厚度；「清亮」来自这些利落的小高光，而不是整片发白。
+ *   · 立体边缘（顶 / 侧亮描边 + 细玻璃壁 + 底 / 另一侧暗边）保持不变，玻璃厚度仍在。
+ * 尺寸 / padding / 布局零改动，只换背板材质。
+ * ========================================================================== */
+.mb-root {
+  --mb-crystal2-bg: color-mix(in srgb, var(--background-primary) 9%, transparent);
+  --mb-crystal2-sheen:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.9) 0%, rgba(255, 255, 255, 0.07) 1.4%, rgba(255, 255, 255, 0) 7%),
+    linear-gradient(112deg, rgba(255, 255, 255, 0) 7%, rgba(255, 255, 255, 0.72) 12%, rgba(255, 255, 255, 0) 18%),
+    radial-gradient(24% 18% at 97% -6%, rgba(255, 255, 255, 0.6) 0%, rgba(255, 255, 255, 0) 70%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0) 50%, rgba(120, 142, 172, 0.09) 100%);
+}
+body.dark .mb-root {
+  --mb-crystal2-bg: color-mix(in srgb, var(--background-primary) 12%, transparent);
+  --mb-crystal2-sheen:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.5) 0%, rgba(255, 255, 255, 0.05) 1.4%, rgba(255, 255, 255, 0) 7%),
+    linear-gradient(112deg, rgba(255, 255, 255, 0) 7%, rgba(255, 255, 255, 0.34) 12%, rgba(255, 255, 255, 0) 18%),
+    radial-gradient(24% 18% at 97% -6%, rgba(255, 255, 255, 0.4) 0%, rgba(255, 255, 255, 0) 70%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.03) 0%, rgba(255, 255, 255, 0) 52%, rgba(0, 0, 0, 0.1) 100%);
+}
+.mb-side,
+.mb-pagedock.is-open .mb-pagedock-body {
+  background-color: var(--mb-crystal2-bg);
+  background-image: var(--mb-crystal2-sheen);
+  backdrop-filter: blur(2.5px) saturate(1.35) brightness(1.02);
+  -webkit-backdrop-filter: blur(2.5px) saturate(1.35) brightness(1.02);
+  border-color: rgba(255, 255, 255, 0.5);
+}
+body.dark .mb-side,
+body.dark .mb-pagedock.is-open .mb-pagedock-body {
+  backdrop-filter: blur(3px) saturate(1.25) brightness(1.04);
+  -webkit-backdrop-filter: blur(3px) saturate(1.25) brightness(1.04);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+.mb-side {
+  box-shadow:
+    -22px 0 58px -28px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 1),
+    inset 1px 0 0 rgba(255, 255, 255, 0.98),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.32),
+    inset -1px 0 0 rgba(0, 0, 0, 0.07),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.09);
+}
+.mb-root.is-tablet .mb-side {
+  box-shadow:
+    -8px 0 30px rgba(0, 0, 0, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 1),
+    inset 1px 0 0 rgba(255, 255, 255, 0.98),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.32),
+    inset -1px 0 0 rgba(0, 0, 0, 0.07),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.09);
+}
+.mb-pagedock.is-open .mb-pagedock-body {
+  box-shadow:
+    22px 0 52px -28px rgba(0, 0, 0, 0.46),
+    inset 0 1px 0 rgba(255, 255, 255, 1),
+    inset -1px 0 0 rgba(255, 255, 255, 0.98),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.32),
+    inset 1px 0 0 rgba(0, 0, 0, 0.07),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.09);
+}
+body.dark .mb-side {
+  box-shadow:
+    -22px 0 58px -28px rgba(0, 0, 0, 0.7),
+    inset 0 1px 0 rgba(255, 255, 255, 0.62),
+    inset 1px 0 0 rgba(255, 255, 255, 0.5),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.12),
+    inset -1px 0 0 rgba(0, 0, 0, 0.32),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.3);
+}
+body.dark .mb-root.is-tablet .mb-side {
+  box-shadow:
+    -8px 0 30px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.62),
+    inset 1px 0 0 rgba(255, 255, 255, 0.5),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.12),
+    inset -1px 0 0 rgba(0, 0, 0, 0.32),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.3);
+}
+body.dark .mb-pagedock.is-open .mb-pagedock-body {
+  box-shadow:
+    22px 0 52px -28px rgba(0, 0, 0, 0.66),
+    inset 0 1px 0 rgba(255, 255, 255, 0.62),
+    inset -1px 0 0 rgba(255, 255, 255, 0.5),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.12),
+    inset 1px 0 0 rgba(0, 0, 0, 0.32),
+    inset 0 -2px 0 rgba(0, 0, 0, 0.3);
+}
+
+/* ============================================================================
+ * 2026-11-13 第四轮：玻璃「边缘光效」——柔化硬描边，做出光滑圆润的 iPhone 玻璃圈光
+ *
+ * 用户：边缘的光效还差点意思，还要不失玻璃那种光滑圆润的质感，要真正像 iPhone。
+ * 现状：边缘是一道 1~2px 的「硬」纯白描边（实测暗色侧栏左缘从 15 一步跳到 153、
+ * 下一像素又跌回 22；顶缘 16 → 216 → 129），像切出来的生玻璃，而不是被打磨圆润、
+ * 会兜住光线的玻璃边。硬的单像素线在 20px 圆角上也是「折」的，缺圆润过渡。
+ *
+ * 本轮只改「边缘光」的箱影，不动底色 / 磨砂 / 半径 / 尺寸 / 布局：
+ *   · 用带模糊的多层内阴影代替单像素硬线：最外一道极细亮圈定形，再叠 2px 与 7~8px
+ *     两层柔光向内渐隐，形成「边缘最亮 → 平滑向内衰减」的圆润高光过渡，光会顺着
+ *     20px 圆角自然兜一圈。
+ *   · 顶缘叠一道略向下偏移的柔光带，模拟光线从上方打在圆角玻璃边上。
+ *   · 外侧加一层很淡的白色辉光（玻璃边把光晕染到纸上），暗色主题下像发亮的玻璃圈。
+ *   · 底 / 另一侧暗边也改用模糊阴影，保住玻璃厚度，同时去掉生硬的 2px 黑线。
+ * ========================================================================== */
+/* 右侧栏（亮）：亮边在左 / 上，暗边在右 / 底 */
+.mb-side {
+  box-shadow:
+    -22px 0 58px -28px rgba(0, 0, 0, 0.5),
+    0 0 15px -5px rgba(255, 255, 255, 0.5),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.5),
+    inset 0 0 2px rgba(255, 255, 255, 0.85),
+    inset 0 0 7px rgba(255, 255, 255, 0.3),
+    inset 0 1px 3px rgba(255, 255, 255, 0.85),
+    inset 1px 0 3px -0.5px rgba(255, 255, 255, 0.75),
+    inset -1px 0 3px rgba(0, 0, 0, 0.06),
+    inset 0 -2px 4px -1px rgba(0, 0, 0, 0.1);
+}
+.mb-root.is-tablet .mb-side {
+  box-shadow:
+    -8px 0 30px rgba(0, 0, 0, 0.22),
+    0 0 15px -5px rgba(255, 255, 255, 0.5),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.5),
+    inset 0 0 2px rgba(255, 255, 255, 0.85),
+    inset 0 0 7px rgba(255, 255, 255, 0.3),
+    inset 0 1px 3px rgba(255, 255, 255, 0.85),
+    inset 1px 0 3px -0.5px rgba(255, 255, 255, 0.75),
+    inset -1px 0 3px rgba(0, 0, 0, 0.06),
+    inset 0 -2px 4px -1px rgba(0, 0, 0, 0.1);
+}
+/* 缩略图抽屉（亮，左侧）：亮边在右 / 上，暗边在左 / 底 */
+.mb-pagedock.is-open .mb-pagedock-body {
+  box-shadow:
+    22px 0 52px -28px rgba(0, 0, 0, 0.46),
+    0 0 15px -5px rgba(255, 255, 255, 0.5),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.5),
+    inset 0 0 2px rgba(255, 255, 255, 0.85),
+    inset 0 0 7px rgba(255, 255, 255, 0.3),
+    inset 0 1px 3px rgba(255, 255, 255, 0.85),
+    inset -1px 0 3px -0.5px rgba(255, 255, 255, 0.75),
+    inset 1px 0 3px rgba(0, 0, 0, 0.06),
+    inset 0 -2px 4px -1px rgba(0, 0, 0, 0.1);
+}
+/* 右侧栏（暗）：同样的柔光，强度按深色底调校 */
+body.dark .mb-side {
+  box-shadow:
+    -22px 0 58px -28px rgba(0, 0, 0, 0.7),
+    0 0 16px -6px rgba(255, 255, 255, 0.3),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.16),
+    inset 0 0 2px rgba(255, 255, 255, 0.6),
+    inset 0 0 8px rgba(255, 255, 255, 0.16),
+    inset 0 1px 4px rgba(255, 255, 255, 0.5),
+    inset 1px 0 4px -1px rgba(255, 255, 255, 0.42),
+    inset -1px 0 3px rgba(0, 0, 0, 0.3),
+    inset 0 -2px 4px -1px rgba(0, 0, 0, 0.32);
+}
+body.dark .mb-root.is-tablet .mb-side {
+  box-shadow:
+    -8px 0 30px rgba(0, 0, 0, 0.4),
+    0 0 16px -6px rgba(255, 255, 255, 0.3),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.16),
+    inset 0 0 2px rgba(255, 255, 255, 0.6),
+    inset 0 0 8px rgba(255, 255, 255, 0.16),
+    inset 0 1px 4px rgba(255, 255, 255, 0.5),
+    inset 1px 0 4px -1px rgba(255, 255, 255, 0.42),
+    inset -1px 0 3px rgba(0, 0, 0, 0.3),
+    inset 0 -2px 4px -1px rgba(0, 0, 0, 0.32);
+}
+body.dark .mb-pagedock.is-open .mb-pagedock-body {
+  box-shadow:
+    22px 0 52px -28px rgba(0, 0, 0, 0.66),
+    0 0 16px -6px rgba(255, 255, 255, 0.3),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.16),
+    inset 0 0 2px rgba(255, 255, 255, 0.6),
+    inset 0 0 8px rgba(255, 255, 255, 0.16),
+    inset 0 1px 4px rgba(255, 255, 255, 0.5),
+    inset -1px 0 4px -1px rgba(255, 255, 255, 0.42),
+    inset 1px 0 3px rgba(0, 0, 0, 0.3),
+    inset 0 -2px 4px -1px rgba(0, 0, 0, 0.32);
+}
+
+/* ---------------- 「在当前笔记中查找」浮条与命中高亮 ---------------- */
+
+/*
+ * 贴在 .mb-paper 右上角（.mb-paper 自己 position:relative），
+ * 仿 Obsidian 文件内搜索那条：输入框 + 第几条 + 上/下/关。
+ * pointer-events 放开，但父层 .mb-paper 里的纸面滚区在它下面，
+ * pointerdown 已在视图里 stopPropagation，不会误落一笔。
+ */
+.mb-find {
+  position: absolute;
+  top: 10px;
+  right: 16px;
+  z-index: 9; /* 高于右下浮标(6)，低于 document.body 上的弹层(80) */
+  display: none;
+  align-items: center;
+  gap: 4px;
+  box-sizing: border-box;
+  max-width: calc(100% - 32px);
+  padding: 4px 5px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  /* 老 Electron 不认 color-mix 时要有不透明底，查找条不能透成一片字 */
+  background: var(--background-primary);
+  background: color-mix(in srgb, var(--background-primary) 92%, transparent);
+  backdrop-filter: blur(16px) saturate(1.4);
+  -webkit-backdrop-filter: blur(16px) saturate(1.4);
+  box-shadow: 0 10px 28px -12px rgba(0, 0, 0, 0.55);
+  pointer-events: auto;
+}
+.mb-find.is-open {
+  display: flex;
+}
+.mb-find-input {
+  width: min(230px, 42vw);
+  min-width: 90px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 13px;
+  line-height: 26px;
+}
+.mb-find-input:focus {
+  outline: 1px solid var(--interactive-accent);
+  border-color: var(--interactive-accent);
+}
+.mb-find-count {
+  min-width: 48px;
+  padding: 0 3px;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: center;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+.mb-find-count[data-state="empty"] {
+  color: var(--text-error, #d64545);
+}
+.mb-find-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.mb-find-btn:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+.mb-find-btn .mb-ic {
+  width: 16px;
+  height: 16px;
+}
+/*
+ * Obsidian app.css 的 `.is-tablet button:not(.clickable-icon){padding:4px 20px}`
+ * 会把这三颗 26px 圆钮撑成横椭圆（INK-166 / INK-171 同款坑），
+ * 用 (0,4,1) 把 padding 压回去。
+ */
+.mb-root.is-tablet .mb-find button.mb-find-btn {
+  padding: 0;
+}
+
+/*
+ * 搜索高亮要落在**文字后面**，不能盖住导入 PDF / Word 的视觉字：
+ * 那些字画在下面的 canvas 上，文字层只是透明的命中/选中层。文字层本身
+ * 有 transform，会形成独立合成组，所以正片叠底必须挂在这一层，而不是
+ * 挂在 <mark> 上（mark 的 backdrop 只是一层透明背景，碰不到 canvas）。
+ * 浅色高光与底图相乘后，白纸染成浅黄 / 浅橙，深色笔画仍保持深色。
+ */
+.mb-textlayer.has-find-hits {
+  mix-blend-mode: multiply;
+}
+
+/* 命中处用 <mark> 包起来；UA 默认 mark 是黑字黄底，必须显式归一 */
+.mb-text mark.mb-find-hit {
+  background: rgba(255, 240, 150, 0.55);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0;
+}
+.mb-text mark.mb-find-hit.is-active {
+  background: rgba(255, 205, 110, 0.68);
+  box-shadow: 0 0 0 1px rgba(216, 155, 44, 0.45);
+}
+/* 导入的 PDF / Word 原文是透明字（视觉由底图承担）：只留底色，别重影成黑字 */
+.mb-text.is-pdf mark.mb-find-hit {
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+}
+
+/* ============================================================================
+ * 2026-11-13 第五轮：Liquid Glass 材质整合（背板 = 侧栏 + 缩略图抽屉）
+ *
+ * 用户这次把想要的效果列成一张清单：iOS 毛玻璃 / Liquid Glass / 玻璃拟态 /
+ * backdrop-filter / 半透明 / 高光边框 / 景深阴影 / 弹性交互。
+ * 前面几轮已经把「通透 + 半透明 + backdrop-filter + 柔和边缘光」做出来了，
+ * 本轮把清单里还偏弱的几件事补齐，并把材质统一成一套 Liquid Glass：
+ *   1) 毛玻璃真正做出来：磨砂 2.5px/3px → 14px/16px，saturate 提到 1.85/1.6，
+ *      同时把底色再压淡（9%/12% → 7%/10%）、brightness 压回 1.0/1.03。
+ *      关键：之前被嫌「奶白磨砂」是高比例白底 + 提亮叠出来的，不是模糊本身；
+ *      这轮是大模糊 + 极淡底色 + 不提亮，背后纸面/笔迹被真实柔化但仍透得清。
+ *   2) 高光边框保留第四轮实测「柔光圆润」的多层内描边，把最里面那层柔光
+ *      从 7px/8px 放宽到 12px/14px、峰值调匀，光顺 20px 圆角更缓地兜一圈。
+ *   3) 景深阴影：外投影叠成「大范围柔和 + 原有近边接触」两层并向下偏移，
+ *      玻璃像浮在纸面上方一层，有了层次景深。
+ * 弹性交互沿用上方「只弹一下」的滑入（用户明确要过一次就够）；本轮把回弹
+ * 轻微调匀（幅度 -1.5%→-2%，缓动更顺），仍然是单次、不来回弹。
+ * 尺寸 / padding / 布局零改动，只换背板材质与边缘光影。
+ * ========================================================================== */
+.mb-root {
+  --mb-lg-bg: color-mix(in srgb, var(--background-primary) 7%, transparent);
+  --mb-lg-sheen:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.8) 0%, rgba(255, 255, 255, 0.06) 1.6%, rgba(255, 255, 255, 0) 9%),
+    linear-gradient(112deg, rgba(255, 255, 255, 0) 6%, rgba(255, 255, 255, 0.6) 11%, rgba(255, 255, 255, 0) 20%),
+    radial-gradient(26% 20% at 98% -6%, rgba(255, 255, 255, 0.55) 0%, rgba(255, 255, 255, 0) 72%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0) 54%, rgba(120, 142, 172, 0.1) 100%);
+}
+body.dark .mb-root {
+  --mb-lg-bg: color-mix(in srgb, var(--background-primary) 10%, transparent);
+  --mb-lg-sheen:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.42) 0%, rgba(255, 255, 255, 0.05) 1.6%, rgba(255, 255, 255, 0) 9%),
+    linear-gradient(112deg, rgba(255, 255, 255, 0) 6%, rgba(255, 255, 255, 0.28) 11%, rgba(255, 255, 255, 0) 20%),
+    radial-gradient(26% 20% at 98% -6%, rgba(255, 255, 255, 0.34) 0%, rgba(255, 255, 255, 0) 72%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.03) 0%, rgba(255, 255, 255, 0) 56%, rgba(0, 0, 0, 0.1) 100%);
+}
+
+/* 侧栏 + 缩略图抽屉：同一块 Liquid Glass 背板 */
+.mb-side,
+.mb-pagedock.is-open .mb-pagedock-body {
+  background-color: var(--mb-lg-bg);
+  background-image: var(--mb-lg-sheen);
+  backdrop-filter: blur(14px) saturate(1.85) brightness(1.0);
+  -webkit-backdrop-filter: blur(14px) saturate(1.85) brightness(1.0);
+  border-color: rgba(255, 255, 255, 0.55);
+}
+body.dark .mb-side,
+body.dark .mb-pagedock.is-open .mb-pagedock-body {
+  backdrop-filter: blur(16px) saturate(1.6) brightness(1.03);
+  -webkit-backdrop-filter: blur(16px) saturate(1.6) brightness(1.03);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+/* 右侧栏（亮，受光边在左 / 上）：景深 + 高光边框
+ * 保留第四轮实测「柔光圆润」的内描边（不换成更硬的窄光带，避免边缘又变生硬），
+ * 只在最外层加两张投影把玻璃「垫」起来形成景深，并把内侧柔光从 7px 放宽到 12px、
+ * 降低单点峰值让高光更均匀（衰减更缓 = 更像打磨过的玻璃边）。 */
+.mb-side {
+  box-shadow:
+    -8px 18px 54px -18px rgba(0, 0, 0, 0.32),
+    -22px 0 58px -28px rgba(0, 0, 0, 0.5),
+    0 0 15px -5px rgba(255, 255, 255, 0.5),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.5),
+    inset 0 0 2px rgba(255, 255, 255, 0.9),
+    inset 0 0 12px rgba(255, 255, 255, 0.24),
+    inset 0 1px 3px rgba(255, 255, 255, 0.9),
+    inset 1px 0 3px -0.5px rgba(255, 255, 255, 0.8),
+    inset -1px 0 3px rgba(0, 0, 0, 0.06),
+    inset 0 -2px 4px -1px rgba(0, 0, 0, 0.1);
+}
+.mb-root.is-tablet .mb-side {
+  box-shadow:
+    -3px 8px 24px -12px rgba(0, 0, 0, 0.22),
+    0 0 15px -5px rgba(255, 255, 255, 0.5),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.5),
+    inset 0 0 2px rgba(255, 255, 255, 0.9),
+    inset 0 0 12px rgba(255, 255, 255, 0.24),
+    inset 0 1px 3px rgba(255, 255, 255, 0.9),
+    inset 1px 0 3px -0.5px rgba(255, 255, 255, 0.8),
+    inset -1px 0 3px rgba(0, 0, 0, 0.06),
+    inset 0 -2px 4px -1px rgba(0, 0, 0, 0.1);
+}
+/* 缩略图抽屉（亮，受光边在右 / 上）：镜像 */
+.mb-pagedock.is-open .mb-pagedock-body {
+  box-shadow:
+    8px 18px 54px -18px rgba(0, 0, 0, 0.30),
+    22px 0 52px -28px rgba(0, 0, 0, 0.46),
+    0 0 15px -5px rgba(255, 255, 255, 0.5),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.5),
+    inset 0 0 2px rgba(255, 255, 255, 0.9),
+    inset 0 0 12px rgba(255, 255, 255, 0.24),
+    inset 0 1px 3px rgba(255, 255, 255, 0.9),
+    inset -1px 0 3px -0.5px rgba(255, 255, 255, 0.8),
+    inset 1px 0 3px rgba(0, 0, 0, 0.06),
+    inset 0 -2px 4px -1px rgba(0, 0, 0, 0.1);
+}
+/* 暗色：同一套光影，按深底调强度 */
+body.dark .mb-side {
+  box-shadow:
+    -8px 18px 54px -18px rgba(0, 0, 0, 0.5),
+    -22px 0 58px -28px rgba(0, 0, 0, 0.7),
+    0 0 16px -6px rgba(255, 255, 255, 0.3),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.16),
+    inset 0 0 2px rgba(255, 255, 255, 0.6),
+    inset 0 0 14px rgba(255, 255, 255, 0.15),
+    inset 0 1px 4px rgba(255, 255, 255, 0.5),
+    inset 1px 0 4px -1px rgba(255, 255, 255, 0.42),
+    inset -1px 0 3px rgba(0, 0, 0, 0.3),
+    inset 0 -2px 4px -1px rgba(0, 0, 0, 0.32);
+}
+body.dark .mb-root.is-tablet .mb-side {
+  box-shadow:
+    -3px 8px 24px -12px rgba(0, 0, 0, 0.34),
+    0 0 16px -6px rgba(255, 255, 255, 0.3),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.16),
+    inset 0 0 2px rgba(255, 255, 255, 0.6),
+    inset 0 0 14px rgba(255, 255, 255, 0.15),
+    inset 0 1px 4px rgba(255, 255, 255, 0.5),
+    inset 1px 0 4px -1px rgba(255, 255, 255, 0.42),
+    inset -1px 0 3px rgba(0, 0, 0, 0.3),
+    inset 0 -2px 4px -1px rgba(0, 0, 0, 0.32);
+}
+body.dark .mb-pagedock.is-open .mb-pagedock-body {
+  box-shadow:
+    8px 18px 54px -18px rgba(0, 0, 0, 0.48),
+    22px 0 52px -28px rgba(0, 0, 0, 0.66),
+    0 0 16px -6px rgba(255, 255, 255, 0.3),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.16),
+    inset 0 0 2px rgba(255, 255, 255, 0.6),
+    inset 0 0 14px rgba(255, 255, 255, 0.15),
+    inset 0 1px 4px rgba(255, 255, 255, 0.5),
+    inset -1px 0 4px -1px rgba(255, 255, 255, 0.42),
+    inset 1px 0 3px rgba(0, 0, 0, 0.3),
+    inset 0 -2px 4px -1px rgba(0, 0, 0, 0.32);
+}
+
+/* 弹性交互：仍是「只弹一下」，回弹幅度与缓动轻微调匀（reduced-motion 已在上方关闭） */
+@keyframes mb-side-in {
+  0%   { transform: translateX(102%); }
+  58%  { transform: translateX(-2%); }
+  100% { transform: translateX(0); }
+}
+@keyframes mb-pagedock-in {
+  0%   { transform: translateX(-102%); }
+  58%  { transform: translateX(2%); }
+  100% { transform: translateX(0); }
+}
+.mb-side.mb-slide-in {
+  animation: mb-side-in 300ms cubic-bezier(0.2, 0.9, 0.25, 1);
+}
+.mb-pagedock-body.mb-slide-in {
+  animation: mb-pagedock-in 300ms cubic-bezier(0.2, 0.9, 0.25, 1);
+}
+
+/* ============================================================================
+ * 2026-11-13：平板把笔工具行留在宿主的「上面那一框」里
+ *
+ * 用户反馈：平板上钢笔 / 圆珠笔 / 橡皮这一整行被 fitTopRow 搬到原生标题栏
+ * 下面的 .mb-topbar；希望它回到上面，同时「不需要显示文件名字」，原生标题栏
+ * 只留上一个文件、下一个文件和三点菜单。
+ *
+ * 根因不是工具行自己要换行，而是宿主 .view-header 的文件名区域把
+ * .view-actions 挤成很窄的一条；fitTopRow 一量放不下，就把整行搬下去了。
+ * 这里只在 .mb-tablet（墨本自己的平板视图根节点）里把文件名区域收成 0、
+ * 让 .view-actions 吃满剩余宽度，并把 13 个按钮压到仍好点的 38px / 3px 间距。
+ * 原生返回 / 前进 / 三点按钮不动，继续由 Obsidian 自己维护。
+ * ========================================================================== */
+.mb-tablet .view-header {
+  display: flex !important;
+  flex: 0 0 auto !important;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 4px;
+  box-sizing: border-box !important;
+  height: auto !important;
+  min-height: 48px;
+  max-height: none !important;
+  padding: 3px 6px !important;
+  overflow: visible !important;
+}
+
+/* 标题文字与文件图标收起来；标题容器保留 0 宽，避免误伤同级的前后文件按钮。 */
+.mb-tablet .view-header-icon,
+.mb-tablet .view-header-title,
+.mb-tablet .view-header-breadcrumb,
+.mb-tablet .view-header-title-container-content {
+  display: none !important;
+}
+.mb-tablet .view-header-title-container {
+  flex: 0 0 auto !important;
+  width: 0 !important;
+  min-width: 0 !important;
+  max-width: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  overflow: visible !important;
+}
+.mb-tablet .view-header-left,
+.mb-tablet .view-header-nav-buttons {
+  display: flex !important;
+  flex: 0 0 auto !important;
+  width: auto !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  align-items: center;
+  overflow: visible !important;
+}
+.mb-tablet .view-header-back-button,
+.mb-tablet .view-header-forward-button {
+  flex: 0 0 auto !important;
+}
+
+/*
+ * 让宿主 action 区域真正占满标题栏剩余空间：fitTopRow 量的就是这个宽度。
+ * 同时必须把 overflow 放开，否则 isClippedByAncestor 仍会误判成被裁掉。
+ */
+.mb-tablet .view-actions {
+  display: flex !important;
+  flex: 1 1 auto !important;
+  width: auto !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  align-items: center;
+  gap: 2px;
+  overflow: visible !important;
+}
+/* 原生三点按钮留在最右，插件自己的整行工具按钮排在它左边。 */
+.mb-tablet .view-actions > :not(.mb-toprow) {
+  order: 1;
+  flex: 0 0 auto !important;
+}
+.mb-tablet .view-actions > .mb-toprow {
+  order: 0;
+  flex: 1 1 auto !important;
+  min-width: 0;
+  justify-content: center;
+  margin: 0 !important;
+}
+
+/* 13 个按钮 + 三个宿主图标要在同一行；38px 仍是够手指点的尺寸。 */
+.mb-tablet .mb-toprow,
+.mb-tablet .mb-top-tools {
+  gap: 3px;
+}
+.mb-tablet .mb-toprow .mb-sep {
+  margin: 0 3px;
+}
+.mb-tablet .mb-toprow .mb-topbtn {
+  box-sizing: border-box !important;
+  width: 38px !important;
+  height: 38px !important;
+  padding: 0 !important;
+  border-radius: 10px;
+}
+.mb-tablet .mb-toprow .mb-ic {
+  width: 20px !important;
+  height: 20px !important;
+  min-width: 20px !important;
+  min-height: 20px !important;
+}
+
+/*
+ * 钢笔 / 圆珠笔弹框里的「一笔成型」开 / 关：
+ * 一行「标签 + 开/关分段」。分段按钮复用与细/中/粗一致的玻璃片观感，
+ * 选中项把紫底让给滑动高亮片（mountSegPill 挂的 SlidePill）。
+ */
+.mb-pen-pop-snaprow {
+  gap: 8px;
+  align-items: center;
+  padding-top: 2px;
+}
+
+.mb-pen-pop-snaplabel {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.mb-pen-pop-snapbtn {
+  flex: 0 0 auto;
+  min-width: 40px;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid color-mix(in srgb, var(--text-normal) 13%, transparent);
+  border-radius: 9px;
+  background-color: color-mix(in srgb, var(--background-primary) 42%, transparent);
+  background-image: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.3) 0%,
+    rgba(255, 255, 255, 0.04) 46%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.5),
+    0 1px 3px rgba(0, 0, 0, 0.1);
+  transition:
+    background-color 0.16s ease,
+    color 0.16s ease,
+    box-shadow 0.16s ease,
+    transform 0.14s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+.mb-pen-pop-snapbtn:hover {
+  background-color: color-mix(in srgb, var(--background-primary) 58%, transparent);
+  color: var(--text-normal);
+}
+.mb-pen-pop-snapbtn:active {
+  transform: scale(0.95);
+}
+.mb-pen-pop-snapbtn.is-active {
+  background-color: var(--interactive-accent);
+  background-image: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.32) 0%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  color: var(--text-on-accent);
+  border-color: transparent;
+}
+.mb-seg-row.mb-slide-host > .mb-pen-pop-snapbtn.is-active {
+  background: transparent;
+  background-image: none;
+  color: var(--text-on-accent);
+  border-color: transparent;
+  box-shadow: none;
 }

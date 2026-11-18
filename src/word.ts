@@ -337,8 +337,53 @@ export interface RenderedDocxPage {
   dataUrl: string;
   width: number;
   height: number;
-  /** 坐标仍是 794×1123 页面单位，不随 PNG 的 3x 像素倍率变化。 */
+  /** 坐标仍是 794×1123 页面单位，不随 PNG 的像素倍率（DOCX_RASTER_DPR）变化。 */
   lines: DocxLine[];
+}
+
+/**
+ * Word 底图的像素倍率：每 1 个页面单位渲染成多少个像素。
+ *
+ * **为什么是 4.2 而不是 3**（INK-225，2026-11-10 再提一档）：
+ * Word 底图是**静态位图**，导入时渲染一次就固定了，之后缩放只能靠
+ * `drawImage` 降采样——降下去的信息永远回不来。用户反馈「导入 Word
+ * 后纸面清晰度不够」，量到的根因就是 3 倍不够：
+ *
+ * 真机各档的显示 backing（页面 794 单位宽）：
+ *   · 桌面 fit      ≈ 843  （zoom 0.85 × dpr 1.25）
+ *   · 平板 fit      ≈ 1350 （dpr 2）
+ *   · 桌面 2.8 倍   ≈ 2223
+ *   · 平板 2.8 倍   ≈ 3357
+ * 3 倍只有 2382 宽：桌面 2.8 倍时只剩 1.07 倍余量（等于没有），
+ * 平板 2.8 倍时只有 0.71 倍——源图比画布还小，字缘全靠插值放大糊出来。
+ *
+ * 4 倍（3176 宽）已把桌面 2.8 倍抬到 1.43 倍余量、平板 2.8 倍抬到 0.95 倍；
+ * 这次再往上取 4.2 倍（3335 宽），平板最大缩放也基本达到 1:1。
+ * 不再继续取 4.24 的原因不是收益，而是**内存红线**：794×1123×4.24²
+ * 已经约 16.03M px，超过 `MAX_CANVAS_PIXELS`(16M)；4.2² 则约 15.7M，
+ * 还有约 27 万像素的安全余量。
+ *
+ * **代价（必须记账）**：单页约 3335×4717 ≈ 15.7M px
+ * （3 倍是 2382×3369 ≈ 8.0M，4 倍是 3176×4492 ≈ 14.3M），
+ * 编码比 4 倍约多 10%（约 100ms 量级），解码后位图约 60MiB。
+ * PNG 体积也约 +10%，仍随文字密度波动。渲染时画布与结果位图不同时存在
+ * （见下方 yield 前释放画布的说明），所以没有把峰值内存翻倍。
+ */
+export const DOCX_RASTER_DPR = 4.2;
+
+/**
+ * 取证/回归用：临时改渲染倍率，跑完记得改回来。
+ *
+ * 只为让 Before / After 两张图跑**同一条真实渲染路径**、只有倍率这一个
+ * 变量不同（否则「改前」那张只能靠另一份代码或别的手段造，就不算证据）。
+ * 正常运行时没人调它，所以生产行为永远等于 DOCX_RASTER_DPR。
+ */
+let docxRasterDprOverride = 0;
+export function setDocxRasterDprForTest(dpr: number): void {
+  docxRasterDprOverride = Number.isFinite(dpr) && dpr > 0 ? dpr : 0;
+}
+export function docxRasterDprNow(): number {
+  return docxRasterDprOverride || DOCX_RASTER_DPR;
 }
 
 /**
@@ -349,10 +394,10 @@ export interface RenderedDocxPage {
  *
  * **画布必须在 yield 之前释放**（2026-11-08）。老代码是先 yield 再
  * `canvas.width = 0`，但生成器的 yield 是**把控制权交回调用方**：
- * 调用方解码 dataURL、写盘的那几帧里，这张 794×1123×3² ≈ 800 万像素、
- * 约 32MB 的画布还活着。再叠加调用方为量尺寸解码出的 Image（又 32MB），
- * 低端平板会直接 OOM。现在先 toDataURL、立刻清画布，再把尺寸一起带出去
- * ——调用方不必再解码一次。
+ * 调用方解码 dataURL、写盘的那几帧里，这张 794×1123×dpr² 的画布还活着
+ * （dpr=4.2 时约 1570 万像素、约 60MB，已贴近 16M 像素红线）。
+ * 再叠加调用方为量尺寸解码出的 Image，低端平板会直接 OOM。现在先
+ * toDataURL、立刻清画布，再把尺寸一起带出去——调用方不必再解码一次。
  */
 export async function* renderDocxToPages(
   paragraphs: DocParagraph[]
@@ -364,9 +409,8 @@ export async function* renderDocxToPages(
 
   for (const lines of pages) {
     const canvas = document.createElement("canvas");
-    // 用 3 倍分辨率：Word 底图是静态位图，放大后无法再升级，
-    // 所以一次性渲染到足够高（3x 覆盖到 2.8 倍缩放仍有 1.07x 余量）
-    const dpr = 3;
+    // 一次性渲染到 DOCX_RASTER_DPR 倍（理由与代价见该常量的说明）
+    const dpr = docxRasterDprNow();
     const width = A4_WIDTH * dpr;
     const height = A4_HEIGHT * dpr;
     canvas.width = width;

@@ -44,6 +44,14 @@ const mainOptions = {
      * 子集只有 1.85MB（见 src/fontasset.ts 的说明）。
      */
     ".ttf": "dataurl",
+    /*
+     * 「手写」档自带的小赖子集（见 src/handfont.ts）。
+     *
+     * 同样必须内联：移动端读不到插件目录里的独立文件，而运行时再去
+     * fetch `app://` 资源在 Obsidian 里并不可靠。woff2 是 1216KB，
+     * base64 后约 1.6MB —— 比同字符集的 TTF（2491KB）省一半。
+     */
+    ".woff2": "dataurl",
   },
 };
 
@@ -58,6 +66,17 @@ const demoOptions = {
   minify: false,
   logLevel: "info",
   legalComments: "none",
+  /*
+   * demo 走的是同一份 src/，所以它也需要 mainOptions 里那两个内联 loader。
+   * 之前漏了 `.worker.min.mjs`，`npm run demo` 直接在
+   * 「pdfjs-dist 没有 default 导出」上失败（构建期就挂，跑不起来）。
+   * 手写字体同理：缺 `.woff2` 会让 demo 里的「手写」档回落到 Noto。
+   */
+  loader: {
+    ".worker.min.mjs": "text",
+    ".ttf": "dataurl",
+    ".woff2": "dataurl",
+  },
 };
 
 /**

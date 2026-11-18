@@ -141,6 +141,15 @@ export class BookStore {
    * 版本号让 UI 一次比较就知道要不要重建，代价是 O(1)。
    */
   outlineRev = 0;
+  /**
+   * 收藏版本号：收藏标记真的变了就 +1。
+   *
+   * 收藏是页上的可选字段，`bookContentSignature` 已经覆盖整份 pages，
+   * 但收藏面板需要单独一个便宜的 O(1) 信号决定「要不要重建列表」，
+   * 免得每落一笔都把收藏页缩略图重画一遍。撤销/重做会整页替换，
+   * 所以 apply() 里也要 bump。
+   */
+  favoriteRev = 0;
   /** 撤销栈：每项是一次操作的前后状态 */
   private undoStack: Array<{ before: HistoryEntry; after: HistoryEntry }> = [];
   private redoStack: Array<{ before: HistoryEntry; after: HistoryEntry }> = [];
@@ -395,6 +404,11 @@ export class BookStore {
   }
 
   private apply(entry: HistoryEntry): void {
+    /*
+     * 撤销/重做会整页（甚至整本）替换对象，收藏标记可能跟着变。
+     * 统一 bump：多重建一次收藏面板很便宜，漏重建会让列表停在旧状态。
+     */
+    this.favoriteRev += 1;
     if (entry.kind === "book") {
       const obj = JSON.parse(entry.data) as { pages: Page[]; activePage: number };
       this.data.pages = obj.pages;
@@ -552,6 +566,8 @@ export class BookStore {
     this.snapshotBook();
     const copy = JSON.parse(JSON.stringify(src)) as Page;
     copy.id = uid("page");
+    // 复制出来的新页不该悄悄继承收藏标记：它是另一页了
+    delete copy.favorite;
     for (const layer of copy.layers) {
       layer.id = uid("layer");
       for (const stroke of layer.strokes) stroke.id = uid("stroke");
@@ -624,6 +640,41 @@ export class BookStore {
     this.snapshotPage(index);
     page.paper = paper;
     this.touch();
+  }
+
+  /**
+   * 收藏 / 取消收藏某一页（收藏是页上的可选布尔，跟着页 id 走，换序不会串页）。
+   *
+   * 走 snapshotPage 而不是整本：只改一个布尔却把几十 MB 的 pages 拷一遍
+   * 完全不成比例。撤销时按页 id 找回，和 setTemplate 一个路子。
+   * favoriteRev 单独 bump，收藏面板据此决定是否重建。
+   *
+   * @returns 状态真的变了才返回 true（重复点同一个值不记历史、不标脏）
+   */
+  setFavorite(index: number, on: boolean): boolean {
+    const page = this.data.pages[index];
+    if (!page) return false;
+    const next = !!on;
+    if (!!page.favorite === next) return false;
+    this.snapshotPage(index);
+    if (next) page.favorite = true;
+    else delete page.favorite;
+    this.favoriteRev += 1;
+    this.touch();
+    return true;
+  }
+
+  toggleFavorite(index = this.data.activePage): boolean {
+    return this.setFavorite(index, !this.data.pages[index]?.favorite);
+  }
+
+  /** 收藏页的下标列表（按当前页序；UI 用） */
+  get favoritePages(): number[] {
+    const out: number[] = [];
+    this.data.pages.forEach((p, i) => {
+      if (p.favorite === true) out.push(i);
+    });
+    return out;
   }
 
   setAllTemplates(template: TemplateId): void {

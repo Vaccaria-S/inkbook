@@ -24,6 +24,16 @@ const ICONS: Record<string, string> = {
     "M9 11l-6 6v3h9l3-3 M22 12l-4.6 4.6a2 2 0 0 1-2.8 0l-5.2-5.2a2 2 0 0 1 0-2.8L14 4l8 8z",
   eraser:
     "M7 21l-4.3-4.3a2 2 0 0 1 0-2.8l9.6-9.6a2 2 0 0 1 2.8 0l5.6 5.6a2 2 0 0 1 0 2.8L14 21H7z M22 21H7 M5 11l9 9",
+  /*
+   * 激光笔：一支斜握的指示笔 + 射向远端的细光柱 + 光点 / 星芒。
+   * 之前按钮用的是 "zap"，本图标表里没有这个名字 → 回退成方块（用户反馈
+   * 「激光笔的图标重绘」）。这里按激光笔该有的样子重画：笔身 + 光束 + 端点。
+   */
+  "laser-pointer":
+    "M4 20l2.6-.7 8.2-8.2-1.9-1.9-8.2 8.2L4 20z " +
+    "M12.8 7.2l1.9 1.9 " +
+    "M16.4 8.2l4-4 " +
+    "M20.4 2.6h.01 M21.4 5.4h.01 M18 2.2h.01",
   type: "M4 7V4h16v3 M9 20h6 M12 4v16",
   cursor: "M4.04 4.69a.5.5 0 0 1 .65-.65l16 6.5a.5.5 0 0 1-.06.95l-6.13 1.58a2 2 0 0 0-1.44 1.44l-1.58 6.12a.5.5 0 0 1-.95.06z",
   square: "M3 3h18v18H3z",
@@ -72,6 +82,14 @@ const ICONS: Record<string, string> = {
   "file-output":
     "M4 22h14a2 2 0 0 0 2-2V7l-5-5H6a2 2 0 0 0-2 2v4 M14 2v4a2 2 0 0 0 2 2h4 M2 15h10 M5 12l3 3-3 3",
   /*
+   * 导出：三点连线（Lucide share-2）。原来用 file-output 与 file-input 太像，
+   * 换成这个形状完全不同的「发送/导出」符号。
+   * ⚠️ 必须把 path 补进本表：setIcon 查不到名字会回退成 ICONS["square"]
+   * （用户看到的「就一个正方形」就是回退造成的）。
+   */
+  "share-2":
+    "M18 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M6 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M18 22a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M8.6 13.5l6.8 4 M15.4 6.5l-6.8 4",
+  /*
    * 软盘 = "保存"，一眼就懂。
    * 外框 + 抽屉 + 上方滑块三段画在**同一条** d 里（用空格分隔），
    * 因为 iconSvg 只生成一个 <path>；拆成多个 path 得改图标系统。
@@ -80,6 +98,8 @@ const ICONS: Record<string, string> = {
   image: "M3 3h18v18H3z M3 16l5-5 4 4 3-3 6 6",
   "file-text": "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z M14 2v6h6 M8 13h8 M8 17h8",
   "layout-template": "M3 3h18v18H3z M3 9h18 M9 21V9",
+  /* 缩略图网格：四个小方块（Lucide layout-grid），一眼看出是缩略图，不再是单个方框 */
+  "layout-grid": "M3 3h7v7H3z M14 3h7v7h-7z M14 14h7v7h-7z M3 14h7v7H3z",
   layers: "m12 2 10 5-10 5L2 7l10-5Z m-10 10 10 5 10-5 M2 17l10 5 10-5",
   list: "M8 6h13 M8 12h13 M8 18h13 M3 6h.01 M3 12h.01 M3 18h.01",
   tablet: "M4 2h16v20H4z M12 18h.01",
@@ -94,6 +114,10 @@ const ICONS: Record<string, string> = {
   "chevron-down": "M6 9l6 6 6-6",
   "chevron-up": "M18 15l-6-6-6 6",
   "mouse-pointer-2": "M4 4l7 17 3-7 7-3z",
+  /* 顶栏「在当前笔记中查找」：Lucide search（放大镜，别和 zoom-in 的 + 号混） */
+  search: "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z M21 21l-4.3-4.3",
+  /* 侧栏「收藏」：Lucide star 轮廓；选中态由 CSS 给 fill 变成实心 */
+  star: "M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z",
 };
 
 const SVG_NS = "http://www.w3.org/2000/svg";

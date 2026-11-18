@@ -16,8 +16,8 @@
  * 见 `pageHasUnsupportedChars()` 与 INK-118。字符集拿不到时同样退回位图（保守）。
  *
  * 字体为 Noto Sans SC（SIL OFL 1.1），由构建期一次性子集化得到；
- * 生成脚本当时没有入库（`tools/mksubset.mjs` 已不存在），要重新生成得照
- * `assets/README.md` 记的来源与字符集重写一份。
+ * 生成脚本见 `tools/mksubset.mjs`（`npm run subset`），字符集说明见
+ * `assets/README.md`。要重新生成直接跑脚本，别手改这个文件。
  */
 import fontkit from "@pdf-lib/fontkit";
 import dataUrl from "../assets/NotoSansSC-subset.ttf";

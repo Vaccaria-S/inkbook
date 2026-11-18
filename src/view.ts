@@ -1,12 +1,14 @@
 import { FileView, Menu, Notice, type TFile } from "obsidian";
 import { setIcon } from "./icons";
+import { keyCombo, resolveHotkeys, hotkeyLabelFor } from "./hotkeys";
 import { BookEditor, bindHoldStepBtn, TEXT_FONTS } from "./editor";
-import { indexDirFor, writeTextIndex } from "./indexer";
+import { ensureTextIndexOnOpen, writeTextIndex } from "./indexer";
 import { BookStore } from "./store";
 import {
   bookStats,
   fingerprint,
-  readBook,
+  hashText,
+  readBookWithText,
   recoverFromBackup,
   TooNewError,
   writeBook,
@@ -21,9 +23,11 @@ import {
   PEN_COLORS,
   PEN_SIZES,
   TEMPLATES,
+  normalizeShapeSnap,
   type InkBook,
   type InkbookSettings,
   type Outline,
+  type PageImage,
   type PaperId,
   type ShapeKind,
   type TemplateId,
@@ -32,13 +36,18 @@ import {
 import { paintPaperPreview } from "./paper";
 import {
   NewBookModal,
-  JumpPageModal,
   PromptModal,
   DeletePageModal,
   OutlineModal,
   ImportSourceModal,
   ImportRangeModal,
+  InsertImageModal,
+  InsertLinkModal,
+  InsertFileBlockModal,
+  ShareModal,
   safeName,
+  collectLinkTargets,
+  type ShareChoice,
 } from "./modals";
 import {
   humanBytes,
@@ -47,8 +56,11 @@ import {
   peekPdf,
   type ImportProgress,
 } from "./importer";
-import { ExportCancelledError, exportBookPdf, exportPagePng } from "./export";
+import { ExportCancelledError, exportBookPdf, exportPagePng, exportPagePngAt } from "./export";
 import { refreshEmbedsForPath } from "./embed";
+import { adoptIncomingSource, remapAssetPrefix } from "./bookdata";
+import { findInNote, MAX_FIND_MATCHES, type FindMatch } from "./find";
+import { makeFileBlockSnapshot } from "./fileblocks";
 
 export const VIEW_TYPE = "inkbook-view";
 
@@ -63,13 +75,13 @@ const INK_DEFER_MAX_MS = 10_000;
 const HIGHLIGHTER_PALETTE = ["#F6E05E", "#9AE6B4", "#90CDF4", "#FBB6CE", "#FBD38D"];
 
 const TOOLS: Array<{ id: ToolId; icon: string; name: string; short: string }> = [
-  { id: "pen", icon: "pen-tool", name: "钢笔 (P)", short: "钢笔" },
-  { id: "ballpoint", icon: "pencil", name: "圆珠笔 (B)", short: "圆珠" },
-  { id: "highlighter", icon: "highlighter", name: "荧光笔 (H)", short: "荧光" },
-  { id: "eraser", icon: "eraser", name: "橡皮 (E)", short: "橡皮" },
-  { id: "text", icon: "type", name: "文字 (T)", short: "文字" },
-  { id: "select", icon: "cursor", name: "选择 / 移动 (V)", short: "选择" },
-  { id: "shape", icon: "square", name: "形状 (R)", short: "形状" },
+  { id: "pen", icon: "pen-tool", name: "钢笔", short: "钢笔" },
+  { id: "ballpoint", icon: "pencil", name: "圆珠笔", short: "圆珠" },
+  { id: "highlighter", icon: "highlighter", name: "荧光笔", short: "荧光" },
+  { id: "eraser", icon: "eraser", name: "橡皮", short: "橡皮" },
+  { id: "text", icon: "type", name: "文字", short: "文字" },
+  { id: "select", icon: "cursor", name: "选择 / 移动", short: "选择" },
+  { id: "shape", icon: "square", name: "形状", short: "形状" },
   { id: "hand", icon: "hand", name: "拖动画布", short: "拖动" },
 ];
 
@@ -89,8 +101,8 @@ const SHAPES: Array<{ id: ShapeKind; label: string }> = [
  *   · shape  —— 形状种类（矩形 / 椭圆 / 直线 / 箭头）
  *
  * 不展开：
- *   · pen / ballpoint / highlighter —— 颜色和粗细都在笔盒区，而且顶栏新增的
- *     当前笔 chip 已经露出「什么色、多粗」；这三支换得最勤，每换一次就把
+ *   · pen / ballpoint / highlighter —— 颜色和粗细都在笔盒区（顶栏按钮二次点击
+ *     弹快捷笔盒 / 侧栏笔盒）；这三支换得最勤，每换一次就把
  *     侧栏盖到纸上（平板）反而碍事。
  *   · select / hand —— 没有可调参数，侧栏里只有一句操作提示。
  */
@@ -100,14 +112,21 @@ const TOOLS_NEED_SIDE = new Set<ToolId>(["text", "eraser", "shape"]);
  * 顶栏工具按钮「二次点击」会在正下方弹出快捷笔盒的工具。
  *
  * 只有这三支有真正意义上的笔参数（颜色 + 粗细），也正好对应侧栏「笔盒」区：
- *   · pen / ballpoint —— 共用 PEN_COLORS + PEN_SIZES
+ *   · pen / ballpoint —— 共用 PEN_COLORS（颜色）与 PEN_SIZES 档位，但粗细各记各的
  *   · highlighter     —— HIGHLIGHTER_PALETTE + HIGHLIGHTER_SIZES
  *
- * 橡皮没有颜色；形状虽然也用 penColor / penSize 落笔，但它的种类选择
- * 只住在侧栏，点第二下已经会展开侧栏，再叠一个浮层反而碍事；
+ * 橡皮没有颜色；形状虽然也用 penColor 落笔、按形状种类各记线宽，但它的种类
+ * 选择只住在侧栏，点第二下已经会展开侧栏，再叠一个浮层反而碍事；
  * 文字 / 选择 / 抓手没有笔参数（见 TOOLS_NEED_SIDE 的说明）。
  */
 const PEN_POP_TOOLS = new Set<ToolId>(["pen", "ballpoint", "highlighter"]);
+
+/**
+ * 侧栏「导出」入口与「导出整本 PDF」菜单项共用图标名。
+ * 用户明确要求两处是同一个 file-text 图标；抽成常量，避免以后改菜单
+ * 时忘了同步按钮（share-2 只留给「分享…」）。
+ */
+const EXPORT_ICON = "file-text";
 
 /**
  * 侧栏页列表窗口化。
@@ -330,6 +349,8 @@ export interface InkbookPluginLike {
   refreshViews(): void;
   /** 关掉自动保存时收回已经排队的落盘（main.ts 实现；测试桩可不给） */
   cancelPendingSaves?: () => void;
+  /** 打开某本 .inkbook 的指定页（main.ts 实现；测试桩可不给） */
+  openBookAt?: (path: string, page: number, opts?: { newTab?: boolean }) => Promise<void>;
 }
 
 /**
@@ -345,6 +366,183 @@ function finiteSetting(v: number | undefined, fallback: number, min: number, max
   // 兜的正是这个），按非法值回落，不要夹成 min 后画出一条几乎看不见的线。
   if (min > 0 && n <= 0) return fallback;
   return Math.max(min, Math.min(max, n));
+}
+
+/** 校验「每种形状一份线宽」，任一形状缺失 / 非法就用 fallback 兜底。 */
+function finiteShapeSizes(src: unknown, fallback: number): Record<ShapeKind, number> {
+  const out: Record<ShapeKind, number> = {
+    line: fallback,
+    arrow: fallback,
+    rect: fallback,
+    ellipse: fallback,
+  };
+  if (src && typeof src === "object") {
+    for (const k of Object.keys(out) as ShapeKind[]) {
+      out[k] = finiteSetting((src as Record<string, unknown>)[k] as number, fallback, 1, 8);
+    }
+  }
+  return out;
+}
+
+/**
+ * 分段控件里的「滑动高亮片」。
+ *
+ * 以前选中态是把强调色直接铺在按钮自己身上，从钢笔切到橡皮时紫色底
+ * 会整块「蹦」过去。这里改成容器里放一枚绝对定位的紫色玻璃片，选中项
+ * 变化时用 transform 平移 + 宽高过渡滑到新按钮下面（像 iOS segmented
+ * control 的指示器）。按钮自己选中时只保留「透明底 + 强调色文字」，
+ * 高亮统一由这片提供，所以能连续滑动而不是瞬移。
+ *
+ * 只在**选中项变化**时播放滑动；首次布局 / 容器尺寸变化（窗口缩放、
+ * 面板开合、桌面↔平板）直接瞬时对齐，免得从角落滑进来或跟着抖。
+ * 尊重系统「减少动态效果」：开了就直接就位、不播滑动。
+ */
+class SlidePill {
+  readonly host: HTMLElement;
+  readonly el: HTMLElement;
+  private ro: ResizeObserver | null = null;
+  private shown = false;
+  private raf = 0;
+  /** 高亮片相对目标四周外扩的像素（色点玻璃框需要圈住圆点） */
+  private readonly expand: number;
+  /** 只认这些直接子元素里的 .is-active；null = 任意直接子元素 */
+  private readonly activeSelector: string | null;
+  /** true = 用 offset* 量（不受父级 scale 动画影响），false = 用 getBoundingClientRect */
+  private readonly measureOffsets: boolean;
+
+  constructor(
+    host: HTMLElement,
+    opts?: { className?: string; expand?: number; activeSelector?: string; measure?: "rect" | "offset" }
+  ) {
+    this.host = host;
+    host.addClass("mb-slide-host");
+    const el = document.createElement("span");
+    el.className = "mb-slide-pill" + (opts?.className ? " " + opts.className : "");
+    el.setAttribute("aria-hidden", "true");
+    host.insertBefore(el, host.firstChild);
+    this.el = el;
+    this.expand = Math.max(0, opts?.expand ?? 0);
+    this.activeSelector = opts?.activeSelector ?? null;
+    this.measureOffsets = opts?.measure === "offset";
+    if (typeof ResizeObserver !== "undefined") {
+      this.ro = new ResizeObserver(() => this.layout(true));
+      this.ro.observe(host);
+    }
+  }
+
+  destroy(): void {
+    this.ro?.disconnect();
+    this.ro = null;
+    if (this.raf && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(this.raf);
+    }
+    this.raf = 0;
+    this.el.remove();
+  }
+
+  /** 当前的 .is-active 直接子元素（跳过高亮片自己） */
+  private activeChild(): HTMLElement | null {
+    for (const node of Array.from(this.host.children)) {
+      if (node === this.el) continue;
+      if (this.activeSelector && !node.matches(this.activeSelector)) continue;
+      if (node.classList.contains("is-active")) return node as HTMLElement;
+    }
+    return null;
+  }
+
+  private reducedMotion(): boolean {
+    try {
+      return !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * 对齐高亮片（排到下一帧）。
+   * @param instant true = 不播滑动、直接就位（首次 / 尺寸变化 / 减少动态效果）
+   */
+  layout(instant = false): void {
+    if (this.raf && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(this.raf);
+    }
+    if (typeof window.requestAnimationFrame === "function") {
+      this.raf = window.requestAnimationFrame(() => {
+        this.raf = 0;
+        this.applyLayout(instant);
+      });
+    } else {
+      this.raf = 0;
+      this.applyLayout(instant);
+    }
+  }
+
+  /**
+   * **立刻**对齐高亮片（不排到下一帧）。
+   *
+   * 抽屉展开时宽度是瞬间给足的（.mb-pagedock-body 没有宽度动画、只做
+   * translateX 滑入），layout() 却要等下一个 rAF 才量尺寸。那一帧画出来的
+   * 就是收起期间按 min-content 量出的「只盖住半个『缩略图』」的紫框，
+   * 再靠 0.30s 的 width 过渡长到全宽——用户说的「刚打开紫框只有一半、
+   * 卡一下才加载好」。展开的同一个任务里同步量一次，第一帧就是全宽。
+   */
+  layoutNow(instant = false): void {
+    if (this.raf && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(this.raf);
+    }
+    this.raf = 0;
+    this.applyLayout(instant);
+  }
+
+  private applyLayout(instant: boolean): void {
+    const active = this.activeChild();
+    if (!active) {
+      this.el.style.opacity = "0";
+      this.shown = false;
+      return;
+    }
+    const hr = this.host.getBoundingClientRect();
+    const ar = active.getBoundingClientRect();
+    // 容器或按钮被隐藏（面板收起 / 后台标签页 / 还没排版）→ 先藏起来
+    if (ar.width <= 0 || ar.height <= 0 || hr.width <= 0) {
+      this.el.style.opacity = "0";
+      // 顺手清掉上次的宽高：收起期间别留一份「半宽」内联值，下次展开
+      // 即使尺寸还没落定，也不会把半片紫框画出来。
+      this.el.style.width = "0px";
+      this.el.style.height = "0px";
+      this.shown = false;
+      return;
+    }
+    let left: number;
+    let top: number;
+    let width: number;
+    let height: number;
+    if (this.measureOffsets && active.offsetParent === this.host) {
+      // offset* 不受祖先 transform: scale 影响，浮层出场动画期间也能量准
+      left = active.offsetLeft;
+      top = active.offsetTop;
+      width = active.offsetWidth;
+      height = active.offsetHeight;
+    } else {
+      left = ar.left - hr.left - this.host.clientLeft;
+      top = ar.top - hr.top - this.host.clientTop;
+      width = ar.width;
+      height = ar.height;
+    }
+    const pad = this.expand;
+    const doInstant = instant || !this.shown || this.reducedMotion();
+    if (doInstant) this.el.style.transition = "none";
+    this.el.style.width = width + pad * 2 + "px";
+    this.el.style.height = height + pad * 2 + "px";
+    this.el.style.transform = "translate(" + (left - pad) + "px," + (top - pad) + "px)";
+    if (doInstant) {
+      // 钉住即时位置：强制一次重排，之后的选中变化才走过渡
+      void this.el.offsetWidth;
+      this.el.style.transition = "";
+    }
+    this.el.style.opacity = "1";
+    this.shown = true;
+  }
 }
 
 export class InkbookView extends FileView {
@@ -371,12 +569,20 @@ export class InkbookView extends FileView {
    * 按钮常驻在顶栏上，不用先展开侧栏。
    */
   private railSaveBtn!: HTMLElement;
+  /** 顶栏上的「插入图片」按钮（null 只在极老宿主里可能出现） */
+  private railImageBtn: HTMLElement | null = null;
+  /** 顶栏上的「插入文件块」按钮（Excalidraw / 笔记 / 文本） */
+  private railFileBlockBtn: HTMLElement | null = null;
+  /** 顶栏上的「在当前笔记中查找」按钮 */
+  private railFindBtn: HTMLElement | null = null;
   private floatEl!: HTMLElement;
   private floatZoomEl!: HTMLElement;
   private bodyEl!: HTMLElement;
   private editorHost!: HTMLElement;
   private paperHost!: HTMLElement;
   private sideEl!: HTMLElement;
+  /** 侧栏顶部的文件名标题（点它可内联重命名笔记文件） */
+  private sideTitleEl: HTMLElement | null = null;
   private dynEl!: HTMLElement;
   /**
    * 侧栏「−/＋」步进按钮的停手句柄。
@@ -392,6 +598,8 @@ export class InkbookView extends FileView {
    */
   private dynToolsSig = "";
   private pageLbl!: HTMLElement;
+  /** 底部页码点开后的「点页码直接跳」浮层；存关闭函数便于收起 */
+  private closePagePicker: (() => void) | null = null;
   /** 顶栏那一行：8 支笔 + 保存/侧栏，全部挤在标题栏同一行 */
   private topRowEl: HTMLElement | null = null;
   /** 顶栏里的工具组 */
@@ -400,6 +608,19 @@ export class InkbookView extends FileView {
   private actionsHostEl: HTMLElement | null = null;
   /** 放不下时，整行搬进视图自己画的这条顶栏条 */
   private topBarEl: HTMLElement | null = null;
+  /**
+   * 「笔记内查找」浮条。
+   *
+   * 挂在 `.mb-paper` 里（它自己 position:relative），右上角浮在纸面上，
+   * 仿 Obsidian 文件内搜索那条；不进 `document.body`，免得切标签后残留。
+   */
+  private findBarEl: HTMLElement | null = null;
+  private findInputEl: HTMLInputElement | null = null;
+  private findCountEl: HTMLElement | null = null;
+  /** 本次查找的全部命中 + 当前第几条（0 起）；null = 查找框没开 */
+  private findState: { query: string; matches: FindMatch[]; index: number } | null = null;
+  /** 输入防抖：几百页 PDF 本子里逐字重扫全文，不防抖会卡输入 */
+  private findTimer = 0;
   /**
    * 从 `obsidian://inkbook?page=N` 跳进来时，编辑器还没建好就先记下来，
    * mountEditor 之后再滚过去。
@@ -450,18 +671,32 @@ export class InkbookView extends FileView {
   /** 右下浮标里的撤销 / 重做（常驻，不依赖侧栏是否展开） */
   private floatUndoBtn: HTMLButtonElement | null = null;
   private floatRedoBtn: HTMLButtonElement | null = null;
-  private stylusBtn!: HTMLButtonElement;
+  /** 面板滑入动画的收尾定时器（按元素存，连续开合只留最后一个） */
+  private slideTimers = new WeakMap<HTMLElement, number>();
   private toolButtons = new Map<ToolId, HTMLButtonElement>();
-  /**
-   * 顶栏上的「当前笔」提示：一枚色点 + 粗细数值。
-   *
-   * 平板侧栏默认收起，顶栏又只亮工具图标——写之前看不到自己拿的
-   * 是什么颜色、多粗。这枚 chip 常驻在工具组右侧，点它开合侧栏。
-   * 由 updatePenChip 在 updateUI 里刷新（纯显示，绝不在这里自动展开侧栏）。
-   */
-  private penChipEl: HTMLElement | null = null;
-  private penChipDotEl: HTMLElement | null = null;
-  private penChipSizeEl: HTMLElement | null = null;
+  /** 工具行选中态的滑动高亮片（见 SlidePill） */
+  private toolPill: SlidePill | null = null;
+  /** 上次对齐工具高亮片时的工具，用来只在工具变化时重排一次，落笔高频 updateUI 不重排 */
+  private slideToolSig: ToolId | null = null;
+  /** 「缩略图 / 目录 / 收藏」标签的滑动高亮片 */
+  private sidePill: SlidePill | null = null;
+  /** 「每行几张」1/2/3/4 的滑动高亮片 */
+  private thumbColsPill: SlidePill | null = null;
+  /** 收藏面板「每行几张」1/2/3/4 的滑动高亮片 */
+  private favoriteColsPill: SlidePill | null = null;
+  /** 收藏面板里的缩略图 canvas（与页列表窗口的 thumbCanvases 分开记） */
+  private favoriteThumbCanvases = new Map<number, HTMLCanvasElement>();
+  /** 收藏列表 / 当前页按钮的上次签名，避免每次落笔重建 DOM */
+  private favoriteListSig = "";
+  private favoriteBtnSig = "";
+  /** 缩略图小星标上次同步时的收藏版本号（只在收藏变化时刷，落笔高频 updateUI 不刷） */
+  private thumbFavRev = -1;
+  /** 收藏页缩略图补画合并到下一帧 */
+  private favoritePaintRaf = 0;
+  /** 各颜色点行里的玻璃框（快捷笔盒 / 文字弹层 / 侧栏文字/形状色板） */
+  private colorPills: SlidePill[] = [];
+  /** 弹层里「细/中/粗 · 字号 · 形状种类」这类分段控件的滑动高亮片 */
+  private segPills: SlidePill[] = [];
   /**
    * 顶栏笔按钮二次点击弹出的快捷笔盒（.mb-pen-pop）。
    *
@@ -472,9 +707,24 @@ export class InkbookView extends FileView {
   private penPopEl: HTMLElement | null = null;
   /** 当前浮层挂在哪枚按钮上；再点同一枚按钮即收起 */
   private penPopAnchorEl: HTMLElement | null = null;
+  /**
+   * 当前浮层画的是哪支笔 / 哪个形状的粗细。
+   *
+   * 用来把「读哪份粗细、写回哪份默认值」钉在浮层打开的这支笔上，
+   * 而不是跟着 editor.tool 走（钢笔、圆珠笔各有各的粗细，浮层打开期间
+   * 也可能被外部改工具）。形状统一记作 "shape"，具体读 shapeKind 对应的那份。
+   */
+  private penPopTool: ToolId | null = null;
   /** 浮层打开期间挂上的 document/window 监听，关闭时逐个摘掉 */
   private penPopDetach: Array<() => void> = [];
+  /** 出场动画结束后摘掉临时类用的定时器（避免动画残留 transform） */
+  private penPopAnimTimer = 0;
+  /** 收起动画期间仍留在 DOM 的浮层（动画结束再移除），以及它的兜底定时器 */
+  private penPopClosingEl: HTMLElement | null = null;
+  private penPopCloseTimer = 0;
   private sideBtn!: HTMLElement;
+  /** 顶栏上的「页面/目录（缩略图）抽屉」开关：和钢笔同一排，仿原生 PDF 阅读器 */
+  private dockBtn: HTMLElement | null = null;
   private layerListEl: HTMLElement | null = null;
   private pageListEl: HTMLElement | null = null;
   /**
@@ -630,23 +880,43 @@ export class InkbookView extends FileView {
    */
   private sideShown = false;
   /**
-   * 侧栏下方「缩略图 / 目录」当前显示哪一页。
+   * 侧栏下方「缩略图 / 目录 / 收藏」当前显示哪一页。
    *
-   * 两个面板共用一个标签区（像 Obsidian 原生 PDF 阅读器的缩略图栏），
+   * 三个面板共用一个标签区（像 Obsidian 原生 PDF 阅读器的缩略图栏），
    * 同一时间只显示一个；没显示的那个保留自己的滚动容器和窗口化状态，
    * 切回来时只需按新尺寸重算窗口，不用重建 DOM。
    */
-  private sideTab: "thumbs" | "outlines" = "thumbs";
-  /** 两个标签页容器（buildPageDock 里建，切换时切 is-hidden） */
+  private sideTab: "thumbs" | "outlines" | "favorites" = "thumbs";
+  /** 三个标签页容器（buildPageDock 里建，切换时切 is-hidden） */
   private sideThumbPane: HTMLElement | null = null;
   private sideOutlinePane: HTMLElement | null = null;
+  private sideFavoritePane: HTMLElement | null = null;
+  /** 收藏面板：列表 / 空状态 / 「收藏当前页」按钮 */
+  private favoriteListEl: HTMLElement | null = null;
+  private favoriteEmptyEl: HTMLElement | null = null;
+  private favoriteCurrentBtn: HTMLButtonElement | null = null;
+  private favoriteCurrentLabel: HTMLElement | null = null;
   private sideTabBtns: HTMLButtonElement[] = [];
+  /** 「每行几张」按钮（buildPageDock 里建，切列数时更新选中态） */
+  private thumbColsBtns: Array<[number, HTMLButtonElement]> = [];
+  /** 收藏面板「每行几张」按钮（1/2/3/4） */
+  private favoriteColsBtns: Array<[number, HTMLButtonElement]> = [];
   /** 左侧「页面」抽屉（缩略图 + 目录），像 Obsidian 原生 PDF 阅读器 */
   private pagedockEl: HTMLElement | null = null;
   private pagedockBodyEl: HTMLElement | null = null;
   private pagedockHandleEl: HTMLButtonElement | null = null;
   /** 抽屉是否展开。默认收起，只留左上角一个按钮 */
   private pagedockOpen = false;
+  /** 三个面板的容器（缩略图侧边滑动条挂这上面，避免跟着内容滚） */
+  private sidePanesEl: HTMLElement | null = null;
+  /** 缩略图面板右缘的自绘滑动条（拖不动系统条时的替代，和纸面那条同款） */
+  private thumbSbEl: HTMLElement | null = null;
+  private thumbSbTrack: HTMLElement | null = null;
+  private thumbSbThumb: HTMLElement | null = null;
+  private thumbSbThumbH = 0;
+  private thumbSbDrag: { pid: number; grab: number } | null = null;
+  private thumbSbHideTimer = 0;
+  private thumbSbAbort: AbortController | null = null;
   /** 缩放指示器：缩放时才浮现，2.6 秒后自己退回去 */
   private zoomHintTimer = 0;
   /** 缩放指示器是否被指针悬停（悬停时不自动隐藏） */
@@ -654,6 +924,12 @@ export class InkbookView extends FileView {
   /** 上一次的缩放值，用来判断"这次状态变化是不是缩放引起的" */
   private lastZoom = -1;
   private touchBtn!: HTMLButtonElement;
+  /*
+   * 侧栏「演示」区（激光笔，经典手写应用移植）。
+   * 全局开关，和当前工具无关，放独立静态区；选中态由 syncAuxControls() 统一刷
+   * （工具切换、快捷键、设置页改动都会走到 updateUI）。
+   */
+  private laserBtn?: HTMLButtonElement;
   private dirty = false;
   /**
    * 「内容变脏」代次：markDirty 一次加一。
@@ -680,6 +956,25 @@ export class InkbookView extends FileView {
   private metaDirty = false;
   /** 上次成功写盘时文件在磁盘上的指纹；null = 拿不到指纹，不做冲突检测 */
   private fp: FileFingerprint | null = null;
+  /**
+   * 上次读到 / 写入的**正文字节**的内容哈希（见 storage.hashText）。
+   *
+   * 指纹（mtime + size）只能说明「文件被动过」，分不清是「有别的程序真改了内容」
+   * 还是「同步盘把同一份文件重写/摸了一下」。同步客户端下载、校验、回写时常常只
+   * 更新 mtime、字节一个不变；只看指纹就会把这种情况误判成外部改动，反复生成
+   * `-disk-` / `-mine-` 副本并停写主文件（用户原话：一写字就说同步失败、还多出
+   * 备份文件）。所以指纹对不上时再比一次内容哈希：与基线一致就当作「没动过」，
+   * 收下新指纹照常保存；只有内容真的变了才走冲突副本。
+   *
+   * null = 还没有基线（打开失败 / 只读恢复 / 刚改名），此时退回旧的保守判定。
+   */
+  private diskHash: string | null = null;
+  /**
+   * 磁盘上「已读/已写」版本的实质内容签名（pages + outlines）。
+   * 同步盘/另一台设备只改时间/当前页等元数据时，用它判断正文其实没变，
+   * 避免误判冲突并反复生成副本。
+   */
+  private diskContentSig: string | null = null;
   /** 上次成功写盘时的 activePage，用来看"翻页后到底要不要写一次" */
   private savedActivePage = -1;
   /**
@@ -773,7 +1068,20 @@ export class InkbookView extends FileView {
     this.buildUI();
     this.renderEmpty();
     this.registerDomEvent(document, "keydown", (e) => this.onKeyDown(e));
+    // Ctrl/⌘+F 在捕获期就接管，别被宿主的全局搜索抢走（详见 onFindHotkeyCapture）
+    this.registerDomEvent(document, "keydown", (e) => this.onFindHotkeyCapture(e), true);
     this.registerDomEvent(window, "resize", () => this.scheduleTopRowFit());
+    /*
+     * 平板交互：缩略图抽屉 / 右侧栏打开后，点它们以外的地方自动收起
+     * （像 Obsidian 原生 PDF 阅读器，点一下文档就把侧边栏收起来）。
+     * 用 pointerdown 捕获：手指按下即收，抬起来时不会误触被点到的元素。
+     */
+    this.registerDomEvent(
+      document,
+      "pointerdown",
+      (e) => this.onGlobalPointerDown(e),
+      true
+    );
     /*
      * 切到后台 / 关页面前把没落盘的内容冲掉。
      *
@@ -809,6 +1117,10 @@ export class InkbookView extends FileView {
   async onClose(): Promise<void> {
     // 浮层挂在 document.body 上，视图关了它不会自己消失，先摘干净
     this.closePenPop();
+    for (const pill of this.colorPills) pill.destroy();
+    this.colorPills = [];
+    for (const pill of this.segPills) pill.destroy();
+    this.segPills = [];
     this.syncActivePage();
     const ok = await this.flushSave();
     // 关窗时写不进去：至少把内容另存出来，别跟着视图一起消失
@@ -844,6 +1156,21 @@ export class InkbookView extends FileView {
     this.file = file;
     this.bookPath = file.path;
     this.fp = null;
+    // 改名不改内容，但新路径的基线要重新建立；先清掉，等下一次读/写再设
+    this.diskHash = null;
+    this.diskContentSig = null;
+  }
+
+  /**
+   * 本子改名时，`main.ts` 把它的数据叶子整体搬到了新 token 目录，
+   * 这里同步改写打开中的这份内存副本里的底图/原件引用，并标脏。
+   *
+   * 不这么做的话，界面仍指向已搬走的旧路径（当场翻页底图丢失），
+   * 而且下一次自动保存会把旧引用又写回磁盘。
+   */
+  remapBookAssetDir(oldDir: string, newDir: string): void {
+    if (!this.store) return;
+    if (remapAssetPrefix(this.store.data, oldDir, newDir)) this.markDirty();
   }
 
   /* ------------------------------- 文件 ------------------------------- */
@@ -944,12 +1271,22 @@ export class InkbookView extends FileView {
     readOnlyReason: "duplicate" | "recovered" | null = readOnly ? "recovered" : null
   ): void {
     this.store = new BookStore(book);
+    /*
+     * 换书时强制重建收藏列表：两本书可能页数、favoriteRev 都刚好相同，
+     * 只比签名会把上一本的收藏页当成这一本的。
+     */
+    this.favoriteListSig = "";
+    this.favoriteBtnSig = "";
+    this.favoriteThumbCanvases.clear();
     // 记住这本书属于哪个路径：之后 `view.file` 被宿主换掉也不会写错地方
     this.bookPath = this.file ? this.file.path : null;
     this.store.onChange = () => this.markDirty();
     this.readOnly = readOnly;
     this.readOnlyReason = readOnly ? readOnlyReason : null;
     this.conflict = false;
+    // 内容基线由 onLoadFile 读到原文后设置；这里先清掉上一本的，防止串本比较
+    this.diskHash = null;
+    this.diskContentSig = null;
     this.metaDirty = false;
     // dirty 必须一起复位：上一本书留下的"未保存"标记会跟着新文件走，
     // 导致打开另一本书什么都不做就白写一次整本
@@ -998,6 +1335,8 @@ export class InkbookView extends FileView {
     this.store = null;
     this.bookPath = null;
     this.fp = null;
+    this.diskHash = null;
+    this.diskContentSig = null;
     this.recoveredCopyName = null;
     this.dirty = false;
     this.metaDirty = false;
@@ -1125,7 +1464,7 @@ export class InkbookView extends FileView {
     this.showLoading(file.basename, await this.fileSizeHint(file.path));
     if (token !== this._loadToken) return;
     try {
-      const book = await readBook(adapter, file.path, file.basename);
+      const { book, text } = await readBookWithText(adapter, file.path, file.basename);
       if (token !== this._loadToken) return;
       this.openBook(book, duplicateTab, duplicateTab ? "duplicate" : null);
       if (duplicateTab) {
@@ -1135,6 +1474,9 @@ export class InkbookView extends FileView {
         );
       }
       this.fp = await fingerprint(adapter, file.path);
+      // 记下读到的原文作为内容基线：之后同步盘只改 mtime 不改字节时不会误判冲突
+      this.diskHash = hashText(text);
+      this.diskContentSig = this.bookContentSignature(book);
     } catch (e: any) {
       console.error("[inkbook] 读取失败", e);
       if (token !== this._loadToken) return;
@@ -1194,6 +1536,8 @@ export class InkbookView extends FileView {
     this.bookPath = null;
     this.file = null;
     this.fp = null;
+    this.diskHash = null;
+    this.diskContentSig = null;
     this.conflict = false;
     this.renderEmpty();
   }
@@ -1212,7 +1556,10 @@ export class InkbookView extends FileView {
       prediction: this.plugin.settings.prediction,
       edgeSwipeBlock: this.plugin.settings.blockEdgeSwipe !== false,
       straighten: this.plugin.settings.straightLine === true,
-      onState: () => this.updateUI(),
+      // 经典手写应用移植功能（默认关，由设置与快捷键控制）
+      shapeSnap: normalizeShapeSnap(this.plugin.settings.shapeSnap),
+      laserPointer: this.plugin.settings.laserPointer === true,
+      onState: () => this.scheduleUIUpdate(),
       onChange: () => this.markDirty(),
       onPageChange: () => this.onPageChanged(),
       // 抬笔 / 擦除收手：把书写期间避让掉的自动保存重新排上
@@ -1227,10 +1574,15 @@ export class InkbookView extends FileView {
       onThumbNeedsRedraw: (i: number) => {
         // 侧栏收起/目录标签时不要画：隐藏状态的 rect 是 0，会走 60×84 的回退尺寸，
         // 白白把 PDF 页排进光栅化队列（展开时会统一补画）
-        if (!this.thumbVisible()) return;
-        const cv = this.thumbCanvases.get(i);
-        // 页号可能不在当前窗口里（大本子只物化可视区），拿不到就等它滚进来再画
-        if (cv && cv.isConnected) this.editor?.renderThumbnail(cv, i);
+        if (this.thumbVisible()) {
+          const cv = this.thumbCanvases.get(i);
+          // 页号可能不在当前窗口里（大本子只物化可视区），拿不到就等它滚进来再画
+          if (cv && cv.isConnected) this.editor?.renderThumbnail(cv, i);
+        }
+        if (this.favoritesVisible()) {
+          const cv = this.favoriteThumbCanvases.get(i);
+          if (cv && cv.isConnected) this.editor?.renderThumbnail(cv, i);
+        }
       },
       /*
        * 文字装不下纸面（INK-192）。
@@ -1246,9 +1598,18 @@ export class InkbookView extends FileView {
           8000
         );
       },
+      // 点了文字里的 [[双链]]：由 view 解析目标并打开（Markdown / .inkbook 均可）
+      onOpenWikiLink: (href, page, newTab) => this.openWikiLink(href, page, newTab),
+      // 文件块属性条：「打开源文件」复用双链解析；「刷新」重新生成快照
+      onOpenFileSource: (path) => this.openWikiLink(path, undefined, false),
+      onRefreshFileBlock: (image) => void this.refreshFileBlock(image),
+      // 文字输入框里打 `[[` 时列出可链接的库内笔记（与「插入双链」弹窗同一份清单）
+      getLinkTargets: () => collectLinkTargets(this.app),
     });
     this.editor.penColor = this.plugin.settings.lastPenColor || "#1A1A1A";
     this.editor.penSize = finiteSetting(this.plugin.settings.defaultPenSize, 2.8, 1, 8);
+    this.editor.ballpointSize = finiteSetting(this.plugin.settings.defaultBallpointSize, 2.8, 1, 8);
+    this.editor.shapeSizes = finiteShapeSizes(this.plugin.settings.defaultShapeSizes, 2.8);
     this.editor.highlighterColor = this.plugin.settings.lastHighlighterColor || "#F6E05E";
     this.editor.highlighterSize = finiteSetting(
       this.plugin.settings.defaultHighlighterSize,
@@ -1256,6 +1617,9 @@ export class InkbookView extends FileView {
       4,
       40
     );
+    // 橡皮「记忆」：恢复上次选的模式与大小（按下橡皮不再弹框，直接用这个）。
+    this.editor.eraserMode = this.plugin.settings.lastEraserMode === "whole" ? "whole" : "part";
+    this.editor.eraserSize = finiteSetting(this.plugin.settings.lastEraserSize, 26, 6, 60);
     // 「允许手指书写」以前只活在编辑器实例上，每次打开都回默认 false；
     // 现在从 settings 恢复（侧栏开关 / 设置页都会写回这里）。
     this.editor.touchDraw = this.plugin.settings.touchDraw === true;
@@ -1280,6 +1644,8 @@ export class InkbookView extends FileView {
     this.buildSide();
     // 缩略图 / 目录搬到左侧抽屉（Obsidian 原生 PDF 阅读器那种）
     this.buildPageDock();
+    // 工具 / 撤销重做按钮的 tooltip 里带上当前（可自定义的）快捷键
+    this.syncHotkeyLabels();
     this.updateUI();
     this.saveState = "saved";
     this.updateStatus();
@@ -1332,38 +1698,23 @@ export class InkbookView extends FileView {
    * 却因为「目录在磁盘上、没进 Obsidian 文件表」导致一个 md 都写不出来（全局搜索
    * 0 结果）。`writeTextIndex` 现在会自愈这种目录，但得有人调用它。
    *
-   * 只做一次轻量检查 + 异步写，不阻塞打开；失败由 writeTextIndex 自己弹可见提示。
+   * 索引目录还不存在、甚至 `list` 抛 ENOENT 时也按缺索引补建（Word 导入新建本子
+   * 不会自动保存，最容易卡在这里）。只做一次轻量检查 + 异步写，不阻塞打开；
+   * 失败由 writeTextIndex 自己弹可见提示。
    */
   private ensureTextIndexIfMissing(): void {
     if (!this.file || !this.store || this.plugin.settings.searchIndex === false) return;
-    const book = this.store.data;
-    const hasText = book.pages.some((p) =>
-      (p?.texts ?? []).some((t) => (t.text || "").trim())
-    );
-    if (!hasText) return;
-    const adapter = this.app.vault.adapter as any;
-    if (typeof adapter?.list !== "function") return;
-    const dir = indexDirFor(this.file);
-    void (async () => {
-      try {
-        const listed = await adapter.list(dir);
-        const files: string[] = listed?.files || [];
-        // 有新命名的索引页就算健康；只有旧命名 / 空目录才需要重建
-        const hasNew = files.some((p) => {
-          const name = String(p).split("/").pop() || "";
-          return /^.+ · 第 \d+ 页\.md$/.test(name);
-        });
-        if (hasNew) return;
-        await writeTextIndex(this.app, this.file!, book);
-      } catch (_) {
-        /* 索引是派生物，打不开就算了，writeTextIndex 自己会兜底 */
-      }
-    })();
+    void ensureTextIndexOnOpen(this.app, this.file, this.store.data).catch(() => {
+      /* 索引是派生物，补建失败不该影响打开本子 */
+    });
   }
 
   private destroyEditor(): void {
+    // 换本子 / 关标签页：查找态属于这一本，不能带到下一本上
+    this.closeFindBar();
     this.editor?.destroy();
     this.editor = null;
+    this.cancelUIUpdateRaf();
     this.cancelInkDeferRetry();
     this.inkDeferAt = 0;
     // 顶栏那一行挂在标题栏/自建条上，不跟着 editorHost 走，得单独摘
@@ -1541,6 +1892,102 @@ export class InkbookView extends FileView {
   }
 
   /**
+   * 用户点开面板时，从侧边缓缓滑入（Obsidian 那种感觉）。
+   *
+   * 只加一个临时类触发 CSS keyframes，动画里**只动 transform**：宽度保持
+   * 瞬时到位，缩略图按最终尺寸排版 / 光栅化，不会每帧重排、也不会糊
+   * （见 styles.css 的 .mb-pagedock-body 注释与 mb-*-in 关键帧）。
+   *
+   * 之所以不把 animation 直接挂在 .is-open / :not(.is-hidden) 上：那样首次
+   * 渲染、平板模式切换、程序化改状态都会误播；而这里只在**用户点开**时播。
+   * 动画结束（或超时兜底）后摘掉类，避免残留 transform 影响之后量尺寸，
+   * 也避免下次 display:none → flex 时把旧动画又放一遍。
+   */
+  private playPanelSlideIn(el: HTMLElement | null | undefined): void {
+    this.playPanelSlide(el, "in");
+  }
+
+  /**
+   * 用户点「收起」时，从侧边缓缓滑出，别瞬间消失。
+   *
+   * 与展开对称：临时给面板加 `mb-slide-out`，CSS 里用更高优先级把收起态的
+   * `display:none` / `width:0` / 子元素 `visibility:hidden` 压回可见，让面板在
+   * **保持最终尺寸**的前提下只做 transform 滑出；动画结束再摘类。状态类
+   * （is-hidden / 非 is-open）其实在点击瞬间就已经切好，所以各类「收起后
+   * is-hidden / 非 is-open」的断言不受影响。
+   */
+  private playPanelSlideOut(el: HTMLElement | null | undefined): void {
+    // 尊重「减少动态效果」：没有动画就别把面板临时压回可见，
+    // 否则它会僵在原地 240ms 才消失——干脆不加类，维持瞬时收起。
+    if (this.prefersReducedMotion()) return;
+    this.playPanelSlide(el, "out");
+  }
+
+  /**
+   * 面板滑入 / 滑出的统一实现：临时加类触发 CSS keyframes，超时兜底后摘掉。
+   * 只动 transform（见 styles.css），不碰宽度 / 布局。同一个元素只保留一个
+   * 定时器 + 一个方向类，连续快速开合能互相取消、从头重放。
+   */
+  private playPanelSlide(el: HTMLElement | null | undefined, dir: "in" | "out"): void {
+    if (!el) return;
+    const inCls = "mb-slide-in";
+    const outCls = "mb-slide-out";
+    const cls = dir === "in" ? inCls : outCls;
+    // 两个类都清掉，保证换方向时不会两个 keyframes 打架
+    el.classList.remove(inCls, outCls);
+    // 强制重排：连续快速开合时让 keyframes 能从头重放
+    void el.offsetWidth;
+    el.classList.add(cls);
+    const prev = this.slideTimers.get(el);
+    if (prev !== undefined) window.clearTimeout(prev);
+    const timer = window.setTimeout(() => {
+      el.classList.remove(cls);
+      this.slideTimers.delete(el);
+    }, 320);
+    this.slideTimers.set(el, timer);
+  }
+
+  /** 用户是否开启了系统级「减少动态效果」。 */
+  private prefersReducedMotion(): boolean {
+    try {
+      return !!(
+        typeof window !== "undefined" &&
+        window.matchMedia &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * 把工具 / 撤销重做按钮 tooltip 里的快捷键更新成当前生效值。
+   * 快捷键可在设置页自定义，刷新视图时（syncSettings）会重跑这里。
+   */
+  private syncHotkeyLabels(): void {
+    const overrides = this.plugin.settings.hotkeys;
+    const suffix = (id: string) => {
+      const l = hotkeyLabelFor(id, overrides);
+      return l ? ` (${l})` : "";
+    };
+    for (const [id, btn] of this.toolButtons) {
+      const t = TOOLS.find((x) => x.id === id);
+      if (!t) continue;
+      const title = t.name + suffix(id);
+      btn.title = title;
+      btn.setAttribute("aria-label", title);
+    }
+    const apply = (btn: HTMLElement | null, base: string, id: string) => {
+      if (btn) btn.title = base + suffix(id);
+    };
+    apply(this.undoBtn, "撤销", "undo");
+    apply(this.redoBtn, "重做", "redo");
+    apply(this.floatUndoBtn, "撤销", "undo");
+    apply(this.floatRedoBtn, "重做", "redo");
+    apply(this.railFindBtn, "在当前笔记中查找文字", "find");
+  }
+
+  /**
    * 缩略图/页列表现在有必要维护吗。
    *
    * 侧栏收起时当然不用；显示「目录」标签时页列表被 display:none，
@@ -1551,10 +1998,35 @@ export class InkbookView extends FileView {
     return this.pagedockOpen && this.sideTab === "thumbs";
   }
 
+  /** 收藏面板的缩略图现在能按真实尺寸画吗 */
+  private favoritesVisible(): boolean {
+    return this.pagedockOpen && this.sideTab === "favorites";
+  }
+
+  /**
+   * 缩略图要对齐的「当前页」：以编辑器实时状态为准。
+   *
+   * 屏幕上的选中高亮（updateUI）一直用的是 editor.getState().pageIndex。
+   * store.data.activePage 是给文件落盘用的镜像：普通翻页时编辑器会顺手
+   * setPage，但快滑（armScrollSettle）会推迟到停稳、缩放 quiet 刷新会跳过，
+   * 两者就可能短暂不一致。缩略图是纯 UI，和选中高亮同源才不会在抽屉
+   * 展开那一下按旧页建窗口、补画隔壁页的邻居。
+   */
+  private activeThumbPage(): number {
+    const live = this.editor?.getState().pageIndex;
+    return typeof live === "number" && Number.isFinite(live)
+      ? Math.max(0, live)
+      : Math.max(0, this.store?.data.activePage ?? 0);
+  }
+
   private buildUI(): void {
     const root = this.contentEl;
     this.loadingEl = null;
     root.empty();
+    // 查找浮条也挂在刚被清空的 contentEl 里，旧引用必须一起丢掉
+    this.findBarEl = null;
+    this.findInputEl = null;
+    this.findCountEl = null;
     root.addClass("mb-root");
     this.tabletMode = this.detectTablet();
     this.bodyEl = root.createDiv("mb-body");
@@ -1697,8 +2169,14 @@ export class InkbookView extends FileView {
     // 顶栏重建（换文件 / 宿主清空标题栏）时旧浮层的锚点就不在了，先收掉
     this.closePenPop();
     this.toolButtons.clear();
+    // 重建工具行时旧的滑动高亮片连同其 ResizeObserver 一起销毁
+    this.toolPill?.destroy();
+    this.toolPill = null;
+    this.slideToolSig = null;
     const wrap = row.createDiv("mb-top-tools");
     this.topToolsEl = wrap;
+    // 选中态的紫色高亮片：放在按钮前面（绝对定位，不在 flex 流里）
+    this.toolPill = new SlidePill(wrap);
     for (const t of TOOLS) {
       /*
        * 用 `clickable-icon` 这一套，而不是裸 `<button>`。
@@ -1715,24 +2193,7 @@ export class InkbookView extends FileView {
       setIcon(b, t.icon);
       b.title = t.name;
       b.setAttribute("aria-label", t.name);
-      b.onclick = () => {
-        /*
-         * 第一次点 = 切到这支笔；已经在这支笔上再点一下 = 按钮正下方
-         * 弹出快捷笔盒（用户原话：「再点一下 就直接能在钢笔下边弹出
-         * 一个笔盒 能直接切换颜色和粗细」）。
-         *
-         * 浮层已经开着时再点同一颗按钮就收起——保持"点一下开、再点一下关"
-         * 的开关手感，不用去够别处。
-         */
-        const cur = this.editor?.getState().tool;
-        if (t.id === cur && PEN_POP_TOOLS.has(t.id)) {
-          if (this.penPopEl && this.penPopAnchorEl === b) this.closePenPop();
-          else this.openPenPop(b, t.id);
-          return;
-        }
-        this.closePenPop();
-        this.chooseTool(t.id);
-      };
+      b.onclick = () => this.activateTool(t.id);
       wrap.appendChild(b);
       this.toolButtons.set(t.id, b);
     }
@@ -1740,71 +2201,88 @@ export class InkbookView extends FileView {
   }
 
   /**
-   * 顶栏上的「当前笔」提示：一枚色点 + 粗细数值。
+   * 「激活某支工具」的唯一入口：顶栏按钮点击和工具快捷键都走这里，
+   * 保证两条「用户动作入口」行为完全一致。
    *
-   * 侧栏收起时（平板默认如此）顶栏只有工具图标亮着，看不出当前是
-   * 什么颜色、多粗。这枚 chip 只占 30px 高、约 40px 宽，挂在工具组右侧，
-   * 不把顶栏塞满；点它开合侧栏——调参入口也就在手边。
+   * 第一次触发 = 切到这支工具；已经在这支工具上再触发一次 = 在它的
+   * 顶栏按钮正下方弹出快捷参数浮层（三支笔 / 形状 / 文字 / 橡皮各自的
+   * 浮层），浮层已开则再触发一次收起——保持「点一下开、再点一下关」。
    *
-   * 注意：这里只建 DOM，显示内容全交给 updatePenChip（updateUI 里刷新）。
-   * 任何「自动展开侧栏」的逻辑都不能跑到 updateUI 里，否则用户手动收起后
-   * 落笔 / 翻页又会把它弹回来。
+   * 用户反馈（本次）：电脑快捷键此前直接走 chooseTool，没接上这层开关，
+   * 所以按第二下不弹颜色框；而且形状这类 TOOLS_NEED_SIDE 工具还会连带
+   * 展开侧栏（点顶栏按钮却不会）。统一到本方法后两处行为一致。
+   *
+   * anchor 默认取这支工具的顶栏按钮；顶栏还没建好（极少见）时退化为
+   * 只切工具，绝不因为拿不到锚点就报错。
    */
-  private buildPenChip(row: HTMLElement): void {
-    const chip = document.createElement("button");
-    chip.type = "button";
-    chip.className = "mb-pen-chip";
-    chip.setAttribute("aria-label", "当前笔色 / 粗细");
-    const dot = chip.createSpan({ cls: "mb-pen-chip-dot" });
-    const size = chip.createSpan({ cls: "mb-pen-chip-size" });
-    chip.onclick = () => this.toggleSide();
-    row.appendChild(chip);
-    this.penChipEl = chip;
-    this.penChipDotEl = dot;
-    this.penChipSizeEl = size;
-    this.updatePenChip();
-  }
-
-  /** 当前工具的颜色 / 粗细；text / select / hand 没有笔参数，整枚收起 */
-  private updatePenChip(): void {
-    const chip = this.penChipEl;
-    const dot = this.penChipDotEl;
-    const size = this.penChipSizeEl;
-    if (!chip || !dot || !size || !this.editor) return;
-
-    const s = this.editor.getState();
-    const fmt = (v: number) => String(Math.round(v * 10) / 10);
-    let name = "";
-    let color = "";
-    let text = "";
-    if (s.tool === "pen" || s.tool === "ballpoint" || s.tool === "shape") {
-      /*
-       * 圆珠笔和形状也用 penColor / penSize 落笔（见 editor.onDown 的
-       * draft 组装），所以三支共用同一组显示，换哪支都不会读错参数。
-       */
-      name = s.tool === "ballpoint" ? "圆珠笔" : s.tool === "shape" ? "形状" : "钢笔";
-      color = s.penColor;
-      text = fmt(s.penSize);
-    } else if (s.tool === "highlighter") {
-      name = "荧光笔";
-      color = s.highlighterColor;
-      text = fmt(s.highlighterSize);
-    } else if (s.tool === "eraser") {
-      name = "橡皮";
-      text = (this.editor.eraserMode === "whole" ? "整笔 " : "局部 ") + fmt(this.editor.eraserSize);
-    } else {
-      chip.toggleClass("is-hidden", true);
+  private activateTool(id: ToolId): void {
+    const b = this.toolButtons.get(id);
+    const cur = this.editor?.getState().tool;
+    if (!b) {
+      // 顶栏按钮还没建出来：只切工具（chooseTool 内部已处理重复点/侧栏策略）
+      this.chooseTool(id);
       return;
     }
-
-    chip.toggleClass("is-hidden", false);
-    dot.style.background = color;
-    dot.toggleClass("is-eraser", !color);
-    size.setText(text);
-    chip.title = color
-      ? `当前：${name} · ${color} · 粗细 ${text}（点按展开侧栏调参）`
-      : `当前：${name} · ${text}（点按展开侧栏调参）`;
-    chip.setAttribute("aria-label", chip.title);
+    /*
+     * 形状：点一下就切到形状，并在按钮正下方弹出形状选项框
+     * （矩形/椭圆/直线/箭头 + 笔色），不再自动展开侧栏
+     * （用户原话：「选择形状之后直接在按钮的底下弹出选项框」）。
+     * 同一颗按钮的浮层已开时再点则收起。
+     */
+    if (id === "shape") {
+      if (this.penPopEl && this.penPopAnchorEl === b) {
+        this.closePenPop(true); // 再点一次收起：播收起动画
+        return;
+      }
+      this.editor?.setTool("shape");
+      this.updateUI();
+      this.openPenPop(b, "shape");
+      return;
+    }
+    /*
+     * 文字：点一下切工具并在按钮下弹出选项框，不再自动展开侧栏
+     * （用户原话：「文字点完直接在下边弹出字号/颜色/字体框」）。
+     */
+    if (id === "text") {
+      if (this.penPopEl && this.penPopAnchorEl === b) {
+        this.closePenPop(true); // 再点一次收起：播收起动画
+        return;
+      }
+      this.editor?.setTool(id);
+      this.updateUI();
+      this.openTextPop(b);
+      return;
+    }
+    /*
+     * 橡皮：**按下不再每次都弹调节框**（用户原话：「每次按下橡皮的时候
+     * 不用都弹出来底下的那个调节框，橡皮只需要有记忆功能」）。
+     * 第一次点只切到橡皮，直接用上次记住的模式/大小落笔；已经在这支
+     * 橡皮上再点一下，才弹出调节框改设置（和钢笔「再点一下」一致）。
+     */
+    if (id === "eraser") {
+      if (this.penPopEl && this.penPopAnchorEl === b) {
+        this.closePenPop(true); // 调节框开着，再点收起
+        return;
+      }
+      const already = cur === "eraser";
+      this.editor?.setTool("eraser");
+      this.updateUI();
+      if (already) this.openEraserPop(b);
+      return;
+    }
+    /*
+     * 第一次点 = 切到这支笔；已经在这支笔上再点一下 = 按钮正下方
+     * 弹出快捷笔盒（用户原话：「再点一下 就直接能在钢笔下边弹出
+     * 一个笔盒 能直接切换颜色和粗细」）。浮层已开着再点则收起——
+     * 保持"点一下开、再点一下关"的开关手感。
+     */
+    if (id === cur && PEN_POP_TOOLS.has(id)) {
+      if (this.penPopEl && this.penPopAnchorEl === b) this.closePenPop(true); // 再点一次收起：播收起动画
+      else this.openPenPop(b, id);
+      return;
+    }
+    this.closePenPop();
+    this.chooseTool(id);
   }
 
   /**
@@ -1830,6 +2308,7 @@ export class InkbookView extends FileView {
     if (this.sideShown) return;
     this.sideShown = true;
     this.applySideVisibility();
+    this.playPanelSlideIn(this.sideEl);
     this.updateUI();
   }
 
@@ -1845,10 +2324,14 @@ export class InkbookView extends FileView {
    */
   private openPenPop(anchor: HTMLElement, tool: ToolId): void {
     this.closePenPop();
+    this.penPopTool = tool;
     const hl = tool === "highlighter";
+    const isShape = tool === "shape";
     const el = document.body.createDiv("mb-pen-pop");
+    // 平板：浮层整体缩小一些（桌面保持原尺寸）
+    if (this.tabletMode) el.addClass("mb-pen-pop-tablet");
     el.setAttribute("role", "dialog");
-    el.setAttribute("aria-label", hl ? "荧光笔颜色与粗细" : "笔颜色与粗细");
+    el.setAttribute("aria-label", isShape ? "形状选项" : hl ? "荧光笔颜色与粗细" : "笔颜色与粗细");
 
     const colorRow = el.createDiv("mb-pen-pop-row mb-pen-pop-colors");
     for (const c of hl ? HIGHLIGHTER_PALETTE : PEN_COLORS) {
@@ -1872,35 +2355,186 @@ export class InkbookView extends FileView {
         this.syncPenPopActive();
       };
     }
+    this.mountColorGlassRing(colorRow, ".mb-pen-pop-dot");
 
-    const sizeRow = el.createDiv("mb-pen-pop-row");
-    const sizes = hl ? HIGHLIGHTER_SIZES : PEN_SIZES;
-    for (let i = 0; i < sizes.length; i++) {
-      const b = sizeRow.createEl("button", {
-        cls: "mb-pen-pop-size",
-        text: ["细", "中", "粗"][i],
-        attr: { type: "button", "data-size": String(sizes[i]) },
+    if (isShape) {
+      /*
+       * 形状：种类（矩形/椭圆/直线/箭头）一排按钮。形状用 penColor 落笔，
+       * 上面的色点行就是它的颜色；这里不再放粗细（形状没有粗细档，只有滑杆）。
+       */
+      const kindRow = el.createDiv("mb-pen-pop-row mb-pen-pop-shapes");
+      for (const sh of SHAPES) {
+        const b = kindRow.createEl("button", {
+          cls: "mb-pen-pop-shape",
+          text: sh.label,
+          attr: { type: "button", "data-shape": sh.id },
+        });
+        b.onclick = () => {
+          this.editor?.setShapeKind(sh.id);
+          this.syncPenPopActive();
+        };
+      }
+      this.mountSegPill(kindRow, ".mb-pen-pop-shape");
+      // 形状用 penSize 当线宽：把粗细滑杆也放进它自己的浮层（侧栏不再有滑动条）
+      this.addPenThicknessSlider(el, "shape");
+    } else {
+      const sizeRow = el.createDiv("mb-pen-pop-row");
+      const sizes = hl ? HIGHLIGHTER_SIZES : PEN_SIZES;
+      for (let i = 0; i < sizes.length; i++) {
+        const b = sizeRow.createEl("button", {
+          cls: "mb-pen-pop-size",
+          text: ["细", "中", "粗"][i],
+          attr: { type: "button", "data-size": String(sizes[i]) },
+        });
+        b.title = (hl ? "荧光笔" : "笔") + "粗细：" + b.textContent;
+        b.onclick = () => {
+          if (hl) {
+            this.editor?.setHighlighterSize(sizes[i]);
+            this.plugin.settings.defaultHighlighterSize = sizes[i];
+          } else if (tool === "ballpoint") {
+            // 圆珠笔有自己的一份粗细，不写进钢笔的 defaultPenSize
+            this.editor?.setBallpointSize(sizes[i]);
+            this.plugin.settings.defaultBallpointSize = sizes[i];
+          } else {
+            this.editor?.setPenSize(sizes[i]);
+            this.plugin.settings.defaultPenSize = sizes[i];
+          }
+          void this.plugin.saveSettings();
+          this.updateUI();
+          this.syncPenPopActive();
+        };
+      }
+      this.mountSegPill(sizeRow, ".mb-pen-pop-size");
+      // 预置「细/中/粗」之外，再加一根滑杆，直接拖到任意具体粗细
+      this.addPenThicknessSlider(el, tool);
+      // 一笔成型：钢笔 / 圆珠笔的弹框里放一个开 / 关（用户要求「加在每个笔下边
+      // 弹出的框里，只有打开和关闭，画完立马识别」）。荧光笔不参与识别，不放。
+      if (tool === "pen" || tool === "ballpoint") this.addPenPopSnapToggle(el);
+    }
+
+    this.mountPopover(el, anchor, () => this.syncPenPopActive());
+  }
+
+  /**
+   * 在同一支笔的弹出调节框里加一根「具体粗细」滑杆 + 数值标签。
+   *
+   * 用户要求把调粗细全部放到每支笔自己的调节框里，不再去侧栏拖滑动条：
+   * 预置档（细/中/粗）给习惯快速切的，这根滑杆给要微调的情况，二者共用
+   * 同一份粗细值。取值范围与设置页滑杆一致：钢笔 1~8、荧光笔 4~40、形状 1~8。
+   *
+   * 拖动时用 `silent=true`（不 emitState），避免一次拖动触发几十次整块
+   * updateUI；松手（change）再写回 settings，和侧栏旧滑杆的做法一致。
+   */
+  private addPenThicknessSlider(el: HTMLElement, tool: ToolId): void {
+    const hl = tool === "highlighter";
+    const st = this.editor?.getState();
+    /*
+     * 读哪份粗细由**浮层属于哪支笔 / 哪个形状**决定（tool），不是 editor.tool：
+     * 钢笔 / 圆珠笔 / 每种形状各记各的，浮层打开期间切工具也不能串。
+     */
+    const cur = hl
+      ? st?.highlighterSize ?? HIGHLIGHTER_SIZES[1]
+      : tool === "ballpoint"
+        ? st?.ballpointSize ?? PEN_SIZES[1]
+        : tool === "shape"
+          ? st?.shapeSize ?? PEN_SIZES[1]
+          : st?.penSize ?? PEN_SIZES[1];
+    const row = el.createDiv("mb-pen-pop-row mb-pen-pop-thickness");
+    const range = row.createEl("input", {
+      cls: "mb-range mb-pen-pop-range",
+      attr: {
+        type: "range",
+        min: hl ? "4" : "1",
+        max: hl ? "40" : "8",
+        step: "0.1",
+        value: String(cur),
+        "aria-label": hl ? "荧光笔粗细" : tool === "shape" ? "形状线宽" : "笔粗细",
+      },
+    });
+    const lbl = row.createSpan({ cls: "mb-size-lbl", text: String(Math.round(cur * 10) / 10) });
+    range.oninput = () => {
+      if (!this.editor) return;
+      const v = Number(range.value);
+      if (hl) this.editor.setHighlighterSize(v, true);
+      else if (tool === "ballpoint") this.editor.setBallpointSize(v, true);
+      else if (tool === "shape") this.editor.setShapeSize(this.editor.shapeKind, v, true);
+      else this.editor.setPenSize(v, true);
+      lbl.setText(String(Math.round(v * 10) / 10));
+      // 顺带把预置档的高亮跟着滑杆走（滑到非预置值时三个档都不亮）
+      this.syncPenPopActive();
+    };
+    range.onchange = () => {
+      if (!this.editor) return;
+      const v = Number(range.value);
+      if (hl) this.plugin.settings.defaultHighlighterSize = v;
+      else if (tool === "ballpoint") this.plugin.settings.defaultBallpointSize = v;
+      else if (tool === "shape") {
+        // 写回这一类形状自己的默认值，别的形状与笔不受影响
+        const kind = this.editor.shapeKind;
+        this.plugin.settings.defaultShapeSizes = {
+          ...this.plugin.settings.defaultShapeSizes,
+          [kind]: v,
+        };
+      } else this.plugin.settings.defaultPenSize = v;
+      void this.plugin.saveSettings();
+    };
+  }
+
+  /**
+   * 钢笔 / 圆珠笔弹框里的「一笔成型」开 / 关。
+   *
+   * 用户要求（2026-11-17）：一笔成型只留在每支笔的弹框里，只有打开和关闭，
+   * 画完立刻识别——不再有侧栏「关 / 停留 / 抬笔」三态，也不再需要先停笔预览。
+   * 打开 = shapeSnap 置 "lift"（抬笔即识别），关闭 = "off"。与当前笔无关，
+   * 是全局开关；改完写回 settings，和其它视图 / 设置页同步。
+   */
+  private addPenPopSnapToggle(el: HTMLElement): void {
+    const row = el.createDiv("mb-pen-pop-row mb-pen-pop-snaprow");
+    row.createSpan({ cls: "mb-pen-pop-snaplabel", text: "一笔成型" });
+    const seg = row.createDiv("mb-seg mb-pen-pop-snap");
+    for (const m of [
+      { id: "off", label: "关" },
+      { id: "on", label: "开" },
+    ] as const) {
+      const b = seg.createEl("button", {
+        cls: "mb-pen-pop-snapbtn",
+        text: m.label,
+        attr: { type: "button", "data-snap": m.id },
       });
-      b.title = (hl ? "荧光笔" : "笔") + "粗细：" + b.textContent;
+      b.title = m.id === "on" ? "开启：画完一笔自动识别成矩形 / 椭圆 / 直线 / 箭头" : "关闭：保持原始手写笔迹";
       b.onclick = () => {
-        if (hl) {
-          this.editor?.setHighlighterSize(sizes[i]);
-          this.plugin.settings.defaultHighlighterSize = sizes[i];
-        } else {
-          this.editor?.setPenSize(sizes[i]);
-          this.plugin.settings.defaultPenSize = sizes[i];
-        }
+        if (!this.editor) return;
+        const on = m.id === "on";
+        this.plugin.settings.shapeSnap = on ? "lift" : "off";
+        this.editor.setShapeSnap(on ? "lift" : "off");
         void this.plugin.saveSettings();
-        this.updateUI();
         this.syncPenPopActive();
       };
     }
+    this.mountSegPill(seg, ".mb-pen-pop-snapbtn");
+  }
 
+  /**
+   * 把一个已建好的浮层挂到 body：定位到锚点按钮正下方，并挂上「点外部 /
+   * Esc / 滚动或转屏就收起」的监听。笔、形状、文字、橡皮四种浮层共用这段。
+   */
+  private mountPopover(el: HTMLElement, anchor: HTMLElement, sync?: () => void): void {
     this.penPopEl = el;
     this.penPopAnchorEl = anchor;
     anchor.setAttribute("aria-expanded", "true");
+    /*
+     * 把所有控件包进一层 .mb-pen-pop-inner：外层 .mb-pen-pop 承载磨砂玻璃
+     * （backdrop-filter），只做透明度淡入、**不缩放**；缩放动画作用在这层
+     * 内容容器上。这样磨砂层始终按最终尺寸栅格化，打开时不会先糊一下再变清
+     * （用户反馈的「一开始很模糊，得加载一下才变成那种质感」）。详见 styles.css
+     * 里 .mb-pen-pop / @keyframes mb-pen-pop-inner-* 的注释。
+     */
+    const inner = document.createElement("div");
+    inner.className = "mb-pen-pop-inner";
+    while (el.firstChild) inner.appendChild(el.firstChild);
+    el.appendChild(inner);
     document.body.appendChild(el);
-    this.syncPenPopActive();
+    sync?.();
     this.positionPenPop(el, anchor);
 
     /*
@@ -1913,15 +2547,15 @@ export class InkbookView extends FileView {
       const t = e.target as Node | null;
       if (!t) return;
       if (el.contains(t) || anchor.contains(t)) return;
-      this.closePenPop();
+      this.closePenPop(true); // 点外部收起：播收起动画
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       // 别让 Esc 继续传下去（编辑框等还有自己的 Esc 处理）
       e.stopPropagation();
-      this.closePenPop();
+      this.closePenPop(true); // Esc 收起：播收起动画
     };
-    const onMove = () => this.closePenPop();
+    const onMove = () => this.closePenPop(true); // 滚动 / 转屏收起：播收起动画
     document.addEventListener("pointerdown", onDown, true);
     document.addEventListener("keydown", onKey, true);
     window.addEventListener("resize", onMove);
@@ -1952,39 +2586,350 @@ export class InkbookView extends FileView {
     let left = r.left + r.width / 2 - w / 2;
     left = Math.max(margin, Math.min(left, window.innerWidth - w - margin));
     let top = r.bottom + 6;
+    let above = false;
     if (top + h > window.innerHeight - margin) {
       // 下方真的放不下（横屏顶栏贴近底边等极端情况）：翻到按钮上方
       top = Math.max(margin, r.top - h - 6);
+      above = true;
     }
-    el.style.left = Math.round(left) + "px";
-    el.style.top = Math.round(top) + "px";
+    const leftPx = Math.round(left);
+    const topPx = Math.round(top);
+    el.style.left = leftPx + "px";
+    el.style.top = topPx + "px";
+    // 缩放原点钉在锚点按钮的中心：看上去像从这枚方形按钮里弹出来 / 缩回去
+    // （iPhone 菜单从触发点展开那种感觉），而不是从浮层自身的边缘缩放。
+    // 用像素值写进自定义属性，CSS 的 transform-origin 直接取用。
+    el.style.setProperty("--mb-pop-origin-x", Math.round(r.left + r.width / 2 - leftPx) + "px");
+    el.style.setProperty("--mb-pop-origin-y", Math.round(r.top + r.height / 2 - topPx) + "px");
+    // 出场动画的位移方向跟着放在按钮上边还是下边走
+    el.toggleClass("mb-pen-pop-above", above);
     el.style.visibility = "visible";
+    this.playPenPopIn(el);
   }
 
-  /** 同步浮层里的选中态（当前色 / 当前粗细），不重建 DOM */
+  /**
+   * 弹出调节框的出场动画：从锚点按钮那一侧「弹」出来。
+   *
+   * 只在量好位置、可见之后再加临时类，动画时钟才不会在 visibility:hidden
+   * 期间空跑；keyframes 只动 transform + opacity（GPU 合成，不触发布局）。
+   * 动画结束（或超时兜底）摘掉类，避免残留 transform 影响下次量尺寸。
+   */
+  private playPenPopIn(el: HTMLElement): void {
+    const cls = "mb-pen-pop-anim";
+    el.classList.remove(cls);
+    void el.offsetWidth; // 强制重排：连续快速开合时也能从头重放
+    el.classList.add(cls);
+    if (this.penPopAnimTimer) window.clearTimeout(this.penPopAnimTimer);
+    this.penPopAnimTimer = window.setTimeout(() => {
+      el.classList.remove(cls);
+      this.penPopAnimTimer = 0;
+    }, 320);
+  }
+
+  /**
+   * 给一行颜色点挂一枚会滑动的玻璃选中框。
+   *
+   * 颜色点和工具行不同：不能把紫色底铺在圆点下面，否则会把用户选的颜色
+   * 洗掉。这里用一圈透明玻璃框圈住当前色点，切换颜色时由 SlidePill 平移
+   * 过去；色点自己只保留玻璃珠高光，不再画静态描边（否则会叠成双层）。
+   */
+  private mountColorGlassRing(host: HTMLElement, activeSelector: string): SlidePill {
+    host.addClass("mb-color-glass-host");
+    const pill = new SlidePill(host, {
+      className: "mb-color-glass-pill",
+      expand: 3,
+      activeSelector,
+      // 浮层内层有 scale 出场动画；offset* 不受祖先缩放影响，量得更稳
+      measure: "offset",
+    });
+    this.colorPills.push(pill);
+    pill.layout(true);
+    return pill;
+  }
+
+  /** 颜色选中态变化后让玻璃框滑到新的色点；顺手清掉随 DOM 重建掉队的框 */
+  private syncColorGlassRings(): void {
+    const keep: SlidePill[] = [];
+    for (const pill of this.colorPills) {
+      if (!pill.host.isConnected) {
+        pill.destroy();
+        continue;
+      }
+      pill.layout();
+      keep.push(pill);
+    }
+    this.colorPills = keep;
+  }
+
+  /**
+   * 给「细/中/粗、字号、形状种类」这样的一排按钮挂一枚会滑动的紫色高亮片，
+   * 效果和顶栏切换各个笔时一致（SlidePill）。measure:"offset" 保证在浮层
+   * 出场 scale 动画期间也量得准。
+   */
+  private mountSegPill(host: HTMLElement, activeSelector: string): SlidePill {
+    host.addClass("mb-seg-row");
+    const pill = new SlidePill(host, { activeSelector, measure: "offset" });
+    this.segPills.push(pill);
+    pill.layout(true);
+    return pill;
+  }
+
+  /** 选中项变化后让分段高亮片滑过去；顺手清掉随 DOM 重建掉队的片 */
+  private syncSegPills(): void {
+    const keep: SlidePill[] = [];
+    for (const pill of this.segPills) {
+      if (!pill.host.isConnected) {
+        pill.destroy();
+        continue;
+      }
+      pill.layout();
+      keep.push(pill);
+    }
+    this.segPills = keep;
+  }
+
+  /** 同步浮层里的选中态（当前色 / 当前粗细 / 当前形状种类），不重建 DOM */
   private syncPenPopActive(): void {
     const el = this.penPopEl;
     if (!el || !this.editor) return;
     const s = this.editor.getState();
-    const hl = s.tool === "highlighter";
+    // 以「浮层属于哪支笔」为准：钢笔 / 圆珠笔 / 各形状的粗细是分开的
+    const tool = this.penPopTool ?? s.tool;
+    const hl = tool === "highlighter";
     const color = (hl ? s.highlighterColor : s.penColor).toLowerCase();
-    const size = hl ? s.highlighterSize : s.penSize;
+    const size = hl
+      ? s.highlighterSize
+      : tool === "ballpoint"
+        ? s.ballpointSize
+        : tool === "shape"
+          ? s.shapeSize
+          : s.penSize;
     for (const dot of Array.from(el.querySelectorAll<HTMLElement>(".mb-pen-pop-dot"))) {
       dot.toggleClass("is-active", (dot.dataset.color || "").toLowerCase() === color);
     }
     for (const b of Array.from(el.querySelectorAll<HTMLElement>(".mb-pen-pop-size"))) {
       b.toggleClass("is-active", Math.abs(Number(b.dataset.size) - size) < 0.01);
     }
+    // 具体粗细滑杆与数值标签：形状读当前 shapeKind 对应的那份线宽
+    const thickVal = size;
+    const range = el.querySelector<HTMLInputElement>(".mb-pen-pop-range");
+    if (range && document.activeElement !== range) range.value = String(Math.round(thickVal * 10) / 10);
+    const thickLbl = el.querySelector<HTMLElement>(".mb-pen-pop-thickness .mb-size-lbl");
+    if (thickLbl) thickLbl.setText(String(Math.round(thickVal * 10) / 10));
+    if (tool === "shape") {
+      const kind = this.editor.shapeKind;
+      for (const b of Array.from(el.querySelectorAll<HTMLElement>(".mb-pen-pop-shape"))) {
+        b.toggleClass("is-active", (b.dataset.shape || "") === kind);
+      }
+    }
+    if (tool === "pen" || tool === "ballpoint") {
+      const on = normalizeShapeSnap(this.plugin.settings.shapeSnap) !== "off";
+      for (const b of Array.from(el.querySelectorAll<HTMLElement>(".mb-pen-pop-snapbtn"))) {
+        b.toggleClass("is-active", (b.dataset.snap === "on") === on);
+      }
+    }
+    this.syncColorGlassRings();
+    this.syncSegPills();
   }
 
-  /** 收起快捷笔盒，并摘掉打开期间挂上的所有监听 */
-  private closePenPop(): void {
+  /* -------------------- 文字 / 橡皮 浮层（与笔同款） -------------------- */
+
+  /** 文字工具：字号档 + 字体 + 颜色，按钮正下方弹出 */
+  private openTextPop(anchor: HTMLElement): void {
+    this.closePenPop();
+    const el = document.body.createDiv("mb-pen-pop");
+    if (this.tabletMode) el.addClass("mb-pen-pop-tablet");
+    el.setAttribute("role", "dialog");
+    el.setAttribute("aria-label", "文字字号、字体与颜色");
+
+    const sizeRow = el.createDiv("mb-pen-pop-row");
+    for (const n of [14, 18, 24, 32]) {
+      const b = sizeRow.createEl("button", {
+        cls: "mb-pen-pop-size",
+        text: String(n),
+        attr: { type: "button", "data-size": String(n) },
+      });
+      b.title = "字号 " + n;
+      b.onclick = () => {
+        this.editor?.setTextSize(n);
+        this.syncTextPopActive();
+      };
+    }
+    this.mountSegPill(sizeRow, ".mb-pen-pop-size");
+
+    const fontRow = el.createDiv("mb-pen-pop-row");
+    const fontSel = fontRow.createEl("select", { cls: "mb-font-sel mb-pen-pop-font dropdown" });
+    fontSel.title = "字体";
+    for (const f of TEXT_FONTS) {
+      const opt = fontSel.createEl("option", { text: f.label, value: f.id });
+      if (this.editor?.getState().textFont === f.id) opt.selected = true;
+    }
+    fontSel.onchange = () => this.editor?.setTextFont(fontSel.value);
+
+    const colorRow = el.createDiv("mb-pen-pop-row mb-pen-pop-colors");
+    for (const c of PEN_COLORS) {
+      const dot = colorRow.createEl("button", {
+        cls: "mb-pen-pop-dot",
+        attr: { type: "button", "aria-label": "文字颜色 " + c },
+      });
+      dot.style.background = c;
+      dot.dataset.color = c;
+      dot.title = c;
+      dot.onclick = () => {
+        this.editor?.setTextColor(c);
+        this.syncTextPopActive();
+      };
+    }
+    this.mountColorGlassRing(colorRow, ".mb-pen-pop-dot");
+
+    // 「插入双链」：选一篇笔记，在当前文字框里插入 [[笔记名]]，之后点它即可跳转
+    const linkRow = el.createDiv("mb-pen-pop-row");
+    const linkBtn = linkRow.createEl("button", {
+      cls: "mb-pen-pop-link",
+      text: "插入双链…",
+      attr: { type: "button", "aria-label": "插入双链到其他笔记" },
+    });
+    linkBtn.title = "插入双链：选一篇笔记，插入 [[笔记名]]，点它即可跳转到那篇笔记";
+    linkBtn.onclick = () => {
+      this.closePenPop();
+      this.openInsertLink();
+    };
+
+    this.mountPopover(el, anchor, () => this.syncTextPopActive());
+  }
+
+  private syncTextPopActive(): void {
+    const el = this.penPopEl;
+    if (!el || !this.editor) return;
+    const s = this.editor.getState();
+    const size = Math.round(s.textSize);
+    for (const b of Array.from(el.querySelectorAll<HTMLElement>(".mb-pen-pop-size"))) {
+      b.toggleClass("is-active", Number(b.dataset.size) === size);
+    }
+    const fs = el.querySelector<HTMLSelectElement>(".mb-pen-pop-font");
+    if (fs && fs.value !== s.textFont) fs.value = s.textFont;
+    const tc = (s.textColor || "").toLowerCase();
+    for (const d of Array.from(el.querySelectorAll<HTMLElement>(".mb-pen-pop-dot"))) {
+      d.toggleClass("is-active", (d.dataset.color || "").toLowerCase() === tc);
+    }
+    this.syncColorGlassRings();
+    this.syncSegPills();
+  }
+
+  /** 橡皮工具：整笔/局部 + 大小滑杆，按钮正下方弹出 */
+  private openEraserPop(anchor: HTMLElement): void {
+    this.closePenPop();
+    const el = document.body.createDiv("mb-pen-pop");
+    if (this.tabletMode) el.addClass("mb-pen-pop-tablet");
+    el.setAttribute("role", "dialog");
+    el.setAttribute("aria-label", "橡皮模式与大小");
+
+    const modeRow = el.createDiv("mb-pen-pop-row");
+    for (const m of [
+      { id: "whole", label: "整笔" },
+      { id: "part", label: "局部" },
+    ] as const) {
+      const b = modeRow.createEl("button", {
+        cls: "mb-pen-pop-shape",
+        text: m.label,
+        attr: { type: "button", "data-mode": m.id },
+      });
+      b.onclick = () => {
+        this.editor?.setEraserMode(m.id);
+        // 记忆到设置：下次按下橡皮直接沿用，切本/重启也不丢
+        this.plugin.settings.lastEraserMode = m.id;
+        void this.plugin.saveSettings();
+        this.syncEraserPopActive();
+      };
+    }
+    this.mountSegPill(modeRow, ".mb-pen-pop-shape");
+
+    const sizeRow = el.createDiv("mb-pen-pop-row");
+    const range = sizeRow.createEl("input", {
+      cls: "mb-range mb-pen-pop-range",
+      attr: {
+        type: "range",
+        min: "6",
+        max: "60",
+        step: "1",
+        value: String(this.editor?.eraserSize ?? 26),
+      },
+    });
+    const lbl = sizeRow.createSpan({
+      cls: "mb-size-lbl",
+      text: String(this.editor?.eraserSize ?? 26),
+    });
+    range.oninput = () => {
+      if (!this.editor) return;
+      this.editor.eraserSize = Number(range.value);
+      lbl.setText(range.value);
+    };
+    range.onchange = () => {
+      // 松手才写盘（拖动期间会连发几十个 oninput，避免反复存盘）
+      this.plugin.settings.lastEraserSize = Number(range.value);
+      void this.plugin.saveSettings();
+    };
+
+    this.mountPopover(el, anchor, () => this.syncEraserPopActive());
+  }
+
+  private syncEraserPopActive(): void {
+    const el = this.penPopEl;
+    if (!el || !this.editor) return;
+    const mode = this.editor.eraserMode === "whole" ? "whole" : "part";
+    for (const b of Array.from(el.querySelectorAll<HTMLElement>(".mb-pen-pop-shape"))) {
+      b.toggleClass("is-active", (b.dataset.mode || "") === mode);
+    }
+    const range = el.querySelector<HTMLInputElement>(".mb-range");
+    if (range && document.activeElement !== range) range.value = String(this.editor.eraserSize);
+    const lbl = el.querySelector<HTMLElement>(".mb-size-lbl");
+    if (lbl) lbl.setText(String(this.editor.eraserSize));
+    this.syncSegPills();
+  }
+
+  /**
+   * 收起快捷笔盒，并摘掉打开期间挂上的所有监听。
+   *
+   * `animate=true` 用于**用户主动收起**（再点按钮 / 点外部 / Esc / 滚动转屏）：
+   * 浮层先缩回按钮方向、淡出，动画结束再从 DOM 移除，做到「有始有终」。
+   * 内部重建 / 切换浮层 / 关视图这类程序化收起一律用默认的立即移除，
+   * `penPopEl` 在返回时已经为 null，调用方可以马上打开新的浮层。
+   */
+  private closePenPop(animate = false): void {
     for (const off of this.penPopDetach) off();
     this.penPopDetach = [];
-    this.penPopAnchorEl?.setAttribute("aria-expanded", "false");
-    this.penPopEl?.remove();
+    if (this.penPopAnimTimer) {
+      window.clearTimeout(this.penPopAnimTimer);
+      this.penPopAnimTimer = 0;
+    }
+    const el = this.penPopEl;
     this.penPopEl = null;
+    this.penPopTool = null;
+    this.penPopAnchorEl?.setAttribute("aria-expanded", "false");
     this.penPopAnchorEl = null;
+    // 先清掉上一条仍在做收起动画的节点，避免快速开合时叠出两个浮层
+    if (this.penPopCloseTimer) {
+      window.clearTimeout(this.penPopCloseTimer);
+      this.penPopCloseTimer = 0;
+    }
+    this.penPopClosingEl?.remove();
+    this.penPopClosingEl = null;
+    if (!el) return;
+    if (animate && !this.prefersReducedMotion()) {
+      el.classList.remove("mb-pen-pop-anim");
+      void el.offsetWidth; // 重排：保证收起 keyframes 从头播
+      el.classList.add("mb-pen-pop-anim-out");
+      this.penPopClosingEl = el;
+      this.penPopCloseTimer = window.setTimeout(() => {
+        el.remove();
+        this.syncColorGlassRings();
+        if (this.penPopClosingEl === el) this.penPopClosingEl = null;
+        this.penPopCloseTimer = 0;
+      }, 220);
+      return;
+    }
+    el.remove();
+    this.syncColorGlassRings();
   }
 
   /* --------------------------- 顶栏上的那一行 --------------------------- */
@@ -2046,6 +2991,40 @@ export class InkbookView extends FileView {
     this.sideBtn = side;
 
     /*
+     * 「页面/目录」抽屉开关：放进顶栏工具行（和钢笔同一排），
+     * 取代原先浮在纸面左上角的手柄——用户要求像 Obsidian 原生 PDF 阅读器
+     * 那样，把缩略图开关放到顶部那一框里。
+     */
+    const dock = mk("layout-grid", "页面与目录", "mb-rail-dock");
+    dock.setAttr("aria-expanded", String(this.pagedockOpen));
+    dock.onclick = () => this.togglePageDock();
+    this.dockBtn = dock;
+
+    /*
+     * 「插入图片」：把一张图片贴到当前页。放在顶栏动作行（与保存/侧栏/目录并列），
+     * 这是"往纸上放东西"的入口，和画/写一样常用，不该埋进菜单里找不到。
+     */
+    const insertImg = mk("image", "插入图片", "mb-rail-image");
+    insertImg.onclick = () => this.openInsertImage();
+    this.railImageBtn = insertImg;
+
+    /*
+     * 「插入文件块」：把 Excalidraw 导图 / 笔记 / 文本文件作为可摆放的卡片贴到当前页，
+     * 直接显示内容，像 Obsidian 白板的文件卡片。
+     */
+    const insertBlock = mk("file-text", "插入文件块（Excalidraw / 笔记 / 文本）", "mb-rail-fileblock");
+    insertBlock.onclick = () => this.openInsertFileBlock();
+    this.railFileBlockBtn = insertBlock;
+
+    /*
+     * 「在当前笔记里查找」：平板上没有 Ctrl/⌘+F，得留一颗能直接点的按钮。
+     * 顶栏放不下时 fitTopRow 会把整行搬进自建顶栏，按钮一样够得着。
+     */
+    const findBtn = mk("search", "在当前笔记中查找文字", "mb-rail-find");
+    findBtn.onclick = () => this.openFindBar();
+    this.railFindBtn = findBtn;
+
+    /*
      * 组装：宿主 action 原本挂在 .view-actions 里，
      * 把整行塞进同一个父容器，才能和宿主自己的按钮并排成一行。
      * 父容器摸不到（测试桩 / 老旧版本）就退到视图自己身上。
@@ -2055,11 +3034,18 @@ export class InkbookView extends FileView {
     const host = (save.parentElement as HTMLElement | null) || this.containerEl;
     this.actionsHostEl = host;
     host.appendChild(row);
+    /*
+     * 顺序按用户要求：左边抽屉（缩略图）开关放到整行最左，
+     * 右边侧栏开关放到整行最右。中间仍是「笔工具组 | 竖线 | 其余动作」，
+     * 13 个按钮一个不少，便于从两端一眼找到两个面板开关。
+     */
+    row.appendChild(dock);
     this.buildToolRow(row);
-    // 当前笔色 / 粗细：紧挨着工具组，不占额外一整排
-    this.buildPenChip(row);
     row.appendChild(row.createDiv("mb-sep"));
     row.appendChild(save);
+    row.appendChild(insertImg);
+    row.appendChild(insertBlock);
+    row.appendChild(findBtn);
     row.appendChild(side);
     this.topRowEl = row;
   }
@@ -2067,6 +3053,34 @@ export class InkbookView extends FileView {
   /* ------------------ 标题栏放不下时：整行搬到自建顶栏条 ------------------ */
 
   private topFitRaf = 0;
+  /** 高频状态 / 翻页通知合并到下一帧的 updateUI，避免捏合和快滚时重复刷整条 UI */
+  private uiUpdateRaf = 0;
+
+  /**
+   * 捏合、连续滚动会连发 onState / onPageChange；编辑器自己已有 rAF 合并，
+   * 这里再合并一次，保证同一帧最多跑一次较重的 updateUI。其他用户动作
+   * 仍直接调用 updateUI()，保持「点完立刻反馈」。
+   */
+  private scheduleUIUpdate(): void {
+    if (this.uiUpdateRaf) return;
+    const raf =
+      typeof window.requestAnimationFrame === "function"
+        ? window.requestAnimationFrame.bind(window)
+        : (fn: FrameRequestCallback) => window.setTimeout(() => fn(0), 16);
+    this.uiUpdateRaf = raf(() => {
+      this.uiUpdateRaf = 0;
+      this.updateUI();
+    });
+  }
+
+  /** 视图卸载时撤掉在途帧，别让旧编辑器的 UI 回调跨文件残留 */
+  private cancelUIUpdateRaf(): void {
+    if (!this.uiUpdateRaf) return;
+    if (typeof window.cancelAnimationFrame === "function")
+      window.cancelAnimationFrame(this.uiUpdateRaf);
+    else window.clearTimeout(this.uiUpdateRaf);
+    this.uiUpdateRaf = 0;
+  }
 
   private scheduleTopRowFit(): void {
     if (this.topFitRaf) return;
@@ -2218,20 +3232,18 @@ export class InkbookView extends FileView {
     prev.title = "上一页";
     prev.onclick = () => {
       const st = this.editor?.getState();
-      if (st) this.editor?.goToPage(Math.max(0, st.pageIndex - 1));
+      if (!st) return;
+      const target = Math.max(0, st.pageIndex - 1);
+      // 页码先跳到目标页，页面再平滑滑过去（用户要的「页码先到、页面同步滑」）
+      this.pageLbl?.setText(`${target + 1} / ${st.pageCount}`);
+      this.editor?.goToPage(target);
     };
     this.pageLbl = nav.createEl("button", {
       cls: "mb-float-num",
       attr: { "aria-label": "跳到指定页" },
     });
     this.pageLbl.title = "跳到指定页";
-    this.pageLbl.onclick = () => {
-      if (!this.editor) return;
-      const st = this.editor.getState();
-      new JumpPageModal(this.app, st.pageCount, st.pageIndex, (i) =>
-        this.editor?.goToPage(i)
-      ).open();
-    };
+    this.pageLbl.onclick = () => this.openPagePicker();
     const next = nav.createEl("button", {
       cls: "mb-float-btn",
       attr: { "aria-label": "下一页" },
@@ -2240,7 +3252,10 @@ export class InkbookView extends FileView {
     next.title = "下一页";
     next.onclick = () => {
       const st = this.editor?.getState();
-      if (st) this.editor?.goToPage(Math.min(st.pageCount - 1, st.pageIndex + 1));
+      if (!st) return;
+      const target = Math.min(st.pageCount - 1, st.pageIndex + 1);
+      this.pageLbl?.setText(`${target + 1} / ${st.pageCount}`);
+      this.editor?.goToPage(target);
     };
 
     /*
@@ -2281,6 +3296,285 @@ export class InkbookView extends FileView {
       this.zoomHintHover = false;
       this.scheduleZoomHintHide();
     });
+  }
+
+  /**
+   * 底部页码点开「点页码直接跳」浮层。
+   *
+   * 用户要求：每按一下底下的页码就跳到那一页、屏幕滚动到对应位置。
+   * 原来这里弹窗再输数字，平板上多一步又慢；改成直接列页码，点哪个跳哪个。
+   */
+  private openPagePicker(): void {
+    if (!this.editor) return;
+    this.closePagePicker?.();
+    const st = this.editor.getState();
+    const total = st.pageCount;
+    if (total <= 0) return;
+    const cur = st.pageIndex;
+    const anchor = this.pageLbl;
+    const r = anchor.getBoundingClientRect();
+
+    const pop = document.body.createDiv("mb-pagepick");
+    // 与其它弹层同款 q 弹出场（见 styles.css 的 mb-pagepick-in）
+    pop.addClass("mb-pagepick-pop");
+    pop.style.right = Math.max(8, window.innerWidth - r.right) + "px";
+    pop.style.bottom = Math.max(8, window.innerHeight - r.top + 6) + "px";
+    pop.style.maxHeight = Math.min(Math.round(window.innerHeight * 0.5), 360) + "px";
+
+    pop.createDiv("mb-pagepick-head").setText(`跳到第几页 · 共 ${total} 页`);
+    // 用户要求：直接弹输入框（搜索框），不再列一版页码网格。
+    const search = pop.createDiv("mb-pagepick-search");
+    const inp = search.createEl("input", {
+      cls: "mb-pagepick-input",
+      attr: {
+        type: "number",
+        inputmode: "numeric",
+        min: "1",
+        max: String(total),
+        placeholder: "输入页码",
+        "aria-label": "输入要跳到的页码",
+      },
+    });
+    inp.value = String(cur + 1);
+    const goBtn = search.createEl("button", {
+      cls: "mb-pagepick-go",
+      text: "跳转",
+      attr: { type: "button" },
+    });
+    const go = () => {
+      const v = Math.round(Number(inp.value));
+      if (!Number.isFinite(v)) return;
+      const target = Math.min(total - 1, Math.max(0, v - 1));
+      this.editor?.goToPage(target);
+      this.closePagePicker?.();
+    };
+    goBtn.onclick = go;
+    inp.onkeydown = (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") {
+        e.preventDefault();
+        go();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        this.closePagePicker?.();
+      }
+    };
+
+    const onDown = (e: Event) => {
+      const t = e.target as Node | null;
+      if (!t) return;
+      if (pop.contains(t) || anchor.contains(t)) return;
+      this.closePagePicker?.();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") this.closePagePicker?.();
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    document.addEventListener("keydown", onKey, true);
+    this.closePagePicker = () => {
+      pop.remove();
+      document.removeEventListener("pointerdown", onDown, true);
+      document.removeEventListener("keydown", onKey, true);
+      this.closePagePicker = null;
+    };
+
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(() => {
+        inp.focus();
+        try { inp.select(); } catch (_) { /* 老引擎不支持就算了 */ }
+      });
+    }
+  }
+
+  /* --------------------------- 笔记内查找文字 --------------------------- */
+
+  /**
+   * 打开「在当前笔记中查找」浮条。
+   *
+   * 交互照 Obsidian 的文件内搜索：Ctrl/⌘+F 或顶栏放大镜打开，输入框里
+   * 逐字出结果，Enter / Shift+Enter 或 ↑↓ 上下翻，`N/N` 显示第几条，
+   * Esc 收起；命中的字在纸上标黄，当前那条标得更深。
+   *
+   * 为什么自己画一条而不是直接调宿主的「搜索当前文件」：
+   * `.inkbook` 是单个 JSON，正文是 Canvas + 透明文字层，不是 CodeMirror
+   * 里的 Markdown 文档。宿主那条命令只认编辑器自己的文档，在这张纸面前
+   * 一个字也搜不到。所以搜索逻辑走 `findInNote()`（按页扫 `texts[]`），
+   * 高亮走编辑器的文字层，键盘/按钮/浮条的行为跟它保持一致。
+   */
+  openFindBar(): void {
+    if (!this.editor || !this.store || !this.paperHost) return;
+    this.buildFindBar();
+    this.findState = { query: "", matches: [], index: 0 };
+    this.findBarEl?.addClass("is-open");
+    const inp = this.findInputEl;
+    if (inp) {
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => {
+          inp.focus();
+          try { inp.select(); } catch (_) { /* 老引擎不支持就算了 */ }
+        });
+      }
+    }
+    this.runFind();
+  }
+
+  /** 懒建浮条：挂在 `.mb-paper` 里，随视图一起生灭，不会残留到别的标签页。 */
+  private buildFindBar(): void {
+    if (this.findBarEl || !this.paperHost) return;
+    const bar = this.paperHost.createDiv("mb-find");
+    bar.setAttribute("role", "search");
+    bar.setAttribute("aria-label", "在当前笔记中查找文字");
+    // 按下浮条别传到纸面（避免在输入框里点一下就落一笔）
+    bar.addEventListener("pointerdown", (e) => e.stopPropagation());
+
+    const inp = bar.createEl("input", {
+      cls: "mb-find-input",
+      attr: {
+        type: "text",
+        placeholder: "在当前笔记中查找",
+        "aria-label": "查找文字",
+        spellcheck: "false",
+        autocomplete: "off",
+      },
+    }) as HTMLInputElement;
+    this.findInputEl = inp;
+    this.findCountEl = bar.createSpan({
+      cls: "mb-find-count",
+      text: "0/0",
+      attr: { "aria-live": "polite" },
+    });
+
+    const mkBtn = (icon: string, title: string, cls: string): HTMLElement => {
+      const b = bar.createEl("button", {
+        cls: "mb-find-btn " + cls,
+        attr: { type: "button", "aria-label": title },
+      });
+      b.title = title;
+      setIcon(b, icon);
+      return b;
+    };
+    const prev = mkBtn("chevron-up", "上一个匹配 (Shift+Enter)", "mb-find-prev");
+    const next = mkBtn("chevron-down", "下一个匹配 (Enter)", "mb-find-next");
+    const close = mkBtn("x", "关闭查找 (Esc)", "mb-find-close");
+    prev.onclick = () => { this.flushFind(); this.gotoFindMatch((this.findState?.index ?? 0) - 1); };
+    next.onclick = () => { this.flushFind(); this.gotoFindMatch((this.findState?.index ?? 0) + 1); };
+    close.onclick = () => this.closeFindBar();
+
+    inp.addEventListener("input", () => this.scheduleFind());
+    inp.addEventListener("keydown", (e) => {
+      // 输入框里的按键一律不冒给全局快捷键（否则打个 p 就切了钢笔）
+      e.stopPropagation();
+      if (e.key === "Escape") {
+        e.preventDefault();
+        this.closeFindBar();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        this.flushFind();
+        this.gotoFindMatch((this.findState?.index ?? 0) + (e.shiftKey ? -1 : 1));
+      }
+    });
+    this.findBarEl = bar;
+  }
+
+  /** 输入防抖：几百页的本子里逐字重扫全文，不防抖会卡手。 */
+  private scheduleFind(): void {
+    window.clearTimeout(this.findTimer);
+    this.findTimer = window.setTimeout(() => {
+      this.findTimer = 0;
+      this.runFind();
+    }, 140);
+  }
+
+  /** Enter / 上下翻之前先把还在排队的那次搜索吃掉，别按旧结果跳。 */
+  private flushFind(): void {
+    if (!this.findTimer) return;
+    window.clearTimeout(this.findTimer);
+    this.findTimer = 0;
+    this.runFind();
+  }
+
+  /** 按当前输入重新收集命中，并落在「当前页起」的第一条上。 */
+  private runFind(): void {
+    if (!this.findState) return;
+    const query = this.findInputEl?.value ?? "";
+    const pages = this.store?.data.pages ?? [];
+    const matches = findInNote(pages, query, MAX_FIND_MATCHES);
+    this.findState = { query, matches, index: 0 };
+    if (!matches.length) {
+      this.editor?.setFindHighlight(query, null);
+      this.updateFindCount();
+      return;
+    }
+    // 从当前所在页往下找，符合「我先在这一页搜」的直觉；到底就回卷到第一页
+    const cur = this.editor?.getState().pageIndex ?? 0;
+    let start = matches.findIndex((m) => m.page >= cur);
+    if (start < 0) start = 0;
+    this.gotoFindMatch(start);
+  }
+
+  /** 翻到第 i 条命中（越界回卷），翻页 + 高亮 + 刷计数。 */
+  private gotoFindMatch(i: number): void {
+    const st = this.findState;
+    if (!st || !st.matches.length) return;
+    const n = st.matches.length;
+    const index = ((Math.round(i) % n) + n) % n;
+    st.index = index;
+    const hit = st.matches[index];
+    this.editor?.goToPage(hit.page, false);
+    this.editor?.setFindHighlight(st.query, hit);
+    this.updateFindCount();
+  }
+
+  private updateFindCount(): void {
+    const el = this.findCountEl;
+    if (!el) return;
+    const st = this.findState;
+    if (!st || !st.query) {
+      el.setText("0/0");
+      el.removeAttribute("data-state");
+      return;
+    }
+    if (!st.matches.length) {
+      el.setText("无结果");
+      el.setAttribute("data-state", "empty");
+      return;
+    }
+    el.removeAttribute("data-state");
+    el.setText(
+      `${st.index + 1}/${st.matches.length}${st.matches.length >= MAX_FIND_MATCHES ? "+" : ""}`
+    );
+  }
+
+  /** 收起浮条、清掉纸上所有高亮。换本子 / 关标签页时也走这里。 */
+  private closeFindBar(): void {
+    window.clearTimeout(this.findTimer);
+    this.findTimer = 0;
+    const wasOpen = !!this.findState;
+    this.findState = null;
+    if (wasOpen) this.editor?.clearFindHighlight();
+    this.findBarEl?.removeClass("is-open");
+    this.findInputEl?.blur();
+  }
+
+  /**
+   * Ctrl/⌘+F 的捕获期入口。
+   *
+   * 宿主自己也监听 Ctrl/⌘+F（全局搜索 / 编辑器内查找），冒泡期的
+   * `onKeyDown` 可能被它先吃掉或跟它打架，所以在捕获期就认下这一下：
+   * 只在**当前活动视图就是本墨水本**、且焦点不在输入框里时接管，
+   * 并且尊重设置页里可自定义的键位（被改走就不再占位）。
+   */
+  private onFindHotkeyCapture(e: KeyboardEvent): void {
+    const t = e.target as HTMLElement | null;
+    if (t && /^(input|textarea|select)$/i.test(t.tagName)) return;
+    if (t && t.isContentEditable) return;
+    if (this.app.workspace.getActiveViewOfType(InkbookView) !== this) return;
+    if (!this.editor) return;
+    const combo = keyCombo(e);
+    if (!combo || resolveHotkeys(this.plugin.settings.hotkeys).get(combo) !== "find") return;
+    e.preventDefault();
+    e.stopPropagation();
+    this.openFindBar();
   }
 
   /** 缩放提示：缩放后浮现，几秒后自己退回去 */
@@ -2554,10 +3848,14 @@ export class InkbookView extends FileView {
 
   /** 显示 / 隐藏右侧栏 */
   private toggleSide(): void {
+    const wasOpen = this.sideShown;
     this.sideShown = !this.sideShown;
     this.plugin.settings.sidebarOpen = this.sideShown;
     void this.plugin.saveSettings();
     this.applySideVisibility();
+    // 展开时从侧边滑入、收起时滑出（都只动 transform；状态类已瞬时切好）
+    if (!wasOpen && this.sideShown) this.playPanelSlideIn(this.sideEl);
+    else if (wasOpen && !this.sideShown) this.playPanelSlideOut(this.sideEl);
     this.updateUI();
   }
 
@@ -2640,8 +3938,8 @@ export class InkbookView extends FileView {
    * 于是**所有靠重建时才刷的显示值都必须在里补刷**，否则会停在旧值。
    * 已覆盖三类：
    *   · 文字工具：四档高亮、数字框值、is-custom 描边、字体下拉、色点高亮
-   *   · 钢笔/荧光笔：粗细滑杆与数值标签（笔盒点「细/中/粗」走这条）
    *   · 橡皮：整笔/局部高亮、大小滑杆
+   *   · 形状：色点高亮（粗细已移进形状自己的浮层）
    */
   private syncDynamicValues(s: any): void {
     const el = this.dynEl;
@@ -2668,6 +3966,7 @@ export class InkbookView extends FileView {
         if (!d.style.background) continue;
         d.classList.toggle("is-active", this.colorMatches(d.title, tc));
       }
+      this.syncColorGlassRings();
       return;
     }
 
@@ -2679,15 +3978,13 @@ export class InkbookView extends FileView {
       return;
     }
 
-    // 钢笔 / 荧光笔 / 形状：粗细滑杆 + 数值标签（形状没有滑杆，syncRange 会 no-op）
-    const hl = s.tool === "highlighter";
-    this.syncRange(el, hl ? s.highlighterSize : s.penSize);
-    // 形状色点高亮（形状区有自己的色点行，按 penColor）
+    // 形状：色点高亮（形状粗细已移进它自己的浮层，侧栏不再有滑杆）
     if (s.tool === "shape") {
       const pc = (s.penColor || "").toLowerCase();
       for (const d of Array.from(el.querySelectorAll<HTMLElement>(".mb-tcolor"))) {
         d.classList.toggle("is-active", this.colorMatches(d.title, pc));
       }
+      this.syncColorGlassRings();
     }
   }
 
@@ -2707,6 +4004,20 @@ export class InkbookView extends FileView {
     return !!title && title.toLowerCase() === lower;
   }
 
+  /**
+   * 刷侧栏「演示」区（激光笔）的选中态（只改 class / aria，不重建 DOM）。
+   * 数据源统一读 plugin.settings：设置页改、快捷键切、别的窗口同步，
+   * 最终都会经 refreshViews → syncSettings → updateUI 走到这里。
+   */
+  private syncAuxControls(): void {
+    if (!this.plugin) return;
+    const laserOn = this.plugin.settings.laserPointer === true;
+    if (this.laserBtn) {
+      this.laserBtn.toggleClass("is-active", laserOn);
+      this.laserBtn.setAttr("aria-pressed", String(laserOn));
+    }
+  }
+
   private renderDynamicTools(): void {
     if (!this.editor) return;
     const s = this.editor.getState();
@@ -2715,6 +4026,19 @@ export class InkbookView extends FileView {
       const sec = this.sideEl?.querySelector(".mb-sec-dyn");
       if (!sec) return;
       this.dynEl = sec.createDiv("mb-dyn");
+    }
+    /*
+     * 钢笔 / 圆珠笔 / 荧光笔的粗细与颜色已经全部搬进各自的弹出调节框，
+     * 侧栏这一区没有控件了；整块隐藏，避免留下一条只有 padding + min-height
+     * 的空白（切到橡皮 / 文字 / 形状再显示回来）。
+     */
+    const dynSec = this.dynEl.parentElement as HTMLElement | null;
+    const noSideTools = s.tool === "pen" || s.tool === "ballpoint" || s.tool === "highlighter";
+    if (dynSec) dynSec.style.display = noSideTools ? "none" : "";
+    if (noSideTools) {
+      if (this.dynEl.childElementCount) this.dynEl.empty();
+      this.dynToolsSig = "";
+      return;
     }
     /*
      * **结构没变就只刷新数值，不重建 DOM**（2026-11-07 修）。
@@ -2741,6 +4065,8 @@ export class InkbookView extends FileView {
     for (const stop of this.dynStepStoppers) stop();
     this.dynStepStoppers = [];
     this.dynEl.empty();
+    // 旧色点行刚被摘掉，先回收它那枚玻璃框，再按新结构重建
+    this.syncColorGlassRings();
 
     if (s.tool === "eraser") {
       const seg = this.dynEl.createDiv("mb-seg");
@@ -2754,6 +4080,8 @@ export class InkbookView extends FileView {
         });
         b.onclick = () => {
           this.editor?.setEraserMode(m.id);
+          this.plugin.settings.lastEraserMode = m.id;
+          void this.plugin.saveSettings();
           this.renderDynamicTools();
         };
       }
@@ -2766,8 +4094,10 @@ export class InkbookView extends FileView {
         if (!this.editor) return;
         this.editor.eraserSize = Number(range.value);
         lbl.setText(range.value);
-        // 橡皮大小是直接改字段（不发 state），顶栏 chip 手动跟一下
-        this.updatePenChip();
+      };
+      range.onchange = () => {
+        this.plugin.settings.lastEraserSize = Number(range.value);
+        void this.plugin.saveSettings();
       };
       return;
     }
@@ -2815,7 +4145,7 @@ export class InkbookView extends FileView {
 
       // 字体（不再 width:100% 独占一行，见 .mb-text-tools .mb-font-sel）
       const fontSel = row.createEl("select", {
-        cls: "mb-font-sel",
+        cls: "mb-font-sel dropdown",
         attr: { "data-mb-text-style": "1" },
       });
       fontSel.title = "字体";
@@ -2918,12 +4248,13 @@ export class InkbookView extends FileView {
           this.renderDynamicTools();
         };
       }
+      this.mountColorGlassRing(crow, ".mb-tcolor");
       return;
     }
     if (s.tool === "select") {
       this.dynEl.createSpan({
         cls: "mb-hint",
-        text: "点文字选中后可拖动；双击改内容，Delete 删除",
+        text: "点文字或形状选中；拖动改位置，拖手柄改大小，Delete 删除",
       });
       return;
     }
@@ -2966,41 +4297,8 @@ export class InkbookView extends FileView {
           this.renderDynamicTools();
         };
       }
+      this.mountColorGlassRing(crow, ".mb-tcolor");
     }
-
-    const hl = s.tool === "highlighter";
-    const v = hl ? s.highlighterSize : s.penSize;
-    const min = hl ? 4 : 1;
-    const max = hl ? 40 : 8;
-    const range = this.dynEl.createEl("input", {
-      cls: "mb-range",
-      attr: { type: "range", min: String(min), max: String(max), step: "0.1", value: String(v) },
-    });
-    const lbl = this.dynEl.createSpan({
-      cls: "mb-size-lbl",
-      text: String(Math.round(v * 10) / 10),
-    });
-    range.oninput = () => {
-      if (!this.editor) return;
-      if (hl) this.editor.setHighlighterSize(Number(range.value), true);
-      else this.editor.setPenSize(Number(range.value), true);
-      lbl.setText(String(Math.round(Number(range.value) * 10) / 10));
-      /*
-       * 粗细是 silent 改的（不 emitState），所以顶栏「当前笔」chip
-       * 不会自己更新 —— 得手动跟一下，否则拖动滑杆时 chip 一直显示旧粗细，
-       * 要等下一次 updateUI（下一笔落下）才刷新。橡皮滑杆早就这么做了。
-       */
-      this.updatePenChip();
-    };
-    // 拖滑杆也是一次明确的粗细选择：松手（change）时写回设置。
-    // 不在 input 里写盘，避免拖一次滑块就 saveData 几十次。
-    range.onchange = () => {
-      if (!this.editor) return;
-      const size = Number(range.value);
-      if (hl) this.plugin.settings.defaultHighlighterSize = size;
-      else this.plugin.settings.defaultPenSize = size;
-      void this.plugin.saveSettings();
-    };
   }
 
   private showShapeMenu(e: MouseEvent): void {
@@ -3045,6 +4343,141 @@ export class InkbookView extends FileView {
   }
 
   /**
+   * 「插入图片」入口：先切到选择工具（插入后立刻能拖动 / 缩放），再弹选图窗。
+   * 选到图后交给 editor.insertImage 决定摆放；它内部会选中新图并刷新界面。
+   */
+  private openInsertImage(): void {
+    if (!this.editor || !this.file) return;
+    this.editor.setTool("select");
+    this.updateUI();
+    new InsertImageModal(this.app, this.file.path, (src, w, h) => {
+      this.editor?.insertImage(src, w, h);
+      this.updateUI();
+    }).open();
+  }
+
+  /**
+   * 「插入文件块」入口：选一个 Excalidraw / 笔记 / 文本文件，生成快照后当作
+   * 可摆放的卡片放到当前页（拖动 / 缩放 / 删除 / 撤销复用插入图片管线）。
+   */
+  private openInsertFileBlock(): void {
+    if (!this.editor || !this.file) return;
+    const bookPath = this.file.path;
+    new InsertFileBlockModal(this.app, this.bookPath || bookPath, (f) => {
+      void this.createFileBlock(f, bookPath);
+    }).open();
+  }
+
+  /** 生成文件块快照并插入当前页；生成期间给一条可消失的 Notice（Excalidraw 导出可能几秒） */
+  private async createFileBlock(file: TFile, bookPath: string): Promise<void> {
+    if (!this.editor) return;
+    const notice = new Notice(`正在生成「${file.basename}」的文件块…`, 0);
+    try {
+      const snap = await makeFileBlockSnapshot(this.app, bookPath, file);
+      this.editor.setTool("select");
+      this.editor.insertImage(snap.src, snap.width, snap.height, snap.source);
+      this.updateUI();
+    } catch (e: any) {
+      const msg = e && e.message ? e.message : String(e);
+      new Notice("插入文件块失败：" + msg, 9000);
+      console.error("[inkbook] 插入文件块失败", e);
+    } finally {
+      notice.hide?.();
+    }
+  }
+
+  /** 刷新文件块：源文件改了之后重新生成快照并替换 */
+  private async refreshFileBlock(img: PageImage): Promise<void> {
+    if (!this.editor || !this.file) return;
+    const path = img.source?.path;
+    if (!path) return;
+    const srcFile = this.app.vault.getAbstractFileByPath(path) as TFile | null;
+    if (!srcFile) {
+      new Notice(`找不到源文件：${path}`);
+      return;
+    }
+    const notice = new Notice("正在刷新文件块…", 0);
+    try {
+      const snap = await makeFileBlockSnapshot(this.app, this.file.path, srcFile);
+      this.editor.updateFileBlockSnapshot(img.id, {
+        src: snap.src,
+        width: snap.width,
+        height: snap.height,
+        mtime: snap.source.mtime,
+      });
+      this.updateUI();
+    } catch (e: any) {
+      const msg = e && e.message ? e.message : String(e);
+      new Notice("刷新文件块失败：" + msg, 9000);
+      console.error("[inkbook] 刷新文件块失败", e);
+    } finally {
+      notice.hide?.();
+    }
+  }
+
+  /**
+   * 「插入双链」入口：选一篇笔记 → 在正在编辑的文字框光标处插入 `[[名字]]`；
+   * 没有打开的输入框就在当前页新建一个文字框。插入后点它即可跳转。
+   */
+  private openInsertLink(): void {
+    if (!this.editor) return;
+    new InsertLinkModal(this.app, this.bookPath || (this.file ? this.file.path : ""), (name) => {
+      this.editor?.insertWikiLink(name);
+    }).open();
+  }
+
+  /**
+   * 打开文字里的 `[[双链]]`。
+   *
+   * 解析优先走 `metadataCache.getFirstLinkpathDest`（和嵌入一样认 Obsidian
+   * 「最短唯一路径」），拿不到再按路径 / basename 兜底；找不到给可见提示。
+   * `.inkbook` 目标走插件的 `openBookAt`（可带页码，切到已开的标签页），
+   * 其余（Markdown 等）走 `workspace.openLinkText`（支持 #标题锚点）。
+   */
+  private openWikiLink(href: string, page?: number, newTab?: boolean): void {
+    const raw = String(href || "").trim();
+    if (!raw) return;
+    const nameOnly = raw.split("#")[0].trim();
+    if (!nameOnly) return;
+    const sourcePath = this.bookPath || (this.file ? this.file.path : "");
+    let file: TFile | null = null;
+    try {
+      const cache: any = (this.app as any).metadataCache;
+      if (cache && typeof cache.getFirstLinkpathDest === "function") {
+        file = cache.getFirstLinkpathDest(nameOnly, sourcePath) || null;
+      }
+    } catch (_) {
+      /* 元数据缓存偶发异常时走下面的兜底，不让一次跳转把视图搞崩 */
+    }
+    if (!file) {
+      file =
+        this.app.vault
+          .getFiles()
+          .find(
+            (f) =>
+              f.path === nameOnly ||
+              f.path === nameOnly + ".md" ||
+              f.basename === nameOnly
+          ) || null;
+    }
+    if (!file) {
+      new Notice(`找不到笔记：${nameOnly}`);
+      return;
+    }
+    const ext = (file.extension || "").toLowerCase();
+    if (ext === "inkbook") {
+      const pg = page && page > 0 ? page : 1;
+      if (this.plugin.openBookAt) {
+        void this.plugin.openBookAt(file.path, pg, newTab ? { newTab: true } : undefined);
+      } else {
+        void this.app.workspace.openLinkText(raw, sourcePath, !!newTab);
+      }
+      return;
+    }
+    void this.app.workspace.openLinkText(raw, sourcePath, !!newTab);
+  }
+
+  /**
    * 选源文档之后、真正导入之前：问一下页码范围。
    *
    * **只在 PDF 页数多的时候问**（2026-11-07 加 INK-163）：
@@ -3086,6 +4519,9 @@ export class InkbookView extends FileView {
       }
       range = picked;
     }
+    // 从设备选进来的原件搬进这本的数据叶子；库内已有文件原样返回、按引用使用。
+    // 放在这里（页码确认之后）才搬：用户若是取消选范围，就不该往本子目录里留文件。
+    file = await adoptIncomingSource(this.app, file, startFile.path);
     await this.doImport(kind, file, range, preopened, startFile, startStore);
   }
 
@@ -3180,6 +4616,8 @@ export class InkbookView extends FileView {
         .replace(/[. ]+$/g, "")
         .trim() || "未命名笔记";
     const path = await this.uniqueBookPath(name);
+    // 从设备选进来的原件先搬进新本的数据叶子，导入引用才落在「墨本文件」里
+    const adopted = await adoptIncomingSource(this.app, source, path);
     const notice = new Notice(kind === "pdf" ? "正在读取 PDF…" : "正在解析 Word…", 0);
 
     /*
@@ -3192,8 +4630,8 @@ export class InkbookView extends FileView {
     try {
       result =
         kind === "pdf"
-          ? await importPdf(this.app, source, path, range, this.importProgressTo(notice), true, preopened)
-          : await importWord(this.app, source, path, this.importProgressTo(notice));
+          ? await importPdf(this.app, adopted, path, range, this.importProgressTo(notice), true, preopened)
+          : await importWord(this.app, adopted, path, this.importProgressTo(notice));
     } catch (e: any) {
       notice.hide();
       // importPdf 成功后 doc 已释放；这里只兜「中途失败」的那一份
@@ -3411,13 +4849,13 @@ export class InkbookView extends FileView {
     menu.addItem((item) =>
       item
         .setTitle("导出整本 PDF")
-        .setIcon("file-text")
+        .setIcon(EXPORT_ICON)
         .onClick(() => this.runExport("pdf"))
     );
     menu.addItem((item) =>
       item
         .setTitle("导出指定页 PDF…")
-        .setIcon("file-text")
+        .setIcon(EXPORT_ICON)
         .onClick(() => {
           const st = this.editor?.getState();
           if (!st) return;
@@ -3430,7 +4868,114 @@ export class InkbookView extends FileView {
           ).open();
         })
     );
+    menu.addSeparator();
+    /*
+     * 分享：先弹窗选「分享格式（图片 / PDF）」和「分享哪些页（全部 / 范围）」，
+     * 再导出并调起系统分享面板。
+     */
+    menu.addItem((item) =>
+      item
+        .setTitle("分享…")
+        .setIcon("share-2")
+        .onClick(() => this.openShare())
+    );
     menu.showAtMouseEvent(e);
+  }
+
+  /** 打开「分享」弹窗（先选格式与页范围） */
+  private openShare(): void {
+    const st = this.editor?.getState();
+    if (!st) return;
+    new ShareModal(this.app, st.pageCount, (choice) => void this.runShare(choice)).open();
+  }
+
+  /** 按用户选择导出并分享：图片=逐页 PNG，PDF=合并整本；再交给系统分享 */
+  private async runShare(choice: ShareChoice): Promise<void> {
+    if (!this.editor || !this.file) return;
+    if (this.exporting) {
+      new Notice("正在导出中，请稍候…", 2500);
+      return;
+    }
+    const range = choice.all ? undefined : { from: choice.from, to: choice.to };
+    this.exporting = true;
+    const notice = new Notice("正在准备分享…", 0);
+    try {
+      // 编辑框里没提交的文字先落库，否则分享出去会少这一段
+      this.editor.commitTextEditNow(true);
+    } catch (_) {
+      /* 忽略 */
+    }
+    try {
+      if (choice.format === "pdf") {
+        const path = await exportBookPdf(this.app.vault, this.editor, this.file, 2, range, {
+          onRangeAdjusted: (norm) => {
+            if (norm.from !== (range?.from ?? 1) || norm.to !== (range?.to ?? norm.to)) {
+              new Notice(`实际分享第 ${norm.from}–${norm.to} 页。`, 4000);
+            }
+          },
+        });
+        await this.sharePaths([path], "application/pdf");
+      } else {
+        const pages = this.pagesToShare(choice);
+        const paths: string[] = [];
+        for (let i = 0; i < pages.length; i++) {
+          notice.setMessage(`正在导出第 ${i + 1}/${pages.length} 页…`);
+          paths.push(
+            await exportPagePngAt(this.app.vault, this.editor, this.file, pages[i], 2, {
+              notice: false,
+            })
+          );
+        }
+        await this.sharePaths(paths, "image/png");
+      }
+    } catch (e) {
+      if (e instanceof ExportCancelledError) {
+        new Notice("已取消分享。", 3500);
+      } else {
+        new Notice("分享失败：" + describeExportError(e), 8000);
+        console.error("[inkbook] 分享失败", e);
+      }
+    } finally {
+      notice.hide();
+      this.exporting = false;
+    }
+  }
+
+  /** 分享页选择 → 0 基页索引数组 */
+  private pagesToShare(choice: ShareChoice): number[] {
+    const total = this.editor?.getState().pageCount ?? 0;
+    const from = choice.all ? 1 : Math.max(1, Math.min(choice.from, choice.to));
+    const to = choice.all ? total : Math.max(choice.from, choice.to);
+    const out: number[] = [];
+    for (let p = from; p <= Math.min(to, total); p++) out.push(p - 1);
+    return out;
+  }
+
+  /** 读出已导出文件 → 交给系统分享；不支持时提示路径让用户手动发送 */
+  private async sharePaths(paths: string[], mime: string): Promise<void> {
+    const files: File[] = [];
+    for (const p of paths) {
+      const data = await this.app.vault.adapter.readBinary(p);
+      const name = p.split("/").pop() || "墨本";
+      files.push(new File([data], name, { type: mime }));
+    }
+    const nav = navigator as Navigator & {
+      canShare?: (data?: { files?: File[] }) => boolean;
+      share?: (data: { files?: File[]; title?: string }) => Promise<void>;
+    };
+    if (nav.share && (!nav.canShare || nav.canShare({ files }))) {
+      try {
+        await nav.share({ files, title: this.file?.basename ?? "墨本" });
+        return;
+      } catch (e) {
+        if ((e as DOMException)?.name === "AbortError") return; // 用户取消分享面板
+        // 落到下面的降级提示
+      }
+    }
+    new Notice(
+      `已导出 ${files.length} 个文件到：${paths.join("、")}\n当前环境不支持系统分享，请从文件里手动发送。`,
+      9000
+    );
   }
 
   private async runExport(
@@ -3554,6 +5099,92 @@ export class InkbookView extends FileView {
    * "导出 PDF 这种工具，可以直接统一全部放在侧边栏里面"——
    * 统一之后想找任何功能只需要展开一个面板，不用在三页之间翻。
    */
+  /**
+   * 侧栏顶部标题：内联编辑，回车 / 失焦真正重命名这个 .inkbook 文件。
+   * 用 Obsidian 的 fileManager.renameFile，链接与索引由宿主维护。
+   */
+  private beginRenameFromSidebar(): void {
+    const file = this.file;
+    const titleEl = this.sideTitleEl;
+    if (!file || !titleEl || !titleEl.isConnected) return;
+    const parent = titleEl.parentElement;
+    if (!parent) return;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "mb-side-title-edit";
+    input.value = file.basename;
+    input.setAttribute("aria-label", "重命名笔记");
+    /*
+     * 输入框必须**原地覆盖文件名**，不能 append 到副标题后面：原来 appendChild
+     * 会让编辑框掉到第三行，把侧栏顶部整块撑高，用户一眼就觉得「占了好大一块」。
+     * 这里保留标题在文档流里的占位（只 visibility:hidden），再把绝对定位的输入框
+     * 按标题的实时 rect 对齐；父容器宽度变化时 ResizeObserver 跟着重算。
+     */
+    titleEl.style.visibility = "hidden";
+    titleEl.insertAdjacentElement("afterend", input);
+    const align = () => {
+      if (!input.isConnected) return;
+      const pr = parent.getBoundingClientRect();
+      const tr = titleEl.getBoundingClientRect();
+      input.style.left = tr.left - pr.left + "px";
+      input.style.top = tr.top - pr.top + "px";
+      input.style.width = tr.width + "px";
+      input.style.height = tr.height + "px";
+    };
+    align();
+    let ro: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(align);
+      ro.observe(parent);
+    }
+    input.focus();
+    input.select();
+
+    let done = false;
+    const finish = (commit: boolean) => {
+      if (done) return;
+      done = true;
+      ro?.disconnect();
+      ro = null;
+      let name = input.value.trim();
+      input.remove();
+      titleEl.style.visibility = "";
+      if (!commit || !name || name === file.basename) return;
+      if (name.includes("/") || name.includes("\\")) {
+        new Notice("文件名不能包含斜杠");
+        return;
+      }
+      const ext = file.extension ? "." + file.extension : "";
+      // 用户可能连扩展名一起打了：去掉重复扩展名
+      if (ext && name.toLowerCase().endsWith(ext.toLowerCase())) {
+        name = name.slice(0, -ext.length).trim();
+      }
+      if (!name) return;
+      const folder = file.parent ? file.parent.path : "";
+      const newPath = (folder ? folder + "/" : "") + name + ext;
+      void this.app.fileManager
+        .renameFile(file, newPath)
+        .then(() => {
+          // renameFile 会把同一个 TFile 的 path / basename 更新掉
+          this.sideTitleEl?.setText(name);
+          new Notice("已重命名：" + name);
+        })
+        .catch((err: unknown) => {
+          new Notice("重命名失败：" + ((err as Error)?.message ?? String(err)));
+        });
+    };
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        finish(true);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        finish(false);
+      }
+    });
+    input.addEventListener("blur", () => finish(true));
+  }
+
   private buildSide(): void {
     if (!this.store || !this.editor) return;
     const side = this.sideEl;
@@ -3561,7 +5192,20 @@ export class InkbookView extends FileView {
     side.id = "mb-side";
     const head = side.createDiv("mb-side-head");
     const headText = head.createDiv("mb-side-headtext");
-    headText.createDiv({ cls: "mb-side-title", text: this.file ? this.file.basename : "手写本" });
+    this.sideTitleEl = headText.createDiv({
+      cls: "mb-side-title",
+      text: this.file ? this.file.basename : "手写本",
+    });
+    this.sideTitleEl.title = "点击可重命名笔记";
+    this.sideTitleEl.setAttribute("role", "button");
+    this.sideTitleEl.setAttribute("tabindex", "0");
+    this.sideTitleEl.onclick = () => this.beginRenameFromSidebar();
+    this.sideTitleEl.onkeydown = (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        this.beginRenameFromSidebar();
+      }
+    };
     headText.createDiv({ cls: "mb-side-sub", text: "A4 · 自动保存" });
     // 侧栏收起按钮（窄屏下侧栏是盖在纸上的，必须有地方关）
     const closeBtn = head.createEl("button", {
@@ -3620,101 +5264,34 @@ export class InkbookView extends FileView {
       attr: { "aria-label": "导出本子" },
     });
     expBtn.title = "导出本子：存成 PDF 或本页 PNG";
-    setIcon(expBtn, "file-output");
+    /*
+     * 用户要求侧栏入口与「导出整本 PDF」菜单项一致，统一用 file-text。
+     * 与导入的 file-input 仍是两种形状，且保留「导出」文字标签；
+     * share-2 只用于「分享…」，不再把导出误表达成分享。
+     */
+    setIcon(expBtn, EXPORT_ICON);
     expBtn.createSpan({ cls: "mb-ib-label", text: "导出" });
     expBtn.onclick = (e) => this.showExportMenu(e);
+    const imgBtn = actRow.createEl("button", {
+      cls: "mb-ib mb-ib-labeled",
+      attr: { "aria-label": "插入图片" },
+    });
+    imgBtn.title = "插入图片：把一张图片贴到当前页，可拖动 / 缩放 / 删除";
+    setIcon(imgBtn, "image");
+    imgBtn.createSpan({ cls: "mb-ib-label", text: "图片" });
+    imgBtn.onclick = () => this.openInsertImage();
 
-    /* ---------------------------- 笔盒 ---------------------------- */
-    const penSec = body.createDiv("mb-sec");
-    penSec.createDiv({ cls: "mb-sec-title", text: "笔盒" });
-    const penRow = penSec.createDiv("mb-pen-row");
-    for (const c of PEN_COLORS) {
-      const b = penRow.createDiv("mb-swatch");
-      b.style.background = c;
-      b.dataset.color = c;
-      b.dataset.kind = "pen";
-      b.title = "钢笔 / 圆珠笔颜色";
-      /*
-       * 只改颜色，**不切工具**。
-       *
-       * 以前这里第一句是 setTool("pen")：圆珠笔用户点一下色板，
-       * 手里的笔就被悄悄换回钢笔了。钢笔和圆珠笔共用 penColor，
-       * 这排色板本来就该作用于「当前那支笔」，而不是替用户选笔。
-       */
-      b.onclick = () => {
-        this.editor?.setPenColor(c);
-        this.plugin.settings.lastPenColor = c;
-        void this.plugin.saveSettings();
-        this.updateUI();
-      };
-    }
-    const penSizes = penSec.createDiv("mb-size-row");
-    penSizes.createSpan({ cls: "mb-row-label", text: "钢笔" });
-    for (let i = 0; i < PEN_SIZES.length; i++) {
-      const b = penSizes.createEl("button", {
-        // 当前粗细要看得见：以前粗细按钮没有选中态，选了「粗」也不知道现在多粗
-        cls:
-          "mb-size-btn" +
-          (Math.abs(this.editor.penSize - PEN_SIZES[i]) < 0.01 ? " is-active" : ""),
-        text: ["细", "中", "粗"][i],
-        attr: { "data-size": String(PEN_SIZES[i]) },
-      });
-      /*
-       * 同色板：只调粗细，不切工具。penSize 是钢笔 / 圆珠笔 / 形状
-       * 三者共用的落笔参数（见 editor.onDown），切到钢笔会让正在画的
-       * 形状或圆珠笔断掉，也是同一种「偷切工具」。
-       */
-      b.onclick = () => {
-        this.editor?.setPenSize(PEN_SIZES[i]);
-        // 粗细要跟着用户走：重启后 mountEditor 读的是 settings.defaultPenSize
-        this.plugin.settings.defaultPenSize = PEN_SIZES[i];
-        void this.plugin.saveSettings();
-        this.updateUI();
-      };
-    }
-    const hlRow = penSec.createDiv("mb-pen-row");
-    for (const c of HIGHLIGHTER_PALETTE) {
-      const b = hlRow.createDiv("mb-swatch mb-swatch-hl");
-      b.style.background = c;
-      b.dataset.color = c;
-      b.dataset.kind = "hl";
-      b.title = "荧光笔颜色";
-      b.onclick = () => {
-        this.editor?.setTool("highlighter");
-        this.editor?.setHighlighterColor(c);
-        this.plugin.settings.lastHighlighterColor = c;
-        void this.plugin.saveSettings();
-        this.updateUI();
-      };
-    }
-    const hlSizes = penSec.createDiv("mb-size-row");
-    hlSizes.createSpan({ cls: "mb-row-label", text: "荧光" });
-    for (let i = 0; i < HIGHLIGHTER_SIZES.length; i++) {
-      const b = hlSizes.createEl("button", {
-        // 与钢笔同理：当前粗细要有选中态
-        cls:
-          "mb-size-btn" +
-          (Math.abs(this.editor.highlighterSize - HIGHLIGHTER_SIZES[i]) < 0.01
-            ? " is-active"
-            : ""),
-        text: ["细", "中", "粗"][i],
-        attr: { "data-size": String(HIGHLIGHTER_SIZES[i]) },
-      });
-      b.onclick = () => {
-        this.editor?.setTool("highlighter");
-        this.editor?.setHighlighterSize(HIGHLIGHTER_SIZES[i]);
-        // 与钢笔同理：粗细选择写回设置，重启后仍生效
-        this.plugin.settings.defaultHighlighterSize = HIGHLIGHTER_SIZES[i];
-        void this.plugin.saveSettings();
-        this.updateUI();
-      };
-    }
+    /*
+     * 侧栏「笔盒」整块已移除：钢笔 / 圆珠笔 / 荧光笔 的颜色和粗细，
+     * 用顶栏工具按钮「二次点击」弹出的快捷笔盒（openPenPop）调就够了，
+     * 侧栏再放一套属于功能重复，用户要求去掉。
+     */
 
     /* ---------------------------- 当前工具 ---------------------------- */
     /*
-     * 这一区随当前工具变化：橡皮出整笔/局部，形状出形状选择，
-     * 钢笔/荧光笔出粗细滑杆。放在笔盒正下方，
-     * 换工具时下面的控件跟着换，不用另开面板。
+     * 这一区随当前工具变化：橡皮出整笔/局部 + 大小滑杆，文字出字号/字体/颜色，
+     * 形状出形状种类 + 色点。钢笔 / 圆珠笔 / 荧光笔没有控件了
+     * （粗细与颜色都移进了各自的弹出调节框），renderDynamicTools 会把这一区隐藏。
      */
     const dynSec = body.createDiv("mb-sec mb-sec-dyn");
     this.dynEl = dynSec.createDiv("mb-dyn");
@@ -3776,28 +5353,44 @@ export class InkbookView extends FileView {
         3600
       );
     };
-    this.stylusBtn = inputRow.createEl("button", {
-      cls: "mb-ib",
-      attr: { "aria-label": "只认触控笔 (I)" },
+    /*
+     * 「只认触控笔」按钮已去掉：它和上面这颗「允许手指书写」是同一件事的两面
+     * ——关掉手指书写，手指本来就只负责滚动、掌根不落笔。两颗并排放着只会让人
+     * 以为是两个独立功能。设置页里的「只认触控笔」开关与 I 快捷键仍保留，
+     * 老本子里存下来的 penOnly 也能被上面这段逻辑正常清掉。
+     */
+
+    /* --------------------------- 演示（经典手写应用移植） --------------------------- */
+    /*
+     * 激光笔是全局开关、和当前工具无关，放独立静态区；选中态由
+     * syncAuxControls() 统一刷（快捷键、设置页改动都会走到 updateUI）。
+     *
+     * 一笔成型不再是侧栏三态按钮：用户要求「加在每个笔下边弹出的框里，
+     * 只有打开和关闭，画完立马识别」，所以搬到钢笔 / 圆珠笔的快捷笔盒
+     * （见 openPenPop）。隐藏笔迹内容已整体移除（和「隐藏笔迹层」冲突）。
+     */
+    const auxSec = body.createDiv("mb-sec");
+    auxSec.createDiv({ cls: "mb-sec-title", text: "演示" });
+
+    const auxRow = auxSec.createDiv("mb-ib-row");
+    // 激光笔：只指示不落墨的开关
+    this.laserBtn = auxRow.createEl("button", {
+      cls: "mb-ib mb-ib-labeled",
+      attr: { type: "button", "aria-label": "激光笔", "aria-pressed": "false" },
     });
-    this.stylusBtn.title = "只认触控笔：手指只滚动，掌根不落笔 (I)";
-    setIcon(this.stylusBtn, "tablet");
-    this.stylusBtn.onclick = () => {
-      const on = !this.plugin.settings.penOnly;
-      this.plugin.settings.penOnly = on;
+    this.laserBtn.title = "激光笔：落笔只在页面上留一条会淡出的红色指示光迹，不落墨、不进撤销、不进导出";
+    setIcon(this.laserBtn, "laser-pointer");
+    this.laserBtn.createSpan({ cls: "mb-ib-label", text: "激光笔" });
+    this.laserBtn.onclick = () => {
+      if (!this.editor) return;
+      const on = this.plugin.settings.laserPointer !== true;
+      this.plugin.settings.laserPointer = on;
+      this.editor.setLaserPointer(on);
       void this.plugin.saveSettings();
-      this.editor?.setPenOnly(on);
-      this.updateUI();
-      // 打开"只认触控笔"等于把手指书写暂停掉，说清楚，否则用户会以为书写坏了
-      new Notice(
-        on
-          ? this.editor?.touchDraw
-            ? "只认触控笔：手指只滚动（手指书写已暂停）"
-            : "只认触控笔：手指只滚动"
-          : "手指和鼠标也能写",
-        2600
-      );
+      this.syncAuxControls();
+      new Notice(on ? "激光笔：开（只指示，不落墨）" : "激光笔：关", 2000);
     };
+    this.syncAuxControls();
 
     /* ---------------------------- 纸张 ---------------------------- */
     const tplSec = body.createDiv("mb-sec");
@@ -3853,7 +5446,7 @@ export class InkbookView extends FileView {
       cls: "mb-pagedock-handle",
       attr: { "aria-label": "页面与目录", "aria-expanded": "false" },
     });
-    setIcon(handle, "panel-left");
+    setIcon(handle, "layout-grid");
     handle.title = "页面与目录";
     handle.onclick = () => this.togglePageDock();
     this.pagedockHandleEl = handle;
@@ -3863,10 +5456,13 @@ export class InkbookView extends FileView {
 
     const tabRow = bodyEl.createDiv({
       cls: "mb-side-tabs",
-      attr: { role: "tablist", "aria-label": "缩略图与目录" },
+      attr: { role: "tablist", "aria-label": "缩略图、目录与收藏" },
     });
     this.sideTabBtns = [];
-    const mkTab = (id: "thumbs" | "outlines", label: string): HTMLButtonElement => {
+    const mkTab = (
+      id: "thumbs" | "outlines" | "favorites",
+      label: string
+    ): HTMLButtonElement => {
       const b = tabRow.createEl("button", {
         cls: "mb-side-tab",
         text: label,
@@ -3878,9 +5474,16 @@ export class InkbookView extends FileView {
     };
     mkTab("thumbs", "缩略图");
     mkTab("outlines", "目录");
+    // 用户要求：第三个「收藏」标签放在「目录」右边
+    mkTab("favorites", "收藏");
+    // 三个标签共用同一枚紫色高亮片：切到收藏时也是滑过去，不是瞬移
+    this.sidePill?.destroy();
+    this.sidePill = new SlidePill(tabRow);
 
-    this.sideThumbPane = bodyEl.createDiv("mb-side-pane mb-side-pane-thumbs");
-    this.sideOutlinePane = bodyEl.createDiv("mb-side-pane mb-side-pane-outlines");
+    this.sidePanesEl = bodyEl.createDiv("mb-side-panes");
+    this.sideThumbPane = this.sidePanesEl.createDiv("mb-side-pane mb-side-pane-thumbs");
+    this.sideOutlinePane = this.sidePanesEl.createDiv("mb-side-pane mb-side-pane-outlines");
+    this.sideFavoritePane = this.sidePanesEl.createDiv("mb-side-pane mb-side-pane-favorites");
     /*
      * 先把显隐落好，再建内容：
      * 隐藏的面板量不到尺寸，窗口化会按兜底值建错（行高 / 视口高都是 0）。
@@ -3892,7 +5495,28 @@ export class InkbookView extends FileView {
     pageHead.createDiv({ cls: "mb-sec-title", text: "页面" });
     const addPage = pageHead.createEl("button", { cls: "mb-link", text: "+ 加一页" });
     addPage.onclick = () => this.editor?.addPage();
+    /*
+     * 每行几张：1/2/3/4（默认 4）。放在缩略图面板顶部，选择写回设置，
+     * 并即时按新列宽重排 + 重画可见缩略图（换列后单元格尺寸变了，必须重画，否则发糊）。
+     */
+    const colsRow = pageSec.createDiv("mb-thumb-cols-row");
+    colsRow.createEl("span", { cls: "mb-thumb-cols-label", text: "每行" });
+    this.thumbColsBtns = [];
+    for (const n of [1, 2, 3, 4]) {
+      const b = colsRow.createEl("button", {
+        cls: "mb-thumb-cols-btn",
+        text: String(n),
+        attr: { type: "button", "aria-label": n + " 张每行", title: n + " 张每行" },
+      });
+      b.onclick = () => this.setThumbCols(n);
+      this.thumbColsBtns.push([n, b]);
+    }
+    // 「每行几张」1/2/3/4 的紫色高亮片（切列数时滑过去）
+    this.thumbColsPill?.destroy();
+    this.thumbColsPill = new SlidePill(colsRow);
     this.pageListEl = pageSec.createDiv("mb-pages");
+    this.applyThumbColsToGrid();
+    this.syncThumbColsBtns();
     /*
      * 滚动容器是**面板**（.mb-side-pane-thumbs），列表在它内部。
      *
@@ -3920,57 +5544,433 @@ export class InkbookView extends FileView {
       { passive: true }
     );
 
+    /*
+     * 收藏面板：直接列出被标了收藏的页缩略图，点卡片跳页、点星标取消。
+     * 「收藏当前页」按钮给平板一个不用长按也能收藏当前页的入口。
+     */
+    const favSec = this.sideFavoritePane.createDiv("mb-sec mb-sec-favorites");
+    const favHead = favSec.createDiv("mb-sec-head");
+    favHead.createDiv({ cls: "mb-sec-title", text: "收藏" });
+    const favBtn = favHead.createEl("button", {
+      cls: "mb-link mb-fav-current",
+      attr: { type: "button", "aria-label": "收藏当前页", title: "收藏当前页" },
+    });
+    const favIc = favBtn.createSpan("mb-fav-current-ic");
+    setIcon(favIc, "star");
+    this.favoriteCurrentBtn = favBtn;
+    this.favoriteCurrentLabel = favBtn.createSpan("mb-fav-current-label");
+    this.favoriteCurrentLabel.setText("收藏当前页");
+    favBtn.onclick = () => this.toggleCurrentFavorite();
+    /*
+     * 收藏面板「每行几张」1/2/3/4。
+     *
+     * 用户要求收藏页也能调布局，并要「紫色框滑过去」的动效。这里复用
+     * 缩略图面板同款分段控件（.mb-thumb-cols-row / .mb-slide-pill），
+     * 选中项变化时紫框连续滑动，而不是瞬移。
+     */
+    const favColsRow = favSec.createDiv("mb-thumb-cols-row mb-fav-cols-row");
+    favColsRow.createEl("span", { cls: "mb-thumb-cols-label", text: "每行" });
+    this.favoriteColsBtns = [];
+    for (const n of [1, 2, 3, 4]) {
+      const b = favColsRow.createEl("button", {
+        cls: "mb-thumb-cols-btn",
+        text: String(n),
+        attr: { type: "button", "aria-label": n + " 张每行", title: n + " 张每行" },
+      });
+      b.onclick = () => this.setFavoriteCols(n);
+      this.favoriteColsBtns.push([n, b]);
+    }
+    this.favoriteColsPill?.destroy();
+    this.favoriteColsPill = new SlidePill(favColsRow);
+    this.favoriteEmptyEl = favSec.createDiv("mb-fav-empty");
+    this.favoriteEmptyEl.setText("还没有收藏页。点「收藏当前页」把这一页放进来。");
+    this.favoriteListEl = favSec.createDiv("mb-favorites");
+    this.applyFavoriteColsToGrid();
+    this.syncFavoriteColsBtns();
+    // 新建 DOM 后必须强制重建一次（签名可能和上一份 DOM 完全相同）
+    this.favoriteListSig = "";
+    this.favoriteBtnSig = "";
+    // 建完立刻把按钮态与列表落到当前 store；之后 updateUI 只在签名变了才重建
+    this.syncFavoritesUI();
+
     this.applyPageDock();
+    // 缩略图面板右缘的自绘滑动条（和纸面那条同款，平板上能拖）
+    this.buildThumbScrollbar(this.sideThumbPane, this.sidePanesEl);
+    this.syncThumbScrollbar();
   }
 
   /** 左侧页面抽屉开合 */
   private togglePageDock(): void {
+    const wasOpen = this.pagedockOpen;
     this.pagedockOpen = !this.pagedockOpen;
     this.applyPageDock();
+    if (!wasOpen && this.pagedockOpen) this.playPanelSlideIn(this.pagedockBodyEl);
+    else if (wasOpen && !this.pagedockOpen) this.playPanelSlideOut(this.pagedockBodyEl);
     if (this.pagedockOpen) {
-      // 展开后才量得到尺寸：补建页列表 / 重算窗口
-      this.updatePageWindow(true);
-      if (this.sideTab === "thumbs") this.refreshThumbs();
-      else {
-        this.outlineWinLo = -1;
-        this.outlineWinHi = -1;
-        this.outlineRowH = 0;
-        this.buildOutlineWindow(true);
+      /*
+       * **首帧对齐**：赶在浏览器第一次绘制之前把「看什么」摆好。
+       *
+       * applyPageDock 已经让 body 瞬间拿到最终宽度（宽度没有动画，只有
+       * translateX 滑入），playPanelSlideIn 又强制过一次重排，此刻量得到
+       * 真实尺寸。以前把这些活全塞进两帧后的 finishOpen，于是动画露出的
+       * 前两帧是空列表 / 第 1 页 / 半片紫框，再跳到当前页——用户说的
+       * 「还是先在第一页然后才加载过来」「紫框只占一半、卡一下才加载好」。
+       * 这里只做便宜的窗口 DOM + 滚动定位 + 高亮片测量，一张缩略图都不画；
+       * 光栅化仍延到动画起步之后，首帧不会被 pdf.js 占住。
+       */
+      if (this.sideTab === "thumbs") {
+        this.primeThumbsToActivePage();
+        this.thumbColsPill?.layoutNow(true);
+      }
+      this.sidePill?.layoutNow(true);
+
+      const finishOpen = () => {
+        if (!this.pagedockOpen) return; // 建的过程中用户又收起了
+        if (this.sideTab === "thumbs") {
+          // 首帧若因为宽度还没落定没能建窗口（无头 / 极端环境），这里兜底补建
+          if (!this.pageListEl?.firstElementChild) this.updatePageWindow(true);
+          this.refreshThumbs();
+          // 抽屉展开动画结束后兜底补画漏掉的缩略图（IO 刚展开时偶尔不回调）
+          if (typeof requestAnimationFrame === "function") {
+            requestAnimationFrame(() => this.sweepUnpaintedThumbs());
+          }
+          window.setTimeout(() => this.sweepUnpaintedThumbs(), 360);
+        } else if (this.sideTab === "outlines") {
+          this.outlineWinLo = -1;
+          this.outlineWinHi = -1;
+          this.outlineRowH = 0;
+          this.buildOutlineWindow(true);
+        } else {
+          this.renderFavorites();
+          this.scheduleFavoritePaint();
+        }
+      };
+      /*
+       * 用户：平板打开缩略图会先卡一下，有时干脆直接蹦出来没有动画。
+       * 根因是「切换面板」和「同步建页列表 + 光栅化缩略图」挤在同一帧：
+       * 首帧被主线程占住，滑入动画还没开始画就结束了。窗口 DOM 已经在
+       * 上面同步建好，这里只把剩下的光栅化 / 统计推到动画起步之后；期间再收起则跳过。
+       */
+      if (this.prefersReducedMotion() || typeof requestAnimationFrame !== "function") {
+        finishOpen();
+      } else {
+        requestAnimationFrame(() => requestAnimationFrame(finishOpen));
       }
     }
+  }
+
+  /**
+   * 展开抽屉的**首帧**就把缩略图窗口对准当前页（同步，赶在第一次绘制之前）。
+   *
+   * 只做三件便宜的事：按当前 scrollTop 建一次窗口（撑出上下 spacer、
+   * 列表才有可滚动高度）、把 scrollTop 落到编辑器当前页、按新位置就地
+   * 重建窗口。光栅化一张都不画，留给两帧后的 finishOpen。
+   *
+   * 顺序不能换：空列表 scrollHeight=0，先设 scrollTop 会被浏览器夹回 0，
+   * 于是又从第 1 页建窗口——正是「先在第一页，然后才加载过来」的老路。
+   */
+  private primeThumbsToActivePage(): void {
+    if (!this.store || !this.editor || !this.thumbVisible()) return;
+    const list = this.pageListEl;
+    const viewport = this.pageListViewportEl;
+    if (!list || !viewport || list.clientWidth <= 0) return;
+    // ① 撑出完整滚动高度（初次展开时列表还是空的）
+    this.updatePageWindow(true);
+    // ② 同步落到编辑器当前页，并按新位置重建窗口
+    const cur = this.activeThumbPage();
+    this.revealThumbForPage(cur, true);
+    this.setActiveThumb(cur);
+    this.syncThumbScrollbar();
   }
 
   private applyPageDock(): void {
     this.pagedockEl?.toggleClass("is-open", this.pagedockOpen);
     this.pagedockHandleEl?.setAttribute("aria-expanded", String(this.pagedockOpen));
+    this.dockBtn?.toggleClass("is-active", this.pagedockOpen);
+    this.dockBtn?.setAttribute("aria-expanded", String(this.pagedockOpen));
+    this.syncThumbScrollbar();
   }
 
-  /** 切换侧栏下方面板：缩略图 ⇄ 目录 */
-  private setSideTab(tab: "thumbs" | "outlines"): void {
+  /** 当前「每行几张」（1–4，越界回落 4） */
+  private currentThumbCols(): number {
+    const raw = this.plugin.settings.thumbCols;
+    const n = typeof raw === "number" && Number.isFinite(raw) ? Math.round(raw) : 4;
+    return Math.min(4, Math.max(1, n));
+  }
+
+  /** 把列数落到页列表的 grid 上（inline style，覆盖默认 4 列） */
+  private applyThumbColsToGrid(): void {
+    if (!this.pageListEl) return;
+    this.pageListEl.style.gridTemplateColumns = `repeat(${this.currentThumbCols()}, minmax(0, 1fr))`;
+  }
+
+  private syncThumbColsBtns(): void {
+    const n = this.currentThumbCols();
+    for (const [val, b] of this.thumbColsBtns) b.toggleClass("is-active", val === n);
+    // 列数切换后把紫色高亮片滑到新的那一档
+    this.thumbColsPill?.layout();
+  }
+
+  /** 切换「每行几张」：写回设置、重排并重画（换列后单元格尺寸变，必须重画否则发糊） */
+  private setThumbCols(n: number): void {
+    const v = Math.min(4, Math.max(1, Math.round(n)));
+    if (this.plugin.settings.thumbCols !== v) {
+      this.plugin.settings.thumbCols = v;
+      void this.plugin.saveSettings();
+    }
+    this.applyThumbColsToGrid();
+    this.syncThumbColsBtns();
+    if (!this.thumbVisible()) return;
+    /*
+     * 列数变了 → 单元格宽高全变。强制重建窗口（pageWinRowLo=-1 会走
+     * resetPageWindowDom），让每张按新尺寸重新光栅化；否则复用旧画布会被
+     * CSS 拉伸成糊的。
+     */
+    this.pageWinRowLo = -1;
+    this.pageWinRowHi = -1;
+    this.pageWinCols = 0;
+    this.pageWinRowH = 0;
+    this.updatePageWindow(true);
+    this.refreshThumbs();
+  }
+
+  /** 收藏面板当前「每行几张」（1–4，越界回落 2） */
+  private currentFavoriteCols(): number {
+    const raw = this.plugin.settings.favoriteCols;
+    const n = typeof raw === "number" && Number.isFinite(raw) ? Math.round(raw) : 2;
+    return Math.min(4, Math.max(1, n));
+  }
+
+  /** 把列数落到收藏列表的 grid 上（inline style，覆盖默认 2 列） */
+  private applyFavoriteColsToGrid(): void {
+    if (!this.favoriteListEl) return;
+    this.favoriteListEl.style.gridTemplateColumns = `repeat(${this.currentFavoriteCols()}, minmax(0, 1fr))`;
+  }
+
+  private syncFavoriteColsBtns(): void {
+    const n = this.currentFavoriteCols();
+    for (const [val, b] of this.favoriteColsBtns) b.toggleClass("is-active", val === n);
+    // 切列数时把紫色高亮片滑到新的那一档
+    this.favoriteColsPill?.layout();
+  }
+
+  /** 切换收藏面板「每行几张」：写回设置、重排并重画（单元格尺寸变了必须重画） */
+  private setFavoriteCols(n: number): void {
+    const v = Math.min(4, Math.max(1, Math.round(n)));
+    if (this.plugin.settings.favoriteCols !== v) {
+      this.plugin.settings.favoriteCols = v;
+      void this.plugin.saveSettings();
+    }
+    this.applyFavoriteColsToGrid();
+    this.syncFavoriteColsBtns();
+    /*
+     * 列数变了 → 卡片宽高全变。重建卡片让画布按新尺寸重新光栅化，
+     * 否则复用旧画布会被 CSS 拉伸成糊的（与缩略图面板同一处理）。
+     */
+    this.renderFavorites();
+    this.scheduleFavoritePaint();
+  }
+
+  /**
+   * 平板：点「抽屉 / 侧栏」以外的地方自动收起。
+   *
+   * 只在平板生效——桌面上右侧栏是常驻面板，点画布不该把它关掉。
+   * 只处理落到本视图内的点击；点开它们的那个开关本身不算「外部」，
+   * 由开关自己的 click 负责开合，避免同一次点击先被关掉又被打开。
+   */
+  private onGlobalPointerDown(e: PointerEvent): void {
+    if (!this.tabletMode) return;
+    const t = e.target as Node | null;
+    if (!t || !this.containerEl.contains(t)) return;
+
+    let closed = false;
+    if (this.pagedockOpen) {
+      const inDock =
+        (this.pagedockEl?.contains(t) ?? false) ||
+        (this.dockBtn?.contains(t) ?? false) ||
+        (this.pagedockHandleEl?.contains(t) ?? false);
+      if (!inDock) {
+        this.togglePageDock();
+        closed = true;
+      }
+    }
+
+    if (this.sideShown) {
+      /*
+       * 侧栏按钮本身要算作「侧栏内部」，否则捕获阶段先收起、
+       * 随后 onclick 又展开，用户第二下永远关不掉侧栏。
+       */
+      const inSide =
+        (this.sideEl?.contains(t) ?? false) ||
+        (this.sideBtn?.contains(t) ?? false) ||
+        (this.railSideBtn?.contains(t) ?? false);
+      if (!inSide) {
+        this.toggleSide();
+        closed = true;
+      }
+    }
+    /*
+     * 点纸面空白处收起面板：这一下不该落笔（用笔点一下只是想关面板，
+     * 不希望顺手画出一道笔迹）。本监听在 document 捕获阶段，早于画布的
+     * pointerdown；命中纸面时拦截掉，画布的 onDown 就收不到。
+     */
+    if (closed) {
+      const onPaper = this.editor?.scrollEl?.contains(t) ?? false;
+      if (onPaper) {
+        e.stopPropagation();
+        e.preventDefault();
+      }
+    }
+  }
+
+  /** 切换侧栏下方面板：缩略图 ⇄ 目录 ⇄ 收藏 */
+  private setSideTab(tab: "thumbs" | "outlines" | "favorites"): void {
     if (this.sideTab === tab) return;
     this.sideTab = tab;
     this.applySideTab();
     if (tab === "thumbs") {
-      // 目录标签期间页列表是 display:none，量不到尺寸、也没建过条目
+      // 别的标签期间页列表是 display:none，量不到尺寸、也没建过条目
       this.updatePageWindow(true);
       this.refreshThumbs();
-    } else {
+      // 切回缩略图时同样同步定位到当前页（同一帧内建好窗口，不闪第 1 页）
+      this.syncThumbsToActivePage();
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => this.sweepUnpaintedThumbs());
+      }
+      window.setTimeout(() => this.sweepUnpaintedThumbs(), 120);
+    } else if (tab === "outlines") {
       // 目录标签期间视口可能是隐藏的，强制重测行高并重建窗口
       this.outlineWinLo = -1;
       this.outlineWinHi = -1;
       this.outlineRowH = 0;
       this.buildOutlineWindow(true);
+    } else {
+      this.renderFavorites();
+      this.scheduleFavoritePaint();
     }
   }
 
-  /** 把当前 sideTab 反映到标签选中态和两个面板的显隐上 */
+  /** 把当前 sideTab 反映到标签选中态和三个面板的显隐上 */
   private applySideTab(): void {
     this.sideThumbPane?.toggleClass("is-hidden", this.sideTab !== "thumbs");
     this.sideOutlinePane?.toggleClass("is-hidden", this.sideTab !== "outlines");
+    this.sideFavoritePane?.toggleClass("is-hidden", this.sideTab !== "favorites");
     for (const b of this.sideTabBtns) {
       const on = b.dataset.tab === this.sideTab;
       b.toggleClass("is-active", on);
       b.setAttribute("aria-selected", String(on));
+    }
+    this.syncThumbScrollbar();
+    // 标签切换后紫色高亮片滑到目标位置（第三个标签同样连续滑过去）
+    this.sidePill?.layout();
+  }
+
+  /** 收藏 / 取消收藏指定页；真的变了才刷 UI、记历史和自动保存 */
+  private setPageFavorite(index: number, on: boolean): void {
+    if (!this.store?.setFavorite(index, on)) return;
+    this.updateUI();
+  }
+
+  /** 「收藏当前页」按钮：以编辑器实时页为准，不用落盘里的 activePage 镜像 */
+  private toggleCurrentFavorite(): void {
+    if (!this.store) return;
+    const index = this.activeThumbPage();
+    this.setPageFavorite(index, !this.store.data.pages[index]?.favorite);
+  }
+
+  /** 收藏列表 / 当前页按钮的轻量同步（updateUI 每帧都可能跑） */
+  private syncFavoritesUI(): void {
+    if (!this.store) return;
+    const listSig = [
+      this.store.favoriteRev,
+      this.store.pageOrderRev,
+      this.store.pageCount,
+    ].join(":");
+    if (listSig !== this.favoriteListSig) {
+      this.favoriteListSig = listSig;
+      this.renderFavorites();
+      this.scheduleFavoritePaint();
+    }
+    const cur = this.activeThumbPage();
+    const on = this.store.data.pages[cur]?.favorite === true;
+    const btnSig = cur + ":" + on;
+    if (btnSig !== this.favoriteBtnSig) {
+      this.favoriteBtnSig = btnSig;
+      this.syncFavoriteCurrentBtn(cur, on);
+    }
+    this.favoriteListEl?.querySelectorAll(".mb-fav-card").forEach((el) => {
+      el.toggleClass("is-active", Number((el as HTMLElement).dataset.page) === cur);
+    });
+    // 收藏变化时把可见缩略图的小星标一起刷正（落笔时 favoriteRev 不变，不重刷）
+    if (this.store.favoriteRev !== this.thumbFavRev) {
+      this.thumbFavRev = this.store.favoriteRev;
+      for (const [i, item] of this.thumbItems) this.applyThumbFavMark(item, i);
+    }
+  }
+
+  private syncFavoriteCurrentBtn(index: number, on: boolean): void {
+    const btn = this.favoriteCurrentBtn;
+    const label = this.favoriteCurrentLabel;
+    if (!btn || !label) return;
+    const text = on ? "取消收藏当前页" : "收藏当前页";
+    label.setText(text);
+    btn.toggleClass("is-active", on);
+    btn.setAttr("aria-pressed", String(on));
+    btn.setAttr("aria-label", text);
+    btn.title = text;
+  }
+
+  /** 重建收藏页缩略图列表（收藏页通常很少，不需要窗口化） */
+  private renderFavorites(): void {
+    const list = this.favoriteListEl;
+    if (!list || !this.store) return;
+    list.empty();
+    this.favoriteThumbCanvases.clear();
+    const pages = this.store.favoritePages;
+    this.favoriteEmptyEl?.toggleClass("is-hidden", pages.length > 0);
+    const cur = this.activeThumbPage();
+    for (const index of pages) {
+      const card = list.createDiv("mb-fav-card" + (index === cur ? " is-active" : ""));
+      card.dataset.page = String(index);
+      card.dataset.pageId = this.store.data.pages[index]?.id ?? "";
+      card.setAttr("aria-label", `跳到第 ${index + 1} 页`);
+      card.title = `跳到第 ${index + 1} 页`;
+      const cv = document.createElement("canvas");
+      cv.className = "mb-fav-canvas";
+      card.appendChild(cv);
+      this.favoriteThumbCanvases.set(index, cv);
+      card.createDiv({ cls: "mb-fav-num", text: String(index + 1) });
+      const remove = card.createEl("button", {
+        cls: "mb-fav-remove",
+        attr: { type: "button", "aria-label": "取消收藏", title: "取消收藏" },
+      });
+      setIcon(remove, "star");
+      remove.onclick = (e) => {
+        e.stopPropagation();
+        this.setPageFavorite(index, false);
+      };
+      card.onclick = () => this.editor?.goToPage(index);
+    }
+  }
+
+  /** 把收藏缩略图补画合并到下一帧；面板隐藏时直接跳过（量不到尺寸） */
+  private scheduleFavoritePaint(): void {
+    if (this.favoritePaintRaf) return;
+    const run = () => {
+      this.favoritePaintRaf = 0;
+      this.paintFavoriteThumbs();
+    };
+    if (typeof window.requestAnimationFrame === "function") {
+      this.favoritePaintRaf = window.requestAnimationFrame(run);
+    } else {
+      this.favoritePaintRaf = window.setTimeout(run, 16);
+    }
+  }
+
+  private paintFavoriteThumbs(): void {
+    if (!this.editor || !this.favoritesVisible()) return;
+    for (const [index, cv] of this.favoriteThumbCanvases) {
+      if (cv.isConnected) this.editor.renderThumbnail(cv, index);
     }
   }
 
@@ -4363,7 +6363,7 @@ export class InkbookView extends FileView {
      * 和首屏那一页抢 IO/CPU，用户感觉就是「打开半天」。
      * 窗口里没有当前页时 drawThumbRange 会自然跳过，等滚进来由 IO 补画。
      */
-    const current = this.store.data.activePage;
+    const current = this.activeThumbPage();
     this.drawThumbRange(current, 0);
     const idle = (window as any).requestIdleCallback as
       | ((cb: () => void, opts?: { timeout: number }) => number)
@@ -4561,7 +6561,7 @@ export class InkbookView extends FileView {
     }
 
     /* ---------- 2. 新进入窗口的页：池里按页号取，取不到才新建 ---------- */
-    const current = this.store?.data.activePage ?? 0;
+    const current = this.activeThumbPage();
     let prev: Element | null = topPad;
     for (let i = firstCell; i < lastCell; i += 1) {
       if (i < count) {
@@ -4582,6 +6582,8 @@ export class InkbookView extends FileView {
              */
             item.dataset.pageId = this.store?.data.pages[i]?.id ?? "";
             item.classList.toggle("is-active", i === current);
+            // 收藏态可能在条目躺池期间改过（比如在收藏面板里取消），复用时要刷正
+            this.applyThumbFavMark(item, i);
             delete item.dataset.longPressAt;
             const cv = item.querySelector(".mb-thumb-canvas") as HTMLCanvasElement | null;
             if (cv) this.thumbCanvases.set(i, cv);
@@ -4717,6 +6719,19 @@ export class InkbookView extends FileView {
     this.ensureThumbObserver()?.observe(item);
   }
 
+  /** 把某一页的收藏态刷到缩略图上的小星标（实心 = 已收藏） */
+  private applyThumbFavMark(item: HTMLElement, index: number): void {
+    const on = this.store?.data.pages[index]?.favorite === true;
+    item.classList.toggle("is-fav", on);
+    const btn = item.querySelector(".mb-thumb-fav") as HTMLButtonElement | null;
+    if (!btn) return;
+    btn.classList.toggle("is-on", on);
+    btn.setAttribute("aria-pressed", String(on));
+    const label = on ? "取消收藏本页" : "收藏本页";
+    btn.setAttribute("aria-label", label);
+    btn.title = label;
+  }
+
   private createThumbItem(index: number, active: boolean): HTMLElement {
     const item = document.createElement("div");
     item.className = "mb-thumb" + (active ? " is-active" : "");
@@ -4726,11 +6741,25 @@ export class InkbookView extends FileView {
      * 长按菜单的动作必须按 id 回查当前下标，闭包里的 index 可能过期。
      */
     item.dataset.pageId = this.store?.data.pages[index]?.id ?? "";
-    item.title = "长按可上移 / 下移";
+    item.title = "长按：上移 / 下移 / 复制 / 收藏 / 删除";
     const cv = document.createElement("canvas");
     cv.className = "mb-thumb-canvas";
     item.appendChild(cv);
     item.createDiv({ cls: "mb-thumb-num", text: String(index + 1) });
+    /*
+     * 收藏按钮：用户要求和「复制 / 删除」并排放在缩略图最上方。
+     * 桌面端悬停才出现（与另两枚一致），平板统一收进长按菜单。
+     */
+    const fav = item.createEl("button", {
+      cls: "mb-thumb-act mb-thumb-fav",
+      attr: { type: "button", "aria-label": "收藏本页" },
+    });
+    setIcon(fav, "star");
+    fav.onclick = (e) => {
+      e.stopPropagation();
+      this.setPageFavorite(index, this.store?.data.pages[index]?.favorite !== true);
+    };
+    this.applyThumbFavMark(item, index);
     const dup = item.createEl("button", { cls: "mb-thumb-act mb-thumb-dup", attr: { "aria-label": "复制本页" } });
     setIcon(dup, "copy");
     dup.onclick = (e) => {
@@ -4943,6 +6972,39 @@ export class InkbookView extends FileView {
     down.onclick = (e) => {
       e.stopPropagation();
       this.movePageBy(item, 1);
+    };
+    /*
+     * 复制 / 删除也放进长按菜单（平板不再常显那两枚 30px 大按钮，见 styles.css）。
+     * 删除仍走二次确认，按页 id 找回原页，避免确认期间页序变化误删。
+     */
+    const dup = menu.createEl("button", { cls: "mb-thumb-menu-btn", text: "复制本页" });
+    dup.onclick = (e) => {
+      e.stopPropagation();
+      this.closeThumbMenu();
+      this.editor?.duplicatePage(at);
+    };
+    const del = menu.createEl("button", { cls: "mb-thumb-menu-btn", text: "删除本页" });
+    del.disabled = n <= 1;
+    del.onclick = (e) => {
+      e.stopPropagation();
+      const pageId = item.dataset.pageId || this.store?.data.pages[at]?.id || "";
+      this.closeThumbMenu();
+      if (!pageId) return;
+      new DeletePageModal(this.app, at + 1, () => {
+        const idx = this.store?.data.pages.findIndex((p) => p.id === pageId) ?? -1;
+        if (idx >= 0) this.editor?.deletePage(idx);
+      }).open();
+    };
+    // 收藏也从长按菜单进：不会在缩略图中间再加一颗挡跳页的常显按钮
+    const favOn = this.store?.data.pages[at]?.favorite === true;
+    const fav = menu.createEl("button", {
+      cls: "mb-thumb-menu-btn",
+      text: favOn ? "取消收藏" : "收藏本页",
+    });
+    fav.onclick = (e) => {
+      e.stopPropagation();
+      this.closeThumbMenu();
+      this.setPageFavorite(at, !favOn);
     };
     this.thumbMenuEl = menu;
     this.thumbMenuOwner = item;
@@ -5414,7 +7476,7 @@ export class InkbookView extends FileView {
    *
    * 窗口化后当前页可能不在窗口里（用户把侧栏滚到了别的页段）：
    * 这时 next 为 null，只是清掉旧高亮，**绝不滚动侧栏**；
-   * 等条目被物化时 createThumbItem 会按 store.data.activePage 补上 is-active。
+   * 等条目被物化时 createThumbItem 会按 activeThumbPage() 补上 is-active。
    */
   private setActiveThumb(index: number): void {
     const next = (this.thumbCanvases.get(index)?.parentElement as HTMLElement | undefined) ?? null;
@@ -5422,6 +7484,154 @@ export class InkbookView extends FileView {
     this.activeThumbEl?.classList.remove("is-active");
     next?.classList.add("is-active");
     this.activeThumbEl = next;
+  }
+
+  /**
+   * 展开抽屉 / 切回缩略图标签时，**同步**把页列表定位到当前页并就地建窗口。
+   *
+   * 旧做法是在当前 scrollTop（往往 0）上先 build 出第 1 页，再只改 scrollTop，
+   * 靠随后的 scroll 事件在**下一帧**才重建窗口。于是用户先看到第 1 页 / 一段
+   * 空白，然后才跳到当前页，大本子上这一下一跳很显眼、也白建了一屏。
+   *
+   * `revealThumbForPage` 会先把 scrollTop 落到当前页、再**同一帧内**重建窗口，
+   * 这样从第一帧起就是当前页那一屏，没有中间态。
+   */
+  private syncThumbsToActivePage(): void {
+    if (!this.store) return;
+    const cur = this.activeThumbPage();
+    this.revealThumbForPage(cur);
+    // reveal 在「当前页已在可视区」时会早退，这里补画一次附近的缩略图并同步选中态
+    this.drawThumbRange(cur, 2);
+    this.setActiveThumb(cur);
+    this.syncThumbScrollbar();
+  }
+
+  /**
+   * 给缩略图面板右缘挂一条自绘滑动条（和纸面 `.mb-sb` 同款）。
+   *
+   * 系统滚动条在平板上拖不动，几百页的缩略图想从第 3 页跳到第 30 页只能
+   * 一页页滑；这里加一枚可拖动的小滑块，交互原则和笔记纸面那条一致。
+   * 滑块挂在 `.mb-side-panes` 上（不是滚动容器内），所以不会跟着内容滚走。
+   */
+  private buildThumbScrollbar(scroller: HTMLElement, host: HTMLElement): void {
+    this.thumbSbAbort?.abort();
+    window.clearTimeout(this.thumbSbHideTimer);
+    this.thumbSbHideTimer = 0;
+    const ac = new AbortController();
+    this.thumbSbAbort = ac;
+
+    const el = host.createDiv("mb-sb mb-pane-sb");
+    this.thumbSbEl = el;
+    const track = el.createDiv("mb-sb-track");
+    this.thumbSbTrack = track;
+    const thumb = track.createDiv("mb-sb-thumb");
+    this.thumbSbThumb = thumb;
+
+    // 缩略图面板不涉及在纸面落笔，滑动条常驻可见即可（不必像纸面那样淡出）
+    el.addClass("is-visible");
+
+    scroller.addEventListener("scroll", () => this.syncThumbScrollbar(), {
+      passive: true,
+      signal: ac.signal,
+    });
+
+    const apply = (clientY: number, grab: number) => {
+      const range = scroller.scrollHeight - scroller.clientHeight;
+      const usable = Math.max(1, track.clientHeight - this.thumbSbThumbH);
+      const y = clientY - track.getBoundingClientRect().top - grab;
+      const r = Math.min(1, Math.max(0, y / usable));
+      scroller.scrollTop = r * range;
+    };
+
+    thumb.addEventListener(
+      "pointerdown",
+      (e) => {
+        if (e.pointerType === "mouse" && e.button !== 0) return;
+        const tr = thumb.getBoundingClientRect();
+        const grab = e.clientY - tr.top;
+        this.thumbSbDrag = { pid: e.pointerId, grab };
+        el.addClass("is-drag");
+        el.addClass("is-visible");
+        window.clearTimeout(this.thumbSbHideTimer);
+        this.thumbSbHideTimer = 0;
+        try {
+          thumb.setPointerCapture(e.pointerId);
+        } catch (_) {}
+        e.preventDefault();
+        e.stopPropagation();
+        apply(e.clientY, grab);
+      },
+      { signal: ac.signal }
+    );
+
+    thumb.addEventListener(
+      "pointermove",
+      (e) => {
+        const d = this.thumbSbDrag;
+        if (!d || e.pointerId !== d.pid) return;
+        apply(e.clientY, d.grab);
+        e.preventDefault();
+      },
+      { signal: ac.signal }
+    );
+
+    const finish = (e: PointerEvent) => {
+      const d = this.thumbSbDrag;
+      if (!d || e.pointerId !== d.pid) return;
+      this.thumbSbDrag = null;
+      el.removeClass("is-drag");
+      try {
+        thumb.releasePointerCapture(e.pointerId);
+      } catch (_) {}
+      this.syncThumbScrollbar();
+    };
+    thumb.addEventListener("pointerup", finish, { signal: ac.signal });
+    thumb.addEventListener("pointercancel", finish, { signal: ac.signal });
+
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(() => this.syncThumbScrollbar());
+      ro.observe(scroller);
+      ac.signal.addEventListener("abort", () => ro.disconnect());
+    }
+  }
+
+  /** 按缩略图滚动容器的滚动位置/比例刷新滑块高度与位置；不需要时隐藏 */
+  private syncThumbScrollbar(): void {
+    const el = this.thumbSbEl;
+    const track = this.thumbSbTrack;
+    const thumb = this.thumbSbThumb;
+    const sc = this.sideThumbPane;
+    if (!el || !track || !thumb || !sc) return;
+    if (sc.clientHeight <= 0) {
+      el.style.display = "none";
+      return;
+    }
+    const scrollH = sc.scrollHeight;
+    const range = scrollH - sc.clientHeight;
+    if (range <= 2) {
+      el.style.display = "none";
+      return;
+    }
+    el.style.display = "";
+    const trackH = track.clientHeight || el.clientHeight;
+    if (trackH <= 0) return;
+    /*
+     * 缩略图抽屉的滑块刻意做得短：它常驻可见，太长会盖住缩略图/目录内容。
+     * 轨道本身也只占面板中段（见 .mb-pane-sb），这里再给比例高度封顶，
+     * 页数少时不会长成一条几乎贯穿面板的黑条。拖动范围用的 thumbSbThumbH
+     * 与这里必须同步更新。
+     */
+    const minTh = this.tabletMode ? 28 : 22;
+    const maxTh = this.tabletMode ? 56 : 64;
+    const th = Math.min(
+      maxTh,
+      Math.max(minTh, Math.round(trackH * (sc.clientHeight / Math.max(1, scrollH))))
+    );
+    this.thumbSbThumbH = th;
+    thumb.style.height = th + "px";
+    const maxTop = Math.max(0, trackH - th);
+    const r = Math.min(1, Math.max(0, sc.scrollTop / range));
+    thumb.style.transform = `translateY(${Math.round(maxTop * r)}px)`;
   }
 
   /**
@@ -5472,6 +7682,22 @@ export class InkbookView extends FileView {
     for (let i = lo; i <= hi; i++) {
       const cv = this.thumbCanvases.get(i);
       if (cv && cv.isConnected) this.editor?.renderThumbnail(cv, i);
+    }
+  }
+
+  /**
+   * 兜底补画：抽屉刚展开 / 从「目录」切回「缩略图」时，IntersectionObserver
+   * 偶尔漏掉回调，个别已经物化的缩略图会一直空白（真机反馈「打开缩略图后
+   * 有的页加载不出来」）。这里扫一遍窗口里连着的 canvas，凡没画过、又量得到
+   * 尺寸的都补画一次；已经画过的直接跳过，不重复光栅化。
+   */
+  private sweepUnpaintedThumbs(): void {
+    if (!this.editor || !this.store || !this.thumbVisible()) return;
+    for (const [idx, cv] of this.thumbCanvases) {
+      if (!cv.isConnected || this.thumbCanvasPainted(cv)) continue;
+      const r = cv.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) continue;
+      this.editor.renderThumbnail(cv, idx);
     }
   }
 
@@ -5561,9 +7787,11 @@ export class InkbookView extends FileView {
       return;
     }
     // 只重画当前页附近的缩略图——其余等滚进视口时再画
-    const current = this.store.data.activePage;
+    const current = this.activeThumbPage();
     this.drawThumbRange(current, 2);
     this.setActiveThumb(current);
+    // 收藏面板同页的缩略图也跟着内容更新（只有几张，不进窗口化）
+    if (this.favoritesVisible()) this.scheduleFavoritePaint();
   }
 
   private renderStats(): void {
@@ -5603,6 +7831,11 @@ export class InkbookView extends FileView {
     const s = this.editor.getState();
 
     for (const [id, btn] of this.toolButtons) btn.toggleClass("is-active", id === s.tool);
+    // 工具切换时把紫色高亮片滑到新工具；同一工具不重复量（落笔时高频跑这里）
+    if (this.toolPill && s.tool !== this.slideToolSig) {
+      this.slideToolSig = s.tool;
+      this.toolPill.layout();
+    }
 
     /*
      * 快捷笔盒跟着工具 / 参数走：
@@ -5610,7 +7843,9 @@ export class InkbookView extends FileView {
      *   · 还在这支笔上就只同步选中态，不重建 DOM（连续落笔会高频跑这里）。
      */
     if (this.penPopEl) {
-      if (PEN_POP_TOOLS.has(s.tool)) this.syncPenPopActive();
+      if (PEN_POP_TOOLS.has(s.tool) || s.tool === "shape") this.syncPenPopActive();
+      else if (s.tool === "text") this.syncTextPopActive();
+      else if (s.tool === "eraser") this.syncEraserPopActive();
       else this.closePenPop();
     }
 
@@ -5647,9 +7882,10 @@ export class InkbookView extends FileView {
       this.floatRedoBtn.toggleClass("is-disabled", !s.canRedo);
       this.floatRedoBtn.setAttribute("aria-disabled", String(!s.canRedo));
     }
-    if (this.stylusBtn) this.stylusBtn.toggleClass("is-active", s.penOnly);
     if (this.touchBtn) this.touchBtn.toggleClass("is-active", !!this.editor?.touchDraw);
     if (this.sideBtn) this.sideBtn.toggleClass("is-active", this.sideShown);
+    // 侧栏「演示」区（激光笔）：工具切换 / 快捷键 / 设置页改动后都要跟上
+    this.syncAuxControls();
     if (this.railSideBtn) {
       this.railSideBtn.setAttribute("aria-expanded", String(this.sideShown));
       this.railSideBtn.setAttribute(
@@ -5671,8 +7907,6 @@ export class InkbookView extends FileView {
       this.showZoomHint();
     }
 
-    // 顶栏「当前笔」提示：色点 + 粗细。纯显示，放 updateUI 不会弹侧栏
-    this.updatePenChip();
     this.renderColors();
     this.renderDynamicTools();
 
@@ -5684,6 +7918,8 @@ export class InkbookView extends FileView {
      * 落笔时 updateUI 会跑几十次，目录不变 → 一次 DOM 都不动。
      */
     this.renderOutlines();
+    // 收藏列表与「收藏当前页」按钮：签名没变就一次 DOM 都不动
+    this.syncFavoritesUI();
     // 侧栏收起时不建页列表（首次展开由 applySideVisibility → refreshThumbs 补建）
     if (
       this.thumbVisible() &&
@@ -5729,7 +7965,8 @@ export class InkbookView extends FileView {
       this.metaDirty = true;
       this.metaEpoch += 1;
     }
-    this.updateUI();
+    // 翻页元数据的脏标记仍同步记，只有重 UI 刷新建到下一帧
+    this.scheduleUIUpdate();
     this.thumbDebounce();
   }
 
@@ -5976,7 +8213,7 @@ export class InkbookView extends FileView {
    * 缩略图停在 y=853，而视口只到 750，用户根本看不到）。
    * 所以先把列表顶部在侧栏坐标系里的位置算出来，再加上行偏移。
    */
-  private revealThumbForPage(index: number): void {
+  private revealThumbForPage(index: number, force = false): void {
     const viewport = this.pageListViewportEl;
     const list = this.pageListEl;
     if (!viewport || !list) return;
@@ -6003,13 +8240,14 @@ export class InkbookView extends FileView {
     const absBottom = listTopInScroll + rowBottom;
     const vpTop = viewport.scrollTop;
     const vpBottom = vpTop + viewport.clientHeight;
-    // 已经在可视区里就不动，别打断用户
-    if (absTop >= vpTop && absBottom <= vpBottom) return;
+    // 已经在可视区里就不动，别打断用户；首帧对齐（force）要强制落位 + 重建
+    if (!force && absTop >= vpTop && absBottom <= vpBottom) return;
     // 滚到「让这一行落在视口中部偏上」，上下都留点邻居
     const target = Math.max(0, absTop - Math.round(viewport.clientHeight * 0.3));
     viewport.scrollTop = target;
-    // 滚完立刻按新位置重建窗口，别等 scroll 事件（无头环境可能不触发）
-    this.updatePageWindow(false);
+    // 滚完立刻按新位置重建窗口，别等 scroll 事件（无头环境可能不触发）。
+    // force 时禁用「窗口没变」的快路径，确保首屏一定是当前页那一屏。
+    this.updatePageWindow(force);
   }
 
   /**
@@ -6112,6 +8350,12 @@ export class InkbookView extends FileView {
      * 平白多产出两份冲突副本。
      */
     const fp = this.fp;
+    /*
+     * 内容基线同样在第一个 await 之前钉死：切本子会把 this.diskHash 清掉/换掉，
+     * 拿新本的基线去比旧文件没有意义（会漏判或误判冲突）。
+     */
+    const baseline = this.diskHash;
+    const baselineSig = this.diskContentSig;
     const run = (async () => {
       try {
         if (this.editor && this.store === store) {
@@ -6121,26 +8365,79 @@ export class InkbookView extends FileView {
         // 写之前先看磁盘上的文件有没有被别处改过（同步、别的窗口、外部编辑器）
         const now = await fingerprint(adapter, path);
         if (fp && now && (now.mtime !== fp.mtime || now.size !== fp.size)) {
-          await this.saveConflictCopies(adapter, path, book);
-          if (this.store !== store) return;
-          this.conflict = true;
-          this.saveState = "dirty";
           /*
-           * 提示里必须给出**怎么退出这个状态**（INK-206）。
+           * 指纹（mtime + size）对不上，**先别急着判冲突**。
            *
-           * 进入冲突后 `saveNow` 整个跳过，本标签页再也不会写主文件。
-           * 老文案只说「请手动检查后选择保留哪一份」，没告诉用户
-           * 处理完之后怎么继续写——他改完副本回到这个标签页，
-           * 发现还是存不进去，只能自己猜。
-           * 实际自救路径就是「关掉本子重新打开」（`openBook` 会复位
-           * `conflict`），必须写出来。
+           * 同步客户端（Obsidian Sync / iCloud / OneDrive / Syncthing…）在下载、
+           * 校验、回写时经常只更新 mtime，正文一个字节没变。旧逻辑一看指纹变了
+           * 就另存 `-disk-` / `-mine-` 两份副本并停写主文件——用户看到的就是
+           * 「一写字就说同步失败、还反复生成备份文件」。
+           *
+           * 所以这里再比一次**内容哈希**：只要磁盘字节和上次读到/写入的基线一致，
+           * 就是「文件被动过、但内容没变」，收下新指纹、照常保存即可。
+           *
+           * 只有内容确实不同（含 size 不同，或同 size 但哈希不同）才走冲突副本。
+           * 读不出磁盘内容时无法确认，保守按真冲突处理，绝不覆盖未知内容。
            */
-          new Notice(
-            "检测到文件已被外部修改，已另存为两份副本，本次未覆盖原文件。" +
-              "请手动检查后选择保留哪一份；处理完后**关掉这个标签页重新打开本子**即可恢复保存。",
-            15000
-          );
-          return;
+          let benign = false;
+          if (baseline != null && typeof adapter.read === "function") {
+            try {
+              const diskText = await adapter.read(path);
+              if (typeof diskText === "string") {
+                if (hashText(diskText) === baseline) {
+                  benign = true;
+                } else {
+                  /*
+                   * 整份 JSON 的哈希不只含正文，还含 `updated` / `activePage` /
+                   * zoom / scrollTop 这些易变元数据：另一台设备只是打开同一本、
+                   * 翻了一页或滚了下，整份哈希就变了。旧逻辑把它当真正冲突，
+                   * 每次保存都另存一对 `-disk-` / `-mine-` 副本——用户看到的
+                   * 就是「电脑端不同步回来，只会不停生成副本」。
+                   *
+                   * 所以哈希不一致时再比**实质内容**（pages + outlines，忽略
+                   * 更新时间和视图状态）。实质相同＝只是元数据被同步盘/另一
+                   * 设备摸过，安全收下新指纹继续写正文，不再产副本。
+                   */
+                  try {
+                    const diskRaw = JSON.parse(diskText);
+                    const diskSig = this.bookContentSignature(diskRaw);
+                    if (baselineSig != null && diskSig === baselineSig) {
+                      benign = true;
+                    }
+                  } catch (_) {
+                    /* 解析失败就按真冲突处理，绝不覆盖未知内容 */
+                  }
+                }
+              }
+            } catch (e) {
+              console.warn("[inkbook] 冲突复核读取磁盘失败，按外部改动保守处理", e);
+            }
+          }
+          if (benign) {
+            // 内容与基线一致：同步盘只是摸了 mtime，不算冲突。收下新指纹继续写。
+            if (this.store === store) this.fp = now;
+          } else {
+            await this.saveConflictCopies(adapter, path, book);
+            if (this.store !== store) return;
+            this.conflict = true;
+            this.saveState = "dirty";
+            /*
+             * 提示里必须给出**怎么退出这个状态**（INK-206）。
+             *
+             * 进入冲突后 `saveNow` 整个跳过，本标签页再也不会写主文件。
+             * 老文案只说「请手动检查后选择保留哪一份」，没告诉用户
+             * 处理完之后怎么继续写——他改完副本回到这个标签页，
+             * 发现还是存不进去，只能自己猜。
+             * 实际自救路径就是「关掉本子重新打开」（`openBook` 会复位
+             * `conflict`），必须写出来。
+             */
+            new Notice(
+              "检测到文件已被外部修改，已另存为两份副本，本次未覆盖原文件。" +
+                "请手动检查后选择保留哪一份；处理完后**关掉这个标签页重新打开本子**即可恢复保存。",
+              15000
+            );
+            return;
+          }
         }
 
         /*
@@ -6163,7 +8460,7 @@ export class InkbookView extends FileView {
           this.editor && this.store === store
             ? this.captureViewState(book)
             : { zoom: book.zoom, scrollTop: book.scrollTop, scrollLeft: book.scrollLeft };
-        await writeBook(adapter, path, book);
+        const writtenJson = await writeBook(adapter, path, book);
         /*
          * 主动通知嵌入重画。
          *
@@ -6207,6 +8504,9 @@ export class InkbookView extends FileView {
          */
         if (this.store !== store) return;
         this.fp = fpAfter;
+        // 这次真正写下去的字节就是新的磁盘基线，下次据此分辨「摸 mtime」和「真改了」
+        this.diskHash = hashText(writtenJson);
+        this.diskContentSig = this.bookContentSignature(book);
         /*
          * 本子落盘之后再更新文字索引：索引是派生物，
          * 万一它写失败，不能反过来把「本子已保存」报成失败。
@@ -6273,6 +8573,36 @@ export class InkbookView extends FileView {
       if (!(await taken(cand))) return cand;
     }
     return `${stem}-${Date.now().toString(36)}${ext}`;
+  }
+
+  /**
+   * 一本书的「实质内容」签名：版本格式、标题/尺寸/来源、pages 与 outlines。
+   *
+   * 刻意排除 `version` / `updated` / `activePage` / `zoom` / `scrollTop` /
+   * `integrity` 这些易变或可升级的元数据——否则另一台设备随手翻页/滚动，
+   * 或旧文件被 normalize 升级版本号，整份哈希变化就会被误判成正文冲突并
+   * 不断生成副本（见 saveNow 的 benign 复核）。
+   */
+  private bookContentSignature(raw: any): string | null {
+    if (!raw || !Array.isArray(raw.pages)) return null;
+    try {
+      return JSON.stringify({
+        /*
+         * 不比 version：老文件读进来会被 normalizeBook 升到当前版本，
+         * 磁盘上的旧 version 与新内存版本只因格式升级而不同，正文其实没变。
+         */
+        kind: raw.kind,
+        title: raw.title,
+        width: raw.width,
+        height: raw.height,
+        source: raw.source ?? null,
+        created: raw.created,
+        pages: raw.pages,
+        outlines: raw.outlines ?? null,
+      });
+    } catch (_) {
+      return null;
+    }
   }
 
   /**
@@ -6513,63 +8843,117 @@ export class InkbookView extends FileView {
     if (this.app.workspace.getActiveViewOfType(InkbookView) !== this) return;
     if (!this.editor) return;
 
-    const mod = e.ctrlKey || e.metaKey;
-    if (mod && e.key.toLowerCase() === "s") {
-      e.preventDefault();
-      this.saveNow();
-      return;
-    }
-    if (mod && e.key.toLowerCase() === "z") {
-      e.preventDefault();
-      if (e.shiftKey) this.editor.redo();
-      else this.editor.undo();
-      return;
-    }
-    if (mod && e.key.toLowerCase() === "y") {
-      e.preventDefault();
-      this.editor.redo();
-      return;
-    }
-    if (mod || e.altKey) return;
+    /*
+     * 快捷键全部走设置里可自定义的映射：把这次按键规范化成 combo，再查动作表。
+     * 表里没有的键一律放行（不 preventDefault），交给宿主处理（如 Ctrl+P）。
+     * 默认值完全复刻旧行为（含 Ctrl+Y 重做、Delete/Backspace 删字、+ 与 = 放大）。
+     */
+    const combo = keyCombo(e);
+    if (!combo) return; // 只按了修饰键
+    const action = resolveHotkeys(this.plugin.settings.hotkeys).get(combo);
+    if (!action) return;
+    this.runHotkeyAction(action, e);
+  }
 
-    const k = e.key.toLowerCase();
-    if ((e.key === "Delete" || e.key === "Backspace") && this.editor.selectedText) {
-      e.preventDefault();
-      this.editor.deleteSelectedText();
-      return;
-    }
-    if (e.key === "Escape") {
-      // 有选中的文字：先取消选中，别顺手去收侧栏
-      if (this.editor.selectedText) {
-        this.editor.selectText(null);
+  /**
+   * 执行一个快捷键动作。e 只用于对系统级组合（保存 / 撤销 / 重做 / 删字）
+   * preventDefault，其余动作按旧行为不拦截默认事件。
+   */
+  private runHotkeyAction(action: string, e: KeyboardEvent): void {
+    const editor = this.editor!;
+    switch (action) {
+      case "save":
+        e.preventDefault();
+        this.saveNow();
+        return;
+      case "undo":
+        e.preventDefault();
+        editor.undo();
+        return;
+      case "redo":
+        e.preventDefault();
+        editor.redo();
+        return;
+      case "deleteText":
+        // 没有选中文字 / 形状 / 图片时不拦截 Delete / Backspace（保持旧行为）
+        if (editor.selectedText) {
+          e.preventDefault();
+          editor.deleteSelectedText();
+        } else if (editor.selectedShape) {
+          e.preventDefault();
+          editor.deleteSelectedShape();
+        } else if (editor.selectedImage) {
+          e.preventDefault();
+          editor.deleteSelectedImage();
+        }
+        return;
+      case "cancel":
+        // 有选中的文字 / 形状 / 图片先取消选中，别顺手去收侧栏
+        if (editor.selectedText) editor.selectText(null);
+        else if (editor.selectedShape) editor.selectShape(null);
+        else if (editor.selectedImage) editor.selectImage(null);
+        else if (this.sideShown) this.toggleSide();
+        return;
+      case "find":
+        // 捕获期通常已经接管了；这里是自定义键位 / 非捕获路径的兜底
+        e.preventDefault();
+        this.openFindBar();
+        return;
+      // ---- 切工具：走 activateTool，和点顶栏按钮是同一种「用户动作入口」，
+      //      第一次切工具、已在该工具上再按一下弹出/收起快捷参数浮层。
+      //      形状 / 文字 / 橡皮不再因为切工具而连带展开侧栏（浮层里就够调参）----
+      case "pen":
+      case "ballpoint":
+      case "highlighter":
+      case "eraser":
+      case "text":
+      case "select":
+      case "shape":
+      case "hand":
+        this.activateTool(action as ToolId);
+        return;
+      case "penOnly": {
+        const on = !this.plugin.settings.penOnly;
+        this.plugin.settings.penOnly = on;
+        void this.plugin.saveSettings();
+        editor.setPenOnly(on);
+        this.updateUI();
+        new Notice(on ? "只认触控笔：手指只滚动" : "手指和鼠标也能写", 2500);
         return;
       }
-      // Esc 只负责收起侧栏；侧栏本来就没开就什么都不做
-      if (this.sideShown) this.toggleSide();
-      return;
+      case "fit":
+        editor.fit();
+        return;
+      case "zoomIn":
+        editor.zoomBy(1.15);
+        return;
+      case "zoomOut":
+        editor.zoomBy(1 / 1.15);
+        return;
+      case "toggleSide":
+        this.toggleSide();
+        return;
+      case "toggleDock":
+        this.togglePageDock();
+        return;
+      /* 经典手写应用移植功能：快捷键只切运行时状态，同时写回设置并同步所有视图 */
+      case "cycleShapeSnap": {
+        const on = normalizeShapeSnap(this.plugin.settings.shapeSnap) === "off";
+        this.plugin.settings.shapeSnap = on ? "lift" : "off";
+        void this.plugin.saveSettings();
+        this.plugin.refreshViews();
+        new Notice(on ? "一笔成型：开（画完立刻识别）" : "一笔成型：关", 2200);
+        return;
+      }
+      case "toggleLaser": {
+        const on = this.plugin.settings.laserPointer !== true;
+        this.plugin.settings.laserPointer = on;
+        void this.plugin.saveSettings();
+        this.plugin.refreshViews();
+        new Notice(on ? "激光笔：开（只指示，不落墨）" : "激光笔：关", 2200);
+        return;
+      }
     }
-    /*
-     * 键盘切工具也走 chooseTool：和点顶栏是同一种「用户动作入口」。
-     * 这样按 E / R 切到橡皮 / 形状时同样会展开侧栏（参数只住在那里），
-     * 而按 P / B / H 不会——展开策略只维护一处。
-     */
-    if (k === "p") this.chooseTool("pen");
-    else if (k === "b") this.chooseTool("ballpoint");
-    else if (k === "h") this.chooseTool("highlighter");
-    else if (k === "e") this.chooseTool("eraser");
-    else if (k === "v") this.chooseTool("select");
-    else if (k === "r") this.chooseTool("shape");
-    else if (k === "t") this.chooseTool("text");
-    else if (k === "i") {
-      const on = !this.plugin.settings.penOnly;
-      this.plugin.settings.penOnly = on;
-      this.plugin.saveSettings();
-      this.editor.setPenOnly(on);
-      this.updateUI();
-      new Notice(on ? "只认触控笔：手指只滚动" : "手指和鼠标也能写", 2500);
-    } else if (k === "0") this.editor.fit();
-    else if (k === "+" || k === "=") this.editor.zoomBy(1.15);
-    else if (k === "-") this.editor.zoomBy(1 / 1.15);
   }
 
   syncSettings(): void {
@@ -6583,9 +8967,14 @@ export class InkbookView extends FileView {
     this.editor.setPrediction(this.plugin.settings.prediction !== false);
     this.editor.setEdgeSwipeBlock(this.plugin.settings.blockEdgeSwipe !== false);
     this.editor.setStraighten(this.plugin.settings.straightLine === true);
+    // 经典手写应用移植功能：设置页改完立刻对所有已打开的视图生效
+    this.editor.setShapeSnap(normalizeShapeSnap(this.plugin.settings.shapeSnap));
+    this.editor.setLaserPointer(this.plugin.settings.laserPointer === true);
     // 与 mountEditor 一致地兜底：0 / NaN / null 会让笔尖宽度变成非法值，
     // 落笔线条消失、Path2D 也会拿到 NaN。别让「改了别的设置」顺手弄坏笔。
     this.editor.penSize = finiteSetting(this.plugin.settings.defaultPenSize, 2.8, 1, 8);
+    this.editor.ballpointSize = finiteSetting(this.plugin.settings.defaultBallpointSize, 2.8, 1, 8);
+    this.editor.shapeSizes = finiteShapeSizes(this.plugin.settings.defaultShapeSizes, 2.8);
     // 设置页里的「上次用的笔色 / 荧光色 / 荧光粗细」改完立即生效
     this.editor.penColor = this.plugin.settings.lastPenColor || "#1A1A1A";
     this.editor.highlighterColor = this.plugin.settings.lastHighlighterColor || "#F6E05E";
@@ -6595,6 +8984,11 @@ export class InkbookView extends FileView {
       4,
       40
     );
+    // 橡皮记忆：设置页/其他窗口改了也同步（同样做非法值兜底）。
+    this.editor.eraserMode = this.plugin.settings.lastEraserMode === "whole" ? "whole" : "part";
+    this.editor.eraserSize = finiteSetting(this.plugin.settings.lastEraserSize, 26, 6, 60);
+    // 快捷键可能刚在设置页改过：刷新按钮 tooltip 上显示的键位
+    this.syncHotkeyLabels();
     this.updateUI();
   }
 }

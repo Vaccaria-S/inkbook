@@ -1,9 +1,0 @@
-{
-  "recommendations": [
-    "dbaeumer.vscode-eslint",
-    "esbenp.prettier-vscode",
-    "usernamehw.errorlens",
-    "eamodio.gitlens",
-    "editorconfig.editorconfig"
-  ]
-}
